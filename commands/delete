@@ -1,0 +1,40 @@
+cove_delete() {
+    source_config
+    local site_name="$1"
+    for protected_name in $PROTECTED_NAMES; do
+        if [ "$site_name" == "$protected_name" ]; then
+            gum style --foreground red "❌ Error: '$site_name' is a reserved name and cannot be deleted."
+            exit 1
+        fi
+    done
+
+    local force_delete=false
+    if [ "$2" == "--force" ]; then
+        force_delete=true
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if [ ! -d "$site_dir" ]; then
+        echo "⚠️ Site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    if ! $force_delete; then
+        if ! gum confirm "🚨 Are you sure you want to delete '$site_name.localhost'? This will remove its files and potentially its database."; then
+            echo "🚫 Deletion cancelled."
+            exit 0
+        fi
+    fi
+
+    echo "🔥 Deleting site: $site_name.localhost"
+    if [ -f "$site_dir/public/wp-config.php" ]; then
+        local db_name; db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        echo "🗄️ Deleting database: $db_name"
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+    fi
+
+    rm -rf "$site_dir"
+    echo "✅ Directory deleted."
+    regenerate_caddyfile
+    echo "✅ Site '$site_name.localhost' has been removed."
+}

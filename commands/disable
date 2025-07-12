@@ -1,0 +1,7 @@
+cove_disable() {
+    echo "🛑 Disabling Cove services..."
+    "$CADDY_CMD" stop --config "$CADDYFILE_PATH"
+    brew services stop mariadb
+    brew services stop mailpit
+    echo "✅ Services stopped."
+}

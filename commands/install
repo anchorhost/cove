@@ -1,0 +1,115 @@
+cove_install() {
+    echo "🚀 Starting Cove installation..."
+    if ! command -v gum &> /dev/null; then brew install gum; fi
+
+    # --- Pre-install Checks ---
+    if [ -d "$COVE_DIR" ]; then
+        if ! gum confirm "⚠️ The Cove directory (~/Cove) already exists. Proceeding may overwrite some configurations. Continue?"; then
+            echo "🚫 Installation cancelled."
+            exit 0
+        fi
+    fi
+
+    # --- Dependency Installation ---
+    local packages_to_install=()
+    if [ "$CADDY_CMD" == "caddy" ] && ! command -v caddy &> /dev/null; then
+        packages_to_install+=("caddy")
+    else
+        echo "ℹ️ Using existing Caddy/FrankenPHP installation."
+    fi
+
+    for pkg_cmd in mariadb mailpit "wp:wp-cli" gum; do
+        local pkg=${pkg_cmd##*:}
+        local cmd=${pkg_cmd%%:*}
+        if ! command -v $cmd &> /dev/null; then
+            packages_to_install+=("$pkg")
+        fi
+    done
+
+    if [ ${#packages_to_install[@]} -gt 0 ]; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Missing Dependencies: ${packages_to_install[*]}"
+        brew install "${packages_to_install[@]}"
+        if [ $? -ne 0 ]; then
+            gum style --foreground red "❌ Dependency installation failed. Please check Homebrew errors."
+            exit 1
+        fi
+    else
+        echo "✅ All dependencies are already installed."
+    fi
+
+    # --- Directory and Service Setup ---
+    echo "📁 Creating Cove directory structure..."
+    mkdir -p "$SITES_DIR" "$LOGS_DIR" "$GUI_DIR" "$ADMINER_DIR" "$CUSTOM_CADDY_DIR"
+    echo "🗃️ Downloading Adminer 5.3.0..."
+    curl -sL "https://github.com/vrana/adminer/releases/download/v5.3.0/adminer-5.3.0.php" -o "$COVE_DIR/adminer/index.php"
+    echo "🎨 Injecting custom Adminer theme..."
+    cat > "$ADMINER_DIR/adminer.css" << 'EOM'
+/*!
+ * Material Design for Adminer, version 1.1.4
+ * https://github.com/arcs-/Adminer-Material-Theme
+ */@import url(https://fonts.googleapis.com/css?family=Noto+Sans:400,700);body{display:flex;height:100vh;background:#FAFAFA;font-family:"Noto Sans",sans-serif;text-rendering:optimizeLegibility !important}*{outline-color:#1E88E5}::selection{background:#4ca0ea;color:#fff}::-moz-selection{background:#4ca0ea;color:#fff}::-webkit-scrollbar{width:9px;height:12px;background-color:#CCC}::-webkit-scrollbar-corner{background-color:#CCC}::-webkit-scrollbar-thumb{background-color:#263238}::-webkit-scrollbar-corner{background-color:#263238;width:8px;height:8px}.scrollable{overflow-x:visible}#lang{position:fixed;top:auto;bottom:0;z-index:3;padding:.8em 1em;width:245px;border-top:1px solid #ccc;background:#fff}#lang select{width:66%}#menu{position:fixed;top:0;z-index:2;display:flex;margin:0;padding:0;height:100%;background:#fff;box-shadow:0 85px 5px 0 rgba(0,0,0,0.14),0 85px 10px 0 rgba(0,0,0,0.12),0 85px 4px -1px rgba(0,0,0,0.2);flex-flow:column}#menu h1{position:fixed;right:54px;border-bottom:none;font-size:12px;background:transparent;padding:4px 0}#menu select{width:86%}#menu #logins{padding:10px 14px 0;height:100%}#menu #logins:before{content:'Saved Logins';display:block;font-size:1.2em;margin:40px 0 10px}#menu #logins a{display:inline-block;margin:4px 0;padding:6px 12px;height:36px;width:86%;border-radius:2px;color:#fff;background:#1E88E5;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12);text-decoration:none;transition:all .2s;border-radius:2px;text-align:center;font-weight:bold;font-size:13px;line-height:30px}#menu #logins a:hover{background:#10538d}#menu.active{background:#1E88E5 !important;color:#fff !important;font-weight:auto}#menu .links a{display:inline-block;margin:4px 2px;padding:5px;width:42%;border-radius:2px;background:#fff;color:#1E88E5;text-align:center;text-transform:uppercase;font-weight:bold;font-size:13px;line-height:24px;transition:all .2s}#menu .links a:hover{background:#1E88E5;color:#fff;text-decoration:none;font-weight:auto}a #h1{color:#AFB3B5}.version{color:#AFB3B5}#tables{overflow-x:hidden !important;margin-bottom:47px;padding:9px 12px 0 6px;flex:1}#tables .select:hover{background:#1E88E5;color:#fff;text-decoration:none;font-weight:auto}#tables a{display:inline-block;overflow:hidden;padding:6px 0 6px 8px;width:175px;border-radius:2px;text-overflow:ellipsis;transition:all .2s;color:#000}#tables a:hover{background:#e4e5e6;color:#000;text-decoration:none}#tables a.select{position:relative;float:right;padding:5px;width:auto;border-radius:2px;background:#fff;color:#1E88E5;text-align:center;text-transform:uppercase;font-weight:bold;font-size:13px;line-height:18px}#content{display:flex;flex-direction:column;overflow-x:auto;margin:83px 0 0 19em;padding:17px 27px 100px;min-width:600px;width:100%}#content h2{position:fixed;top:0;z-index:1;margin-left:-28px;padding-top:0;padding-left:30px;width:100%;height:65px;background:#263238;color:#AFB3B5;line-height:104px}#breadcrumb{position:fixed;z-index:2;padding-top:10px;padding-left:20px;background:#263238;color:#263238}#breadcrumb a{color:#1E88E5;font-size:13px;line-height:18px;transition:all .2s}#breadcrumb a:hover{color:#10538d;text-decoration:none}#logout{position:fixed;top:21px;right:50px;z-index:2;margin:4px 2px;padding:5px;min-width:88px;outline:none;border:none;border-radius:2px;background:#1E88E5;box-shadow:0 1px 4px rgba(48,48,48,0.41),0 2px 3px rgba(0,0,0,0.26);color:#fff;text-align:center;text-transform:uppercase;font-weight:bold;font-size:13px;line-height:24px;transition:all .2s}#logout:hover{background:#10538d}select{margin:0;padding:3px;border:none;border:1px solid rgba(0,0,0,0.12);border-radius:2px;color:#666;background:#fff;cursor:pointer}a,a:link{color:#1E88E5;transition:all .2s}a:hover,a:link:hover{color:#10538d;text-decoration:none}input:not([type]),input[type=number],input[type=password],input[type=search],input[type=text]{padding:8px;border:1px solid rgba(0,0,0,0.12);border-radius:2px;font-size:15px}input[type=search]:first-child{box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12)}input[type=submit]{padding:0 16px;min-width:64px;height:36px;border:none;border-radius:2px;background:#1E88E5;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12);color:#fff;text-transform:uppercase;font-size:14px;cursor:pointer;transition:all .2s}input[type=submit]:hover{background:#10538d}input[type=button][disabled],input[type=submit][disabled]{background:#AFB3B5 !important;color:#504c4a;cursor:no-drop}div input[name=delete],div input[name=drop],div input[name=truncate],input[value=Kill]{background:repeating-linear-gradient(-55deg, #1E88E5, #1E88E5 5px, #4ca0ea 5px, #4ca0ea 10px);transition:all .2s}div input[name=delete]:hover,div input[name=drop]:hover,div input[name=truncate]:hover,input[value=Kill]:hover{background:repeating-linear-gradient(-55deg, #10538d, #10538d 5px, #1E88E5 5px, #1E88E5 10px)}input[type=checkbox]{display:inline-block;padding-left:25px;height:20px;outline:0;background-image:url("data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9Im5vIj8+CjxzdmcKICAgeG1sbnM6ZGM9Imh0dHA6Ly9wdXJsLm9yZy9kYy9lbGVtZW50cy8xLjEvIgogICB4bWxuczpjYz0iaHR0cDovL2NyZWF0aXZlY29tbW9ucy5vcmcvbnMjIgogICB4bWxuczpyZGY9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkvMDIvMjItcmRmLXN5bnRheC1ucyMiCiAgIHhtbG5zOnN2Zz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciCiAgIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIKICAgeG1sbnM6c29kaXBvZGk9Imh0dHA6Ly9zb2RpcG9kaS5zb3VyY2Vmb3JnZS5uZXQvRFREL3NvZGlwb2RpLTAuZHRkIgogICB4bWxuczppbmtzY2FwZT0iaHR0cDovL3d3dy5pbmtzY2FwZS5vcmcvbmFtZXNwYWNlcy9pbmtzY2FwZSIKICAgd2lkdGg9IjIwcHQiCiAgIGhlaWdodD0iNDBwdCIKICAgdmlld0JveD0iMCAwIDIwIDQwIgogICB2ZXJzaW9uPSIxLjEiCiAgIGlkPSJzdmcyIgogICBpbmtzY2FwZTp2ZXJzaW9uPSIwLjQ4LjUgcjEwMDQwIgogICBzb2RpcG9kaTpkb2NuYW1lPSJjaGVjay5zdmciPgogIDxtZXRhZGF0YQogICAgIGlkPSJtZXRhZGF0YTE5Ij4KICAgIDxyZGY6UkRGPgogICAgICA8Y2M6V29yawogICAgICAgICByZGY6YWJvdXQ9IiI+CiAgICAgICAgPGRjOmZvcm1hdD5pbWFnZS9zdmcreG1sPC9kYzpmb3JtYXQ+CiAgICAgICAgPGRjOnR5cGUKICAgICAgICAgICByZGY6cmVzb3VyY2U9Imh0dHA6Ly9wdXJsLm9yZy9kYy9kY21pdHlwZS9TdGlsbEltYWdlIiAvPgogICAgICA8L2NjOldvcms+CiAgICA8L3JkZjpSREY+CiAgPC9tZXRhZGF0YT4KICA8ZGVmcwogICAgIGlkPSJkZWZzMTciIC8+CiAgPHNvZGlwb2RpOm5hbWVkdmlldwogICAgIHBhZ2Vjb2xvcj0iI2ZmZmZmZiIKICAgICBib3JkZXJjb2xvcj0iIzY2NjY2NiIKICAgICBib3JkZXJvcGFjaXR5PSIxIgogICAgIG9iamVjdHRvbGVyYW5jZT0iMTAiCiAgICAgZ3JpZHRvbGVyYW5jZT0iMTAiCiAgICAgZ3VpZGV0b2xlcmFuY2U9IjEwIgogICAgIGlua3NjYXBlOnBhZ2VvcGFjaXR5PSIwIgogICAgIGlua3NjYXBlOnBhZ2VzaGFkb3c9IjIiCiAgICAgaW5rc2NhcGU6d2luZG93LXdpZHRoPSIxOTIwIgogICAgIGlua3NjYXBlOndpbmRvdy1oZWlnaHQ9IjEwMTciCiAgICAgaWQ9Im5hbWVkdmlldzE1IgogICAgIHNob3dncmlkPSJmYWxzZSIKICAgICBpbmtzY2FwZTp6b29tPSIxNiIKICAgICBpbmtzY2FwZTpjeD0iNDMuNzAyNjQ2IgogICAgIGlua3NjYXBlOmN5PSIzMS45NTE3ODMiCiAgICAgaW5rc2NhcGU6d2luZG93LXg9IjE5MTIiCiAgICAgaW5rc2NhcGU6d2luZG93LXk9Ii04IgogICAgIGlua3NjYXBlOndpbmRvdy1tYXhpbWl6ZWQ9IjEiCiAgICAgaW5rc2NhcGU6Y3VycmVudC1sYXllcj0ic3ZnMiIgLz4KICA8ZwogICAgIHN0eWxlPSJmaWxsOiMwMDAwMDAiCiAgICAgaWQ9ImczMDY4IgogICAgIHRyYW5zZm9ybT0ic2NhbGUoMC44LDAuOCkiPgogICAgPHBhdGgKICAgICAgIGlkPSJwYXRoMzA1OCIKICAgICAgIGQ9Ik0gMTksNSBWIDE5IEggNSBWIDUgSCAxOSBNIDE5LDMgSCA1IEMgMy45LDMgMywzLjkgMyw1IHYgMTQgYyAwLDEuMSAwLjksMiAyLDIgaCAxNCBjIDEuMSwwIDIsLTAuOSAyLC0yIFYgNSBDIDIxLDMuOSAyMC4xLDMgMTksMyB6IgogICAgICAgaW5rc2NhcGU6Y29ubmVjdG9yLWN1cnZhdHVyZT0iMCIgLz4KICAgIDxwYXRoCiAgICAgICBpZD0icGF0aDMwNjAiCiAgICAgICBkPSJNIDAsMCBIIDI0IFYgMjQgSCAwIHoiCiAgICAgICBpbmtzY2FwZTpjb25uZWN0b3ItY3VydmF0dXJlPSIwIgogICAgICAgc3R5bGU9ImZpbGw6bm9uZSIgLz4KICA8L2c+CiAgPGcKICAgICBzdHlsZT0iZmlsbDojMDAwMDAwIgogICAgIGlkPSJnMzA4NCIKICAgICB0cmFuc2Zvcm09Im1hdHJpeCgwLjgsMCwwLDAuOCwwLDIwKSI+CiAgICA8cGF0aAogICAgICAgaWQ9InBhdGgzMDc0IgogICAgICAgZD0iTSAwLDAgSCAyNCBWIDI0IEggMCB6IgogICAgICAgaW5rc2NhcGU6Y29ubmVjdG9yLWN1cnZhdHVyZT0iMCIKICAgICAgIHN0eWxlPSJmaWxsOm5vbmUiIC8+CiAgICA8cGF0aAogICAgICAgaWQ9InBhdGgzMDc2IgogICAgICAgZD0iTSAxOSwzIEggNSBDIDMuODksMyAzLDMuOSAzLDUgdiAxNCBjIDAsMS4xIDAuODksMiAyLDIgaCAxNCBjIDEuMTEsMCAyLC0wLjkgMiwtMiBWIDUgQyAyMSwzLjkgMjAuMTEsMyAxOSwzIHogTSAxMCwxNyA1LDEyIDYuNDEsMTAuNTkgMTAsMTQuMTcgMTcuNTksNi41OCAxOSw4IDEwLDE3IHoiCiAgICAgICBpbmtzY2FwZTpjb25uZWN0b3ItY3VydmF0dXJlPSIwIiAvPgogIDwvZz4KPC9zdmc+Cg==");background-position:0 0;background-size:20px;background-repeat:no-repeat;vertical-align:middle;font-size:20px;line-height:20px;cursor:pointer;-webkit-appearance:none;-webkit-user-select:none;user-select:none}input[type=checkbox]:checked{background-position:0 -20px}input[type=radio]{display:inline-block;padding-left:25px;height:20px;outline:0;background-image:url("data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9Im5vIj8+CjxzdmcKICAgeG1sbnM6ZGM9Imh0dHA6Ly9wdXJsLm9yZy9kYy9lbGVtZW50cy8xLjEvIgogICB4bWxuczpjYz0iaHR0cDovL2NyZWF0aXZlY29tbW9ucy5vcmcvbnMjIgogICB4bWxuczpyZGY9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkvMDIvMjItcmRmLXN5bnRheC1ucyMiCiAgIHhtbG5zOnN2Zz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciCiAgIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIKICAgeG1sbnM6c29kaXBvZGk9Imh0dHA6Ly9zb2RpcG9kaS5zb3VyY2Vmb3JnZS5uZXQvRFREL3NvZGlwb2RpLTAuZHRkIgogICB4bWxuczppbmtzY2FwZT0iaHR0cDovL3d3dy5pbmtzY2FwZS5vcmcvbmFtZXNwYWNlcy9pbmtzY2FwZSIKICAgd2lkdGg9IjIwcHQiCiAgIGhlaWdodD0iNDBwdCIKICAgdmlld0JveD0iMCAwIDIwIDQwIgogICB2ZXJzaW9uPSIxLjEiCiAgIGlkPSJzdmcyIgogICBpbmtzY2FwZTp2ZXJzaW9uPSIwLjQ4LjUgcjEwMDQwIgogICBzb2RpcG9kaTpkb2NuYW1lPSJjaGVjay5zdmciPgogIDxtZXRhZGF0YQogICAgIGlkPSJtZXRhZGF0YTE5Ij4KICAgIDxyZGY6UkRGPgogICAgICA8Y2M6V29yawogICAgICAgICByZGY6YWJvdXQ9IiI+CiAgICAgICAgPGRjOmZvcm1hdD5pbWFnZS9zdmcreG1sPC9kYzpmb3JtYXQ+CiAgICAgICAgPGRjOnR5cGUKICAgICAgICAgICByZGY6cmVzb3VyY2U9Imh0dHA6Ly9wdXJsLm9yZy9kYy9kY21pdHlwZS9TdGlsbEltYWdlIiAvPgogICAgICAgIDxkYzp0aXRsZT48L2RjOnRpdGxlPgogICAgICA8L2NjOldvcms+CiAgICA8L3JkZjpSREY+CiAgPC9tZXRhZGF0YT4KICA8ZGVmcwogICAgIGlkPSJkZWZzMTciIC8+CiAgPHNvZGlwb2RpOm5hbWVkdmlldwogICAgIHBhZ2Vjb2xvcj0iI2ZmZmZmZiIKICAgICBib3JkZXJjb2xvcj0iIzY2NjY2NiIKICAgICBib3JkZXJvcGFjaXR5PSIxIgogICAgIG9iamVjdHRvbGVyYW5jZT0iMTAiCiAgICAgZ3JpZHRvbGVyYW5jZT0iMTAiCiAgICAgZ3VpZGV0b2xlcmFuY2U9IjEwIgogICAgIGlua3NjYXBlOnBhZ2VvcGFjaXR5PSIwIgogICAgIGlua3NjYXBlOnBhZ2VzaGFkb3c9IjIiCiAgICAgaW5rc2NhcGU6d2luZG93LXdpZHRoPSIxOTIwIgogICAgIGlua3NjYXBlOndpbmRvdy1oZWlnaHQ9IjEwMTciCiAgICAgaWQ9Im5hbWVkdmlldzE1IgogICAgIHNob3dncmlkPSJmYWxzZSIKICAgICBpbmtzY2FwZTp6b29tPSIyMi42Mjc0MTciCiAgICAgaW5rc2NhcGU6Y3g9IjguNzkxODMzNyIKICAgICBpbmtzY2FwZTpjeT0iMTEuODUxMjkzIgogICAgIGlua3NjYXBlOndpbmRvdy14PSItOCIKICAgICBpbmtzY2FwZTp3aW5kb3cteT0iLTgiCiAgICAgaW5rc2NhcGU6d2luZG93LW1heGltaXplZD0iMSIKICAgICBpbmtzY2FwZTpjdXJyZW50LWxheWVyPSJzdmcyIiAvPgogIDxnCiAgICAgaWQ9ImczMDE1IgogICAgIHRyYW5zZm9ybT0ic2NhbGUoMC44LDAuOCkiPgogICAgPHBhdGgKICAgICAgIGlkPSJwYXRoMzAwNSIKICAgICAgIGQ9Ik0gMTIsMiBDIDYuNDgsMiAyLDYuNDggMiwxMiAyLDE3LjUyIDYuNDgsMjIgMTIsMjIgMTcuNTIsMjIgMjIsMTcuNTIgMjIsMTIgMjIsNi40OCAxNy41MiwyIDEyLDIgeiBtIDAsMTggQyA3LjU4LDIwIDQsMTYuNDIgNCwxMiA0LDcuNTggNy41OCw0IDEyLDQgYyA0LjQyLDAgOCwzLjU4IDgsOCAwLDQuNDIgLTMuNTgsOCAtOCw4IHoiCiAgICAgICBpbmtzY2FwZTpjb25uZWN0b3ItY3VydmF0dXJlPSIwIiAvPgogICAgPHBhdGgKICAgICAgIGlkPSJwYXRoMzAwNyIKICAgICAgIGQ9Ik0gMCwwIEggMjQgViAyNCBIIDAgeiIKICAgICAgIGlua3NjYXBlOmNvbm5lY3Rvci1jdXJ2YXR1cmU9IjAiCiAgICAgICBzdHlsZT0iZmlsbDpub25lIiAvPgogIDwvZz4KICA8ZwogICAgIGlkPSJnMzA0MiIKICAgICB0cmFuc2Zvcm09Im1hdHJpeCgwLjgsMCwwLDAuOCwwLDIwLjgpIj4KICAgIDxwYXRoCiAgICAgICBpZD0icGF0aDMwMzIiCiAgICAgICBkPSJtIDEyLDcgYyAtMi43NiwwIC01LDIuMjQgLTUsNSAwLDIuNzYgMi4yNCw1IDUsNSAyLjc2LDAgNSwtMi4yNCA1LC01IEMgMTcsOS4yNCAxNC43Niw3IDEyLDcgeiBNIDEyLDIgQyA2LjQ4LDIgMiw2LjQ4IDIsMTIgMiwxNy41MiA2LjQ4LDIyIDEyLDIyIDE3LjUyLDIyIDIyLDE3LjUyIDIyLDEyIDIyLDYuNDggMTcuNTIsMiAxMiwyIHogbSAwLDE4IEMgNy41OCwyMCA0LDE2LjQyIDQsMTIgNCw3LjU4IDcuNTgsNCAxMiw0IGMgNC40MiwwIDgsMy41OCA4LDggMCw0LjQyIC0zLjU4LDggLTgsOCB6IgogICAgICAgaW5rc2NhcGU6Y29ubmVjdG9yLWN1ydmF0dXJlPSIwIiAvPgogICAgPHBhdGgKICAgICAgIGlkPSJwYXRoMzAzNCIKICAgICAgIGQ9Ik0gMCwwIEggMjQgViAyNCBIIDAgeiIKICAgICAgIGlua3NjYXBlOmNvbm5lY3Rvci1jdXJ2YXR1cmU9IjAiCiAgICAgICBzdHlsZT0iZmlsbDpub25lIiAvPgogIDwvZz4KPC9zdmc+");background-position:0 0;background-size:20px;background-repeat:no-repeat;vertical-align:middle;font-size:20px;line-height:20px;cursor:pointer;-webkit-appearance:none;-webkit-user-select:none;user-select:none}input[type=radio]:checked{background-position:0 -21px}input[type=number]{padding:8px}#help{display:none}.sqlarea.jush-sql.jush{border:1px solid rgba(0,0,0,0.12) !important;background:#fff;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12)}.js .column{left:-50px;margin:-6px 0 0;padding:5px 0 7px 3px;border:1px solid rgba(0,0,0,0.12);border-radius:3px;background:#fff;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12)}.js .column a{padding:1px 8px 3px 5px;margin-right:3px;border-radius:2px;color:#1E88E5;transition:all .2s}.js .column a:hover{color:#fff;background:#1E88E5}table{margin-top:20px;min-width:800px;border-collapse:collapse;box-shadow:0 1px 4px rgba(88,88,88,0.01),0 2px 3px rgba(88,88,88,0.26);white-space:nowrap;font-size:13px;order:4}form table{width:100%}thead td,thead th{background:#ececec;position:sticky;top:0;z-index:2}thead td:before,thead th:before{content:'';position:absolute;background:#fafafa;top:-20px;left:-10px;width:120%;height:20px}thead td:after,thead th:after{content:'';position:absolute;left:0;bottom:0;width:100%;border-bottom:1px solid #cecece}thead th{padding:0 18px;text-align:left}th{box-sizing:border-box;padding:5px 18px !important;width:20%;border:1px solid #ececec;background:#fff;font-weight:normal;font-size:14px}td{box-sizing:border-box;padding:2px 10px 0;height:45px;border:1px solid #ececec;background:#fff;color:#000}.odd td,.odd th{background:#fafafa}td a,td a:visited,th a,th a:visited{color:#1E88E5;font-weight:700}.js .checkable .checked td,.js .checkable .checked th{background:#e0e0e0}#noindex,sup{display:none}.pages{position:absolute;padding:10px 20px 0;height:35px;border:1px solid rgba(0,0,0,0.12);background-color:#fff;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12);font-size:15px}.pages a:not(:first-child){margin-top:5px;padding:5px;border:1px solid #1E88E5;border-radius:2px;color:#263238;text-align:center}.pages a:not(:first-child):hover{background:#1E88E5;color:#fff;text-decoration:none}.icon{width:24px;height:24px;border-radius:2px;background:#000;opacity:.8;-webkit-filter:contrast(125%) invert(1);filter:contrast(125%) invert(1);transition:all .2s}.icon:hover{background:#e1771a}.footer{background:none;border:none;border-color:transparent;position:relative}.footer>div{background:transparent}#content form{display:table;order:1}#content table:nth-of-type(1){order:1;margin:38px 0}#content .links,#content h3,#content h3+.error{margin:15px 0 0;order:4}#content .links:nth-of-type(2){margin-top:30px;order:1}#content .links a{display:inline-block;margin:4px;padding:6px 12px;min-width:88px;border-radius:2px;background:#fff;box-shadow:0 1px 4px rgba(88,88,88,0.41),0 2px 3px rgba(88,88,88,0.26);color:#1E88E5;text-align:center;text-transform:uppercase;font-weight:bold;font-size:13px;line-height:24px;transition:all .2s}#content .links a:hover{background:#1E88E5;color:#fff;text-decoration:none}#content .links .active{background:#1E88E5;color:#fff;cursor:default}#content form>fieldset:first-child{background-color:transparent;border:none;box-shadow:none;float:right;margin:0;padding:0;margin-bottom:4px;margin-top:-40px}#content form>fieldset:first-child legend{display:none}#content #form fieldset:nth-of-type(1){margin-bottom:10px;margin-top:0;padding-bottom:11px;min-height:57px;border:1px solid rgba(0,0,0,0.12);background-color:#fff;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12);padding:.5em .8em;margin:.8em .5em 0 0;float:initial}#content #form fieldset:nth-of-type(1) legend{display:block}#content fieldset:nth-of-type(2).jsonly{float:right;margin-top:-30px;margin-right:8px;border:none}#content fieldset:nth-of-type(2).jsonly legend{display:none}#content fieldset:first-child #fieldset-import,#content fieldset:nth-of-type(1),#content fieldset:nth-of-type(2):not(.jsonly),#content fieldset:nth-of-type(3),#content fieldset:nth-of-type(4),#content fieldset:nth-of-type(5){margin-bottom:10px;padding-bottom:11px;min-height:57px;border:1px solid rgba(0,0,0,0.12);background-color:#fff;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12)}#content fieldset:nth-of-type(6){border:none}#content fieldset:nth-of-type(6) legend{visibility:hidden}#content legend a{padding:5px;color:#1E88E5;font-weight:bold;font-size:13px;line-height:18px;transition:all .2s}#content legend a:hover{color:#10538d;text-decoration:none}#content fieldset:first-child #fieldset-import{margin-top:36px;padding:13px 10px 0 9px;margin-left:-12px}#content fieldset:first-child #fieldset-import:before{content:'Import';position:absolute;top:8px;left:20px;background:#fff;padding:0 7px}#content input[name=copy],#content input[name=move]{float:right;margin-right:-20px;margin-left:25px}#content input[name=copy],#content input[name=move]{float:right;margin-right:-20px;margin-left:25px}#content select{margin-bottom:2px;padding:8px}
+EOM
+
+    # Download and install Whoops into a clean directory
+    echo "✨ Downloading Whoops error handler..."
+    rm -rf "$APP_DIR/whoops" # Remove any old versions first
+    mkdir -p "$APP_DIR/whoops"
+    curl -sL "https://github.com/filp/whoops/archive/refs/tags/2.18.3.tar.gz" | tar -xz -C "$APP_DIR/whoops" --strip-components=1
+
+    echo "⚙️ Starting services..."
+    brew services restart mariadb # Use restart to be safe
+    brew services restart mailpit # Use restart to be safe
+
+    # --- Database Configuration ---
+    local skip_db_setup=false
+    if [ -f "$CONFIG_FILE" ]; then
+        if gum confirm "Existing Cove database config found. Use it and skip database setup?"; then
+            skip_db_setup=true
+            echo "✅ Using existing database configuration."
+        else
+            echo "🔥 Proceeding with database reconfiguration..."
+        fi
+    fi
+
+    if ! $skip_db_setup; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Configuring MariaDB"
+
+        # Wait for MariaDB to be ready
+        echo "Waiting for MariaDB..."
+        i=0
+        while ! mysqladmin pink --silent; do
+            sleep 1; i=$((i+1))
+            if [ $i -ge 20 ]; then
+                gum style --foreground red "❌ MariaDB did not become available in time."
+                exit 1
+            fi
+        done
+        echo "✅ MariaDB is ready."
+
+        echo "Please provide your MariaDB root credentials to create a 'cove' user."
+        local root_user; root_user=$(gum input --value "root" --prompt "Root username: ")
+        local root_pass; root_pass=$(gum input --password --placeholder "Password for '$root_user'")
+        local db_user="cove_user"
+        local db_pass; db_pass=$(openssl rand -base64 16)
+
+        local sql_command="DROP USER IF EXISTS '$db_user'@'localhost'; CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass'; GRANT ALL PRIVILEGES ON *.* TO '$db_user'@'localhost' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+        echo "$sql_command" | mysql -u "$root_user" -p"$root_pass"
+        
+        if [ $? -ne 0 ]; then
+            gum style --foreground red "❌ Database user creation failed. Check credentials and try again."
+            exit 1
+        fi
+        echo "✅ Database user '$db_user' created."
+
+        echo "📝 Saving new configuration..."
+        echo "DB_USER='$db_user'" > "$CONFIG_FILE"
+        echo "DB_PASSWORD='$db_pass'" >> "$CONFIG_FILE"
+    fi
+    
+    # --- Finalize ---
+    create_whoops_bootstrap
+    create_gui_file
+    regenerate_caddyfile
+
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 Cove installation complete!" "Run 'cove enable' to start the server." "Your Cove Dashboard is at https://cove.localhost"
+}

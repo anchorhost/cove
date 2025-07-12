@@ -1,0 +1,99 @@
+cove_directive_add_or_update() {
+    local site_name="$1"
+    if [ -z "$site_name" ];
+ then
+        gum style --foreground red "❌ Error: Please provide a site name."
+ echo "Usage: cove directive <add|update> <name>"
+        exit 1
+    fi
+    
+    local site_hostname="${site_name}.localhost"
+    local site_dir="$SITES_DIR/$site_hostname"
+    local custom_conf_file="$CUSTOM_CADDY_DIR/$site_hostname"
+
+    if [ ! -d "$site_dir" ]; then
+        gum style --foreground red "❌ Error: Site '$site_hostname' not found."
+ exit 1
+    fi
+
+    if [ -f "$custom_conf_file" ];
+ then
+        echo "📝 Editing custom Caddy directives for $site_hostname..."
+    else
+        echo "📝 Adding new custom Caddy directives for $site_hostname..."
+    fi
+    echo "   Press Ctrl+D to save and exit, Ctrl+C to cancel."
+ local existing_rules=""
+    if [ -f "$custom_conf_file" ];
+ then
+        existing_rules=$(cat "$custom_conf_file")
+    fi
+    
+    local custom_rules
+    custom_rules=$(gum write --value "$existing_rules" --placeholder "Enter custom Caddy directives here...")
+
+    if [ -n "$custom_rules" ];
+ then
+        mkdir -p "$CUSTOM_CADDY_DIR"
+        echo "$custom_rules" > "$custom_conf_file"
+        echo "✅ Custom directives saved for $site_hostname."
+ regenerate_caddyfile
+    else
+        echo "🚫 No input provided. Action cancelled."
+ fi
+}
+
+# This new function handles deleting directives
+cove_directive_delete() {
+    local site_name="$1"
+    if [ -z "$site_name" ];
+ then
+        gum style --foreground red "❌ Error: Please provide a site name."
+ echo "Usage: cove directive delete <name>"
+        exit 1
+    fi
+
+    local site_hostname="${site_name}.localhost"
+    local custom_conf_file="$CUSTOM_CADDY_DIR/$site_hostname"
+
+    if [ -f "$custom_conf_file" ];
+ then
+        if gum confirm "🚨 Are you sure you want to delete the custom directives for '$site_hostname'?";
+ then
+            rm "$custom_conf_file"
+            echo "✅ Custom directives deleted for $site_hostname."
+ regenerate_caddyfile
+        else
+            echo "🚫 Deletion cancelled."
+ fi
+    else
+        echo "ℹ️ No custom directives found for $site_hostname."
+ fi
+}
+
+cove_directive_list() {
+    echo "🔎 Listing all custom Caddy directives..."
+    
+    if [ ! -d "$CUSTOM_CADDY_DIR" ] || [ -z "$(ls -A "$CUSTOM_CADDY_DIR" 2>/dev/null)" ]; then
+        echo ""
+        gum style --foreground "yellow" "ℹ️ No custom directives found for any sites."
+        exit 0
+    fi
+
+    local found_one=false
+    for conf_file in $(find "$CUSTOM_CADDY_DIR" -type f | sort); do
+        found_one=true
+        local site_name
+        site_name=$(basename "$conf_file")
+        
+        local content
+        content=$(cat "$conf_file")
+
+        gum style --border normal --margin "1 0" --padding "1 2" --border-foreground 212 "📄 $site_name" "" "$content"
+    done
+
+    if ! $found_one; then
+        echo ""
+        gum style --foreground "yellow" "ℹ️ No custom directives found for any sites."
+    fi
+}

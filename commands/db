@@ -1,0 +1,79 @@
+cove_db_backup() {
+    echo "🚀 Starting database backup for all WordPress sites..."
+
+    if [ ! -d "$SITES_DIR" ] || [ -z "$(ls -A "$SITES_DIR")" ]; then
+        gum style --foreground yellow "ℹ️ No sites found to back up."
+        exit 0
+    fi
+
+    local dump_command
+    if command -v mariadb-dump &> /dev/null; then
+        dump_command="mariadb-dump"
+    elif command -v mysqldump &> /dev/null; then
+        dump_command="mysqldump"
+    else
+        gum style --foreground red "❌ Error: Neither mariadb-dump nor mysqldump could be found. Please install MariaDB or MySQL."
+        return 1
+    fi
+    echo "ℹ️ Using '$dump_command' for backups."
+
+    local overall_success=true
+    for site_path in "$SITES_DIR"/*; do
+        if [ -d "$site_path" ] && [ -f "$site_path/public/wp-config.php" ]; then
+            local site_name
+            site_name=$(basename "$site_path")
+            echo "-----------------------------------------------------"
+            echo "➡️ Backing up site: $site_name"
+
+            local public_dir="$site_path/public"
+            local private_dir="$site_path/private"
+            mkdir -p "$private_dir"
+
+            # Use a subshell to avoid manual cd back and forth
+            (
+                cd "$public_dir" || return 1
+                
+                # Check if wp-cli can connect
+                if ! wp core is-installed --skip-plugins --skip-themes &> /dev/null; then
+                    echo "   ❌ Error: wp-cli cannot connect to the database for this site. Skipping."
+                    return 1 # This exits the subshell, not the main script
+                fi
+
+                local db_name db_user db_pass
+                db_name=$(wp config get DB_NAME --skip-plugins --skip-themes)
+                db_user=$(wp config get DB_USER --skip-plugins --skip-themes)
+                db_pass=$(wp config get DB_PASSWORD --skip-plugins --skip-themes)
+
+                if [ -z "$db_name" ] || [ -z "$db_user" ]; then
+                    echo "   ❌ Error: Could not retrieve database credentials from wp-config.php. Skipping."
+                    return 1
+                fi
+                
+                local backup_file="../private/database-backup.sql"
+                echo "   Saving backup to: $(basename "$site_path")/private/$(basename "$backup_file")"
+
+                # Execute the dump command
+                if ! "${dump_command}" -u"${db_user}" -p"${db_pass}" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "${db_name}" > "${backup_file}"; then
+                    echo "   ❌ Error: Database dump failed for '${db_name}'."
+                    rm -f "${backup_file}" # Clean up failed backup file
+                    return 1
+                fi
+                
+                chmod 600 "$backup_file"
+                echo "   ✅ Backup successful."
+            )
+            
+            # Check the exit code of the subshell
+            if [ $? -ne 0 ]; then
+                overall_success=false
+            fi
+        fi
+    done
+    
+    echo "-----------------------------------------------------"
+    if $overall_success; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 All WordPress database backups completed successfully!"
+    else
+        gum style --foreground red "⚠️ Some database backups failed. Please review the output above."
+    fi
+}

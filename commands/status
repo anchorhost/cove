@@ -1,0 +1,40 @@
+cove_status() {
+    echo "🔎 Checking Cove service status..."
+
+    local caddy_status="❌ Stopped"
+    local mariadb_status="❌ Stopped"
+    local mailpit_status="❌ Stopped"
+    local all_running=false
+
+    # Check Caddy status by looking for the PID file and checking if the process is running.
+    if [ -f "$COVE_DIR/caddy.pid" ] && ps -p "$(cat "$COVE_DIR/caddy.pid")" > /dev/null; then
+        caddy_status="✅ Running"
+    fi
+
+    # Check the status of Homebrew services.
+    if brew services list | grep -q "mariadb.*started"; then
+        mariadb_status="✅ Running"
+    fi
+
+    if brew services list | grep -q "mailpit.*started"; then
+        mailpit_status="✅ Running"
+    fi
+
+    # Print the status of each individual service.
+    echo "  - Caddy Server: $caddy_status"
+    echo "  - MariaDB:      $mariadb_status"
+    echo "  - Mailpit:      $mailpit_status"
+
+    if [[ "$caddy_status" == "✅ Running" && "$mariadb_status" == "✅ Running" && "$mailpit_status" == "✅ Running" ]]; then
+        all_running=true
+    fi
+
+    echo "" # Add a blank line for spacing.
+
+    # Display the final summary message using gum.
+    if $all_running; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: https://cove.localhost" "Mailpit:   https://mailpit.localhost" "Adminer:   https://adminer.localhost"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" "ℹ️ Some services are stopped." "Run 'cove enable' to start them."
+    fi
+}

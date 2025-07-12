@@ -1,0 +1,63 @@
+cove_add() {
+    local site_name="$1"
+    for protected_name in $PROTECTED_NAMES; do
+        if [ "$site_name" == "$protected_name" ]; then
+            gum style --foreground red "❌ Error: '$site_name' is a reserved name. Choose another."
+            exit 1
+        fi
+    done
+
+    local site_type="wordpress"
+    if [ "$2" == "--plain" ]; then
+        site_type="plain"
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    # NEW: Define the full hostname from the site directory for consistency.
+    local full_hostname
+    full_hostname=$(basename "$site_dir")
+
+    if [ -d "$site_dir" ]; then
+        echo "⚠️ Site '$full_hostname' already exists."
+        exit 1
+    fi
+
+    echo "➕ Creating $site_type site: $full_hostname"
+    mkdir -p "$site_dir/public" "$site_dir/logs"
+
+    # Define credential variables outside the if-statement to widen their scope
+    local admin_user="admin"
+    local admin_pass
+
+    if [ "$site_type" == "wordpress" ]; then
+        source_config
+        local db_name
+        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        
+        echo "🗄️ Creating database: $db_name"
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
+        
+        echo "Installing WordPress..."
+        # Generate the random password and store it
+        admin_pass=$(openssl rand -base64 12)
+        
+        ( cd "$site_dir/public" || exit
+            wp core download --quiet
+            wp config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
+define( 'WP_DEBUG', true );
+define( 'WP_DEBUG_LOG', true );
+PHP
+            # CORRECTED: Use the consistent hostname variable for the URL.
+            wp core install --url="https://$full_hostname" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
+        )
+    fi
+
+    regenerate_caddyfile
+    echo "✅ Site '$full_hostname' created successfully!"
+
+    # Display WordPress credentials only after everything else is done.
+    if [ "$site_type" == "wordpress" ]; then
+        # CORRECTED: Use the consistent hostname variable for the URL.
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: https://$full_hostname/wp-admin" "User: $admin_user" "Pass: $admin_pass"
+    fi
+}

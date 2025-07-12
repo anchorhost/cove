@@ -1,0 +1,16 @@
+cove_list() {
+    echo "Sites managed by Cove:"
+    echo "-----------------------"
+    if [ -d "$SITES_DIR" ] && [ "$(ls -A "$SITES_DIR")" ]; then
+        for d in "$SITES_DIR"/*; do
+            if [ -d "$d" ]; then
+                site_name=$(basename "$d")
+                type=$(if [ -f "$d/public/wp-config.php" ]; then echo "WordPress"; else echo "Plain"; fi)
+                printf "🌐 https://%-30s (%s)\n" "$site_name" "$type"
+            fi
+        done
+    else
+        echo "No sites found. Add one with 'cove add <name>'."
+    fi
+    echo "-----------------------"
+}

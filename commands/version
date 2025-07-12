@@ -1,0 +1,3 @@
+cove_version() {
+    echo "Cove version $COVE_VERSION"
+}
