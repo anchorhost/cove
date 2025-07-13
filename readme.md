@@ -68,16 +68,6 @@ If you're contributing to Cove, the `watch.sh` script is helpful. It uses `fswat
 ./watch.sh
 ```
 
-## 🖥️ The Dashboard
-
-The web dashboard, available at `https://cove.localhost`, provides a quick and easy way to:
-
-  * View all your managed sites.
-  * Add new WordPress or Plain sites via a simple form.
-  * Delete existing sites with a click.
-  * Access quick links to Adminer and Mailpit.
-  * See your database connection credentials.
-
 ## 📜 License
 
 Cove is open-source software licensed under the MIT License.
