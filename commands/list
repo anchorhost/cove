@@ -1,16 +1,119 @@
 cove_list() {
-    echo "Sites managed by Cove:"
-    echo "-----------------------"
-    if [ -d "$SITES_DIR" ] && [ "$(ls -A "$SITES_DIR")" ]; then
-        for d in "$SITES_DIR"/*; do
-            if [ -d "$d" ]; then
-                site_name=$(basename "$d")
-                type=$(if [ -f "$d/public/wp-config.php" ]; then echo "WordPress"; else echo "Plain"; fi)
-                printf "🌐 https://%-30s (%s)\n" "$site_name" "$type"
-            fi
-        done
-    else
-        echo "No sites found. Add one with 'cove add <name>'."
+    local show_totals=false
+    if [[ "$1" == "--totals" ]]; then
+        show_totals=true
     fi
-    echo "-----------------------"
+
+    # This heredoc contains a PHP script to find, sort, and format the site list.
+    # The output is a single, pre-formatted text block.
+    local php_output
+    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" php -r '
+        function getDirectorySize(string $path): int {
+            if (!is_dir($path)) return 0;
+            $total_size = 0;
+            $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS));
+            foreach ($iterator as $file) {
+                if ($file->isFile()) {
+                    $total_size += $file->getSize();
+                }
+            }
+            return $total_size;
+        }
+
+        function formatSize(int $bytes): string {
+            if ($bytes === 0) return "0 B";
+            $units = ["B", "KB", "MB", "GB", "TB"];
+            $i = floor(log($bytes, 1024));
+            return round($bytes / (1024 ** $i), 2) . " " . $units[$i];
+        }
+
+        $sites_dir = getenv("SITES_DIR");
+        $show_totals = getenv("SHOW_TOTALS") === "true";
+
+        if (!is_dir($sites_dir)) {
+            exit;
+        }
+
+        $sites = [];
+        $items = scandir($sites_dir);
+
+        foreach ($items as $item) {
+            if ($item === "." || $item === "..") continue;
+            
+            $site_path = $sites_dir . "/" . $item;
+            if (is_dir($site_path)) {
+                $public_path = $site_path . "/public";
+                $size = $show_totals && is_dir($public_path) ? formatSize(getDirectorySize($public_path)) : null;
+
+                $sites[] = [
+                    "name" => str_replace(".localhost", "", $item),
+                    "domain" => "https://" . $item,
+                    "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
+                    "size" => $size,
+                ];
+            }
+        }
+
+        if (empty($sites)) {
+             exit;
+        }
+
+        // Sort the array: first by type, then by name
+        array_multisort(
+            array_column($sites, "type"), SORT_ASC,
+            array_column($sites, "name"), SORT_ASC,
+            $sites
+        );
+        
+        $output = [];
+        // Define column widths
+        $name_width = 25;
+        $domain_width = 45;
+        $type_width = 10;
+        $size_width = 15;
+
+        // Manually build and pad the header
+        $header = str_pad("Name", $name_width) .
+                  " " . str_pad("Domain", $domain_width) .
+                  " " . str_pad("Type", $type_width);
+        
+        // Manually build the separator line
+        $separator = str_repeat("-", $name_width) .
+                     " " . str_repeat("-", $domain_width) .
+                     " " . str_repeat("-", $type_width);
+
+        if ($show_totals) {
+            $header    .= " " . str_pad("Size", $size_width);
+            $separator .= " " . str_repeat("-", $size_width);
+        }
+        
+        $output[] = $header;
+        $output[] = $separator;
+
+        // Build each data row with manual padding
+        foreach ($sites as $site) {
+            $name_col = str_pad($site["name"], $name_width);
+            // Pad the URL first, then prepend the emoji to preserve alignment
+            $domain_col = "🌐 " . str_pad($site["domain"], $domain_width - 3); // Subtract 3 for "🌐 "
+            $type_col = str_pad($site["type"], $type_width);
+            $row = $name_col . " " . $domain_col . " " . $type_col;
+
+            if ($show_totals) {
+                $row .= " " . str_pad($site["size"] ?? "N/A", $size_width);
+            }
+            $output[] = $row;
+        }
+
+        // Print the entire formatted block
+        echo implode("\n", $output);
+    ')
+
+    if [ -z "$php_output" ];
+    then
+        # Display a message if no sites are found.
+        gum style --padding "1 2" "ℹ️ No sites found. Add one with 'cove add <name>'."
+    else
+        # Pipe the pre-formatted text block into gum style to wrap it in a nice box.
+        echo "$php_output" | gum style --border normal --margin "1" --padding "1 2" --border-foreground 212
+    fi
 }

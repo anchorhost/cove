@@ -359,9 +359,12 @@ display_command_help() {
             echo "Checks the status of all background services."
             ;;
         list)
-            echo "Usage: cove list"
+            echo "Usage: cove list [--totals]"
             echo ""
             echo "Lists all sites currently managed by Cove, showing their domain and type (WordPress/Plain)."
+            echo ""
+            echo "Flags:"
+            echo "  --totals       Calculates and displays the size of each site's public directory."
             ;;
         add)
             echo "Usage: cove add <name> [--plain]"
@@ -462,7 +465,7 @@ main() {
             ;;
         list)
             check_dependencies
-            cove_list
+            cove_list "$@"
             ;;
         install)
             cove_install
