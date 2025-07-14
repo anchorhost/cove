@@ -386,7 +386,7 @@ display_command_help() {
             echo "  --force        Deletes a site without the interactive confirmation prompt."
             ;;
         directive)
-            echo "Usage: cove directive <command> <name>"
+            echo "Usage: cove directive <subcommand>"
             echo ""
             echo "Add or remove custom Caddyfile rules for a site."
             echo "Opens an editor to add/edit rules which are then included in the main Caddyfile."
@@ -398,9 +398,13 @@ display_command_help() {
             echo "  list        Lists all custom directives for all managed sites."
             ;;
         db)
-            echo "Usage: cove db backup"
+            echo "Usage: cove db <subcommand>"
             echo ""
-            echo "Manage databases. 'backup' creates a .sql dump for each WP site."
+            echo "Manage databases."
+            echo ""
+            echo "Subcommands:"
+            echo "  backup      Creates a .sql dump for each WP site."
+            echo "  list        Lists database connection details for each WP site."
             ;;
         reload)
             echo "Usage: cove reload"
@@ -479,16 +483,17 @@ main() {
             check_dependencies
             cove_status
             ;;
-
-        # --- Refactored Commands with Sub-routing ---
-
         db)
             check_dependencies
             local action="$1"
             shift # Remove subcommand from argument list to pass the rest to the function
             case "$action" in
                 backup)
+      
                     cove_db_backup "$@"
+                    ;;
+                list)
+                    cove_db_list "$@"
                     ;;
                 *)
                     display_command_help "db"
@@ -496,7 +501,6 @@ main() {
                     ;;
             esac
             ;;
-
         directive)
             check_dependencies
             local action="$1"

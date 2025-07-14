@@ -1,79 +1,100 @@
-cove_db_backup() {
-    echo "🚀 Starting database backup for all WordPress sites..."
+cove_db_list() {
+    source_config # To get DB_USER and DB_PASSWORD for mysql command
 
-    if [ ! -d "$SITES_DIR" ] || [ -z "$(ls -A "$SITES_DIR")" ]; then
-        gum style --foreground yellow "ℹ️ No sites found to back up."
+    echo "🔎 Gathering database information for all WordPress sites..."
+
+    if ! command -v wp &> /dev/null; then
+        gum style --foreground red "❌ wp-cli is not installed or not in your PATH. Please run 'cove install'."
+        exit 1
+    fi
+
+    if [ ! -d "$SITES_DIR" ] || [ -z "$(ls -A "$SITES_DIR" 2>/dev/null)" ]; then
+        gum style --padding "1 2" "ℹ️ No sites found."
         exit 0
     fi
 
-    local dump_command
-    if command -v mariadb-dump &> /dev/null; then
-        dump_command="mariadb-dump"
-    elif command -v mysqldump &> /dev/null; then
-        dump_command="mysqldump"
+    # This heredoc contains a PHP script to find, connect, and format the database list.
+    local php_output
+    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" php -r '
+        function formatSize(int $bytes): string {
+            if ($bytes === 0) return "0 B";
+            $units = ["B", "KB", "MB", "GB", "TB"];
+            $i = floor(log($bytes, 1024));
+            return round($bytes / (1024 ** $i), 2) . " " . $units[$i];
+        }
+
+        $sites_dir = getenv("SITES_DIR");
+        $db_user = getenv("DB_USER");
+        $db_pass = getenv("DB_PASSWORD");
+
+        if (!is_dir($sites_dir)) { exit; }
+
+        try {
+            $pdo = new PDO("mysql:host=localhost", $db_user, $db_pass, [PDO::ATTR_TIMEOUT => 2]);
+            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        } catch (PDOException $e) { exit; }
+
+        $sites_info = [];
+        foreach (scandir($sites_dir) as $item) {
+            $public_dir = $sites_dir . "/" . $item . "/public";
+            if (is_file($public_dir . "/wp-config.php")) {
+                $site_name = str_replace(".localhost", "", $item);
+                $public_dir_esc = escapeshellarg($public_dir);
+                $cmd_suffix = " --skip-plugins --skip-themes --quiet 2>/dev/null";
+                
+                $name_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_NAME" . $cmd_suffix);
+                if (is_null($name_raw)) { continue; }
+                $site_db_name = trim($name_raw);
+                if (empty($site_db_name)) { continue; }
+
+                $site_db_user = "N/A";
+                $site_db_pass = "N/A";
+                $size_str = "N/A";
+
+                if (!str_contains(strtolower($site_db_name), "sqlite")) {
+                    $user_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_USER" . $cmd_suffix);
+                    if (!is_null($user_raw)) { $site_db_user = trim($user_raw); }
+
+                    $pass_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_PASSWORD" . $cmd_suffix);
+                    if (!is_null($pass_raw)) { $site_db_pass = trim($pass_raw); }
+                    
+                    $stmt = $pdo->prepare("SELECT SUM(data_length + index_length) as size FROM information_schema.TABLES WHERE table_schema = ?");
+                    $stmt->execute([$site_db_name]);
+                    $size_bytes = $stmt->fetch(PDO::FETCH_ASSOC)["size"] ?? 0;
+                    $size_str = formatSize((int)$size_bytes);
+                }
+
+                $sites_info[] = [
+                    "name" => $site_name,
+                    "db_name" => $site_db_name,
+                    "db_user" => $site_db_user,
+                    "db_pass" => $site_db_pass,
+                    "size" => $size_str,
+                ];
+            }
+        }
+
+        if (empty($sites_info)) { exit; }
+
+        array_multisort(array_column($sites_info, "name"), SORT_ASC, $sites_info);
+        
+        $output = [];
+        $w = ["name" => 20, "db_name" => 25, "db_user" => 20, "db_pass" => 25, "size" => 15];
+        $header = str_pad("Name", $w["name"]) . " " . str_pad("DB Name", $w["db_name"]) . " " . str_pad("DB User", $w["db_user"]) . " " . str_pad("DB Pass", $w["db_pass"]) . " " . str_pad("Size", $w["size"]);
+        $separator = str_repeat("-", $w["name"]) . " " . str_repeat("-", $w["db_name"]) . " " . str_repeat("-", $w["db_user"]) . " " . str_repeat("-", $w["db_pass"]) . " " . str_repeat("-", $w["size"]);
+        $output[] = $header;
+        $output[] = $separator;
+
+        foreach ($sites_info as $site) {
+            $row = str_pad($site["name"], $w["name"]) . " " . str_pad($site["db_name"], $w["db_name"]) . " " . str_pad($site["db_user"], $w["db_user"]) . " " . str_pad($site["db_pass"], $w["db_pass"]) . " " . str_pad($site["size"], $w["size"]);
+            $output[] = $row;
+        }
+        echo implode("\n", $output);
+    ')
+
+    if [ -z "$php_output" ]; then
+        gum style --padding "1 2" "ℹ️ No WordPress sites with readable database configurations found."
     else
-        gum style --foreground red "❌ Error: Neither mariadb-dump nor mysqldump could be found. Please install MariaDB or MySQL."
-        return 1
-    fi
-    echo "ℹ️ Using '$dump_command' for backups."
-
-    local overall_success=true
-    for site_path in "$SITES_DIR"/*; do
-        if [ -d "$site_path" ] && [ -f "$site_path/public/wp-config.php" ]; then
-            local site_name
-            site_name=$(basename "$site_path")
-            echo "-----------------------------------------------------"
-            echo "➡️ Backing up site: $site_name"
-
-            local public_dir="$site_path/public"
-            local private_dir="$site_path/private"
-            mkdir -p "$private_dir"
-
-            # Use a subshell to avoid manual cd back and forth
-            (
-                cd "$public_dir" || return 1
-                
-                # Check if wp-cli can connect
-                if ! wp core is-installed --skip-plugins --skip-themes &> /dev/null; then
-                    echo "   ❌ Error: wp-cli cannot connect to the database for this site. Skipping."
-                    return 1 # This exits the subshell, not the main script
-                fi
-
-                local db_name db_user db_pass
-                db_name=$(wp config get DB_NAME --skip-plugins --skip-themes)
-                db_user=$(wp config get DB_USER --skip-plugins --skip-themes)
-                db_pass=$(wp config get DB_PASSWORD --skip-plugins --skip-themes)
-
-                if [ -z "$db_name" ] || [ -z "$db_user" ]; then
-                    echo "   ❌ Error: Could not retrieve database credentials from wp-config.php. Skipping."
-                    return 1
-                fi
-                
-                local backup_file="../private/database-backup.sql"
-                echo "   Saving backup to: $(basename "$site_path")/private/$(basename "$backup_file")"
-
-                # Execute the dump command
-                if ! "${dump_command}" -u"${db_user}" -p"${db_pass}" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "${db_name}" > "${backup_file}"; then
-                    echo "   ❌ Error: Database dump failed for '${db_name}'."
-                    rm -f "${backup_file}" # Clean up failed backup file
-                    return 1
-                fi
-                
-                chmod 600 "$backup_file"
-                echo "   ✅ Backup successful."
-            )
-            
-            # Check the exit code of the subshell
-            if [ $? -ne 0 ]; then
-                overall_success=false
-            fi
-        fi
-    done
-    
-    echo "-----------------------------------------------------"
-    if $overall_success; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 All WordPress database backups completed successfully!"
-    else
-        gum style --foreground red "⚠️ Some database backups failed. Please review the output above."
+        echo "$php_output" | gum style --border normal --margin "1" --padding "1 2" --border-foreground 212
     fi
 }
