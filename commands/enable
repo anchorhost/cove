@@ -8,7 +8,7 @@ cove_enable() {
     "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid"
 
     if [ $? -eq 0 ]; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: http://cove.localhost" "Mailpit:   http://mailpit.localhost" "Adminer:   http://adminer.localhost"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: https://cove.localhost" "Adminer:   https://db.cove.localhost" "Mailpit:   https://mail.cove.localhost"
     else
         gum style --foreground red "❌ Caddy server failed to start. Check for errors above, or try running 'cove reload'."
     fi

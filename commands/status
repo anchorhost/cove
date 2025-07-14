@@ -30,10 +30,9 @@ cove_status() {
     fi
 
     echo "" # Add a blank line for spacing.
-
     # Display the final summary message using gum.
     if $all_running; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: https://cove.localhost" "Mailpit:   https://mailpit.localhost" "Adminer:   https://adminer.localhost"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: https://cove.localhost" "Adminer:   https://db.cove.localhost" "Mailpit:   https://mail.cove.localhost"
     else
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" "ℹ️ Some services are stopped." "Run 'cove enable' to start them."
     fi

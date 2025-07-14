@@ -20,16 +20,9 @@ GUI_DIR="$APP_DIR/gui"
 ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
-PROTECTED_NAMES="cove mailpit adminer"
+PROTECTED_NAMES="cove"
 COVE_VERSION="1.0"
-
-# --- Dynamic Command Configuration ---
-# Detect if a manual frankenphp installation exists and prioritize it.
-if [ -x "/usr/local/bin/frankenphp" ]; then
-    CADDY_CMD="/usr/local/bin/frankenphp"
-else
-    CADDY_CMD="caddy"
-fi
+CADDY_CMD="frankenphp"
 
 # --- Whoops Bootstrap Generation ---
 create_whoops_bootstrap() {
@@ -127,12 +120,12 @@ regenerate_caddyfile() {
 
 # --- Global Services ---
 
-mailpit.localhost {
+mail.cove.localhost {
     reverse_proxy 127.0.0.1:8025
     tls internal
 }
 
-adminer.localhost {
+db.cove.localhost {
     root * "$ADMINER_DIR"
     php_server
     tls internal
@@ -202,7 +195,6 @@ $sitedir = 'SITES_DIR_PLACEHOLDER';
 $config_file = getenv('HOME') . '/Cove/config';
 $message = '';
 $refresh_script = '';
-
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $cove_path = 'COVE_EXECUTABLE_PATH';
     if (isset($_POST['add_site'])) {

@@ -85,7 +85,6 @@ EOM
             fi
         done
         echo "✅ MariaDB is ready."
-
         echo "Please provide your MariaDB root credentials to create a 'cove' user."
         local root_user; root_user=$(gum input --value "root" --prompt "Root username: ")
         local root_pass; root_pass=$(gum input --password --placeholder "Password for '$root_user'")
@@ -100,7 +99,6 @@ EOM
             exit 1
         fi
         echo "✅ Database user '$db_user' created."
-
         echo "📝 Saving new configuration..."
         echo "DB_USER='$db_user'" > "$CONFIG_FILE"
         echo "DB_PASSWORD='$db_pass'" >> "$CONFIG_FILE"
@@ -111,5 +109,6 @@ EOM
     create_gui_file
     regenerate_caddyfile
 
-    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 Cove installation complete!" "Run 'cove enable' to start the server." "Your Cove Dashboard is at https://cove.localhost"
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 Cove installation complete!" \
+"Run 'cove enable' to start the server." "Dashboard is at https://cove.localhost"
 }
