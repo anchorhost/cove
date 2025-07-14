@@ -1,5 +1,31 @@
 cove_install() {
     echo "🚀 Starting Cove installation..."
+
+    # Check for services using standard web ports
+    if lsof -i :80 -i :443 | grep -q 'LISTEN'; then
+        local listening_app
+        listening_app=$(lsof -i :80 -i :443 | grep 'LISTEN' | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')
+
+        # If the listening app is the one Cove uses, don't show a warning.
+        if [[ "$listening_app" == "$CADDY_CMD" || "$listening_app" == "frankenph" ]]; then
+            echo "✅ Detected that FrankenPHP is already running."
+        else
+            # Otherwise, show the original warning for other apps like Nginx.
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
+                "⚠️  Warning: A conflicting web server may be running!" \
+                "" \
+                "Cove has detected that another program ('${listening_app}') is already using" \
+                "the standard web ports (80/443). Cove needs these ports to function." \
+                "" \
+                "To resolve this, you must stop the conflicting service before using Cove." \
+                "For NGINX, you can often use 'sudo brew services stop nginx' or 'sudo nginx -s stop'."
+            if ! gum confirm "Do you want to proceed with the installation anyway?"; then
+                echo "🚫 Installation cancelled."
+                exit 0
+            fi
+       fi
+    fi
+
     if ! command -v gum &> /dev/null; then brew install gum; fi
 
     # --- Pre-install Checks ---
@@ -11,17 +37,40 @@ cove_install() {
     fi
 
     # --- Dependency Installation ---
-    local packages_to_install=()
-    if [ "$CADDY_CMD" == "caddy" ] && ! command -v caddy &> /dev/null; then
-        packages_to_install+=("caddy")
+    # Handle FrankenPHP separately as it's not in Homebrew core.
+    if ! command -v frankenphp &> /dev/null; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Missing Dependency: frankenphp"
+        echo "   Using the official installer (this may take a moment)..."
+        
+        if curl -sL https://frankenphp.dev/install.sh | sh; then
+            if [ -f "./frankenphp" ]; then
+                echo "   Moving 'frankenphp' to /usr/local/bin/..."
+                if mv ./frankenphp /usr/local/bin/frankenphp; then
+                    echo "✅ FrankenPHP installed successfully."
+                else
+                    gum style --foreground red "❌ Failed to move frankenphp." \
+                                              "Please run this command manually from the directory you ran the installer:" \
+                                              "mv ./frankenphp /usr/local/bin/frankenphp"
+                    exit 1
+                fi
+            else
+                gum style --foreground red "❌ FrankenPHP download script failed to create the 'frankenphp' file."
+                exit 1
+            fi
+        else
+            gum style --foreground red "❌ The FrankenPHP download script failed."
+            exit 1
+        fi
     else
-        echo "ℹ️ Using existing Caddy/FrankenPHP installation."
+        echo "✅ FrankenPHP is already installed."
     fi
+
+    local packages_to_install=()
 
     for pkg_cmd in mariadb mailpit "wp:wp-cli" gum; do
         local pkg=${pkg_cmd##*:}
         local cmd=${pkg_cmd%%:*}
-        if ! command -v $cmd &> /dev/null; then
+        if ! brew list "$pkg" &> /dev/null; then
             packages_to_install+=("$pkg")
         fi
     done
@@ -57,8 +106,14 @@ EOM
     curl -sL "https://github.com/filp/whoops/archive/refs/tags/2.18.3.tar.gz" | tar -xz -C "$APP_DIR/whoops" --strip-components=1
 
     echo "⚙️ Starting services..."
-    brew services restart mariadb # Use restart to be safe
-    brew services restart mailpit # Use restart to be safe
+    # Ensure the MariaDB service can be started before proceeding.
+    if ! brew services restart mariadb; then
+        gum style --foreground red "❌ Failed to start MariaDB via Homebrew." \
+                  "Please run 'brew services start mariadb' manually and check for errors." \
+                  "If the issue persists, try 'brew reinstall mariadb'."
+        exit 1
+    fi
+    brew services restart mailpit
 
     # --- Database Configuration ---
     local skip_db_setup=false
@@ -77,7 +132,7 @@ EOM
         # Wait for MariaDB to be ready
         echo "Waiting for MariaDB..."
         i=0
-        while ! mysqladmin pink --silent; do
+        while ! mysqladmin ping --silent; do
             sleep 1; i=$((i+1))
             if [ $i -ge 20 ]; then
                 gum style --foreground red "❌ MariaDB did not become available in time."
