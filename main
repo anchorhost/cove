@@ -186,69 +186,105 @@ EOM
 
 # --- GUI Generation ---
 create_gui_file() {
-    echo "🎨 Creating Cove dashboard file..."
+    echo "🎨 Creating Cove dashboard files..."
     mkdir -p "$GUI_DIR"
     
+    # Create the API file that handles the logic
+    cat > "$GUI_DIR/api.php.tmp" << 'EOM'
+<?php
+header('Content-Type: application/json');
+
+$sitedir = 'SITES_DIR_PLACEHOLDER';
+$cove_path = 'COVE_EXECUTABLE_PATH_PLACEHOLDER';
+$user_home = 'USER_HOME_PLACEHOLDER';
+
+// Handle GET requests for listing sites
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    $action = $_GET['action'] ?? '';
+    if ($action === 'list_sites') {
+        $sites_info = [];
+        if (file_exists($sitedir) && is_dir($sitedir)) {
+            $items = scandir($sitedir);
+            foreach ($items as $item) {
+                if ($item === '.' || $item === '..') continue;
+                $site_path = $sitedir . '/' . $item;
+                if (is_dir($site_path)) {
+                    $sites_info[] = [
+                        'name' => str_replace('.localhost', '', $item),
+                        'domain' => 'https://' . $item,
+                        'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
+                        'display_path' => '~/Cove/Sites/' . $item,
+                        'full_path' => $site_path
+                    ];
+                }
+            }
+            if (!empty($sites_info)) {
+                array_multisort(
+                    array_column($sites_info, "type"), SORT_ASC,
+                    array_column($sites_info, "name"), SORT_ASC,
+                    $sites_info
+                );
+            }
+        }
+        echo json_encode($sites_info);
+        exit;
+    }
+}
+
+// Handle POST requests for adding/deleting/reloading
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $input = json_decode(file_get_contents('php://input'), true);
+    $action = $input['action'] ?? '';
+    $response = ['success' => false, 'message' => 'Invalid request.'];
+    $command = '';
+    $site_name = $input['site_name'] ?? '';
+
+    switch ($action) {
+        case 'add_site':
+            if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $type_flag = ($input['is_plain'] ?? false) ? '--plain' : '';
+                $command = sprintf('HOME=%s %s add %s %s 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag);
+            } else { $response['message'] = 'Invalid site name provided.'; }
+            break;
+        case 'delete_site':
+            if (!empty($site_name)) {
+                $command = sprintf('HOME=%s %s delete %s --force 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
+            } else { $response['message'] = 'Site name not provided for deletion.'; }
+            break;
+        case 'reload_server':
+            // This command is run in the background to prevent deadlocking the server.
+            // Output is redirected to /dev/null and the '&' backgrounds the process.
+            $reload_command = sprintf('HOME=%s %s reload > /dev/null 2>&1 &', escapeshellarg($user_home), escapeshellarg($cove_path));
+            shell_exec($reload_command);
+            $response = ['success' => true, 'message' => 'Server reload initiated.'];
+            echo json_encode($response);
+            exit; // Exit immediately
+    }
+
+    if (!empty($command)) {
+        exec($command, $output, $return_code);
+        if ($return_code === 0) {
+            $response = ['success' => true, 'message' => 'Operation completed successfully.'];
+        } else {
+            $response = ['success' => false, 'message' => 'An error occurred.', 'output' => implode("\n", $output)];
+        }
+    }
+    echo json_encode($response);
+    exit;
+}
+
+http_response_code(405);
+echo json_encode(['success' => false, 'message' => 'Method Not Allowed']);
+EOM
+
+    # Create the main dashboard file (the UI)
     cat > "$GUI_DIR/index.php.tmp" << 'EOM'
 <?php
-$sitedir = 'SITES_DIR_PLACEHOLDER';
 $config_file = getenv('HOME') . '/Cove/config';
-$message = '';
-$refresh_script = '';
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $cove_path = 'COVE_EXECUTABLE_PATH';
-    if (isset($_POST['add_site'])) {
-        $site_name = trim($_POST['site_name']);
-        $type_flag = isset($_POST['is_plain']) ? '--plain' : '';
-        if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
-            $command = sprintf('%s add %s %s > /dev/null 2>&1 &', escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag);
-            shell_exec($command);
-            $message = "<p>✅ Site creation for '<strong>" . htmlspecialchars($site_name) . ".localhost</strong>' has been initiated.</p>";
-            $refresh_script = '<script>setTimeout(() => window.location.reload(), 5000);</script>';
-        } else {
-            $message = "<p class='error'>Invalid site name. Use letters, numbers, and hyphens only.</p>";
-        }
-    } elseif (isset($_POST['delete_site'])) {
-        $site_name = $_POST['site_name'];
-        if (!empty($site_name)) {
-            $command = sprintf('%s delete %s --force > /dev/null 2>&1 &', escapeshellarg($cove_path), escapeshellarg($site_name));
-            shell_exec($command);
-            $message = "<p>✅ Deletion for '<strong>" . htmlspecialchars($site_name) . ".localhost</strong>' has been initiated.</p>";
-            $refresh_script = '<script>setTimeout(() => window.location.reload(), 2000);</script>';
-        }
-    }
-}
 $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
-
-// --- Prepare and Sort Site Data ---
-$sites_info = [];
-if (file_exists($sitedir)) {
-    $items = scandir($sitedir);
-    foreach ($items as $item) {
-        if ($item === '.' || $item === '..') continue;
-        $site_path = $sitedir . '/' . $item;
-        if (is_dir($site_path)) {
-            $sites_info[] = [
-                'name' => str_replace('.localhost', '', $item),
-                'domain' => 'https://' . $item,
-                'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
-                'display_path' => '~/Cove/Sites/' . $item,
-                'full_path' => $site_path
-            ];
-        }
-    }
-
-    if (!empty($sites_info)) {
-        array_multisort(
-            array_column($sites_info, "type"), SORT_ASC,
-            array_column($sites_info, "name"), SORT_ASC,
-            $sites_info
-        );
-    }
-}
 ?>
 <!DOCTYPE html>
-<html lang="en" x-data="{ theme: localStorage.getItem('theme') || 'dark', snackbar: { visible: false, message: '' } }" x-init="$watch('theme', val => localStorage.setItem('theme', val))" :data-theme="theme">
+<html lang="en" x-data="{ theme: localStorage.getItem('theme') || 'dark' }" x-init="$watch('theme', val => localStorage.setItem('theme', val))" :data-theme="theme">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -259,132 +295,84 @@ if (file_exists($sitedir)) {
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"/>
     <script src="//unpkg.com/alpinejs" defer></script>
     <style>
-        :root {
-            --pico-font-family: 'Inter', sans-serif;
-            --pico-font-size: 95%;
-            --pico-spacing: 0.75rem;
-            --pico-card-padding: 1.25rem;
-            --pico-form-element-spacing-vertical: 0.75rem;
-            --pico-form-element-spacing-horizontal: 1rem;
-        }
-        code, pre, kbd {
-            font-family: 'Fira Code', monospace;
-        }
-        [data-theme="light"], :root:not([data-theme="dark"]) {
-            --pico-primary: #163c52;
-            --pico-primary-hover: #1f5472;
-            --pico-primary-focus: rgba(22, 60, 82, 0.25);
-            --pico-card-background-color: #fdf4e9;
-            --pico-card-border-color: #e9e2d9;
-            --pico-code-background-color: #e9e2d9;
-        }
-        [data-theme="dark"] {
-            --pico-primary: #00a9ff;
-            --pico-primary-hover: #33bbff;
-            --pico-primary-focus: rgba(0, 169, 255, 0.25);
-            --pico-background-color: #1a1b26;
-            --pico-card-background-color: #24283b;
-            --pico-card-border-color: #414868;
-            --pico-code-color: #ff9e64;
-            --pico-code-background-color: #2e3247;
-        }
+        :root { --pico-font-family: 'Inter', sans-serif; --pico-font-size: 95%; --pico-spacing: 0.75rem; --pico-card-padding: 1.25rem; --pico-form-element-spacing-vertical: 0.75rem; --pico-form-element-spacing-horizontal: 1rem; }
+        code, pre, kbd { font-family: 'Fira Code', monospace; }
+        [data-theme="light"], :root:not([data-theme="dark"]) { --pico-primary: #163c52; --pico-primary-hover: #1f5472; --pico-primary-focus: rgba(22, 60, 82, 0.25); --pico-card-background-color: #fdf4e9; --pico-card-border-color: #e9e2d9; --pico-code-background-color: #e9e2d9; }
+        [data-theme="dark"] { --pico-primary: #00a9ff; --pico-primary-hover: #33bbff; --pico-primary-focus: rgba(0, 169, 255, 0.25); --pico-background-color: #1a1b26; --pico-card-background-color: #24283b; --pico-card-border-color: #414868; --pico-code-color: #ff9e64; --pico-code-background-color: #2e3247; }
         body { padding: 1rem; background-color: var(--pico-background-color); max-width: 1000px; margin: auto; }
         header { text-align: center; margin: 2rem 0; }
-        .theme-toggle {
-            position: absolute;
-            top: 1rem;
-            right: 1rem;
-            background: transparent;
-            border: none;
-            padding: 0.5rem;
-            cursor: pointer;
-            font-size: 1.25rem;
-            line-height: 1;
-            width: auto;
-            height: auto;
-        }
+        section { margin-bottom: 36px; }
+        .theme-toggle { position: absolute; top: 1rem; right: 1rem; background: transparent; border: none; padding: 0.5rem; cursor: pointer; font-size: 1.25rem; line-height: 1; width: auto; height: auto; }
         table { --pico-table-border-color: var(--pico-card-border-color); }
         article, figure { border-color: var(--pico-card-border-color); }
-        .clickable-code {
-            cursor: pointer;
-            text-decoration: underline;
-            text-decoration-style: dotted;
-        }
-        .clickable-code:hover {
-            color: var(--pico-primary);
-        }
-        .snackbar {
-            position: fixed;
-            bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            padding: 0.75rem 1.25rem;
-            border-radius: var(--pico-border-radius);
-            background-color: var(--pico-primary);
-            color: var(--pico-primary-inverse);
-            box-shadow: var(--pico-box-shadow);
-            z-index: 1000;
-            font-size: 0.9em;
-        }
+        .clickable-code { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; }
+        .clickable-code:hover { color: var(--pico-primary); }
+        .snackbar { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); padding: 0.75rem 1.25rem; border-radius: var(--pico-border-radius); background-color: var(--pico-primary); color: var(--pico-primary-inverse); box-shadow: var(--pico-box-shadow); z-index: 1000; font-size: 0.9em; }
+        .snackbar.error { background-color: #d32f2f; color: white; }
+        button[aria-busy='true'] { pointer-events: none; }
     </style>
 </head>
 <body>
-    <button class="theme-toggle" @click="theme = (theme === 'light' ? 'dark' : 'light')" x-text="theme === 'light' ? '🌙' : '☀️'"></button>
-    <main class="container">
-        <header><h1>🏝️ Cove Dashboard</h1><p>Your local development environment, simplified.</p></header>
-        <?php if ($message): ?><article><?= $message ?></article><?php endif; ?>
+    <main class="container" x-data="sitesManager" x-init="getSites">
+        <button class="theme-toggle" @click="theme = (theme === 'light' ? 'dark' : 'light')" x-text="theme === 'light' ? '🌙' : '☀️'"></button>
+        <header><h1><img src="https://cove.run/content/15/uploads/2025/07/cropped-cove-1-192x192.webp" style="width: 38px;"> Cove</h1>
+        <p>Local Development Powered by Caddy</p></header>
         
         <section>
             <h2>🚀 Quick Links</h2>
             <div class="grid">
                 <a href="https://db.cove.localhost" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">🗃️ Manage Databases (Adminer)</a>
                 <a href="https://mail.cove.localhost" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">✉️ Inspect Emails (Mailpit)</a>
-           </div>
+            </div>
         </section>
 
         <section>
             <h2>✨ Add New Site</h2>
-            <article x-data="{ siteName: '' }">
-                <form method="POST">
+            <article>
+                <form @submit.prevent="addSite">
                     <div class="grid">
                         <label>Site Name
-                            <input type="text" name="site_name" required x-model="siteName" @input="siteName = siteName.toLowerCase().replace(/[^a-z0-9-]/g, '')">
-                            <small>This will create <code x-text="siteName ? siteName + '.localhost' : '.localhost'"></code></small>
+                            <input type="text" name="site_name" required x-model="newSite.name" @input="newSite.name = newSite.name.toLowerCase().replace(/[^a-z0-9-]/g, '')" :disabled="newSite.isLoading">
+                            <small>This will create <code x-text="newSite.name ? newSite.name + '.localhost' : '.localhost'"></code></small>
                         </label>
-                        <label><input type="checkbox" name="is_plain">Plain Site</label>
+                        <label><input type="checkbox" name="is_plain" x-model="newSite.isPlain" :disabled="newSite.isLoading">Plain Site</label>
                     </div>
-                    <button type="submit">Create Site</button>
+                    <button type="submit" :aria-busy="newSite.isLoading" x-text="newSite.isLoading ? 'Creating...' : 'Create Site'"></button>
                 </form>
             </article>
         </section>
 
         <section>
             <h2>🗂️ Managed Sites</h2>
-            <?php if (!empty($sites_info)): ?>
             <figure>
-            <table>
-                <thead><tr><th>Site Domain</th><th>Type</th><th>Path</th><th>Actions</th></tr></thead>
-                <tbody>
-                <?php foreach ($sites_info as $site): ?>
-                    <tr>
-                        <td><a href="<?= htmlspecialchars($site['domain']) ?>" target="_blank" rel="noopener noreferrer">🔗 <?= htmlspecialchars(str_replace('https://', '', $site['domain'])) ?></a></td>
-                        <td><?= htmlspecialchars($site['type']) ?></td>
-                        <td>
-                            <div @click="navigator.clipboard.writeText('<?= htmlspecialchars($site['full_path']) ?>'); snackbar.message = '✅ Path copied to clipboard!'; snackbar.visible = true; setTimeout(() => snackbar.visible = false, 2500)" style="cursor: pointer;display:inline-flex;" title="Click to copy path">
-                                <small><code class="clickable-code"><?= htmlspecialchars($site['display_path']) ?></code></small>
-                            </div>
-                        </td>
-                        <td>
-                            <form method="POST" style="margin-bottom: 0;" onsubmit="return confirm('Are you sure you want to permanently delete <?= htmlspecialchars($site['name']) ?>? This cannot be undone.');">
-                                <input type="hidden" name="site_name" value="<?= htmlspecialchars($site['name']) ?>"><button class="secondary outline">🗑️ Delete</button>
-                            </form>
-                        </td>
-                    </tr>
-                <?php endforeach; ?>
-                </tbody>
-            </table>
+                <table role="grid">
+                    <thead><tr><th>Site Domain</th><th>Type</th><th>Path</th><th>Actions</th></tr></thead>
+                    <tbody>
+                        <template x-for="site in sites" :key="site.name">
+                            <tr>
+                                <td><a :href="site.domain" target="_blank" rel="noopener noreferrer" x-text="'🔗 ' + site.domain.replace('https://', '')"></a></td>
+                                <td x-text="site.type"></td>
+                                <td>
+                                    <div @click="$store.snackbar.show('✅ Path copied!'); navigator.clipboard.writeText(site.full_path)" style="cursor: pointer;display:inline-flex;" title="Click to copy path">
+                                        <small><code class="clickable-code" x-text="site.display_path"></code></small>
+                                    </div>
+                                </td>
+                                <td>
+                                    <form @submit.prevent="deleteSite(site.name)" style="margin-bottom: 0;">
+                                        <button type="submit" class="secondary outline">🗑️ Delete</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        </template>
+                        <tr x-show="sites.length === 0 && !isLoading">
+                            <td colspan="4"><article>No sites found. Add one above!</article></td>
+                        </tr>
+                        <tr x-show="isLoading">
+                            <td colspan="4"><progress></progress></td>
+                        </tr>
+                    </tbody>
+                </table>
             </figure>
-            <?php else: ?><article>No sites found. Add one above!</article><?php endif; ?>
         </section>
 
         <section>
@@ -396,35 +384,101 @@ if (file_exists($sitedir)) {
             </article>
         </section>
     </main>
-    <div x-show="snackbar.visible"
-         x-transition:enter="transition ease-out duration-300"
-         x-transition:enter-start="opacity-0 transform translate-y-2"
-         x-transition:enter-end="opacity-100 transform translate-y-0"
-         x-transition:leave="transition ease-in duration-300"
-         x-transition:leave-start="opacity-100 transform translate-y-0"
-         x-transition:leave-end="opacity-0 transform translate-y-2"
-         class="snackbar"
-         style="display: none;">
-        <span x-text="snackbar.message"></span>
+
+    <div x-show="$store.snackbar.visible" x-transition class="snackbar" :class="{ 'error': $store.snackbar.isError }" style="display: none;">
+        <span x-text="$store.snackbar.message"></span>
     </div>
-    <?php if (!empty($refresh_script)) echo $refresh_script; ?>
+
+    <script>
+        document.addEventListener('alpine:init', () => {
+            Alpine.data('sitesManager', () => ({
+                sites: [],
+                isLoading: true,
+                newSite: { name: '', isPlain: false, isLoading: false },
+
+                async apiCall(action, payload = {}) {
+                    try {
+                        const response = await fetch('api.php', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action, ...payload })
+                        }).then(res => res.json());
+
+                        if (!response.success) {
+                            Alpine.store('snackbar').show(`❌ Error: ${response.message || 'Unknown error'}`, true);
+                        }
+                        return response;
+                    } catch (e) {
+                        Alpine.store('snackbar').show('❌ A network error occurred.', true);
+                        return { success: false };
+                    }
+                },
+                
+                async getSites() { this.isLoading = true; try { const r = await fetch('api.php?action=list_sites'); this.sites = await r.json(); } catch (e) { Alpine.store('snackbar').show('❌ Could not fetch site list.', true); } finally { this.isLoading = false; } },
+                
+                async addSite() {
+                    this.newSite.isLoading = true;
+                    const addResponse = await this.apiCall('add_site', { site_name: this.newSite.name, is_plain: this.newSite.isPlain });
+                    if (addResponse.success) {
+                        this.newSite.name = '';
+                        Alpine.store('snackbar').show("✅ Site created. Initiating server reload...");
+                        const reloadResponse = await this.apiCall('reload_server');
+                        if (reloadResponse.success) {
+                            Alpine.store('snackbar').show("✅ Reload initiated. List will refresh shortly.");
+                            setTimeout(() => this.getSites(), 2000); // Refresh list after a delay
+                        }
+                    }
+                    this.newSite.isLoading = false;
+                },
+
+                async deleteSite(siteName) {
+                    if (!confirm(`Are you sure you want to permanently delete ${siteName}? This cannot be undone.`)) return;
+                    const deleteResponse = await this.apiCall('delete_site', { site_name: siteName });
+                    if (deleteResponse.success) {
+                        Alpine.store('snackbar').show("✅ Site deleted. Initiating server reload...");
+                        const reloadResponse = await this.apiCall('reload_server');
+                        if (reloadResponse.success) {
+                            Alpine.store('snackbar').show("✅ Reload initiated. List will refresh shortly.");
+                            setTimeout(() => this.getSites(), 2000); // Refresh list after a delay
+                        }
+                    }
+                }
+            }));
+
+            Alpine.store('snackbar', {
+                visible: false, message: '', isError: false,
+                show(message, isError = false) { this.message = message; this.isError = isError; this.visible = true; setTimeout(() => this.visible = false, 4000); }
+            });
+        });
+    </script>
 </body>
 </html>
 EOM
 
+    # Find the absolute path to this script to pass to the GUI
     local script_dir
     script_dir=$(cd "$(dirname "$0")" && pwd)
     local absolute_script_path="$script_dir/$(basename "$0")"
     
+    # Escape the paths for use in `sed`
     local escaped_path
     escaped_path=$(printf '%s\n' "$absolute_script_path" | sed -e 's/[\/&]/\\&/g')
     local escaped_sites_dir
     escaped_sites_dir=$(printf '%s\n' "$SITES_DIR" | sed -e 's/[\/&]/\\&/g')
+    local escaped_home
+    escaped_home=$(printf '%s\n' "$HOME" | sed -e 's/[\/&]/\\&/g')
 
-    sed -e "s/COVE_EXECUTABLE_PATH/${escaped_path}/g" \
+    # Substitute placeholders in both api.php and index.php
+    sed -e "s/COVE_EXECUTABLE_PATH_PLACEHOLDER/${escaped_path}/g" \
         -e "s/SITES_DIR_PLACEHOLDER/${escaped_sites_dir}/g" \
+        -e "s/USER_HOME_PLACEHOLDER/${escaped_home}/g" \
+        "$GUI_DIR/api.php.tmp" > "$GUI_DIR/api.php"
+
+    sed -e "s/SITES_DIR_PLACEHOLDER/${escaped_sites_dir}/g" \
         "$GUI_DIR/index.php.tmp" > "$GUI_DIR/index.php"
-    rm "$GUI_DIR/index.php.tmp"
+        
+    # Clean up temp files
+    rm "$GUI_DIR/api.php.tmp" "$GUI_DIR/index.php.tmp"
 }
 
 # --- Help Functions ---
