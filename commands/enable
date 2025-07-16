@@ -1,7 +1,33 @@
 cove_enable() {
     echo "🚀 Enabling Cove services..."
     brew services restart mariadb &> /dev/null
-    brew services restart mailpit &> /dev/null
+
+    # Stop any running Mailpit instance (from brew or manual) before starting our own.
+    pkill -f mailpit &> /dev/null
+    brew services stop mailpit &> /dev/null
+
+    # Start Mailpit directly with a persistent database file.
+    local mailpit_path
+    mailpit_path="$(brew --prefix mailpit)/bin/mailpit"
+    if [ -x "$mailpit_path" ]; then
+        echo "   - Starting Mailpit with persistent storage..."
+        # --- CORRECTED FLAG ---
+        nohup "$mailpit_path" --database "$COVE_DIR/mailpit.db" > "$LOGS_DIR/mailpit.log" 2>&1 &
+
+        # --- Verify Mailpit has started ---
+        echo "   - Waiting for Mailpit to initialize..."
+        local i=0
+        while ! lsof -i :8025 -sTCP:LISTEN -t >/dev/null; do
+            sleep 1
+            i=$((i+1))
+            if [ $i -ge 10 ]; then
+                gum style --foreground red "❌ Mailpit failed to start within 10 seconds." \
+                          "Check the log for errors: ~/Cove/Logs/mailpit.log"
+                exit 1
+            fi
+        done
+        echo "   - Mailpit started successfully."
+    fi
     
     "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
     

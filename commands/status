@@ -16,7 +16,8 @@ cove_status() {
         mariadb_status="✅ Running"
     fi
 
-    if brew services list | grep -q "mailpit.*started"; then
+    # Check for a running mailpit process directly.
+    if pgrep -f mailpit > /dev/null; then
         mailpit_status="✅ Running"
     fi
 
