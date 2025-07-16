@@ -35,6 +35,5 @@ cove_delete() {
 
     rm -rf "$site_dir"
     echo "✅ Directory deleted."
-    regenerate_caddyfile
     echo "✅ Site '$site_name.localhost' has been removed."
 }
