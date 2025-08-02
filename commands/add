@@ -74,14 +74,16 @@ PHP
         )
     fi
 
+    # Only run the reload if the --no-reload flag was NOT passed.
+    if [ "$no_reload_flag" = false ]; then
+        regenerate_caddyfile
+    fi
+
+    sleep 0.25
     echo "✅ Site '$full_hostname' created successfully!"
     
     if [ "$site_type" == "wordpress" ]; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: https://$full_hostname/wp-admin" "User: $admin_user" "Pass: $admin_pass"
     fi
 
-    # Only run the reload if the --no-reload flag was NOT passed.
-    if [ "$no_reload_flag" = false ]; then
-        regenerate_caddyfile
-    fi
 }
