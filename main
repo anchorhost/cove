@@ -243,7 +243,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'add_site':
             if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
                 $type_flag = ($input['is_plain'] ?? false) ? '--plain' : '';
-                $command = sprintf('HOME=%s %s add %s %s 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag);
+                $command = sprintf('HOME=%s %s add %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag);
             } else { $response['message'] = 'Invalid site name provided.'; }
             break;
         case 'delete_site':

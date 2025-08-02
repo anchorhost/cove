@@ -1,16 +1,24 @@
 cove_add() {
     local site_name="$1"
+    local site_type="wordpress"
+    local no_reload_flag=false
+
+    # Check all arguments passed to the function for our flags
+    for arg in "$@"; do
+        if [ "$arg" == "--plain" ]; then
+            site_type="plain"
+        fi
+        if [ "$arg" == "--no-reload" ]; then
+            no_reload_flag=true
+        fi
+    done
+
     for protected_name in $PROTECTED_NAMES; do
         if [ "$site_name" == "$protected_name" ]; then
             gum style --foreground red "❌ Error: '$site_name' is a reserved name. Choose another."
             exit 1
         fi
     done
-
-    local site_type="wordpress"
-    if [ "$2" == "--plain" ]; then
-        site_type="plain"
-    fi
 
     local site_dir="$SITES_DIR/$site_name.localhost"
     local full_hostname
@@ -48,10 +56,14 @@ PHP
         )
     fi
 
-    # The reload call is now handled by the GUI to prevent deadlocks.
     echo "✅ Site '$full_hostname' created successfully!"
     
     if [ "$site_type" == "wordpress" ]; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: https://$full_hostname/wp-admin" "User: $admin_user" "Pass: $admin_pass"
+    fi
+
+    # Only run the reload if the --no-reload flag was NOT passed.
+    if [ "$no_reload_flag" = false ]; then
+        regenerate_caddyfile
     fi
 }
