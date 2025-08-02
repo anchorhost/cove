@@ -3,6 +3,24 @@ cove_add() {
     local site_type="wordpress"
     local no_reload_flag=false
 
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove add <name> [--plain]"
+        exit 1
+    fi
+
+    # Check for invalid characters.
+    if [[ "$site_name" =~ [^a-z0-9-] ]]; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'." "Site names can only contain lowercase letters, numbers, and hyphens."
+        exit 1
+    fi
+
+    # Check if the name starts or ends with a hyphen.
+    if [[ "$site_name" == -* || "$site_name" == *- ]]; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'." "Site names cannot begin or end with a hyphen."
+        exit 1
+    fi
+
     # Check all arguments passed to the function for our flags
     for arg in "$@"; do
         if [ "$arg" == "--plain" ]; then
