@@ -90,7 +90,92 @@ cove_install() {
     echo "📁 Creating Cove directory structure..."
     mkdir -p "$SITES_DIR" "$LOGS_DIR" "$GUI_DIR" "$ADMINER_DIR" "$CUSTOM_CADDY_DIR"
     echo "🗃️ Downloading Adminer 5.3.0..."
-    curl -sL "https://github.com/vrana/adminer/releases/download/v5.3.0/adminer-5.3.0.php" -o "$COVE_DIR/adminer/index.php"
+    curl -sL "https://github.com/vrana/adminer/releases/download/v5.3.0/adminer-5.3.0.php" -o "$ADMINER_DIR/adminer-core.php"
+    echo "⚙️ Creating Adminer autologin..."
+    # Create a custom index.php to handle autologin
+    cat > "$ADMINER_DIR/index.php" << 'EOM'
+<?php
+// This is the custom entry point for Adminer with autologin.
+
+function adminer_object() {
+    // This class extends the namespaced Adminer class.
+    class AdminerCoveLogin extends Adminer\Adminer {
+        /**
+         * Returns the friendly name of the server.
+         * @return string
+         */
+        function name() {
+            return 'Cove DB Manager';
+        }
+
+        /**
+         * Returns a fixed key to enable the permanent login feature.
+         * This signature must match the parent class exactly.
+         * @return string
+         */
+        function permanentLogin($i = false) {
+            return "cove-local-development-key";
+        }
+
+        /**
+         * Reads credentials from the Cove config file.
+         * @return array
+         */
+        function credentials() {
+            $configFile = getenv('HOME') . '/Cove/config';
+            if (file_exists($configFile)) {
+                $config = parse_ini_file($configFile);
+                $db_user = $config['DB_USER'] ?? null;
+                $db_pass = $config['DB_PASSWORD'] ?? null;
+                // Return server, username, and password
+                return ['localhost', $db_user, $db_pass];
+            }
+            // Fallback if config is missing
+            return ['localhost', null, null];
+        }
+
+        function loginForm() {
+            $html = <<<HTML
+        <table class="layout" style="display:none;">
+        <tbody><tr><th>System</th><td><select name="auth[driver]"><option value="server" selected="">MySQL / MariaDB</option><option value="sqlite">SQLite</option><option value="pgsql">PostgreSQL</option><option value="oracle">Oracle (beta)</option><option value="mssql">MS SQL</option></select><script nonce="">qsl('select').onchange = function () { loginDriver(this); };</script>
+        </td></tr><tr><th>Server</th><td><input name="auth[server]" value="" title="hostname[:port]" placeholder="localhost" autocapitalize="off">
+        </td></tr><tr><th>Username</th><td><input name="auth[username]" id="username" autofocus="" value="" autocomplete="username" autocapitalize="off"><script nonce="">const authDriver = qs('#username').form['auth[driver]']; authDriver && authDriver.onchange();</script>
+
+        </td></tr><tr><th>Password</th><td><input type="password" name="auth[password]" autocomplete="current-password">
+        </td></tr><tr><th>Database</th><td><input name="auth[db]" value="" autocapitalize="off">
+        </td></tr></tbody></table>
+        <p><input type="submit" value="Login" class="">
+        <label><input type="checkbox" name="auth[permanent]" value="1">Permanent login</label>
+        </p>
+        HTML;
+            echo $html;
+            return false;
+        }
+
+        /**
+         * Bypasses the login form by always returning true.
+         * @return bool
+         */
+        function login($login, $password) {
+            return true;
+        }
+
+        /**
+         * Optionally specifies a default database to connect to.
+         * @return string
+         */
+        function database() {
+            return '';
+        }
+    }
+
+    return new AdminerCoveLogin();
+}
+
+// Include the original Adminer core file to run the application.
+include "./adminer-core.php";
+EOM
+
     echo "🎨 Injecting custom Adminer theme..."
     cat > "$ADMINER_DIR/adminer.css" << 'EOM'
 /*!
