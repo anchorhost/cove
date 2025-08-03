@@ -21,7 +21,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.0"
+COVE_VERSION="1.1"
 CADDY_CMD="frankenphp"
 
 # --- Whoops Bootstrap Generation ---

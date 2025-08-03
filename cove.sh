@@ -20,16 +20,9 @@ GUI_DIR="$APP_DIR/gui"
 ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
-PROTECTED_NAMES="cove mailpit adminer"
-COVE_VERSION="1.0"
-
-# --- Dynamic Command Configuration ---
-# Detect if a manual frankenphp installation exists and prioritize it.
-if [ -x "/usr/local/bin/frankenphp" ]; then
-    CADDY_CMD="/usr/local/bin/frankenphp"
-else
-    CADDY_CMD="caddy"
-fi
+PROTECTED_NAMES="cove"
+COVE_VERSION="1.1"
+CADDY_CMD="frankenphp"
 
 # --- Whoops Bootstrap Generation ---
 create_whoops_bootstrap() {
@@ -127,12 +120,12 @@ regenerate_caddyfile() {
 
 # --- Global Services ---
 
-mailpit.localhost {
+mail.cove.localhost {
     reverse_proxy 127.0.0.1:8025
     tls internal
 }
 
-adminer.localhost {
+db.cove.localhost {
     root * "$ADMINER_DIR"
     php_server
     tls internal
@@ -193,123 +186,299 @@ EOM
 
 # --- GUI Generation ---
 create_gui_file() {
-    echo "🎨 Creating Cove dashboard file..."
+    echo "🎨 Creating Cove dashboard files..."
     mkdir -p "$GUI_DIR"
     
-    cat > "$GUI_DIR/index.php.tmp" << 'EOM'
+    # Create the API file that handles the logic
+    cat > "$GUI_DIR/api.php.tmp" << 'EOM'
 <?php
-$sitedir = 'SITES_DIR_PLACEHOLDER';
-$config_file = getenv('HOME') . '/Cove/config';
-$message = '';
-$refresh_script = '';
+header('Content-Type: application/json');
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $cove_path = 'COVE_EXECUTABLE_PATH';
-    if (isset($_POST['add_site'])) {
-        $site_name = trim($_POST['site_name']);
-        $type_flag = isset($_POST['is_plain']) ? '--plain' : '';
-        if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
-            $command = sprintf('%s add %s %s > /dev/null 2>&1 &', escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag);
-            shell_exec($command);
-            $message = "<p>✅ Site creation for '<strong>" . htmlspecialchars($site_name) . ".localhost</strong>' has been initiated.</p>";
-            $refresh_script = '<script>setTimeout(() => window.location.reload(), 5000);</script>';
-        } else {
-            $message = "<p class='error'>Invalid site name. Use letters, numbers, and hyphens only.</p>";
+$sitedir = 'SITES_DIR_PLACEHOLDER';
+$cove_path = 'COVE_EXECUTABLE_PATH_PLACEHOLDER';
+$user_home = 'USER_HOME_PLACEHOLDER';
+
+// Handle GET requests for listing sites
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    $action = $_GET['action'] ?? '';
+    if ($action === 'list_sites') {
+        $sites_info = [];
+        if (file_exists($sitedir) && is_dir($sitedir)) {
+            $items = scandir($sitedir);
+            foreach ($items as $item) {
+                if ($item === '.' || $item === '..') continue;
+                $site_path = $sitedir . '/' . $item;
+                if (is_dir($site_path)) {
+                    $sites_info[] = [
+                        'name' => str_replace('.localhost', '', $item),
+                        'domain' => 'https://' . $item,
+                        'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
+                        'display_path' => '~/Cove/Sites/' . $item,
+                        'full_path' => $site_path
+                    ];
+                }
+            }
+            if (!empty($sites_info)) {
+                array_multisort(
+                    array_column($sites_info, "type"), SORT_ASC,
+                    array_column($sites_info, "name"), SORT_ASC,
+                    $sites_info
+                );
+            }
         }
-    } elseif (isset($_POST['delete_site'])) {
-        $site_name = $_POST['site_name'];
-        if (!empty($site_name)) {
-            $command = sprintf('%s delete %s --force > /dev/null 2>&1 &', escapeshellarg($cove_path), escapeshellarg($site_name));
-            shell_exec($command);
-            $message = "<p>✅ Deletion for '<strong>" . htmlspecialchars($site_name) . ".localhost</strong>' has been initiated.</p>";
-            $refresh_script = '<script>setTimeout(() => window.location.reload(), 2000);</script>';
-        }
+        echo json_encode($sites_info);
+        exit;
     }
 }
+
+// Handle POST requests for adding/deleting/reloading
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $input = json_decode(file_get_contents('php://input'), true);
+    $action = $input['action'] ?? '';
+    $response = ['success' => false, 'message' => 'Invalid request.'];
+    $command = '';
+    $site_name = $input['site_name'] ?? '';
+
+    switch ($action) {
+        case 'add_site':
+            if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $type_flag = ($input['is_plain'] ?? false) ? '--plain' : '';
+                $command = sprintf('HOME=%s %s add %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag);
+            } else { $response['message'] = 'Invalid site name provided.'; }
+            break;
+        case 'delete_site':
+            if (!empty($site_name)) {
+                $command = sprintf('HOME=%s %s delete %s --force 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
+            } else { $response['message'] = 'Site name not provided for deletion.'; }
+            break;
+        case 'reload_server':
+            // This command is run in the background to prevent deadlocking the server.
+            // Output is redirected to /dev/null and the '&' backgrounds the process.
+            $reload_command = sprintf('HOME=%s %s reload > /dev/null 2>&1 &', escapeshellarg($user_home), escapeshellarg($cove_path));
+            shell_exec($reload_command);
+            $response = ['success' => true, 'message' => 'Server reload initiated.'];
+            echo json_encode($response);
+            exit; // Exit immediately
+    }
+
+    if (!empty($command)) {
+        exec($command, $output, $return_code);
+        if ($return_code === 0) {
+            $response = ['success' => true, 'message' => 'Operation completed successfully.'];
+        } else {
+            $response = ['success' => false, 'message' => 'An error occurred.', 'output' => implode("\n", $output)];
+        }
+    }
+    echo json_encode($response);
+    exit;
+}
+
+http_response_code(405);
+echo json_encode(['success' => false, 'message' => 'Method Not Allowed']);
+EOM
+
+    # Create the main dashboard file (the UI)
+    cat > "$GUI_DIR/index.php.tmp" << 'EOM'
+<?php
+$config_file = getenv('HOME') . '/Cove/config';
 $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
 ?>
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" x-data="{ theme: localStorage.getItem('theme') || 'dark' }" x-init="$watch('theme', val => localStorage.setItem('theme', val))" :data-theme="theme">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cove Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code&family=Inter:wght@400;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"/>
+    <script src="//unpkg.com/alpinejs" defer></script>
     <style>
-        body { padding-bottom: 5rem; }
-        .error { color: var(--pico-del-color); }
-        pre { background-color: var(--pico-secondary-background); padding: 1em; border-radius: var(--pico-border-radius); white-space: pre-wrap; }
-        .grid > article { margin-bottom: 0; }
-        .delete-form { margin-bottom: 0; }
+        :root { --pico-font-family: 'Inter', sans-serif; --pico-font-size: 95%; --pico-spacing: 0.75rem; --pico-card-padding: 1.25rem; --pico-form-element-spacing-vertical: 0.75rem; --pico-form-element-spacing-horizontal: 1rem; }
+        code, pre, kbd { font-family: 'Fira Code', monospace; }
+        [data-theme="light"], :root:not([data-theme="dark"]) { --pico-primary: #163c52; --pico-primary-hover: #1f5472; --pico-primary-focus: rgba(22, 60, 82, 0.25); --pico-card-background-color: #fdf4e9; --pico-card-border-color: #e9e2d9; --pico-code-background-color: #e9e2d9; }
+        [data-theme="dark"] { --pico-primary: #00a9ff; --pico-primary-hover: #33bbff; --pico-primary-focus: rgba(0, 169, 255, 0.25); --pico-background-color: #1a1b26; --pico-card-background-color: #24283b; --pico-card-border-color: #414868; --pico-code-color: #ff9e64; --pico-code-background-color: #2e3247; }
+        body { padding: 1rem; background-color: var(--pico-background-color); max-width: 1000px; margin: auto; }
+        header { text-align: center; margin: 2rem 0; }
+        section { margin-bottom: 36px; }
+        .theme-toggle { position: absolute; top: 1rem; right: 1rem; background: transparent; border: none; padding: 0.5rem; cursor: pointer; font-size: 1.25rem; line-height: 1; width: auto; height: auto; }
+        table { --pico-table-border-color: var(--pico-card-border-color); }
+        article, figure { border-color: var(--pico-card-border-color); }
+        .clickable-code { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; }
+        .clickable-code:hover { color: var(--pico-primary); }
+        .snackbar { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); padding: 0.75rem 1.25rem; border-radius: var(--pico-border-radius); background-color: var(--pico-primary); color: var(--pico-primary-inverse); box-shadow: var(--pico-box-shadow); z-index: 1000; font-size: 0.9em; }
+        .snackbar.error { background-color: #d32f2f; color: white; }
+        button[aria-busy='true'] { pointer-events: none; }
     </style>
 </head>
 <body>
-    <main class="container">
-        <header><h1>Cove Dashboard</h1><p>Manage your local development environment.</p></header>
-        <?php if ($message): ?><article><footer><?= $message ?></footer></article><?php endif; ?>
+    <main class="container" x-data="sitesManager" x-init="getSites">
+        <button class="theme-toggle" @click="theme = (theme === 'light' ? 'dark' : 'light')" x-text="theme === 'light' ? '🌙' : '☀️'"></button>
+        <header><h1><img src="https://cove.run/content/15/uploads/2025/07/cropped-cove-1-192x192.webp" style="width: 38px;"> Cove</h1>
+        <p>Local Development Powered by Caddy</p></header>
+        
         <section>
-            <h2>Quick Links</h2>
+            <h2>🚀 Quick Links</h2>
             <div class="grid">
-                <a href="http://adminer.localhost" role="button" class="outline">🗃️ Manage Databases (Adminer)</a>
-                <a href="http://mailpit.localhost" role="button" class="outline">✉️ Inspect Emails (Mailpit)</a>
+                <a href="https://db.cove.localhost" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">🗃️ Manage Databases (Adminer)</a>
+                <a href="https://mail.cove.localhost" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">✉️ Inspect Emails (Mailpit)</a>
             </div>
         </section>
-  
-       <section>
-            <h2>Add New Site</h2>
-            <article><form method="POST"><div class="grid"><label for="site_name">Site Name<input type="text" id="site_name" name="site_name" placeholder="my-awesome-project" required><small>This will create <code>my-awesome-project.localhost</code></small></label><label for="is_plain"><input type="checkbox" id="is_plain" name="is_plain">Plain Site<small>Creates a static site without WordPress or a database.</small></label></div><button type="submit" name="add_site">Add Site</button></form></article>
-        </section>
+
         <section>
-            <h2>Managed Sites</h2>
-           
-             <?php $sites = file_exists($sitedir) ? scandir($sitedir) : []; if (count($sites) > 2): ?>
-            <table><thead><tr><th>Site Domain</th><th>Type</th><th>Actions</th></tr></thead>
-                <tbody>
-                <?php foreach ($sites as $site): if ($site === '.' || $site === '..' || !is_dir($sitedir . '/' . $site)) continue; ?>
-                    <tr>
-                        <td><a href="https://<?= htmlspecialchars($site) ?>" target="_blank"><?= htmlspecialchars($site) ?></a></td>
-                        <td><?= file_exists("$sitedir/$site/public/wp-config.php") ? 'WordPress' : 'Plain' ?></td>
-                        <td><form method="POST" class="delete-form" onsubmit="return confirm('Are you sure you want to permanently delete <?= htmlspecialchars($site) ?>? This cannot be undone.');"><input type="hidden" name="site_name" value="<?= htmlspecialchars(str_replace('.localhost', '', $site)) ?>"><button type="submit" name="delete_site" class="secondary outline">Delete</button></form></td>
-                    </tr>
-                <?php endforeach; ?>
-                </tbody>
-            </table>
-            <?php 
-            $site_directories = array_filter($sites, function($site) use ($sitedir) {
-                return !in_array($site, ['.', '..']) && is_dir($sitedir . '/' . $site);
-            });
-            if (empty($site_directories)): ?>
-            <p>No sites found. Add one above!</p>
-            <?php endif; ?>
-            <?php else: ?><p>No sites found. Add one above!</p><?php endif; ?>
+            <h2>✨ Add New Site</h2>
+            <article>
+                <form @submit.prevent="addSite">
+                    <div class="grid">
+                        <label>Site Name
+                            <input type="text" name="site_name" required x-model="newSite.name" @input="newSite.name = newSite.name.toLowerCase().replace(/[^a-z0-9-]/g, '')" :disabled="newSite.isLoading">
+                            <small>This will create <code x-text="newSite.name ? newSite.name + '.localhost' : '.localhost'"></code></small>
+                        </label>
+                        <label><input type="checkbox" name="is_plain" x-model="newSite.isPlain" :disabled="newSite.isLoading">Plain Site</label>
+                    </div>
+                    <button type="submit" :aria-busy="newSite.isLoading" x-text="newSite.isLoading ? 'Creating...' : 'Create Site'"></button>
+                </form>
+            </article>
         </section>
+
         <section>
-            <h2>Cove Configuration</h2>
+            <h2>🗂️ Managed Sites</h2>
+            <figure>
+                <table role="grid">
+                    <thead><tr><th>Site Domain</th><th>Type</th><th>Path</th><th>Actions</th></tr></thead>
+                    <tbody>
+                        <template x-for="site in sites" :key="site.name">
+                            <tr>
+                                <td><a :href="site.domain" target="_blank" rel="noopener noreferrer" x-text="'🔗 ' + site.domain.replace('https://', '')"></a></td>
+                                <td x-text="site.type"></td>
+                                <td>
+                                    <div @click="$store.snackbar.show('✅ Path copied!'); navigator.clipboard.writeText(site.full_path)" style="cursor: pointer;display:inline-flex;" title="Click to copy path">
+                                        <small><code class="clickable-code" x-text="site.display_path"></code></small>
+                                    </div>
+                                </td>
+                                <td>
+                                    <form @submit.prevent="deleteSite(site.name)" style="margin-bottom: 0;">
+                                        <button type="submit" class="secondary outline">🗑️ Delete</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        </template>
+                        <tr x-show="sites.length === 0 && !isLoading">
+                            <td colspan="4"><article>No sites found. Add one above!</article></td>
+                        </tr>
+                        <tr x-show="isLoading">
+                            <td colspan="4"><progress></progress></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </figure>
+        </section>
+
+        <section>
+            <h2>⚙️ Cove Configuration</h2>
             <article>
                 <p>These are the credentials Cove uses to create new WordPress databases.</p>
-                <pre><strong>Database User:</strong> <?= htmlspecialchars($config_data['DB_USER'] ?? 'Not set') ?>&#x000A;<strong>Database Password:</strong> <?= htmlspecialchars($config_data['DB_PASSWORD'] ?? 'Not set') ?></pre>
-                <small>Configuration stored in <code><?= htmlspecialchars($config_file) ?></code>.</small>
+                <pre><code><strong>Database User:</strong> <?= htmlspecialchars($config_data['DB_USER'] ?? 'Not set') ?>&#x000A;<strong>Database Password:</strong> <?= htmlspecialchars($config_data['DB_PASSWORD'] ?? 'Not set') ?></code></pre>
+                <p><small>Configuration stored in <code><?= htmlspecialchars($config_file) ?></code>.</small></p>
             </article>
         </section>
     </main>
-    <?php if (!empty($refresh_script)) echo $refresh_script; ?>
+
+    <div x-show="$store.snackbar.visible" x-transition class="snackbar" :class="{ 'error': $store.snackbar.isError }" style="display: none;">
+        <span x-text="$store.snackbar.message"></span>
+    </div>
+
+    <script>
+        document.addEventListener('alpine:init', () => {
+            Alpine.data('sitesManager', () => ({
+                sites: [],
+                isLoading: true,
+                newSite: { name: '', isPlain: false, isLoading: false },
+
+                async apiCall(action, payload = {}) {
+                    try {
+                        const response = await fetch('api.php', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action, ...payload })
+                        }).then(res => res.json());
+
+                        if (!response.success) {
+                            Alpine.store('snackbar').show(`❌ Error: ${response.message || 'Unknown error'}`, true);
+                        }
+                        return response;
+                    } catch (e) {
+                        Alpine.store('snackbar').show('❌ A network error occurred.', true);
+                        return { success: false };
+                    }
+                },
+                
+                async getSites() { this.isLoading = true; try { const r = await fetch('api.php?action=list_sites'); this.sites = await r.json(); } catch (e) { Alpine.store('snackbar').show('❌ Could not fetch site list.', true); } finally { this.isLoading = false; } },
+                
+                async addSite() {
+                    this.newSite.isLoading = true;
+                    const addResponse = await this.apiCall('add_site', { site_name: this.newSite.name, is_plain: this.newSite.isPlain });
+                    if (addResponse.success) {
+                        this.newSite.name = '';
+                        Alpine.store('snackbar').show("✅ Site created. Initiating server reload...");
+                        const reloadResponse = await this.apiCall('reload_server');
+                        if (reloadResponse.success) {
+                            Alpine.store('snackbar').show("✅ Reload initiated. List will refresh shortly.");
+                            setTimeout(() => this.getSites(), 2000); // Refresh list after a delay
+                        }
+                    }
+                    this.newSite.isLoading = false;
+                },
+
+                async deleteSite(siteName) {
+                    if (!confirm(`Are you sure you want to permanently delete ${siteName}? This cannot be undone.`)) return;
+                    const deleteResponse = await this.apiCall('delete_site', { site_name: siteName });
+                    if (deleteResponse.success) {
+                        Alpine.store('snackbar').show("✅ Site deleted. Initiating server reload...");
+                        const reloadResponse = await this.apiCall('reload_server');
+                        if (reloadResponse.success) {
+                            Alpine.store('snackbar').show("✅ Reload initiated. List will refresh shortly.");
+                            setTimeout(() => this.getSites(), 2000); // Refresh list after a delay
+                        }
+                    }
+                }
+            }));
+
+            Alpine.store('snackbar', {
+                visible: false, message: '', isError: false,
+                show(message, isError = false) { this.message = message; this.isError = isError; this.visible = true; setTimeout(() => this.visible = false, 4000); }
+            });
+        });
+    </script>
 </body>
 </html>
 EOM
 
+    # Find the absolute path to this script to pass to the GUI
     local script_dir
     script_dir=$(cd "$(dirname "$0")" && pwd)
     local absolute_script_path="$script_dir/$(basename "$0")"
     
+    # Escape the paths for use in `sed`
     local escaped_path
     escaped_path=$(printf '%s\n' "$absolute_script_path" | sed -e 's/[\/&]/\\&/g')
     local escaped_sites_dir
     escaped_sites_dir=$(printf '%s\n' "$SITES_DIR" | sed -e 's/[\/&]/\\&/g')
+    local escaped_home
+    escaped_home=$(printf '%s\n' "$HOME" | sed -e 's/[\/&]/\\&/g')
 
-    sed -e "s/COVE_EXECUTABLE_PATH/${escaped_path}/g" \
+    # Substitute placeholders in both api.php and index.php
+    sed -e "s/COVE_EXECUTABLE_PATH_PLACEHOLDER/${escaped_path}/g" \
         -e "s/SITES_DIR_PLACEHOLDER/${escaped_sites_dir}/g" \
+        -e "s/USER_HOME_PLACEHOLDER/${escaped_home}/g" \
+        "$GUI_DIR/api.php.tmp" > "$GUI_DIR/api.php"
+
+    sed -e "s/SITES_DIR_PLACEHOLDER/${escaped_sites_dir}/g" \
         "$GUI_DIR/index.php.tmp" > "$GUI_DIR/index.php"
-    rm "$GUI_DIR/index.php.tmp"
+        
+    # Clean up temp files
+    rm "$GUI_DIR/api.php.tmp" "$GUI_DIR/index.php.tmp"
 }
 
 # --- Help Functions ---
@@ -331,6 +500,7 @@ show_general_help() {
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
+    echo "  upgrade          Upgrades Cove to the latest available version."
     echo "  version          Displays the current version of Cove."
 }
 
@@ -359,9 +529,12 @@ display_command_help() {
             echo "Checks the status of all background services."
             ;;
         list)
-            echo "Usage: cove list"
+            echo "Usage: cove list [--totals]"
             echo ""
             echo "Lists all sites currently managed by Cove, showing their domain and type (WordPress/Plain)."
+            echo ""
+            echo "Flags:"
+            echo "  --totals       Calculates and displays the size of each site's public directory."
             ;;
         add)
             echo "Usage: cove add <name> [--plain]"
@@ -386,7 +559,7 @@ display_command_help() {
             echo "  --force        Deletes a site without the interactive confirmation prompt."
             ;;
         directive)
-            echo "Usage: cove directive <command> <name>"
+            echo "Usage: cove directive <subcommand>"
             echo ""
             echo "Add or remove custom Caddyfile rules for a site."
             echo "Opens an editor to add/edit rules which are then included in the main Caddyfile."
@@ -398,14 +571,23 @@ display_command_help() {
             echo "  list        Lists all custom directives for all managed sites."
             ;;
         db)
-            echo "Usage: cove db backup"
+            echo "Usage: cove db <subcommand>"
             echo ""
-            echo "Manage databases. 'backup' creates a .sql dump for each WP site."
+            echo "Manage databases."
+            echo ""
+            echo "Subcommands:"
+            echo "  backup      Creates a .sql dump for each WP site."
+            echo "  list        Lists database connection details for each WP site."
             ;;
         reload)
             echo "Usage: cove reload"
             echo ""
             echo "Regenerates the Caddyfile and reloads the Caddy server gracefully."
+            ;;
+        upgrade)
+            echo "Usage: cove upgrade"
+            echo ""
+            echo "Checks for the latest version of Cove on GitHub and replaces the current executable if a newer version is available."
             ;;
         version)
             echo "Usage: cove version"
@@ -458,7 +640,7 @@ main() {
             ;;
         list)
             check_dependencies
-            cove_list
+            cove_list "$@"
             ;;
         install)
             cove_install
@@ -479,16 +661,17 @@ main() {
             check_dependencies
             cove_status
             ;;
-
-        # --- Refactored Commands with Sub-routing ---
-
         db)
             check_dependencies
             local action="$1"
             shift # Remove subcommand from argument list to pass the rest to the function
             case "$action" in
                 backup)
+      
                     cove_db_backup "$@"
+                    ;;
+                list)
+                    cove_db_list "$@"
                     ;;
                 *)
                     display_command_help "db"
@@ -496,7 +679,6 @@ main() {
                     ;;
             esac
             ;;
-
         directive)
             check_dependencies
             local action="$1"
@@ -517,6 +699,9 @@ main() {
                     ;;
             esac
             ;;
+        upgrade)
+            cove_upgrade
+            ;;
         version)
             cove_version
             ;;
@@ -533,7 +718,39 @@ main() {
 # The following functions are sourced from the 'commands/' directory.
 
 cove_add() {
+    cd ~/
     local site_name="$1"
+    local site_type="wordpress"
+    local no_reload_flag=false
+
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove add <name> [--plain]"
+        exit 1
+    fi
+
+    # Check for invalid characters.
+    if [[ "$site_name" =~ [^a-z0-9-] ]]; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'." "Site names can only contain lowercase letters, numbers, and hyphens."
+        exit 1
+    fi
+
+    # Check if the name starts or ends with a hyphen.
+    if [[ "$site_name" == -* || "$site_name" == *- ]]; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'." "Site names cannot begin or end with a hyphen."
+        exit 1
+    fi
+
+    # Check all arguments passed to the function for our flags
+    for arg in "$@"; do
+        if [ "$arg" == "--plain" ]; then
+            site_type="plain"
+        fi
+        if [ "$arg" == "--no-reload" ]; then
+            no_reload_flag=true
+        fi
+    done
+
     for protected_name in $PROTECTED_NAMES; do
         if [ "$site_name" == "$protected_name" ]; then
             gum style --foreground red "❌ Error: '$site_name' is a reserved name. Choose another."
@@ -541,13 +758,7 @@ cove_add() {
         fi
     done
 
-    local site_type="wordpress"
-    if [ "$2" == "--plain" ]; then
-        site_type="plain"
-    fi
-
     local site_dir="$SITES_DIR/$site_name.localhost"
-    # NEW: Define the full hostname from the site directory for consistency.
     local full_hostname
     full_hostname=$(basename "$site_dir")
 
@@ -559,7 +770,6 @@ cove_add() {
     echo "➕ Creating $site_type site: $full_hostname"
     mkdir -p "$site_dir/public" "$site_dir/logs"
 
-    # Define credential variables outside the if-statement to widen their scope
     local admin_user="admin"
     local admin_pass
 
@@ -570,9 +780,7 @@ cove_add() {
         
         echo "🗄️ Creating database: $db_name"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
-        
         echo "Installing WordPress..."
-        # Generate the random password and store it
         admin_pass=$(openssl rand -base64 12)
         
         ( cd "$site_dir/public" || exit
@@ -581,19 +789,189 @@ cove_add() {
 define( 'WP_DEBUG', true );
 define( 'WP_DEBUG_LOG', true );
 PHP
-            # CORRECTED: Use the consistent hostname variable for the URL.
+            
             wp core install --url="https://$full_hostname" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
         )
+        
+        # Generate must-use plugin
+read -r -d '' build_mu_plugin << 'heredoc'
+<?php
+/**
+ * Plugin Name: CaptainCore Helper
+ * Plugin URI: https://captaincore.io
+ * Description: Collection of helper functions for CaptainCore
+ * Version: 0.2.8
+ * Author: CaptainCore
+ * Author URI: https://captaincore.io
+ * Text Domain: captaincore-helper
+ */
+
+/**
+ * Registers AJAX callback for quick logins
+ */
+function captaincore_quick_login_action_callback() {
+
+	$post = json_decode( file_get_contents( 'php://input' ) );
+
+	// Error if token not valid
+	if ( ! isset( $post->token ) || $post->token != md5( AUTH_KEY ) ) {
+		return new WP_Error( 'token_invalid', 'Invalid Token', [ 'status' => 404 ] );
+		wp_die();
+	}
+
+	$post->user_login = str_replace( "%20", " ", $post->user_login );
+	$user     = get_user_by( 'login', $post->user_login );
+	$password = wp_generate_password();
+	$token    = sha1( $password );
+
+	update_user_meta( $user->ID, 'captaincore_login_token', $token );
+
+		$query_args = [
+			'user_id'                 => $user->ID,
+			'captaincore_login_token' => $token,
+		];
+        $login_url    = wp_login_url();
+		$one_time_url = add_query_arg( $query_args, $login_url );
+
+	echo $one_time_url;
+	wp_die();
+
+}
+
+add_action( 'wp_ajax_nopriv_captaincore_quick_login', 'captaincore_quick_login_action_callback' );
+
+/**
+ * Login a request in as a user if the token is valid.
+ */
+function captaincore_login_handle_token() {
+
+	global $pagenow;
+
+	if ( 'wp-login.php' !== $pagenow || empty( $_GET['user_id'] ) || empty( $_GET['captaincore_login_token'] ) ) {
+		return;
+	}
+
+	if ( is_user_logged_in() ) {
+		$error = sprintf( __( 'Invalid one-time login token, but you are logged in as \'%1$s\'. <a href="%2$s">Go to the dashboard instead</a>?', 'captaincore-login' ), wp_get_current_user()->user_login, admin_url() );
+	} else {
+		$error = sprintf( __( 'Invalid one-time login token. <a href="%s">Try signing in instead</a>?', 'captaincore-login' ), wp_login_url() );
+	}
+
+	// Use a generic error message to ensure user ids can't be sniffed
+	$user = get_user_by( 'id', (int) $_GET['user_id'] );
+	if ( ! $user ) {
+		wp_die( $error );
+	}
+
+	$token    = get_user_meta( $user->ID, 'captaincore_login_token', true );
+	$is_valid = false;
+		if ( hash_equals( $token, $_GET['captaincore_login_token'] ) ) {
+			$is_valid = true;
+	}
+
+	if ( ! $is_valid ) {
+		wp_die( $error );
+	}
+
+	delete_user_meta( $user->ID, 'captaincore_login_token' );
+	wp_set_auth_cookie( $user->ID, 1 );
+	wp_safe_redirect( admin_url() );
+	exit;
+
+}
+
+add_action( 'init', 'captaincore_login_handle_token' );
+
+if (defined('WP_CLI') && WP_CLI) {
+
+    /**
+     * Generates a one-time login link for a user based on user ID, email, or login.
+     *
+     * ## OPTIONS
+     *
+     * <user_identifier>
+     * : The user ID, email, or login of the user to generate the login link for.
+     *
+     * ## EXAMPLES
+     *
+     *     wp user login 123
+     *     wp user login user@example.com
+     *     wp user login myusername
+     *
+     * @param array $args The command arguments.
+     */
+    function captaincore_generate_login_link( $args ) {
+
+        $user_identifier = $args[0];
+
+        // Determine if the identifier is a user ID, email, or login
+        if (is_numeric($user_identifier)) {
+            $user = get_user_by('ID', $user_identifier);
+        } elseif (is_email($user_identifier)) {
+            $user = get_user_by('email', $user_identifier);
+        } else {
+            $user = get_user_by('login', $user_identifier);
+        }
+
+        // Check if the user exists
+        if (!$user) {
+            WP_CLI::error("User not found: $user_identifier");
+            return;
+        }
+
+        // Generate tokens
+        $password = wp_generate_password();
+        $token    = sha1($password);
+
+        // Update user meta with the new token
+        update_user_meta( $user->ID, 'captaincore_login_token', $token );
+
+        // Construct the one-time login URL
+        $query_args = [
+            'user_id'                 => $user->ID,
+            'captaincore_login_token' => $token,
+        ];
+        $login_url    = wp_login_url();
+        $one_time_url = add_query_arg($query_args, $login_url);
+
+        // Output the URL to the CLI
+        WP_CLI::log("$one_time_url");
+
+    }
+
+    WP_CLI::add_command( 'user login', 'captaincore_generate_login_link' );
+}
+
+/**
+ * Disable auto-update email notifications for plugins.
+ */
+add_filter( 'auto_plugin_update_send_email', '__return_false' );
+
+/**
+ * Disable auto-update email notifications for themes.
+ */
+add_filter( 'auto_theme_update_send_email', '__return_false' );
+
+heredoc
+        wp_content="$site_dir/public/wp-content"
+        echo "Generating '$wp_content/mu-plugins/captaincore-helper.php'"
+        mkdir -p "$wp_content/mu-plugins/"
+        echo "$build_mu_plugin" > $wp_content/mu-plugins/captaincore-helper.php
+        one_time_login_url=$(wp user login $admin_user --path="$site_dir/public/")
     fi
 
-    regenerate_caddyfile
+    # Only run the reload if the --no-reload flag was NOT passed.
+    if [ "$no_reload_flag" = false ]; then
+        regenerate_caddyfile
+    fi
+
+    sleep 0.25
     echo "✅ Site '$full_hostname' created successfully!"
-
-    # Display WordPress credentials only after everything else is done.
+    
     if [ "$site_type" == "wordpress" ]; then
-        # CORRECTED: Use the consistent hostname variable for the URL.
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: https://$full_hostname/wp-admin" "User: $admin_user" "Pass: $admin_pass"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: https://$full_hostname/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
     fi
+
 }
 cove_db_backup() {
     echo "🚀 Starting database backup for all WordPress sites..."
@@ -674,6 +1052,106 @@ cove_db_backup() {
         gum style --foreground red "⚠️ Some database backups failed. Please review the output above."
     fi
 }
+cove_db_list() {
+    source_config # To get DB_USER and DB_PASSWORD for mysql command
+
+    echo "🔎 Gathering database information for all WordPress sites..."
+
+    if ! command -v wp &> /dev/null; then
+        gum style --foreground red "❌ wp-cli is not installed or not in your PATH. Please run 'cove install'."
+        exit 1
+    fi
+
+    if [ ! -d "$SITES_DIR" ] || [ -z "$(ls -A "$SITES_DIR" 2>/dev/null)" ]; then
+        gum style --padding "1 2" "ℹ️ No sites found."
+        exit 0
+    fi
+
+    # This heredoc contains a PHP script to find, connect, and format the database list.
+    local php_output
+    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" php -r '
+        function formatSize(int $bytes): string {
+            if ($bytes === 0) return "0 B";
+            $units = ["B", "KB", "MB", "GB", "TB"];
+            $i = floor(log($bytes, 1024));
+            return round($bytes / (1024 ** $i), 2) . " " . $units[$i];
+        }
+
+        $sites_dir = getenv("SITES_DIR");
+        $db_user = getenv("DB_USER");
+        $db_pass = getenv("DB_PASSWORD");
+
+        if (!is_dir($sites_dir)) { exit; }
+
+        try {
+            $pdo = new PDO("mysql:host=localhost", $db_user, $db_pass, [PDO::ATTR_TIMEOUT => 2]);
+            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        } catch (PDOException $e) { exit; }
+
+        $sites_info = [];
+        foreach (scandir($sites_dir) as $item) {
+            $public_dir = $sites_dir . "/" . $item . "/public";
+            if (is_file($public_dir . "/wp-config.php")) {
+                $site_name = str_replace(".localhost", "", $item);
+                $public_dir_esc = escapeshellarg($public_dir);
+                $cmd_suffix = " --skip-plugins --skip-themes --quiet 2>/dev/null";
+                
+                $name_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_NAME" . $cmd_suffix);
+                if (is_null($name_raw)) { continue; }
+                $site_db_name = trim($name_raw);
+                if (empty($site_db_name)) { continue; }
+
+                $site_db_user = "N/A";
+                $site_db_pass = "N/A";
+                $size_str = "N/A";
+
+                if (!str_contains(strtolower($site_db_name), "sqlite")) {
+                    $user_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_USER" . $cmd_suffix);
+                    if (!is_null($user_raw)) { $site_db_user = trim($user_raw); }
+
+                    $pass_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_PASSWORD" . $cmd_suffix);
+                    if (!is_null($pass_raw)) { $site_db_pass = trim($pass_raw); }
+                    
+                    $stmt = $pdo->prepare("SELECT SUM(data_length + index_length) as size FROM information_schema.TABLES WHERE table_schema = ?");
+                    $stmt->execute([$site_db_name]);
+                    $size_bytes = $stmt->fetch(PDO::FETCH_ASSOC)["size"] ?? 0;
+                    $size_str = formatSize((int)$size_bytes);
+                }
+
+                $sites_info[] = [
+                    "name" => $site_name,
+                    "db_name" => $site_db_name,
+                    "db_user" => $site_db_user,
+                    "db_pass" => $site_db_pass,
+                    "size" => $size_str,
+                ];
+            }
+        }
+
+        if (empty($sites_info)) { exit; }
+
+        array_multisort(array_column($sites_info, "name"), SORT_ASC, $sites_info);
+        
+        $output = [];
+        $w = ["name" => 20, "db_name" => 25, "db_user" => 20, "db_pass" => 25, "size" => 15];
+        $header = str_pad("Name", $w["name"]) . " " . str_pad("DB Name", $w["db_name"]) . " " . str_pad("DB User", $w["db_user"]) . " " . str_pad("DB Pass", $w["db_pass"]) . " " . str_pad("Size", $w["size"]);
+        $separator = str_repeat("-", $w["name"]) . " " . str_repeat("-", $w["db_name"]) . " " . str_repeat("-", $w["db_user"]) . " " . str_repeat("-", $w["db_pass"]) . " " . str_repeat("-", $w["size"]);
+        $output[] = $header;
+        $output[] = $separator;
+
+        foreach ($sites_info as $site) {
+            $row = str_pad($site["name"], $w["name"]) . " " . str_pad($site["db_name"], $w["db_name"]) . " " . str_pad($site["db_user"], $w["db_user"]) . " " . str_pad($site["db_pass"], $w["db_pass"]) . " " . str_pad($site["size"], $w["size"]);
+            $output[] = $row;
+        }
+        echo implode("\n", $output);
+    ')
+
+    if [ -z "$php_output" ]; then
+        gum style --padding "1 2" "ℹ️ No WordPress sites with readable database configurations found."
+    else
+        echo "$php_output" | gum style --border normal --margin "1" --padding "1 2" --border-foreground 212
+    fi
+}
 cove_delete() {
     source_config
     local site_name="$1"
@@ -711,7 +1189,6 @@ cove_delete() {
 
     rm -rf "$site_dir"
     echo "✅ Directory deleted."
-    regenerate_caddyfile
     echo "✅ Site '$site_name.localhost' has been removed."
 }
 cove_directive_add_or_update() {
@@ -817,26 +1294,78 @@ cove_disable() {
     echo "🛑 Disabling Cove services..."
     "$CADDY_CMD" stop --config "$CADDYFILE_PATH"
     brew services stop mariadb
-    brew services stop mailpit
+    pkill -f mailpit &> /dev/null
     echo "✅ Services stopped."
 }
 cove_enable() {
     echo "🚀 Enabling Cove services..."
     brew services restart mariadb &> /dev/null
-    brew services restart mailpit &> /dev/null
+
+    # Stop any running Mailpit instance (from brew or manual) before starting our own.
+    pkill -f mailpit &> /dev/null
+    brew services stop mailpit &> /dev/null
+
+    # Start Mailpit directly with a persistent database file.
+    local mailpit_path
+    mailpit_path="$(brew --prefix mailpit)/bin/mailpit"
+    if [ -x "$mailpit_path" ]; then
+        echo "   - Starting Mailpit with persistent storage..."
+        # --- CORRECTED FLAG ---
+        nohup "$mailpit_path" --database "$COVE_DIR/mailpit.db" > "$LOGS_DIR/mailpit.log" 2>&1 &
+
+        # --- Verify Mailpit has started ---
+        echo "   - Waiting for Mailpit to initialize..."
+        local i=0
+        while ! lsof -i :8025 -sTCP:LISTEN -t >/dev/null; do
+            sleep 1
+            i=$((i+1))
+            if [ $i -ge 10 ]; then
+                gum style --foreground red "❌ Mailpit failed to start within 10 seconds." \
+                          "Check the log for errors: ~/Cove/Logs/mailpit.log"
+                exit 1
+            fi
+        done
+        echo "   - Mailpit started successfully."
+    fi
     
     "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
     
     "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid"
 
     if [ $? -eq 0 ]; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: http://cove.localhost" "Mailpit:   http://mailpit.localhost" "Adminer:   http://adminer.localhost"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: https://cove.localhost" "Adminer:   https://db.cove.localhost" "Mailpit:   https://mail.cove.localhost"
     else
         gum style --foreground red "❌ Caddy server failed to start. Check for errors above, or try running 'cove reload'."
     fi
 }
 cove_install() {
     echo "🚀 Starting Cove installation..."
+
+    # Check for services using standard web ports
+    if lsof -i :80 -i :443 | grep -q 'LISTEN'; then
+        local listening_app
+        listening_app=$(lsof -i :80 -i :443 | grep 'LISTEN' | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')
+
+        # If the listening app is the one Cove uses, don't show a warning.
+        if [[ "$listening_app" == "$CADDY_CMD" || "$listening_app" == "frankenph" ]]; then
+            echo "✅ Detected that FrankenPHP is already running."
+        else
+            # Otherwise, show the original warning for other apps like Nginx.
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
+                "⚠️  Warning: A conflicting web server may be running!" \
+                "" \
+                "Cove has detected that another program ('${listening_app}') is already using" \
+                "the standard web ports (80/443). Cove needs these ports to function." \
+                "" \
+                "To resolve this, you must stop the conflicting service before using Cove." \
+                "For NGINX, you can often use 'sudo brew services stop nginx' or 'sudo nginx -s stop'."
+            if ! gum confirm "Do you want to proceed with the installation anyway?"; then
+                echo "🚫 Installation cancelled."
+                exit 0
+            fi
+       fi
+    fi
+
     if ! command -v gum &> /dev/null; then brew install gum; fi
 
     # --- Pre-install Checks ---
@@ -848,17 +1377,40 @@ cove_install() {
     fi
 
     # --- Dependency Installation ---
-    local packages_to_install=()
-    if [ "$CADDY_CMD" == "caddy" ] && ! command -v caddy &> /dev/null; then
-        packages_to_install+=("caddy")
+    # Handle FrankenPHP separately as it's not in Homebrew core.
+    if ! command -v frankenphp &> /dev/null; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Missing Dependency: frankenphp"
+        echo "   Using the official installer (this may take a moment)..."
+        
+        if curl -sL https://frankenphp.dev/install.sh | sh; then
+            if [ -f "./frankenphp" ]; then
+                echo "   Moving 'frankenphp' to /usr/local/bin/..."
+                if mv ./frankenphp /usr/local/bin/frankenphp; then
+                    echo "✅ FrankenPHP installed successfully."
+                else
+                    gum style --foreground red "❌ Failed to move frankenphp." \
+                                              "Please run this command manually from the directory you ran the installer:" \
+                                              "mv ./frankenphp /usr/local/bin/frankenphp"
+                    exit 1
+                fi
+            else
+                gum style --foreground red "❌ FrankenPHP download script failed to create the 'frankenphp' file."
+                exit 1
+            fi
+        else
+            gum style --foreground red "❌ The FrankenPHP download script failed."
+            exit 1
+        fi
     else
-        echo "ℹ️ Using existing Caddy/FrankenPHP installation."
+        echo "✅ FrankenPHP is already installed."
     fi
+
+    local packages_to_install=()
 
     for pkg_cmd in mariadb mailpit "wp:wp-cli" gum; do
         local pkg=${pkg_cmd##*:}
         local cmd=${pkg_cmd%%:*}
-        if ! command -v $cmd &> /dev/null; then
+        if ! brew list "$pkg" &> /dev/null; then
             packages_to_install+=("$pkg")
         fi
     done
@@ -878,7 +1430,92 @@ cove_install() {
     echo "📁 Creating Cove directory structure..."
     mkdir -p "$SITES_DIR" "$LOGS_DIR" "$GUI_DIR" "$ADMINER_DIR" "$CUSTOM_CADDY_DIR"
     echo "🗃️ Downloading Adminer 5.3.0..."
-    curl -sL "https://github.com/vrana/adminer/releases/download/v5.3.0/adminer-5.3.0.php" -o "$COVE_DIR/adminer/index.php"
+    curl -sL "https://github.com/vrana/adminer/releases/download/v5.3.0/adminer-5.3.0.php" -o "$ADMINER_DIR/adminer-core.php"
+    echo "⚙️ Creating Adminer autologin..."
+    # Create a custom index.php to handle autologin
+    cat > "$ADMINER_DIR/index.php" << 'EOM'
+<?php
+// This is the custom entry point for Adminer with autologin.
+
+function adminer_object() {
+    // This class extends the namespaced Adminer class.
+    class AdminerCoveLogin extends Adminer\Adminer {
+        /**
+         * Returns the friendly name of the server.
+         * @return string
+         */
+        function name() {
+            return 'Cove DB Manager';
+        }
+
+        /**
+         * Returns a fixed key to enable the permanent login feature.
+         * This signature must match the parent class exactly.
+         * @return string
+         */
+        function permanentLogin($i = false) {
+            return "cove-local-development-key";
+        }
+
+        /**
+         * Reads credentials from the Cove config file.
+         * @return array
+         */
+        function credentials() {
+            $configFile = getenv('HOME') . '/Cove/config';
+            if (file_exists($configFile)) {
+                $config = parse_ini_file($configFile);
+                $db_user = $config['DB_USER'] ?? null;
+                $db_pass = $config['DB_PASSWORD'] ?? null;
+                // Return server, username, and password
+                return ['localhost', $db_user, $db_pass];
+            }
+            // Fallback if config is missing
+            return ['localhost', null, null];
+        }
+
+        function loginForm() {
+            $html = <<<HTML
+        <table class="layout" style="display:none;">
+        <tbody><tr><th>System</th><td><select name="auth[driver]"><option value="server" selected="">MySQL / MariaDB</option><option value="sqlite">SQLite</option><option value="pgsql">PostgreSQL</option><option value="oracle">Oracle (beta)</option><option value="mssql">MS SQL</option></select><script nonce="">qsl('select').onchange = function () { loginDriver(this); };</script>
+        </td></tr><tr><th>Server</th><td><input name="auth[server]" value="" title="hostname[:port]" placeholder="localhost" autocapitalize="off">
+        </td></tr><tr><th>Username</th><td><input name="auth[username]" id="username" autofocus="" value="" autocomplete="username" autocapitalize="off"><script nonce="">const authDriver = qs('#username').form['auth[driver]']; authDriver && authDriver.onchange();</script>
+
+        </td></tr><tr><th>Password</th><td><input type="password" name="auth[password]" autocomplete="current-password">
+        </td></tr><tr><th>Database</th><td><input name="auth[db]" value="" autocapitalize="off">
+        </td></tr></tbody></table>
+        <p><input type="submit" value="Login" class="">
+        <label><input type="checkbox" name="auth[permanent]" value="1">Permanent login</label>
+        </p>
+        HTML;
+            echo $html;
+            return false;
+        }
+
+        /**
+         * Bypasses the login form by always returning true.
+         * @return bool
+         */
+        function login($login, $password) {
+            return true;
+        }
+
+        /**
+         * Optionally specifies a default database to connect to.
+         * @return string
+         */
+        function database() {
+            return '';
+        }
+    }
+
+    return new AdminerCoveLogin();
+}
+
+// Include the original Adminer core file to run the application.
+include "./adminer-core.php";
+EOM
+
     echo "🎨 Injecting custom Adminer theme..."
     cat > "$ADMINER_DIR/adminer.css" << 'EOM'
 /*!
@@ -894,8 +1531,14 @@ EOM
     curl -sL "https://github.com/filp/whoops/archive/refs/tags/2.18.3.tar.gz" | tar -xz -C "$APP_DIR/whoops" --strip-components=1
 
     echo "⚙️ Starting services..."
-    brew services restart mariadb # Use restart to be safe
-    brew services restart mailpit # Use restart to be safe
+    # Ensure the MariaDB service can be started before proceeding.
+    if ! brew services restart mariadb; then
+        gum style --foreground red "❌ Failed to start MariaDB via Homebrew." \
+                  "Please run 'brew services start mariadb' manually and check for errors." \
+                  "If the issue persists, try 'brew reinstall mariadb'."
+        exit 1
+    fi
+    brew services restart mailpit
 
     # --- Database Configuration ---
     local skip_db_setup=false
@@ -914,7 +1557,7 @@ EOM
         # Wait for MariaDB to be ready
         echo "Waiting for MariaDB..."
         i=0
-        while ! mysqladmin pink --silent; do
+        while ! mysqladmin ping --silent; do
             sleep 1; i=$((i+1))
             if [ $i -ge 20 ]; then
                 gum style --foreground red "❌ MariaDB did not become available in time."
@@ -922,7 +1565,6 @@ EOM
             fi
         done
         echo "✅ MariaDB is ready."
-
         echo "Please provide your MariaDB root credentials to create a 'cove' user."
         local root_user; root_user=$(gum input --value "root" --prompt "Root username: ")
         local root_pass; root_pass=$(gum input --password --placeholder "Password for '$root_user'")
@@ -937,7 +1579,6 @@ EOM
             exit 1
         fi
         echo "✅ Database user '$db_user' created."
-
         echo "📝 Saving new configuration..."
         echo "DB_USER='$db_user'" > "$CONFIG_FILE"
         echo "DB_PASSWORD='$db_pass'" >> "$CONFIG_FILE"
@@ -948,23 +1589,127 @@ EOM
     create_gui_file
     regenerate_caddyfile
 
-    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 Cove installation complete!" "Run 'cove enable' to start the server." "Your Cove Dashboard is at https://cove.localhost"
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 Cove installation complete!" \
+"Run 'cove enable' to start the server." "Dashboard is at https://cove.localhost"
 }
 cove_list() {
-    echo "Sites managed by Cove:"
-    echo "-----------------------"
-    if [ -d "$SITES_DIR" ] && [ "$(ls -A "$SITES_DIR")" ]; then
-        for d in "$SITES_DIR"/*; do
-            if [ -d "$d" ]; then
-                site_name=$(basename "$d")
-                type=$(if [ -f "$d/public/wp-config.php" ]; then echo "WordPress"; else echo "Plain"; fi)
-                printf "🌐 https://%-30s (%s)\n" "$site_name" "$type"
-            fi
-        done
-    else
-        echo "No sites found. Add one with 'cove add <name>'."
+    local show_totals=false
+    if [[ "$1" == "--totals" ]]; then
+        show_totals=true
     fi
-    echo "-----------------------"
+
+    # This heredoc contains a PHP script to find, sort, and format the site list.
+    # The output is a single, pre-formatted text block.
+    local php_output
+    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" php -r '
+        function getDirectorySize(string $path): int {
+            if (!is_dir($path)) return 0;
+            $total_size = 0;
+            $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS));
+            foreach ($iterator as $file) {
+                if ($file->isFile()) {
+                    $total_size += $file->getSize();
+                }
+            }
+            return $total_size;
+        }
+
+        function formatSize(int $bytes): string {
+            if ($bytes === 0) return "0 B";
+            $units = ["B", "KB", "MB", "GB", "TB"];
+            $i = floor(log($bytes, 1024));
+            return round($bytes / (1024 ** $i), 2) . " " . $units[$i];
+        }
+
+        $sites_dir = getenv("SITES_DIR");
+        $show_totals = getenv("SHOW_TOTALS") === "true";
+
+        if (!is_dir($sites_dir)) {
+            exit;
+        }
+
+        $sites = [];
+        $items = scandir($sites_dir);
+
+        foreach ($items as $item) {
+            if ($item === "." || $item === "..") continue;
+            
+            $site_path = $sites_dir . "/" . $item;
+            if (is_dir($site_path)) {
+                $public_path = $site_path . "/public";
+                $size = $show_totals && is_dir($public_path) ? formatSize(getDirectorySize($public_path)) : null;
+
+                $sites[] = [
+                    "name" => str_replace(".localhost", "", $item),
+                    "domain" => "https://" . $item,
+                    "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
+                    "size" => $size,
+                ];
+            }
+        }
+
+        if (empty($sites)) {
+             exit;
+        }
+
+        // Sort the array: first by type, then by name
+        array_multisort(
+            array_column($sites, "type"), SORT_ASC,
+            array_column($sites, "name"), SORT_ASC,
+            $sites
+        );
+        
+        $output = [];
+        // Define column widths
+        $name_width = 25;
+        $domain_width = 45;
+        $type_width = 10;
+        $size_width = 15;
+
+        // Manually build and pad the header
+        $header = str_pad("Name", $name_width) .
+                  " " . str_pad("Domain", $domain_width) .
+                  " " . str_pad("Type", $type_width);
+        
+        // Manually build the separator line
+        $separator = str_repeat("-", $name_width) .
+                     " " . str_repeat("-", $domain_width) .
+                     " " . str_repeat("-", $type_width);
+
+        if ($show_totals) {
+            $header    .= " " . str_pad("Size", $size_width);
+            $separator .= " " . str_repeat("-", $size_width);
+        }
+        
+        $output[] = $header;
+        $output[] = $separator;
+
+        // Build each data row with manual padding
+        foreach ($sites as $site) {
+            $name_col = str_pad($site["name"], $name_width);
+            // Pad the URL first, then prepend the emoji to preserve alignment
+            $domain_col = "🌐 " . str_pad($site["domain"], $domain_width - 3); // Subtract 3 for "🌐 "
+            $type_col = str_pad($site["type"], $type_width);
+            $row = $name_col . " " . $domain_col . " " . $type_col;
+
+            if ($show_totals) {
+                $row .= " " . str_pad($site["size"] ?? "N/A", $size_width);
+            }
+            $output[] = $row;
+        }
+
+        // Print the entire formatted block
+        echo implode("\n", $output);
+    ')
+
+    if [ -z "$php_output" ];
+    then
+        # Display a message if no sites are found.
+        gum style --padding "1 2" "ℹ️ No sites found. Add one with 'cove add <name>'."
+    else
+        # Pipe the pre-formatted text block into gum style to wrap it in a nice box.
+        echo "$php_output" | gum style --border normal --margin "1" --padding "1 2" --border-foreground 212
+    fi
 }
 cove_reload() {
     create_gui_file
@@ -988,7 +1733,8 @@ cove_status() {
         mariadb_status="✅ Running"
     fi
 
-    if brew services list | grep -q "mailpit.*started"; then
+    # Check for a running mailpit process directly.
+    if pgrep -f mailpit > /dev/null; then
         mailpit_status="✅ Running"
     fi
 
@@ -1002,12 +1748,83 @@ cove_status() {
     fi
 
     echo "" # Add a blank line for spacing.
-
     # Display the final summary message using gum.
     if $all_running; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: https://cove.localhost" "Mailpit:   https://mailpit.localhost" "Adminer:   https://adminer.localhost"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: https://cove.localhost" "Adminer:   https://db.cove.localhost" "Mailpit:   https://mail.cove.localhost"
     else
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" "ℹ️ Some services are stopped." "Run 'cove enable' to start them."
+    fi
+}
+cove_upgrade() {
+    echo "🔎 Checking for the latest version of Cove..."
+
+    local download_url="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
+    local temp_script="/tmp/cove.sh.latest"
+    local install_path
+
+    # Find the real path of the currently running script
+    install_path=$(command -v cove)
+    if [ -z "$install_path" ]; then
+        install_path="/usr/local/bin/cove" # Fallback to default
+    fi
+
+    # 1. Download the latest script
+    echo "   - Downloading latest version from GitHub..."
+    if ! curl -L --fail --progress-bar "$download_url" -o "$temp_script"; then
+        echo "❌ Error: Failed to download the latest version. Please check your connection."
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    fi
+
+    # 2. Make it executable
+    chmod +x "$temp_script"
+
+    # 3. Get the new version from the downloaded script
+    local new_version
+    new_version=$("$temp_script" version | awk '{print $3}')
+
+    if [ -z "$new_version" ]; then
+        echo "❌ Error: Could not determine the version from the downloaded script."
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    fi
+
+    # 4. Get the current version from the running script
+    local current_version="$COVE_VERSION"
+    echo "   - Current version:          $current_version"
+    echo "   - Latest available version: $new_version"
+
+    # 5. Compare versions
+    local latest
+    latest=$(printf '%s\n' "$current_version" "$new_version" | sort -V | tail -n1)
+
+    if [[ "$latest" == "$current_version" ]] && [[ "$new_version" != "$current_version" ]]; then
+         echo "✅ Your current version ($current_version) is newer than the latest release ($new_version). No action taken."
+         rm -f "$temp_script" 2>/dev/null
+         return 0
+    elif [[ "$latest" == "$current_version" ]]; then
+        echo "✅ You are already using the latest version of Cove."
+        rm -f "$temp_script" 2>/dev/null
+        return 0
+    fi
+
+    # 6. Perform the upgrade
+    echo "🚀 Upgrading to version $new_version..."
+
+    if [ ! -w "$(dirname "$install_path")" ]; then
+        echo "❌ Error: No write permissions for '$(dirname "$install_path")'."
+        echo "   Please try running with sudo: 'sudo cove upgrade'"
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    fi
+
+    if ! mv "$temp_script" "$install_path"; then
+        echo "❌ Error: Failed to replace the old script at '$install_path'."
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    else
+        echo "✅ Cove has been successfully upgraded to version $new_version!"
+        echo "   Run 'cove version' to see the new version."
     fi
 }
 cove_version() {
