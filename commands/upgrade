@@ -1,0 +1,72 @@
+cove_upgrade() {
+    echo "🔎 Checking for the latest version of Cove..."
+
+    local download_url="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
+    local temp_script="/tmp/cove.sh.latest"
+    local install_path
+
+    # Find the real path of the currently running script
+    install_path=$(command -v cove)
+    if [ -z "$install_path" ]; then
+        install_path="/usr/local/bin/cove" # Fallback to default
+    fi
+
+    # 1. Download the latest script
+    echo "   - Downloading latest version from GitHub..."
+    if ! curl -L --fail --progress-bar "$download_url" -o "$temp_script"; then
+        echo "❌ Error: Failed to download the latest version. Please check your connection."
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    fi
+
+    # 2. Make it executable
+    chmod +x "$temp_script"
+
+    # 3. Get the new version from the downloaded script
+    local new_version
+    new_version=$("$temp_script" version | awk '{print $3}')
+
+    if [ -z "$new_version" ]; then
+        echo "❌ Error: Could not determine the version from the downloaded script."
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    fi
+
+    # 4. Get the current version from the running script
+    local current_version="$COVE_VERSION"
+    echo "   - Current version:          $current_version"
+    echo "   - Latest available version: $new_version"
+
+    # 5. Compare versions
+    local latest
+    latest=$(printf '%s\n' "$current_version" "$new_version" | sort -V | tail -n1)
+
+    if [[ "$latest" == "$current_version" ]] && [[ "$new_version" != "$current_version" ]]; then
+         echo "✅ Your current version ($current_version) is newer than the latest release ($new_version). No action taken."
+         rm -f "$temp_script" 2>/dev/null
+         return 0
+    elif [[ "$latest" == "$current_version" ]]; then
+        echo "✅ You are already using the latest version of Cove."
+        rm -f "$temp_script" 2>/dev/null
+        return 0
+    fi
+
+    # 6. Perform the upgrade
+    echo "🚀 Upgrading to version $new_version..."
+
+    if [ ! -w "$(dirname "$install_path")" ]; then
+        echo "❌ Error: No write permissions for '$(dirname "$install_path")'."
+        echo "   Please try running with sudo: 'sudo cove upgrade'"
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    fi
+
+    if ! mv "$temp_script" "$install_path"; then
+        echo "❌ Error: Failed to replace the old script at '$install_path'."
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    else
+        echo "✅ Cove has been successfully upgraded to version $new_version!"
+        echo "   Run 'cove version' to see the new version."
+    fi
+}
