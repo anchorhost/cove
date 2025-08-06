@@ -39,16 +39,15 @@ cove_list() {
 
         foreach ($items as $item) {
             if ($item === "." || $item === "..") continue;
-            
             $site_path = $sites_dir . "/" . $item;
             if (is_dir($site_path)) {
                 $public_path = $site_path . "/public";
                 $size = $show_totals && is_dir($public_path) ? formatSize(getDirectorySize($public_path)) : null;
-
                 $sites[] = [
                     "name" => str_replace(".localhost", "", $item),
                     "domain" => "https://" . $item,
                     "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
+                    "path" => "~/Cove/Sites/" . $item . "/public",
                     "size" => $size,
                 ];
             }
@@ -64,24 +63,21 @@ cove_list() {
             array_column($sites, "name"), SORT_ASC,
             $sites
         );
-        
+
         $output = [];
         // Define column widths
-        $name_width = 25;
-        $domain_width = 45;
-        $type_width = 10;
+        $name_width = 22;
+        $domain_width = 40;
+        $type_width = 11;
+        $path_width = 52;
         $size_width = 15;
 
         // Manually build and pad the header
-        $header = str_pad("Name", $name_width) .
-                  " " . str_pad("Domain", $domain_width) .
-                  " " . str_pad("Type", $type_width);
+        $header = str_pad("Name", $name_width) . " " . str_pad("Domain", $domain_width) . " " . str_pad("Type", $type_width) . " " . str_pad("Path", $path_width);
         
         // Manually build the separator line
-        $separator = str_repeat("-", $name_width) .
-                     " " . str_repeat("-", $domain_width) .
-                     " " . str_repeat("-", $type_width);
-
+        $separator = str_repeat("-", $name_width) . " " . str_repeat("-", $domain_width) . " " . str_repeat("-", $type_width) . " " . str_repeat("-", $path_width);
+        
         if ($show_totals) {
             $header    .= " " . str_pad("Size", $size_width);
             $separator .= " " . str_repeat("-", $size_width);
@@ -96,8 +92,9 @@ cove_list() {
             // Pad the URL first, then prepend the emoji to preserve alignment
             $domain_col = "🌐 " . str_pad($site["domain"], $domain_width - 3); // Subtract 3 for "🌐 "
             $type_col = str_pad($site["type"], $type_width);
-            $row = $name_col . " " . $domain_col . " " . $type_col;
-
+            $path_col = str_pad($site["path"], $path_width - 3);
+            $row = $name_col . " " . $domain_col . " " . $type_col . " " . $path_col;
+            
             if ($show_totals) {
                 $row .= " " . str_pad($site["size"] ?? "N/A", $size_width);
             }
@@ -108,8 +105,7 @@ cove_list() {
         echo implode("\n", $output);
     ')
 
-    if [ -z "$php_output" ];
-    then
+    if [ -z "$php_output" ]; then
         # Display a message if no sites are found.
         gum style --padding "1 2" "ℹ️ No sites found. Add one with 'cove add <name>'."
     else
