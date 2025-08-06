@@ -497,6 +497,7 @@ show_general_help() {
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
     echo "  delete           Deletes a site's directory and associated database."
+    echo "  path             Outputs the full path to a site's directory."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
@@ -579,6 +580,14 @@ display_command_help() {
             echo "  backup      Creates a .sql dump for each WP site."
             echo "  list        Lists database connection details for each WP site."
             ;;
+        path)
+            echo "Usage: cove path <name>"
+            echo ""
+            echo "Outputs the full path to the specified site's directory."
+            echo ""
+            echo "Arguments:"
+            echo "  <name>         The name of the site."
+            ;;
         reload)
             echo "Usage: cove reload"
             echo ""
@@ -641,6 +650,10 @@ main() {
         list)
             check_dependencies
             cove_list "$@"
+            ;;
+        path)
+            check_dependencies
+            cove_path "$@"
             ;;
         install)
             cove_install

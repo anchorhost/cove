@@ -1,0 +1,18 @@
+cove_path() {
+    local site_name="$1"
+
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove path <name>"
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+
+    if [ ! -d "$site_dir" ]; then
+        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    echo "$site_dir"
+}
