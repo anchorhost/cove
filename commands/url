@@ -1,0 +1,30 @@
+cove_url() {
+    # -----------------------------------------------------------------
+    #  cove url <site>
+    #  Prints the HTTPS URL for a given site (e.g. https://foo.localhost)
+    # -----------------------------------------------------------------
+    local site_name="$1"
+
+    # -------------------------------------------------------------
+    #  Basic validation – the command requires exactly one argument.
+    # -------------------------------------------------------------
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove url <site>"
+        exit 1
+    fi
+
+    # -------------------------------------------------------------
+    #  Build the expected directory name and verify that it exists.
+    # -------------------------------------------------------------
+    local site_dir="${SITES_DIR}/${site_name}.localhost"
+    if [ ! -d "$site_dir" ]; then
+        gum style --foreground red "❌ Error: Site '${site_name}.localhost' not found."
+        exit 1
+    fi
+
+    # -------------------------------------------------------------
+    #  Print the URL – we keep the output plain so it can be piped.
+    # -------------------------------------------------------------
+    echo "https://${site_name}.localhost"
+}

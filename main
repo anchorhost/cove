@@ -503,6 +503,7 @@ show_general_help() {
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
+    echo "  url              Prints the HTTPS URL for a given site."
     echo "  upgrade          Upgrades Cove to the latest available version."
     echo "  version          Displays the current version of Cove."
 }
@@ -594,6 +595,11 @@ display_command_help() {
             echo "Usage: cove reload"
             echo ""
             echo "Regenerates the Caddyfile and reloads the Caddy server gracefully."
+            ;;
+        url)
+            echo "Usage: cove url <site>"
+            echo ""
+            echo "Prints the HTTPS URL for the given site."
             ;;
         upgrade)
             echo "Usage: cove upgrade"
@@ -713,6 +719,9 @@ main() {
                     exit 0
                     ;;
             esac
+            ;;
+        url)
+            cove_url "$@"
             ;;
         upgrade)
             cove_upgrade
