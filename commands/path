@@ -7,7 +7,7 @@ cove_path() {
         exit 1
     fi
 
-    local site_dir="$SITES_DIR/$site_name.localhost"
+    local site_dir="$SITES_DIR/$site_name.localhost/public"
 
     if [ ! -d "$site_dir" ]; then
         gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
