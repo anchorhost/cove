@@ -499,6 +499,7 @@ show_general_help() {
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
     echo "  delete           Deletes a site's directory and associated database."
+    echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  db               Manage databases (e.g., 'cove db backup')."
@@ -561,6 +562,17 @@ display_command_help() {
             echo ""
             echo "Flags:"
             echo "  --force        Deletes a site without the interactive confirmation prompt."
+            ;;
+        rename)
+            echo "Usage: cove rename <old-name> <new-name>"
+            echo ""
+            echo "Renames an existing local site."
+            echo "This command will rename the site's directory, update its database name and"
+            echo "contents for WordPress sites, and regenerate the server configuration."
+            echo ""
+            echo "Arguments:"
+            echo "  <old-name>     The current name of the site to rename."
+            echo "  <new-name>     The new name for the site."
             ;;
         directive)
             echo "Usage: cove directive <subcommand>"
@@ -654,6 +666,10 @@ main() {
         delete)
             check_dependencies
             cove_delete "$@"
+            ;;
+        rename)
+            check_dependencies
+            cove_rename "$@"
             ;;
         list)
             check_dependencies

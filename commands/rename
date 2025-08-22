@@ -1,0 +1,94 @@
+cove_rename() {
+    local old_name="$1"
+    local new_name="$2"
+
+    # --- Validation ---
+    if [ -z "$old_name" ] || [ -z "$new_name" ]; then
+        gum style --foreground red "❌ Error: Both old and new site names are required."
+        echo "Usage: cove rename <old-name> <new-name>"
+        exit 1
+    fi
+
+    if [ "$old_name" == "$new_name" ]; then
+         gum style --foreground red "❌ Error: The new name must be different from the old name."
+         exit 1
+    fi
+
+    local old_site_dir="$SITES_DIR/$old_name.localhost"
+    if [ ! -d "$old_site_dir" ]; then
+        gum style --foreground red "❌ Error: Site '$old_name.localhost' not found."
+        exit 1
+    fi
+
+    # Validate the new_name using the same rules as the 'add' command
+    if [[ "$new_name" =~ [^a-z0-9-] ]]; then
+        gum style --foreground red "❌ Error: Invalid new site name '$new_name'." "Site names can only contain lowercase letters, numbers, and hyphens."
+        exit 1
+    fi
+    if [[ "$new_name" == -* || "$new_name" == *- ]]; then
+        gum style --foreground red "❌ Error: Invalid new site name '$new_name'." "Site names cannot begin or end with a hyphen."
+        exit 1
+    fi
+    for protected_name in $PROTECTED_NAMES; do
+        if [ "$new_name" == "$protected_name" ]; then
+            gum style --foreground red "❌ Error: '$new_name' is a reserved name. Choose another."
+            exit 1
+        fi
+    done
+
+    local new_site_dir="$SITES_DIR/$new_name.localhost"
+    if [ -d "$new_site_dir" ]; then
+        gum style --foreground red "❌ Error: A site named '$new_name.localhost' already exists."
+        exit 1
+    fi
+
+    echo "🔄 Renaming '$old_name.localhost' to '$new_name.localhost'..."
+
+    # --- Rename Directory ---
+    mv "$old_site_dir" "$new_site_dir"
+    echo "   - Directory renamed."
+
+    # --- Handle WordPress Specifics ---
+    if [ -f "$new_site_dir/public/wp-config.php" ]; then
+        source_config
+        local old_db_name
+        old_db_name=$(echo "cove_$old_name" | tr -c '[:alnum:]_' '_')
+        local new_db_name
+        new_db_name=$(echo "cove_$new_name" | tr -c '[:alnum:]_' '_')
+        local temp_sql_dump="/tmp/${old_db_name}.sql"
+
+        echo "   - Backing up old database '$old_db_name'..."
+        if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$old_db_name" > "$temp_sql_dump"; then
+            gum style --foreground red "❌ Error: Failed to dump the old database. Aborting."
+            mv "$new_site_dir" "$old_site_dir" # Revert directory rename
+            exit 1
+        fi
+
+        echo "   - Creating and importing to new database '$new_db_name'..."
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db_name" < "$temp_sql_dump"
+        rm "$temp_sql_dump"
+
+        echo "   - Updating wp-config.php..."
+        (cd "$new_site_dir/public" && wp config set DB_NAME "$new_db_name" --quiet)
+
+        echo "   - Running search-replace for site URL..."
+        (cd "$new_site_dir/public" && wp search-replace "https://$old_name.localhost" "https://$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet)
+
+        echo "   - Dropping old database '$old_db_name'..."
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
+    fi
+
+    # --- Rename Custom Caddy Directives File ---
+    local old_custom_conf_file="$CUSTOM_CADDY_DIR/$old_name.localhost"
+    local new_custom_conf_file="$CUSTOM_CADDY_DIR/$new_name.localhost"
+    if [ -f "$old_custom_conf_file" ]; then
+        mv "$old_custom_conf_file" "$new_custom_conf_file"
+        echo "   - Custom Caddy directive file renamed."
+    fi
+
+    # --- Reload Server Configuration ---
+    regenerate_caddyfile
+
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: https://$new_name.localhost"
+}
