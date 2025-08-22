@@ -21,7 +21,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.1"
+COVE_VERSION="1.2"
 CADDY_CMD="frankenphp"
 
 # --- Whoops Bootstrap Generation ---
@@ -114,6 +114,8 @@ regenerate_caddyfile() {
         php_ini log_errors On
         php_ini error_log "$LOGS_DIR/errors.log"
         php_ini auto_prepend_file "$APP_DIR/whoops_bootstrap.php"
+        php_ini upload_max_filesize 512M
+        php_ini post_max_size 512M
     }
     order php_server before file_server
 }
@@ -497,9 +499,12 @@ show_general_help() {
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
     echo "  delete           Deletes a site's directory and associated database."
+    echo "  rename           Renames a site, its directory, and database."
+    echo "  path             Outputs the full path to a site's directory."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
+    echo "  url              Prints the HTTPS URL for a given site."
     echo "  upgrade          Upgrades Cove to the latest available version."
     echo "  version          Displays the current version of Cove."
 }
@@ -558,6 +563,17 @@ display_command_help() {
             echo "Flags:"
             echo "  --force        Deletes a site without the interactive confirmation prompt."
             ;;
+        rename)
+            echo "Usage: cove rename <old-name> <new-name>"
+            echo ""
+            echo "Renames an existing local site."
+            echo "This command will rename the site's directory, update its database name and"
+            echo "contents for WordPress sites, and regenerate the server configuration."
+            echo ""
+            echo "Arguments:"
+            echo "  <old-name>     The current name of the site to rename."
+            echo "  <new-name>     The new name for the site."
+            ;;
         directive)
             echo "Usage: cove directive <subcommand>"
             echo ""
@@ -579,10 +595,23 @@ display_command_help() {
             echo "  backup      Creates a .sql dump for each WP site."
             echo "  list        Lists database connection details for each WP site."
             ;;
+        path)
+            echo "Usage: cove path <name>"
+            echo ""
+            echo "Outputs the full path to the specified site's directory."
+            echo ""
+            echo "Arguments:"
+            echo "  <name>         The name of the site."
+            ;;
         reload)
             echo "Usage: cove reload"
             echo ""
             echo "Regenerates the Caddyfile and reloads the Caddy server gracefully."
+            ;;
+        url)
+            echo "Usage: cove url <site>"
+            echo ""
+            echo "Prints the HTTPS URL for the given site."
             ;;
         upgrade)
             echo "Usage: cove upgrade"
@@ -638,9 +667,17 @@ main() {
             check_dependencies
             cove_delete "$@"
             ;;
+        rename)
+            check_dependencies
+            cove_rename "$@"
+            ;;
         list)
             check_dependencies
             cove_list "$@"
+            ;;
+        path)
+            check_dependencies
+            cove_path "$@"
             ;;
         install)
             cove_install
@@ -698,6 +735,9 @@ main() {
                     exit 0
                     ;;
             esac
+            ;;
+        url)
+            cove_url "$@"
             ;;
         upgrade)
             cove_upgrade
@@ -1633,16 +1673,15 @@ cove_list() {
 
         foreach ($items as $item) {
             if ($item === "." || $item === "..") continue;
-            
             $site_path = $sites_dir . "/" . $item;
             if (is_dir($site_path)) {
                 $public_path = $site_path . "/public";
                 $size = $show_totals && is_dir($public_path) ? formatSize(getDirectorySize($public_path)) : null;
-
                 $sites[] = [
                     "name" => str_replace(".localhost", "", $item),
                     "domain" => "https://" . $item,
                     "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
+                    "path" => "~/Cove/Sites/" . $item . "/public",
                     "size" => $size,
                 ];
             }
@@ -1658,24 +1697,21 @@ cove_list() {
             array_column($sites, "name"), SORT_ASC,
             $sites
         );
-        
+
         $output = [];
         // Define column widths
-        $name_width = 25;
-        $domain_width = 45;
-        $type_width = 10;
+        $name_width = 22;
+        $domain_width = 40;
+        $type_width = 11;
+        $path_width = 52;
         $size_width = 15;
 
         // Manually build and pad the header
-        $header = str_pad("Name", $name_width) .
-                  " " . str_pad("Domain", $domain_width) .
-                  " " . str_pad("Type", $type_width);
+        $header = str_pad("Name", $name_width) . " " . str_pad("Domain", $domain_width) . " " . str_pad("Type", $type_width) . " " . str_pad("Path", $path_width);
         
         // Manually build the separator line
-        $separator = str_repeat("-", $name_width) .
-                     " " . str_repeat("-", $domain_width) .
-                     " " . str_repeat("-", $type_width);
-
+        $separator = str_repeat("-", $name_width) . " " . str_repeat("-", $domain_width) . " " . str_repeat("-", $type_width) . " " . str_repeat("-", $path_width);
+        
         if ($show_totals) {
             $header    .= " " . str_pad("Size", $size_width);
             $separator .= " " . str_repeat("-", $size_width);
@@ -1690,8 +1726,9 @@ cove_list() {
             // Pad the URL first, then prepend the emoji to preserve alignment
             $domain_col = "🌐 " . str_pad($site["domain"], $domain_width - 3); // Subtract 3 for "🌐 "
             $type_col = str_pad($site["type"], $type_width);
-            $row = $name_col . " " . $domain_col . " " . $type_col;
-
+            $path_col = str_pad($site["path"], $path_width - 3);
+            $row = $name_col . " " . $domain_col . " " . $type_col . " " . $path_col;
+            
             if ($show_totals) {
                 $row .= " " . str_pad($site["size"] ?? "N/A", $size_width);
             }
@@ -1702,8 +1739,7 @@ cove_list() {
         echo implode("\n", $output);
     ')
 
-    if [ -z "$php_output" ];
-    then
+    if [ -z "$php_output" ]; then
         # Display a message if no sites are found.
         gum style --padding "1 2" "ℹ️ No sites found. Add one with 'cove add <name>'."
     else
@@ -1711,9 +1747,122 @@ cove_list() {
         echo "$php_output" | gum style --border normal --margin "1" --padding "1 2" --border-foreground 212
     fi
 }
+cove_path() {
+    local site_name="$1"
+
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove path <name>"
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost/public"
+
+    if [ ! -d "$site_dir" ]; then
+        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    echo "$site_dir"
+}
+
 cove_reload() {
     create_gui_file
     regenerate_caddyfile
+}
+cove_rename() {
+    local old_name="$1"
+    local new_name="$2"
+
+    # --- Validation ---
+    if [ -z "$old_name" ] || [ -z "$new_name" ]; then
+        gum style --foreground red "❌ Error: Both old and new site names are required."
+        echo "Usage: cove rename <old-name> <new-name>"
+        exit 1
+    fi
+
+    if [ "$old_name" == "$new_name" ]; then
+         gum style --foreground red "❌ Error: The new name must be different from the old name."
+         exit 1
+    fi
+
+    local old_site_dir="$SITES_DIR/$old_name.localhost"
+    if [ ! -d "$old_site_dir" ]; then
+        gum style --foreground red "❌ Error: Site '$old_name.localhost' not found."
+        exit 1
+    fi
+
+    # Validate the new_name using the same rules as the 'add' command
+    if [[ "$new_name" =~ [^a-z0-9-] ]]; then
+        gum style --foreground red "❌ Error: Invalid new site name '$new_name'." "Site names can only contain lowercase letters, numbers, and hyphens."
+        exit 1
+    fi
+    if [[ "$new_name" == -* || "$new_name" == *- ]]; then
+        gum style --foreground red "❌ Error: Invalid new site name '$new_name'." "Site names cannot begin or end with a hyphen."
+        exit 1
+    fi
+    for protected_name in $PROTECTED_NAMES; do
+        if [ "$new_name" == "$protected_name" ]; then
+            gum style --foreground red "❌ Error: '$new_name' is a reserved name. Choose another."
+            exit 1
+        fi
+    done
+
+    local new_site_dir="$SITES_DIR/$new_name.localhost"
+    if [ -d "$new_site_dir" ]; then
+        gum style --foreground red "❌ Error: A site named '$new_name.localhost' already exists."
+        exit 1
+    fi
+
+    echo "🔄 Renaming '$old_name.localhost' to '$new_name.localhost'..."
+
+    # --- Rename Directory ---
+    mv "$old_site_dir" "$new_site_dir"
+    echo "   - Directory renamed."
+
+    # --- Handle WordPress Specifics ---
+    if [ -f "$new_site_dir/public/wp-config.php" ]; then
+        source_config
+        local old_db_name
+        old_db_name=$(echo "cove_$old_name" | tr -c '[:alnum:]_' '_')
+        local new_db_name
+        new_db_name=$(echo "cove_$new_name" | tr -c '[:alnum:]_' '_')
+        local temp_sql_dump="/tmp/${old_db_name}.sql"
+
+        echo "   - Backing up old database '$old_db_name'..."
+        if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$old_db_name" > "$temp_sql_dump"; then
+            gum style --foreground red "❌ Error: Failed to dump the old database. Aborting."
+            mv "$new_site_dir" "$old_site_dir" # Revert directory rename
+            exit 1
+        fi
+
+        echo "   - Creating and importing to new database '$new_db_name'..."
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db_name" < "$temp_sql_dump"
+        rm "$temp_sql_dump"
+
+        echo "   - Updating wp-config.php..."
+        (cd "$new_site_dir/public" && wp config set DB_NAME "$new_db_name" --quiet)
+
+        echo "   - Running search-replace for site URL..."
+        (cd "$new_site_dir/public" && wp search-replace "https://$old_name.localhost" "https://$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet)
+
+        echo "   - Dropping old database '$old_db_name'..."
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
+    fi
+
+    # --- Rename Custom Caddy Directives File ---
+    local old_custom_conf_file="$CUSTOM_CADDY_DIR/$old_name.localhost"
+    local new_custom_conf_file="$CUSTOM_CADDY_DIR/$new_name.localhost"
+    if [ -f "$old_custom_conf_file" ]; then
+        mv "$old_custom_conf_file" "$new_custom_conf_file"
+        echo "   - Custom Caddy directive file renamed."
+    fi
+
+    # --- Reload Server Configuration ---
+    regenerate_caddyfile
+
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: https://$new_name.localhost"
 }
 cove_status() {
     echo "🔎 Checking Cove service status..."
@@ -1826,6 +1975,36 @@ cove_upgrade() {
         echo "✅ Cove has been successfully upgraded to version $new_version!"
         echo "   Run 'cove version' to see the new version."
     fi
+}
+cove_url() {
+    # -----------------------------------------------------------------
+    #  cove url <site>
+    #  Prints the HTTPS URL for a given site (e.g. https://foo.localhost)
+    # -----------------------------------------------------------------
+    local site_name="$1"
+
+    # -------------------------------------------------------------
+    #  Basic validation – the command requires exactly one argument.
+    # -------------------------------------------------------------
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove url <site>"
+        exit 1
+    fi
+
+    # -------------------------------------------------------------
+    #  Build the expected directory name and verify that it exists.
+    # -------------------------------------------------------------
+    local site_dir="${SITES_DIR}/${site_name}.localhost"
+    if [ ! -d "$site_dir" ]; then
+        gum style --foreground red "❌ Error: Site '${site_name}.localhost' not found."
+        exit 1
+    fi
+
+    # -------------------------------------------------------------
+    #  Print the URL – we keep the output plain so it can be piped.
+    # -------------------------------------------------------------
+    echo "https://${site_name}.localhost"
 }
 cove_version() {
     echo "Cove version $COVE_VERSION"

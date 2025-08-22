@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2] - 2025-08-22
+
+### **New Features**
+
+* **Site Renaming:** A new `cove rename <old-name> <new-name>` command has been added to fully rename a site. This includes updating the directory name, database name, and running a search-and-replace on the site's URL within the database.
+* **Path & URL Commands:**
+    * Added `cove path <name>` to quickly get the full system path to a site's public directory.
+    * Added `cove url <name>` to print the full `https://<name>.localhost` URL for a site.
+
+### **Improvements & Changes**
+
+* **Increased Upload Limits:** The default PHP `upload_max_filesize` and `post_max_size` have been increased to 512M to allow for larger file and database imports.
+* **Enhanced `list` Command:** The `cove list` command now includes a "Path" column, displaying the path to each site's public directory.
+
 ## [1.1] - 2025-08-02
 
 ### **New Features**
