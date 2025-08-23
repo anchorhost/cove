@@ -195,7 +195,6 @@ create_gui_file() {
     cat > "$GUI_DIR/api.php.tmp" << 'EOM'
 <?php
 header('Content-Type: application/json');
-
 $sitedir = 'SITES_DIR_PLACEHOLDER';
 $cove_path = 'COVE_EXECUTABLE_PATH_PLACEHOLDER';
 $user_home = 'USER_HOME_PLACEHOLDER';
@@ -253,6 +252,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $command = sprintf('HOME=%s %s delete %s --force 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
             } else { $response['message'] = 'Site name not provided for deletion.'; }
             break;
+        case 'get_login_link':
+            $response = ['success' => false, 'message' => 'An unknown error occurred.'];
+            if (!empty($site_name)) {
+                $public_path = $sitedir . '/' . $site_name . '.localhost/public';
+                if (is_dir($public_path) && is_file($public_path . '/wp-config.php')) {
+                    $get_admin_cmd = sprintf(
+                        'cd %s && wp user list --role=administrator --field=user_login --format=json --skip-plugins --skip-themes 2>&1',
+                        escapeshellarg($public_path)
+                    );
+                    $admin_output_raw = shell_exec($get_admin_cmd);
+                    $admin_users = json_decode($admin_output_raw, true);
+
+                    if (json_last_error() === JSON_ERROR_NONE && !empty($admin_users[0])) {
+                        $admin_login = $admin_users[0]; // Corrected line
+                        $login_link_cmd = sprintf(
+                            'cd %s && wp user login %s --skip-plugins --skip-themes 2>&1',
+                            escapeshellarg($public_path),
+                            escapeshellarg($admin_login)
+                        );
+                        exec($login_link_cmd, $output, $return_code);
+                        if ($return_code === 0) {
+                            $response = ['success' => true, 'url' => trim(implode("\n", $output))];
+                        } else {
+                            $response = ['success' => false, 'message' => 'Failed to generate login link.', 'output' => implode("\n", $output)];
+                        }
+                    } else {
+                        $response['message'] = 'Could not find an administrator user for this site.';
+                    }
+                } else {
+                    $response['message'] = 'This is not a valid WordPress site.';
+                }
+            } else {
+                $response['message'] = 'Site name not provided for login link.';
+            }
+            echo json_encode($response);
+            exit; // Exit immediately after handling
         case 'reload_server':
             // This command is run in the background to prevent deadlocking the server.
             // Output is redirected to /dev/null and the '&' backgrounds the process.
@@ -297,7 +332,7 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"/>
     <script src="//unpkg.com/alpinejs" defer></script>
     <style>
-        :root { --pico-font-family: 'Inter', sans-serif; --pico-font-size: 95%; --pico-spacing: 0.75rem; --pico-card-padding: 1.25rem; --pico-form-element-spacing-vertical: 0.75rem; --pico-form-element-spacing-horizontal: 1rem; }
+        :root { --pico-font-family: 'Inter', sans-serif; --pico-font-size: 95%; --pico-spacing: 0.75rem; --pico-card-padding: 1.25rem; --pico-form-element-spacing-vertical: 0.75rem; --pico-form-element-spacing-horizontal: 1rem; --pico-form-element-spacing-vertical: 0.5rem; --pico-form-element-spacing-horizontal: 0.75rem;}
         code, pre, kbd { font-family: 'Fira Code', monospace; }
         [data-theme="light"], :root:not([data-theme="dark"]) { --pico-primary: #163c52; --pico-primary-hover: #1f5472; --pico-primary-focus: rgba(22, 60, 82, 0.25); --pico-card-background-color: #fdf4e9; --pico-card-border-color: #e9e2d9; --pico-code-background-color: #e9e2d9; }
         [data-theme="dark"] { --pico-primary: #00a9ff; --pico-primary-hover: #33bbff; --pico-primary-focus: rgba(0, 169, 255, 0.25); --pico-background-color: #1a1b26; --pico-card-background-color: #24283b; --pico-card-border-color: #414868; --pico-code-color: #ff9e64; --pico-code-background-color: #2e3247; }
@@ -348,7 +383,7 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
             <h2>🗂️ Managed Sites</h2>
             <figure>
                 <table role="grid">
-                    <thead><tr><th>Site Domain</th><th>Type</th><th>Path</th><th>Actions</th></tr></thead>
+                    <thead><tr><th scope="col">Site Domain</th><th scope="col">Type</th><th scope="col">Path</th><th scope="col"></th></tr></thead>
                     <tbody>
                         <template x-for="site in sites" :key="site.name">
                             <tr>
@@ -359,10 +394,15 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
                                         <small><code class="clickable-code" x-text="site.display_path"></code></small>
                                     </div>
                                 </td>
-                                <td>
-                                    <form @submit.prevent="deleteSite(site.name)" style="margin-bottom: 0;">
-                                        <button type="submit" class="secondary outline">🗑️ Delete</button>
-                                    </form>
+                                <td style="text-align: right; width: 132px;">
+                                    <div style="margin-bottom: 0; display: inline-block;">
+                                        <template x-if="site.type === 'WordPress'">
+                                            <button @click="getLoginLink(site.name)" :aria-busy="site.isLoggingIn" class="primay">Login</button>
+                                        </template>
+                                        <form @submit.prevent="deleteSite(site.name)" style="margin-bottom: 0; display: inline-block;">
+                                            <button type="submit" class="secondary outline" style="margin-bottom: 0;">🗑️</button>
+                                        </form>
+                                    </div>
                                 </td>
                             </tr>
                         </template>
@@ -405,7 +445,6 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ action, ...payload })
                         }).then(res => res.json());
-
                         if (!response.success) {
                             Alpine.store('snackbar').show(`❌ Error: ${response.message || 'Unknown error'}`, true);
                         }
@@ -416,7 +455,18 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
                     }
                 },
                 
-                async getSites() { this.isLoading = true; try { const r = await fetch('api.php?action=list_sites'); this.sites = await r.json(); } catch (e) { Alpine.store('snackbar').show('❌ Could not fetch site list.', true); } finally { this.isLoading = false; } },
+                async getSites() {
+                    this.isLoading = true;
+                    try {
+                        const r = await fetch('api.php?action=list_sites');
+                        const siteData = await r.json();
+                        this.sites = siteData.map(site => ({ ...site, isLoggingIn: false }));
+                    } catch (e) {
+                        Alpine.store('snackbar').show('❌ Could not fetch site list.', true);
+                    } finally {
+                        this.isLoading = false;
+                    }
+                },
                 
                 async addSite() {
                     this.newSite.isLoading = true;
@@ -444,9 +494,21 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
                             setTimeout(() => this.getSites(), 2000); // Refresh list after a delay
                         }
                     }
+                },
+
+                async getLoginLink(siteName) {
+                    const site = this.sites.find(s => s.name === siteName);
+                    if (!site) return;
+                    site.isLoggingIn = true;
+                    const response = await this.apiCall('get_login_link', { site_name: siteName });
+                    if (response.success && response.url) {
+                        window.open(response.url, '_blank');
+                        Alpine.store('snackbar').show('✅ Login link opened in a new tab.');
+                    }
+                    // apiCall already shows an error snackbar on failure
+                    site.isLoggingIn = false;
                 }
             }));
-
             Alpine.store('snackbar', {
                 visible: false, message: '', isError: false,
                 show(message, isError = false) { this.message = message; this.isError = isError; this.visible = true; setTimeout(() => this.visible = false, 4000); }
@@ -469,7 +531,7 @@ EOM
     escaped_sites_dir=$(printf '%s\n' "$SITES_DIR" | sed -e 's/[\/&]/\\&/g')
     local escaped_home
     escaped_home=$(printf '%s\n' "$HOME" | sed -e 's/[\/&]/\\&/g')
-
+    
     # Substitute placeholders in both api.php and index.php
     sed -e "s/COVE_EXECUTABLE_PATH_PLACEHOLDER/${escaped_path}/g" \
         -e "s/SITES_DIR_PLACEHOLDER/${escaped_sites_dir}/g" \
