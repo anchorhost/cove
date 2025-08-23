@@ -44,13 +44,13 @@ cove_install() {
         
         if curl -sL https://frankenphp.dev/install.sh | sh; then
             if [ -f "./frankenphp" ]; then
-                echo "   Moving 'frankenphp' to /usr/local/bin/..."
-                if mv ./frankenphp /usr/local/bin/frankenphp; then
+                echo "   Moving 'frankenphp' to $BIN_DIR/..."
+                if mv ./frankenphp "$BIN_DIR/frankenphp"; then
                     echo "✅ FrankenPHP installed successfully."
                 else
                     gum style --foreground red "❌ Failed to move frankenphp." \
-                                              "Please run this command manually from the directory you ran the installer:" \
-                                              "mv ./frankenphp /usr/local/bin/frankenphp"
+                        "Please run this command manually from the directory you ran the installer:" \
+                        "mv ./frankenphp \"$BIN_DIR/frankenphp\""
                     exit 1
                 fi
             else

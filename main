@@ -24,6 +24,12 @@ PROTECTED_NAMES="cove"
 COVE_VERSION="1.2"
 CADDY_CMD="frankenphp"
 
+# Set the correct binary installation directory based on architecture
+BIN_DIR="/usr/local/bin" # Default for Intel
+if [ "$(uname -m)" = "arm64" ]; then
+    BIN_DIR="/opt/homebrew/bin" # Override for Apple Silicon
+fi
+
 # --- Whoops Bootstrap Generation ---
 create_whoops_bootstrap() {
     echo "📜 Creating Whoops bootstrap file..."
