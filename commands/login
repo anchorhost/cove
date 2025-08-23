@@ -1,0 +1,70 @@
+#!/bin/bash
+
+cove_login() {
+    local site_name="$1"
+    local user_identifier="$2" # Optional second argument for the user
+
+    # 1. Validate that a site name was provided.
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove login <site> [<user>]"
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    local public_dir="$site_dir/public"
+
+    # 2. Check if the site exists and is a WordPress installation.
+    if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
+        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    local admin_to_login
+
+    if [ -n "$user_identifier" ]; then
+        # A specific user was provided.
+        echo "🔎 Verifying user '$user_identifier' for '$site_name.localhost'..."
+        
+        # Check if the specified user exists and has the 'administrator' role.
+        local user_roles
+        user_roles=$( (cd "$public_dir" && wp user get "$user_identifier" --field=roles --format=json --skip-plugins --skip-themes 2>/dev/null) )
+
+        if [ -z "$user_roles" ]; then
+            gum style --foreground red "❌ Error: User '$user_identifier' not found on this site."
+            exit 1
+        fi
+
+        if ! echo "$user_roles" | grep -q "administrator"; then
+            gum style --foreground red "❌ Error: User '$user_identifier' is not an administrator."
+            exit 1
+        fi
+        
+        admin_to_login="$user_identifier"
+        echo "✅ User '$admin_to_login' verified."
+
+    else
+        # No user was specified; fall back to finding the first admin.
+        echo "🔎 Finding an administrator for '$site_name.localhost'..."
+        admin_to_login=$( (cd "$public_dir" && wp user list --role=administrator --field=user_login --format=csv --skip-plugins --skip-themes | head -n 1) )
+
+        if [ -z "$admin_to_login" ]; then
+            gum style --foreground red "❌ Error: Could not find any administrator users for this site."
+            exit 1
+        fi
+        echo "✅ Found admin: '$admin_to_login'."
+    fi
+
+    # 4. Generate the one-time login URL.
+    echo "   Generating login link..."
+    local login_url
+    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) )
+
+    # 5. Display the final URL in a styled box.
+    if [ -n "$login_url" ]; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🔗 One-Time Login URL for '$admin_to_login'" "$login_url"
+    else
+        gum style --foreground red "❌ Error: Failed to generate the login link."
+        exit 1
+    fi
+}

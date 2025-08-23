@@ -561,6 +561,7 @@ show_general_help() {
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
     echo "  delete           Deletes a site's directory and associated database."
+    echo "  login            Generates a one-time login link for a WordPress site."
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
@@ -657,6 +658,16 @@ display_command_help() {
             echo "  backup      Creates a .sql dump for each WP site."
             echo "  list        Lists database connection details for each WP site."
             ;;
+        login)
+            echo "Usage: cove login <site> [<user>]"
+            echo ""
+            echo "Generates a one-time login link for a WordPress site."
+            echo "If no user is specified, it defaults to the first available administrator."
+            echo ""
+            echo "Arguments:"
+            echo "  <site>         The name of the WordPress site."
+            echo "  <user>         (Optional) The user ID, email, or login of the admin to use."
+            ;;
         path)
             echo "Usage: cove path <name>"
             echo ""
@@ -743,6 +754,10 @@ main() {
             ;;
         install)
             cove_install
+            ;;
+        login)
+            check_dependencies
+            cove_login "$@"
             ;;
         enable)
             check_dependencies
