@@ -444,7 +444,7 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
                                 <td style="text-align: right; width: 132px;">
                                     <div style="margin-bottom: 0; display: inline-block;">
                                         <template x-if="site.type === 'WordPress'">
-                                            <button @click="getLoginLink(site.name)" :aria-busy="site.isLoggingIn" class="primay">Login</button>
+                                            <button @click="getLoginLink(site.name)" :aria-busy="site.isLoggingIn" class="primary">Login</button>
                                         </template>
                                         <form @submit.prevent="deleteSite(site.name)" style="margin-bottom: 0; display: inline-block;">
                                             <button type="submit" class="secondary outline" style="margin-bottom: 0;">🗑️</button>
