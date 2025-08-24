@@ -102,6 +102,47 @@ check_dependencies() {
     done
 }
 
+# --- Helper Functions ---
+
+# Manage /etc/hosts file for local domains
+update_etc_hosts() {
+    echo "🔎 Checking /etc/hosts for required entries..."
+
+    # An array of all hostnames Cove will manage
+    local required_hosts=("cove.localhost" "db.cove.localhost" "mail.cove.localhost")
+
+    # Also find all site-specific hostnames
+    if [ -d "$SITES_DIR" ]; then
+        for site_path in "$SITES_DIR"/*; do
+            if [ -d "$site_path" ]; then
+                required_hosts+=("$(basename "$site_path")")
+            fi
+        done
+    fi
+
+    local missing_hosts=()
+    for host in "${required_hosts[@]}"; do
+        # Use grep -q to quietly check if the entry exists
+        if ! grep -q "127.0.0.1[[:space:]]\+$host" /etc/hosts; then
+            missing_hosts+=("$host")
+        fi
+    done
+
+    if [ ${#missing_hosts[@]} -gt 0 ]; then
+        echo "   - Adding missing entries to /etc/hosts (requires sudo)..."
+        local entries_to_add=""
+        for host in "${missing_hosts[@]}"; do
+            entries_to_add+="127.0.0.1 $host\n"
+        done
+
+        # Use sudo tee to append all missing entries at once
+        echo -e "$entries_to_add" | sudo tee -a /etc/hosts > /dev/null
+        echo "   - ✅ Done."
+    else
+        echo "   - ✅ All entries are present."
+    fi
+}
+
 # Function to regenerate the Caddyfile
 regenerate_caddyfile() {
     echo "🔄 Regenerating Caddyfile..."

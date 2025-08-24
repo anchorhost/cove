@@ -1,4 +1,5 @@
 cove_reload() {
     create_gui_file
     regenerate_caddyfile
+    update_etc_hosts
 }
