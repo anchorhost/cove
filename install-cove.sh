@@ -2,21 +2,23 @@
 
 # ====================================================
 #  Cove Installer
-#  Description: Downloads the latest version of cove.sh,
-#               installs it to /usr/local/bin, and
-#               runs the initial setup.
+#  Description: Detects architecture, creates install paths,
+#               and installs the latest version of cove.sh.
 # ====================================================
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-# --- Configuration ---
-INSTALL_DIR="/usr/local/bin"
+# --- Configuration & Architecture Detection ---
+INSTALL_DIR="/usr/local/bin" # Default for Intel
+if [ "$(uname -m)" = "arm64" ]; then
+    INSTALL_DIR="/opt/homebrew/bin" # Override for Apple Silicon
+fi
+
 EXECUTABLE_NAME="cove"
 DOWNLOAD_URL="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
 DESTINATION_PATH="$INSTALL_DIR/$EXECUTABLE_NAME"
 
 # --- Helper Functions for Colored Output ---
-# (Checks if TTY is available for color support)
 if [ -t 1 ]; then
     RED=$(tput setaf 1)
     GREEN=$(tput setaf 2)
@@ -43,6 +45,7 @@ echo_success() {
 
 echo_error() {
     echo "${RED}${BOLD}ERROR:${NC} $1" >&2
+    exit 1
 }
 
 # --- Pre-flight Checks ---
@@ -60,48 +63,70 @@ fi
 # 2. Check for required command: curl
 if ! command -v curl &> /dev/null; then
     echo_error "cURL is not installed. Please install it to proceed."
-    exit 1
 fi
 
-# 3. Check if the installation directory exists and is writable
-if [ ! -d "$INSTALL_DIR" ]; then
-    echo_error "Installation directory '$INSTALL_DIR' not found."
-    exit 1
+# 3. Check for Homebrew. If not found, offer to install it.
+if ! command -v brew &> /dev/null; then
+    echo "${YELLOW}${BOLD}CONFIRM:${NC} Homebrew is not installed, but it's required by Cove."
+    read -p "Would you like to install it now? (y/N) " -n 1 -r
+    echo # Move to a new line
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo_info "Installing Homebrew. This may take a few minutes and will likely ask for your password."
+        # Run the official Homebrew installer
+        if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+            echo_error "Homebrew installation failed. Please try installing it manually and then run this script again."
+        fi
+        
+        echo_info "Temporarily configuring shell environment for Homebrew..."
+        # Add brew to the current shell session's PATH
+        # This is crucial so the script can find the 'brew' command immediately after install
+        eval "$($INSTALL_DIR/brew shellenv)"
+
+        echo_success "Homebrew installed successfully."
+    else
+        echo_error "Homebrew installation declined. Cannot proceed."
+    fi
 fi
+
+# 4. Check if the installation directory exists. If not, create it.
+if [ ! -d "$INSTALL_DIR" ]; then
+    echo_info "Installation directory '$INSTALL_DIR' not found. Attempting to create it..."
+    if ! sudo mkdir -p "$INSTALL_DIR"; then
+        echo_error "Failed to create installation directory. Please check your permissions."
+    fi
+    if ! sudo chown -R "$(whoami)" "$INSTALL_DIR"; then
+        echo_error "Failed to set correct ownership for '$INSTALL_DIR'."
+    fi
+    echo_success "Successfully created and configured '$INSTALL_DIR'."
+fi
+
+# 5. Check if the directory is writable.
 if [ ! -w "$INSTALL_DIR" ]; then
-    echo_error "Installation directory '$INSTALL_DIR' is not writable. Please run with sudo or ensure you have permissions."
-    exit 1
+    echo_error "Installation directory '$INSTALL_DIR' is not writable. Please fix permissions or run with sudo."
 fi
 
 # --- Installation Steps ---
 
-# 1. Download the script
-echo_info "Downloading the latest version of Cove from GitHub..."
+echo_info "Downloading the latest version of Cove..."
 if ! curl -L --fail --progress-bar "$DOWNLOAD_URL" -o "$DESTINATION_PATH"; then
-    echo_error "Failed to download from '$DOWNLOAD_URL'. Please check the URL and your connection."
-    exit 1
+    echo_error "Failed to download from '$DOWNLOAD_URL'. Please check your connection."
 fi
 echo_success "Download complete."
 
-# 2. Set execute permissions
-echo_info "Setting execute permissions for '$DESTINATION_PATH'..."
+echo_info "Setting execute permissions..."
 if ! chmod +x "$DESTINATION_PATH"; then
     echo_error "Failed to set execute permissions. You may need to run this script with sudo."
-    exit 1
 fi
 echo_success "Permissions set successfully."
 
-# 3. Run the final installation command
 echo_info "Handing off to Cove to complete the installation..."
 echo "--------------------------------------------------"
 
-# Executing the final command
-# The 'cove install' command will now run, and its output will be displayed to the user.
 if ! "$DESTINATION_PATH" install; then
     echo_error "The 'cove install' command failed. Please see the output above for details."
-    exit 1
 fi
 
 echo "--------------------------------------------------"
 echo_success "Cove has been installed successfully!"
 echo_info "You can now use the 'cove' command from anywhere in your terminal."
+echo_info "You may need to restart your terminal for all changes to take effect."
