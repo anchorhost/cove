@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.3] - 2025-08-24
+
+### ✨ New Features
+
+* **Admin Login Command:** A new `cove login <site> [<user>]` command has been added to generate a one-time login link for a WordPress site. This works by finding the first available administrator or by specifying a user ID, email, or login.
+* **Dashboard Login Button:** The web dashboard now includes a "Login" button for WordPress sites, allowing for one-click access to the admin area. This is powered by a new `get_login_link` API endpoint.
+
+### 🛠️ Improvements & Changes
+
+* **Automatic `/etc/hosts` Management:** The `reload` command now automatically checks for and adds required entries for all Cove sites to the `/etc/hosts` file, ensuring local domains resolve without manual setup. This requires sudo privileges upon first run.
+* **Smarter Installation Script:** The main installer (`install-cove.sh`) is now architecture-aware, correctly using `/opt/homebrew/bin` on Apple Silicon and `/usr/local/bin` on Intel Macs. It will also offer to install Homebrew if it's not detected and attempt to create the installation directory if it doesn't exist.
+* **Robust MariaDB Setup:** The `cove install` command now first attempts an automatic, non-interactive `sudo mysql` command to create the database user. If this fails, it falls back to the interactive prompt for root credentials, improving the initial setup experience.
+* **Resilient Site Creation:** The `cove add` command for WordPress sites is now more robust. It will automatically clean up the site directory and database if the installation process fails, preventing partial sites. It also now deletes the default "Hello Dolly" and "Akismet" plugins for a cleaner start.
+
 ## [1.2] - 2025-08-22
 
 ### **New Features**

@@ -21,8 +21,14 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.2"
+COVE_VERSION="1.3"
 CADDY_CMD="frankenphp"
+
+# Set the correct binary installation directory based on architecture
+BIN_DIR="/usr/local/bin" # Default for Intel
+if [ "$(uname -m)" = "arm64" ]; then
+    BIN_DIR="/opt/homebrew/bin" # Override for Apple Silicon
+fi
 
 # --- Whoops Bootstrap Generation ---
 create_whoops_bootstrap() {
@@ -94,6 +100,47 @@ check_dependencies() {
             exit 1
         fi
     done
+}
+
+# --- Helper Functions ---
+
+# Manage /etc/hosts file for local domains
+update_etc_hosts() {
+    echo "🔎 Checking /etc/hosts for required entries..."
+
+    # An array of all hostnames Cove will manage
+    local required_hosts=("cove.localhost" "db.cove.localhost" "mail.cove.localhost")
+
+    # Also find all site-specific hostnames
+    if [ -d "$SITES_DIR" ]; then
+        for site_path in "$SITES_DIR"/*; do
+            if [ -d "$site_path" ]; then
+                required_hosts+=("$(basename "$site_path")")
+            fi
+        done
+    fi
+
+    local missing_hosts=()
+    for host in "${required_hosts[@]}"; do
+        # Use grep -q to quietly check if the entry exists
+        if ! grep -q "127.0.0.1[[:space:]]\+$host" /etc/hosts; then
+            missing_hosts+=("$host")
+        fi
+    done
+
+    if [ ${#missing_hosts[@]} -gt 0 ]; then
+        echo "   - Adding missing entries to /etc/hosts (requires sudo)..."
+        local entries_to_add=""
+        for host in "${missing_hosts[@]}"; do
+            entries_to_add+="127.0.0.1 $host\n"
+        done
+
+        # Use sudo tee to append all missing entries at once
+        echo -e "$entries_to_add" | sudo tee -a /etc/hosts > /dev/null
+        echo "   - ✅ Done."
+    else
+        echo "   - ✅ All entries are present."
+    fi
 }
 
 # Function to regenerate the Caddyfile
@@ -195,7 +242,6 @@ create_gui_file() {
     cat > "$GUI_DIR/api.php.tmp" << 'EOM'
 <?php
 header('Content-Type: application/json');
-
 $sitedir = 'SITES_DIR_PLACEHOLDER';
 $cove_path = 'COVE_EXECUTABLE_PATH_PLACEHOLDER';
 $user_home = 'USER_HOME_PLACEHOLDER';
@@ -253,6 +299,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $command = sprintf('HOME=%s %s delete %s --force 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
             } else { $response['message'] = 'Site name not provided for deletion.'; }
             break;
+        case 'get_login_link':
+            $response = ['success' => false, 'message' => 'An unknown error occurred.'];
+            if (!empty($site_name)) {
+                $public_path = $sitedir . '/' . $site_name . '.localhost/public';
+                if (is_dir($public_path) && is_file($public_path . '/wp-config.php')) {
+                    $get_admin_cmd = sprintf(
+                        'cd %s && wp user list --role=administrator --field=user_login --format=json --skip-plugins --skip-themes 2>&1',
+                        escapeshellarg($public_path)
+                    );
+                    $admin_output_raw = shell_exec($get_admin_cmd);
+                    $admin_users = json_decode($admin_output_raw, true);
+
+                    if (json_last_error() === JSON_ERROR_NONE && !empty($admin_users[0])) {
+                        $admin_login = $admin_users[0]; // Corrected line
+                        $login_link_cmd = sprintf(
+                            'cd %s && wp user login %s --skip-plugins --skip-themes 2>&1',
+                            escapeshellarg($public_path),
+                            escapeshellarg($admin_login)
+                        );
+                        exec($login_link_cmd, $output, $return_code);
+                        if ($return_code === 0) {
+                            $response = ['success' => true, 'url' => trim(implode("\n", $output))];
+                        } else {
+                            $response = ['success' => false, 'message' => 'Failed to generate login link.', 'output' => implode("\n", $output)];
+                        }
+                    } else {
+                        $response['message'] = 'Could not find an administrator user for this site.';
+                    }
+                } else {
+                    $response['message'] = 'This is not a valid WordPress site.';
+                }
+            } else {
+                $response['message'] = 'Site name not provided for login link.';
+            }
+            echo json_encode($response);
+            exit; // Exit immediately after handling
         case 'reload_server':
             // This command is run in the background to prevent deadlocking the server.
             // Output is redirected to /dev/null and the '&' backgrounds the process.
@@ -297,7 +379,7 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"/>
     <script src="//unpkg.com/alpinejs" defer></script>
     <style>
-        :root { --pico-font-family: 'Inter', sans-serif; --pico-font-size: 95%; --pico-spacing: 0.75rem; --pico-card-padding: 1.25rem; --pico-form-element-spacing-vertical: 0.75rem; --pico-form-element-spacing-horizontal: 1rem; }
+        :root { --pico-font-family: 'Inter', sans-serif; --pico-font-size: 95%; --pico-spacing: 0.75rem; --pico-card-padding: 1.25rem; --pico-form-element-spacing-vertical: 0.75rem; --pico-form-element-spacing-horizontal: 1rem; --pico-form-element-spacing-vertical: 0.5rem; --pico-form-element-spacing-horizontal: 0.75rem;}
         code, pre, kbd { font-family: 'Fira Code', monospace; }
         [data-theme="light"], :root:not([data-theme="dark"]) { --pico-primary: #163c52; --pico-primary-hover: #1f5472; --pico-primary-focus: rgba(22, 60, 82, 0.25); --pico-card-background-color: #fdf4e9; --pico-card-border-color: #e9e2d9; --pico-code-background-color: #e9e2d9; }
         [data-theme="dark"] { --pico-primary: #00a9ff; --pico-primary-hover: #33bbff; --pico-primary-focus: rgba(0, 169, 255, 0.25); --pico-background-color: #1a1b26; --pico-card-background-color: #24283b; --pico-card-border-color: #414868; --pico-code-color: #ff9e64; --pico-code-background-color: #2e3247; }
@@ -348,7 +430,7 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
             <h2>🗂️ Managed Sites</h2>
             <figure>
                 <table role="grid">
-                    <thead><tr><th>Site Domain</th><th>Type</th><th>Path</th><th>Actions</th></tr></thead>
+                    <thead><tr><th scope="col">Site Domain</th><th scope="col">Type</th><th scope="col">Path</th><th scope="col"></th></tr></thead>
                     <tbody>
                         <template x-for="site in sites" :key="site.name">
                             <tr>
@@ -359,10 +441,15 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
                                         <small><code class="clickable-code" x-text="site.display_path"></code></small>
                                     </div>
                                 </td>
-                                <td>
-                                    <form @submit.prevent="deleteSite(site.name)" style="margin-bottom: 0;">
-                                        <button type="submit" class="secondary outline">🗑️ Delete</button>
-                                    </form>
+                                <td style="text-align: right; width: 132px;">
+                                    <div style="margin-bottom: 0; display: inline-block;">
+                                        <template x-if="site.type === 'WordPress'">
+                                            <button @click="getLoginLink(site.name)" :aria-busy="site.isLoggingIn" class="primay">Login</button>
+                                        </template>
+                                        <form @submit.prevent="deleteSite(site.name)" style="margin-bottom: 0; display: inline-block;">
+                                            <button type="submit" class="secondary outline" style="margin-bottom: 0;">🗑️</button>
+                                        </form>
+                                    </div>
                                 </td>
                             </tr>
                         </template>
@@ -405,7 +492,6 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ action, ...payload })
                         }).then(res => res.json());
-
                         if (!response.success) {
                             Alpine.store('snackbar').show(`❌ Error: ${response.message || 'Unknown error'}`, true);
                         }
@@ -416,7 +502,18 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
                     }
                 },
                 
-                async getSites() { this.isLoading = true; try { const r = await fetch('api.php?action=list_sites'); this.sites = await r.json(); } catch (e) { Alpine.store('snackbar').show('❌ Could not fetch site list.', true); } finally { this.isLoading = false; } },
+                async getSites() {
+                    this.isLoading = true;
+                    try {
+                        const r = await fetch('api.php?action=list_sites');
+                        const siteData = await r.json();
+                        this.sites = siteData.map(site => ({ ...site, isLoggingIn: false }));
+                    } catch (e) {
+                        Alpine.store('snackbar').show('❌ Could not fetch site list.', true);
+                    } finally {
+                        this.isLoading = false;
+                    }
+                },
                 
                 async addSite() {
                     this.newSite.isLoading = true;
@@ -444,9 +541,21 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
                             setTimeout(() => this.getSites(), 2000); // Refresh list after a delay
                         }
                     }
+                },
+
+                async getLoginLink(siteName) {
+                    const site = this.sites.find(s => s.name === siteName);
+                    if (!site) return;
+                    site.isLoggingIn = true;
+                    const response = await this.apiCall('get_login_link', { site_name: siteName });
+                    if (response.success && response.url) {
+                        window.open(response.url, '_blank');
+                        Alpine.store('snackbar').show('✅ Login link opened in a new tab.');
+                    }
+                    // apiCall already shows an error snackbar on failure
+                    site.isLoggingIn = false;
                 }
             }));
-
             Alpine.store('snackbar', {
                 visible: false, message: '', isError: false,
                 show(message, isError = false) { this.message = message; this.isError = isError; this.visible = true; setTimeout(() => this.visible = false, 4000); }
@@ -469,7 +578,7 @@ EOM
     escaped_sites_dir=$(printf '%s\n' "$SITES_DIR" | sed -e 's/[\/&]/\\&/g')
     local escaped_home
     escaped_home=$(printf '%s\n' "$HOME" | sed -e 's/[\/&]/\\&/g')
-
+    
     # Substitute placeholders in both api.php and index.php
     sed -e "s/COVE_EXECUTABLE_PATH_PLACEHOLDER/${escaped_path}/g" \
         -e "s/SITES_DIR_PLACEHOLDER/${escaped_sites_dir}/g" \
@@ -499,6 +608,7 @@ show_general_help() {
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
     echo "  delete           Deletes a site's directory and associated database."
+    echo "  login            Generates a one-time login link for a WordPress site."
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
@@ -595,6 +705,16 @@ display_command_help() {
             echo "  backup      Creates a .sql dump for each WP site."
             echo "  list        Lists database connection details for each WP site."
             ;;
+        login)
+            echo "Usage: cove login <site> [<user>]"
+            echo ""
+            echo "Generates a one-time login link for a WordPress site."
+            echo "If no user is specified, it defaults to the first available administrator."
+            echo ""
+            echo "Arguments:"
+            echo "  <site>         The name of the WordPress site."
+            echo "  <user>         (Optional) The user ID, email, or login of the admin to use."
+            ;;
         path)
             echo "Usage: cove path <name>"
             echo ""
@@ -681,6 +801,10 @@ main() {
             ;;
         install)
             cove_install
+            ;;
+        login)
+            check_dependencies
+            cove_login "$@"
             ;;
         enable)
             check_dependencies
@@ -812,6 +936,7 @@ cove_add() {
 
     local admin_user="admin"
     local admin_pass
+    local one_time_login_url=""
 
     if [ "$site_type" == "wordpress" ]; then
         source_config
@@ -823,15 +948,41 @@ cove_add() {
         echo "Installing WordPress..."
         admin_pass=$(openssl rand -base64 12)
         
-        ( cd "$site_dir/public" || exit
-            wp core download --quiet
-            wp config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
+        # Use a variable for the WP-CLI command to increase memory limit
+        local wp_cmd="php -d memory_limit=512M $(command -v wp)"
+
+        (
+            cd "$site_dir/public" || exit 1
+            
+            # 1. Download WordPress with a higher memory limit
+            if ! $wp_cmd core download --quiet; then
+                echo "❌ Error: Failed to download WordPress core. This might be a network issue or a permissions problem."
+                exit 1 # Exit the subshell with an error
+            fi
+            
+            # 2. Create the config file
+            $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
 define( 'WP_DEBUG', true );
 define( 'WP_DEBUG_LOG', true );
 PHP
             
-            wp core install --url="https://$full_hostname" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
+            # 3. Install WordPress
+            $wp_cmd core install --url="https://$full_hostname" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
+
+            # 4. Delete default plugins
+            echo "   - Deleting default plugins (Hello Dolly, Akismet)..."
+            $wp_cmd plugin delete hello akismet --quiet
         )
+
+        # Check the exit code of the subshell. If it's not 0, something failed.
+        if [ $? -ne 0 ]; then
+            gum style --foreground red "❌ WordPress installation failed. Please review the errors above."
+            # Clean up the failed site directory and database
+            echo "   - Cleaning up failed installation..."
+            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+            rm -rf "$site_dir"
+            exit 1
+        fi
         
         # Generate must-use plugin
 read -r -d '' build_mu_plugin << 'heredoc'
@@ -934,9 +1085,9 @@ if (defined('WP_CLI') && WP_CLI) {
      *
      * ## EXAMPLES
      *
-     *     wp user login 123
-     *     wp user login user@example.com
-     *     wp user login myusername
+     * wp user login 123
+     * wp user login user@example.com
+     * wp user login myusername
      *
      * @param array $args The command arguments.
      */
@@ -996,8 +1147,8 @@ heredoc
         wp_content="$site_dir/public/wp-content"
         echo "Generating '$wp_content/mu-plugins/captaincore-helper.php'"
         mkdir -p "$wp_content/mu-plugins/"
-        echo "$build_mu_plugin" > $wp_content/mu-plugins/captaincore-helper.php
-        one_time_login_url=$(wp user login $admin_user --path="$site_dir/public/")
+        echo "$build_mu_plugin" > "$wp_content/mu-plugins/captaincore-helper.php"
+        one_time_login_url=$($wp_cmd user login "$admin_user" --path="$site_dir/public/")
     fi
 
     # Only run the reload if the --no-reload flag was NOT passed.
@@ -1011,7 +1162,6 @@ heredoc
     if [ "$site_type" == "wordpress" ]; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: https://$full_hostname/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
     fi
-
 }
 cove_db_backup() {
     echo "🚀 Starting database backup for all WordPress sites..."
@@ -1424,13 +1574,13 @@ cove_install() {
         
         if curl -sL https://frankenphp.dev/install.sh | sh; then
             if [ -f "./frankenphp" ]; then
-                echo "   Moving 'frankenphp' to /usr/local/bin/..."
-                if mv ./frankenphp /usr/local/bin/frankenphp; then
+                echo "   Moving 'frankenphp' to $BIN_DIR/..."
+                if mv ./frankenphp "$BIN_DIR/frankenphp"; then
                     echo "✅ FrankenPHP installed successfully."
                 else
                     gum style --foreground red "❌ Failed to move frankenphp." \
-                                              "Please run this command manually from the directory you ran the installer:" \
-                                              "mv ./frankenphp /usr/local/bin/frankenphp"
+                        "Please run this command manually from the directory you ran the installer:" \
+                        "mv ./frankenphp \"$BIN_DIR/frankenphp\""
                     exit 1
                 fi
             else
@@ -1581,47 +1731,60 @@ EOM
     brew services restart mailpit
 
     # --- Database Configuration ---
-    local skip_db_setup=false
-    if [ -f "$CONFIG_FILE" ]; then
-        if gum confirm "Existing Cove database config found. Use it and skip database setup?"; then
-            skip_db_setup=true
-            echo "✅ Using existing database configuration."
-        else
-            echo "🔥 Proceeding with database reconfiguration..."
-        fi
-    fi
-
-    if ! $skip_db_setup; then
+    if [ -f "$CONFIG_FILE" ] && gum confirm "Existing Cove database config found. Use it and skip database setup?"; then
+        echo "✅ Using existing database configuration."
+    else
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Configuring MariaDB"
 
         # Wait for MariaDB to be ready
-        echo "Waiting for MariaDB..."
+        echo "   - Waiting for MariaDB service..."
         i=0
         while ! mysqladmin ping --silent; do
-            sleep 1; i=$((i+1))
+            sleep 1;
+            i=$((i+1))
             if [ $i -ge 20 ]; then
                 gum style --foreground red "❌ MariaDB did not become available in time."
                 exit 1
             fi
         done
-        echo "✅ MariaDB is ready."
-        echo "Please provide your MariaDB root credentials to create a 'cove' user."
-        local root_user; root_user=$(gum input --value "root" --prompt "Root username: ")
-        local root_pass; root_pass=$(gum input --password --placeholder "Password for '$root_user'")
-        local db_user="cove_user"
-        local db_pass; db_pass=$(openssl rand -base64 16)
+        echo "   - ✅ MariaDB is ready."
 
+        local db_user="cove_user"
+        local db_pass
+        db_pass=$(openssl rand -base64 16)
         local sql_command="DROP USER IF EXISTS '$db_user'@'localhost'; CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass'; GRANT ALL PRIVILEGES ON *.* TO '$db_user'@'localhost' WITH GRANT OPTION; FLUSH PRIVILEGES;"
-        echo "$sql_command" | mysql -u "$root_user" -p"$root_pass"
-        
-        if [ $? -ne 0 ]; then
-            gum style --foreground red "❌ Database user creation failed. Check credentials and try again."
+        local user_created_successfully=false
+
+        # First, attempt the automated, non-interactive setup
+        echo "   - Attempting automatic setup..."
+        if echo "$sql_command" | sudo mysql &> /dev/null; then
+            echo "   - ✅ Automatic database user creation successful."
+            user_created_successfully=true
+        else
+            # If the automated method fails, fall back to the interactive prompt
+            echo "   - ⚠️ Automatic setup failed. This can happen on custom MariaDB installs."
+            echo "   - Falling back to manual credential entry..."
+            
+            local root_user
+            root_user=$(gum input --value "root" --prompt "MariaDB Root Username: ")
+            local root_pass
+            root_pass=$(gum input --password --placeholder "Password for '$root_user'")
+
+            if echo "$sql_command" | mysql -u "$root_user" -p"$root_pass"; then
+                echo "   - ✅ Manual database user creation successful."
+                user_created_successfully=true
+            fi
+        fi
+
+        # Final check: only proceed if one of the methods worked
+        if $user_created_successfully; then
+            echo "   - 📝 Saving new configuration..."
+            echo "DB_USER='$db_user'" > "$CONFIG_FILE"
+            echo "DB_PASSWORD='$db_pass'" >> "$CONFIG_FILE"
+        else
+            gum style --foreground red "❌ Database user creation failed. Please check credentials and MariaDB logs."
             exit 1
         fi
-        echo "✅ Database user '$db_user' created."
-        echo "📝 Saving new configuration..."
-        echo "DB_USER='$db_user'" > "$CONFIG_FILE"
-        echo "DB_PASSWORD='$db_pass'" >> "$CONFIG_FILE"
     fi
     
     # --- Finalize ---
@@ -1629,8 +1792,8 @@ EOM
     create_gui_file
     regenerate_caddyfile
 
-    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 Cove installation complete!" \
-"Run 'cove enable' to start the server." "Dashboard is at https://cove.localhost"
+    echo "✅ Initial configuration complete. Starting services..."
+    cove_enable
 }
 cove_list() {
     local show_totals=false
@@ -1747,6 +1910,76 @@ cove_list() {
         echo "$php_output" | gum style --border normal --margin "1" --padding "1 2" --border-foreground 212
     fi
 }
+#!/bin/bash
+
+cove_login() {
+    local site_name="$1"
+    local user_identifier="$2" # Optional second argument for the user
+
+    # 1. Validate that a site name was provided.
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove login <site> [<user>]"
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    local public_dir="$site_dir/public"
+
+    # 2. Check if the site exists and is a WordPress installation.
+    if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
+        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    local admin_to_login
+
+    if [ -n "$user_identifier" ]; then
+        # A specific user was provided.
+        echo "🔎 Verifying user '$user_identifier' for '$site_name.localhost'..."
+        
+        # Check if the specified user exists and has the 'administrator' role.
+        local user_roles
+        user_roles=$( (cd "$public_dir" && wp user get "$user_identifier" --field=roles --format=json --skip-plugins --skip-themes 2>/dev/null) )
+
+        if [ -z "$user_roles" ]; then
+            gum style --foreground red "❌ Error: User '$user_identifier' not found on this site."
+            exit 1
+        fi
+
+        if ! echo "$user_roles" | grep -q "administrator"; then
+            gum style --foreground red "❌ Error: User '$user_identifier' is not an administrator."
+            exit 1
+        fi
+        
+        admin_to_login="$user_identifier"
+        echo "✅ User '$admin_to_login' verified."
+
+    else
+        # No user was specified; fall back to finding the first admin.
+        echo "🔎 Finding an administrator for '$site_name.localhost'..."
+        admin_to_login=$( (cd "$public_dir" && wp user list --role=administrator --field=user_login --format=csv --skip-plugins --skip-themes | head -n 1) )
+
+        if [ -z "$admin_to_login" ]; then
+            gum style --foreground red "❌ Error: Could not find any administrator users for this site."
+            exit 1
+        fi
+        echo "✅ Found admin: '$admin_to_login'."
+    fi
+
+    # 4. Generate the one-time login URL.
+    echo "   Generating login link..."
+    local login_url
+    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) )
+
+    # 5. Display the final URL in a styled box.
+    if [ -n "$login_url" ]; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🔗 One-Time Login URL for '$admin_to_login'" "$login_url"
+    else
+        gum style --foreground red "❌ Error: Failed to generate the login link."
+        exit 1
+    fi
+}
 cove_path() {
     local site_name="$1"
 
@@ -1769,6 +2002,7 @@ cove_path() {
 cove_reload() {
     create_gui_file
     regenerate_caddyfile
+    update_etc_hosts
 }
 cove_rename() {
     local old_name="$1"
