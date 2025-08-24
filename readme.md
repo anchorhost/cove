@@ -39,14 +39,20 @@ Cove provides a simple set of commands to manage your local environment.
 | --- | --- |
 | `cove add <name> [--plain]` | ➕ Creates a new WordPress site (`<name>.localhost`). Use `--plain` for a static site. |
 | `cove delete <name> [--force]` | 🗑️ Deletes a site's directory and its associated database. |
-| `cove list` | 📝 Lists all sites managed by Cove. |
+| `cove rename <old-name> <new-name>` | 🔄 Renames a site, its directory, database, and updates its URL in the database. |
+| `cove list [--totals]` | 📝 Lists all sites managed by Cove. Use `--totals` to show disk usage. |
+| `cove login <site> [<user>]` | 🔑 Generates a one-time login link for a WordPress site. |
+| `cove path <name>` | 📁 Outputs the full system path to a site's public directory. |
+| `cove url <name>` | 🌐 Prints the full `https://<name>.localhost` URL for a site. |
 | `cove enable` | ✅ Starts the Caddy, MariaDB, and Mailpit background services. |
 | `cove disable` | 🛑 Stops all Cove background services. |
 | `cove status` | 🔎 Checks the status of all background services. |
 | `cove reload` | 🔄 Regenerates the Caddyfile and reloads the Caddy server gracefully. |
-| `cove db backup` | 💾 Creates a `.sql` backup for every WordPress site. |
+| `cove db <backup\|list>` | 💾 `backup` creates a `.sql` backup for every WordPress site. `list` shows database credentials. |
 | `cove directive <add\|update\|delete\|list>` | ⚙️ Manages custom Caddyfile rules for a specific site. |
 | `cove install` | 🛠️ Installs and configures all required dependencies. |
+| `cove upgrade` | ⬆️ Upgrades Cove to the latest available version from GitHub. |
+| `cove version` | ℹ️ Displays the current version of Cove. |
 
 *You can get help for any command by running `cove <command> --help`.*
 
