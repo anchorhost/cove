@@ -53,6 +53,7 @@ cove_add() {
 
     local admin_user="admin"
     local admin_pass
+    local one_time_login_url=""
 
     if [ "$site_type" == "wordpress" ]; then
         source_config
@@ -64,15 +65,41 @@ cove_add() {
         echo "Installing WordPress..."
         admin_pass=$(openssl rand -base64 12)
         
-        ( cd "$site_dir/public" || exit
-            wp core download --quiet
-            wp config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
+        # Use a variable for the WP-CLI command to increase memory limit
+        local wp_cmd="php -d memory_limit=512M $(command -v wp)"
+
+        (
+            cd "$site_dir/public" || exit 1
+            
+            # 1. Download WordPress with a higher memory limit
+            if ! $wp_cmd core download --quiet; then
+                echo "❌ Error: Failed to download WordPress core. This might be a network issue or a permissions problem."
+                exit 1 # Exit the subshell with an error
+            fi
+            
+            # 2. Create the config file
+            $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
 define( 'WP_DEBUG', true );
 define( 'WP_DEBUG_LOG', true );
 PHP
             
-            wp core install --url="https://$full_hostname" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
+            # 3. Install WordPress
+            $wp_cmd core install --url="https://$full_hostname" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
+
+            # 4. Delete default plugins
+            echo "   - Deleting default plugins (Hello Dolly, Akismet)..."
+            $wp_cmd plugin delete hello akismet --quiet
         )
+
+        # Check the exit code of the subshell. If it's not 0, something failed.
+        if [ $? -ne 0 ]; then
+            gum style --foreground red "❌ WordPress installation failed. Please review the errors above."
+            # Clean up the failed site directory and database
+            echo "   - Cleaning up failed installation..."
+            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+            rm -rf "$site_dir"
+            exit 1
+        fi
         
         # Generate must-use plugin
 read -r -d '' build_mu_plugin << 'heredoc'
@@ -175,9 +202,9 @@ if (defined('WP_CLI') && WP_CLI) {
      *
      * ## EXAMPLES
      *
-     *     wp user login 123
-     *     wp user login user@example.com
-     *     wp user login myusername
+     * wp user login 123
+     * wp user login user@example.com
+     * wp user login myusername
      *
      * @param array $args The command arguments.
      */
@@ -237,8 +264,8 @@ heredoc
         wp_content="$site_dir/public/wp-content"
         echo "Generating '$wp_content/mu-plugins/captaincore-helper.php'"
         mkdir -p "$wp_content/mu-plugins/"
-        echo "$build_mu_plugin" > $wp_content/mu-plugins/captaincore-helper.php
-        one_time_login_url=$(wp user login $admin_user --path="$site_dir/public/")
+        echo "$build_mu_plugin" > "$wp_content/mu-plugins/captaincore-helper.php"
+        one_time_login_url=$($wp_cmd user login "$admin_user" --path="$site_dir/public/")
     fi
 
     # Only run the reload if the --no-reload flag was NOT passed.
@@ -252,5 +279,4 @@ heredoc
     if [ "$site_type" == "wordpress" ]; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: https://$full_hostname/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
     fi
-
 }
