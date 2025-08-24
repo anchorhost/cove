@@ -201,47 +201,60 @@ EOM
     brew services restart mailpit
 
     # --- Database Configuration ---
-    local skip_db_setup=false
-    if [ -f "$CONFIG_FILE" ]; then
-        if gum confirm "Existing Cove database config found. Use it and skip database setup?"; then
-            skip_db_setup=true
-            echo "✅ Using existing database configuration."
-        else
-            echo "🔥 Proceeding with database reconfiguration..."
-        fi
-    fi
-
-    if ! $skip_db_setup; then
+    if [ -f "$CONFIG_FILE" ] && gum confirm "Existing Cove database config found. Use it and skip database setup?"; then
+        echo "✅ Using existing database configuration."
+    else
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Configuring MariaDB"
 
         # Wait for MariaDB to be ready
-        echo "Waiting for MariaDB..."
+        echo "   - Waiting for MariaDB service..."
         i=0
         while ! mysqladmin ping --silent; do
-            sleep 1; i=$((i+1))
+            sleep 1;
+            i=$((i+1))
             if [ $i -ge 20 ]; then
                 gum style --foreground red "❌ MariaDB did not become available in time."
                 exit 1
             fi
         done
-        echo "✅ MariaDB is ready."
-        echo "Please provide your MariaDB root credentials to create a 'cove' user."
-        local root_user; root_user=$(gum input --value "root" --prompt "Root username: ")
-        local root_pass; root_pass=$(gum input --password --placeholder "Password for '$root_user'")
-        local db_user="cove_user"
-        local db_pass; db_pass=$(openssl rand -base64 16)
+        echo "   - ✅ MariaDB is ready."
 
+        local db_user="cove_user"
+        local db_pass
+        db_pass=$(openssl rand -base64 16)
         local sql_command="DROP USER IF EXISTS '$db_user'@'localhost'; CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass'; GRANT ALL PRIVILEGES ON *.* TO '$db_user'@'localhost' WITH GRANT OPTION; FLUSH PRIVILEGES;"
-        echo "$sql_command" | mysql -u "$root_user" -p"$root_pass"
-        
-        if [ $? -ne 0 ]; then
-            gum style --foreground red "❌ Database user creation failed. Check credentials and try again."
+        local user_created_successfully=false
+
+        # First, attempt the automated, non-interactive setup
+        echo "   - Attempting automatic setup..."
+        if echo "$sql_command" | sudo mysql &> /dev/null; then
+            echo "   - ✅ Automatic database user creation successful."
+            user_created_successfully=true
+        else
+            # If the automated method fails, fall back to the interactive prompt
+            echo "   - ⚠️ Automatic setup failed. This can happen on custom MariaDB installs."
+            echo "   - Falling back to manual credential entry..."
+            
+            local root_user
+            root_user=$(gum input --value "root" --prompt "MariaDB Root Username: ")
+            local root_pass
+            root_pass=$(gum input --password --placeholder "Password for '$root_user'")
+
+            if echo "$sql_command" | mysql -u "$root_user" -p"$root_pass"; then
+                echo "   - ✅ Manual database user creation successful."
+                user_created_successfully=true
+            fi
+        fi
+
+        # Final check: only proceed if one of the methods worked
+        if $user_created_successfully; then
+            echo "   - 📝 Saving new configuration..."
+            echo "DB_USER='$db_user'" > "$CONFIG_FILE"
+            echo "DB_PASSWORD='$db_pass'" >> "$CONFIG_FILE"
+        else
+            gum style --foreground red "❌ Database user creation failed. Please check credentials and MariaDB logs."
             exit 1
         fi
-        echo "✅ Database user '$db_user' created."
-        echo "📝 Saving new configuration..."
-        echo "DB_USER='$db_user'" > "$CONFIG_FILE"
-        echo "DB_PASSWORD='$db_pass'" >> "$CONFIG_FILE"
     fi
     
     # --- Finalize ---
@@ -249,6 +262,6 @@ EOM
     create_gui_file
     regenerate_caddyfile
 
-    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 Cove installation complete!" \
-"Run 'cove enable' to start the server." "Dashboard is at https://cove.localhost"
+    echo "✅ Initial configuration complete. Starting services..."
+    cove_enable
 }
