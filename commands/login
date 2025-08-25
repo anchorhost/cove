@@ -1,5 +1,3 @@
-#!/bin/bash
-
 cove_login() {
     local site_name="$1"
     local user_identifier="$2" # Optional second argument for the user
@@ -21,12 +19,8 @@ cove_login() {
     fi
 
     local admin_to_login
-
     if [ -n "$user_identifier" ]; then
-        # A specific user was provided.
         echo "🔎 Verifying user '$user_identifier' for '$site_name.localhost'..."
-        
-        # Check if the specified user exists and has the 'administrator' role.
         local user_roles
         user_roles=$( (cd "$public_dir" && wp user get "$user_identifier" --field=roles --format=json --skip-plugins --skip-themes 2>/dev/null) )
 
@@ -42,9 +36,7 @@ cove_login() {
         
         admin_to_login="$user_identifier"
         echo "✅ User '$admin_to_login' verified."
-
     else
-        # No user was specified; fall back to finding the first admin.
         echo "🔎 Finding an administrator for '$site_name.localhost'..."
         admin_to_login=$( (cd "$public_dir" && wp user list --role=administrator --field=user_login --format=csv --skip-plugins --skip-themes | head -n 1) )
 
@@ -55,16 +47,36 @@ cove_login() {
         echo "✅ Found admin: '$admin_to_login'."
     fi
 
-    # 4. Generate the one-time login URL.
+    # 3. Attempt to generate the login URL.
     echo "   Generating login link..."
     local login_url
-    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) )
+    # Suppress stderr on the first try so we can handle the error gracefully.
+    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) 2>/dev/null )
+    local exit_code=$?
 
-    # 5. Display the final URL in a styled box.
+    # 4. If the command failed, check for the mu-plugin and retry.
+    if [ $exit_code -ne 0 ]; then
+        echo "   ⚠️ Login command failed. Checking for missing MU-plugin..."
+        local mu_plugin_path="$public_dir/wp-content/mu-plugins/captaincore-helper.php"
+        
+        if [ ! -f "$mu_plugin_path" ]; then
+            # The plugin is missing, so inject it.
+            inject_mu_plugin "$public_dir"
+            
+            echo "   - Retrying login link generation..."
+            # Run the command again, but this time, show errors if it fails.
+            login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) )
+        else
+            # The plugin exists, so the failure is for another reason.
+            echo "   - MU-plugin is already present. The issue may be with WP-CLI or the site's database."
+        fi
+    fi
+
+    # 5. Display the final URL or an error message.
     if [ -n "$login_url" ]; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🔗 One-Time Login URL for '$admin_to_login'" "$login_url"
     else
-        gum style --foreground red "❌ Error: Failed to generate the login link."
+        gum style --foreground red "❌ Error: Failed to generate the login link after all checks."
         exit 1
     fi
 }
