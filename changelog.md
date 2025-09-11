@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.4] - 2025-09-11
+
+### ✨ New Features
+
+* **Self-Healing Login Command:** The `cove login` command is now "self-healing." If the command fails, it will automatically check for and inject a required Must-Use (MU) plugin into the WordPress site, then retry the login process. This ensures the command works reliably even on sites created with older versions of Cove or if the plugin was manually deleted.
+* **Integrated MU-Plugin:** Cove now uses a dedicated MU-plugin (`captaincore-helper.php`) which is automatically added to new WordPress sites. This plugin provides the core functionality for one-time logins via a custom WP-CLI command (`wp user login <user>`) and also disables WordPress's plugin and theme auto-update email notifications for a cleaner local experience.
+
+### 🛠️ Improvements & Changes
+
+* **Global PHP Memory Limit:** The global PHP `memory_limit` has been increased to **512M** in the main Caddyfile configuration. This helps prevent errors when working with memory-intensive plugins or operations across all sites.
+* **Refactored Plugin Injection:** The logic for creating the MU-plugin has been moved into its own dedicated function (`inject_mu_plugin`), cleaning up the `cove add` command and allowing the new self-healing `cove login` command to utilize it.
+* **More Robust Dashboard Logins:** The web dashboard's "Login" button is now significantly more reliable. It delegates directly to the `cove login` command, inheriting its new self-healing capabilities and simplifying the dashboard's backend logic.
+* **Non-Blocking Server Reloads:** Server reloads triggered from the web UI (or the `cove reload` command) now run as a background process. This fixes a potential deadlock issue, preventing the dashboard from freezing and providing a much smoother user experience when adding, deleting, or modifying sites.
+
+***
+
 ## [1.3] - 2025-08-24
 
 ### ✨ New Features
@@ -79,28 +95,28 @@
 
 ### Added
 
-- **Initial Release** of Cove, a command-line tool for local development.
-- **Core Service Management**: Commands to `enable`, `disable`, and check the `status` of background services (Caddy, MariaDB, Mailpit).
-- **Site Management**:
-    - `cove add <name>`: Create new WordPress sites.
-    - `cove add <name> --plain`: Create new plain/static HTML sites.
-    - `cove delete <name>`: Delete sites and their associated databases.
-    - `cove list`: List all currently managed local sites.
-- **Web Dashboard**: A GUI at `https://cove.localhost` to view, add, and delete sites. It also provides quick links to Adminer and Mailpit.
-- **Database Features**:
-    - `cove db backup`: Command to create a `.sql` backup for every WordPress site.
-    - Integrated Adminer for web-based database management.
-- **Caddy Integration**:
-    - `cove reload`: Regenerates the master Caddyfile and gracefully reloads the Caddy server.
-    - `cove directive`: Sub-commands (`add`, `update`, `delete`, `list`) to manage site-specific Caddyfile rules.
-    - Automatic HTTPS for all local sites using internal certificates.
-- **Development Environment**:
-    - `cove install`: Installs and configures all required dependencies like Caddy, MariaDB, and Mailpit using Homebrew.
-    - Built-in Mailpit service to catch all outgoing application emails.
-    - Integrated Whoops for informative PHP error pages.
-- **Build System**:
-    - `compile.sh`: Script to combine all source files into a single, distributable shell script.
-    - `watch.sh`: A helper script using `fswatch` to automatically re-compile the project on file changes.
-- **Versioning**:
-    - `cove version` command to display the current version of the tool.
-- **License**: The project is licensed under the MIT License.
+* **Initial Release** of Cove, a command-line tool for local development.
+* **Core Service Management**: Commands to `enable`, `disable`, and check the `status` of background services (Caddy, MariaDB, Mailpit).
+* **Site Management**:
+    * `cove add <name>`: Create new WordPress sites.
+    * `cove add <name> --plain`: Create new plain/static HTML sites.
+    * `cove delete <name>`: Delete sites and their associated databases.
+    * `cove list`: List all currently managed local sites.
+* **Web Dashboard**: A GUI at `https://cove.localhost` to view, add, and delete sites. It also provides quick links to Adminer and Mailpit.
+* **Database Features**:
+    * `cove db backup`: Command to create a `.sql` backup for every WordPress site.
+    * Integrated Adminer for web-based database management.
+* **Caddy Integration**:
+    * `cove reload`: Regenerates the master Caddyfile and gracefully reloads the Caddy server.
+    * `cove directive`: Sub-commands (`add`, `update`, `delete`, `list`) to manage site-specific Caddyfile rules.
+    * Automatic HTTPS for all local sites using internal certificates.
+* **Development Environment**:
+    * `cove install`: Installs and configures all required dependencies like Caddy, MariaDB, and Mailpit using Homebrew.
+    * Built-in Mailpit service to catch all outgoing application emails.
+    * Integrated Whoops for informative PHP error pages.
+* **Build System**:
+    * `compile.sh`: Script to combine all source files into a single, distributable shell script.
+    * `watch.sh`: A helper script using `fswatch` to automatically re-compile the project on file changes.
+* **Versioning**:
+    * `cove version` command to display the current version of the tool.
+* **License**: The project is licensed under the MIT License.

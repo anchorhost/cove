@@ -21,7 +21,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.3"
+COVE_VERSION="1.4"
 CADDY_CMD="frankenphp"
 
 # Set the correct binary installation directory based on architecture

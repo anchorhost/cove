@@ -21,7 +21,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.3"
+COVE_VERSION="1.4"
 CADDY_CMD="frankenphp"
 
 # Set the correct binary installation directory based on architecture
@@ -71,6 +71,170 @@ EOM
 }
 
 # --- Helper Functions ---
+
+# Inject the mu-plugin for one-time logins
+inject_mu_plugin() {
+    local public_dir="$1"
+    if [ -z "$public_dir" ] || [ ! -d "$public_dir" ]; then
+        return 1 # Exit if no valid directory is provided
+    fi
+
+    # Heredoc containing the mu-plugin code
+read -r -d '' build_mu_plugin << 'heredoc'
+<?php
+/**
+ * Plugin Name: CaptainCore Helper
+ * Plugin URI: https://captaincore.io
+ * Description: Collection of helper functions for CaptainCore
+ * Version: 0.2.8
+ * Author: CaptainCore
+ * Author URI: https://captaincore.io
+ * Text Domain: captaincore-helper
+ */
+
+/**
+ * Registers AJAX callback for quick logins
+ */
+function captaincore_quick_login_action_callback() {
+
+	$post = json_decode( file_get_contents( 'php://input' ) );
+	// Error if token not valid
+	if ( ! isset( $post->token ) || $post->token != md5( AUTH_KEY ) ) {
+		return new WP_Error( 'token_invalid', 'Invalid Token', [ 'status' => 404 ] );
+		wp_die();
+	}
+
+	$post->user_login = str_replace( "%20", " ", $post->user_login );
+	$user     = get_user_by( 'login', $post->user_login );
+	$password = wp_generate_password();
+	$token    = sha1( $password );
+
+	update_user_meta( $user->ID, 'captaincore_login_token', $token );
+	$query_args = [
+			'user_id'                 => $user->ID,
+			'captaincore_login_token' => $token,
+		];
+	$login_url    = wp_login_url();
+		$one_time_url = add_query_arg( $query_args, $login_url );
+
+	echo $one_time_url;
+	wp_die();
+
+}
+
+add_action( 'wp_ajax_nopriv_captaincore_quick_login', 'captaincore_quick_login_action_callback' );
+/**
+ * Login a request in as a user if the token is valid.
+ */
+function captaincore_login_handle_token() {
+
+	global $pagenow;
+	if ( 'wp-login.php' !== $pagenow || empty( $_GET['user_id'] ) || empty( $_GET['captaincore_login_token'] ) ) {
+		return;
+	}
+
+	if ( is_user_logged_in() ) {
+		$error = sprintf( __( 'Invalid one-time login token, but you are logged in as \'%1$s\'. <a href="%2$s">Go to the dashboard instead</a>?', 'captaincore-login' ), wp_get_current_user()->user_login, admin_url() );
+	} else {
+		$error = sprintf( __( 'Invalid one-time login token. <a href="%s">Try signing in instead</a>?', 'captaincore-login' ), wp_login_url() );
+	}
+
+	// Use a generic error message to ensure user ids can't be sniffed
+	$user = get_user_by( 'id', (int) $_GET['user_id'] );
+	if ( ! $user ) {
+		wp_die( $error );
+	}
+
+	$token    = get_user_meta( $user->ID, 'captaincore_login_token', true );
+	$is_valid = false;
+		if ( hash_equals( $token, $_GET['captaincore_login_token'] ) ) {
+			$is_valid = true;
+		}
+
+	if ( ! $is_valid ) {
+		wp_die( $error );
+	}
+
+	delete_user_meta( $user->ID, 'captaincore_login_token' );
+	wp_set_auth_cookie( $user->ID, 1 );
+	wp_safe_redirect( admin_url() );
+	exit;
+}
+
+add_action( 'init', 'captaincore_login_handle_token' );
+
+if (defined('WP_CLI') && WP_CLI) {
+
+    /**
+     * Generates a one-time login link for a user based on user ID, email, or login.
+     *
+     * ## OPTIONS
+     *
+     * <user_identifier>
+     * : The user ID, email, or login of the user to generate the login link for.
+     *
+     * ## EXAMPLES
+     *
+     * wp user login 123
+     * wp user login user@example.com
+     * wp user login myusername
+     *
+     * @param array $args The command arguments.
+     */
+    function captaincore_generate_login_link( $args ) {
+
+        $user_identifier = $args[0];
+        // Determine if the identifier is a user ID, email, or login
+        if (is_numeric($user_identifier)) {
+            $user = get_user_by('ID', $user_identifier);
+        } elseif (is_email($user_identifier)) {
+            $user = get_user_by('email', $user_identifier);
+        } else {
+            $user = get_user_by('login', $user_identifier);
+        }
+
+        // Check if the user exists
+        if (!$user) {
+            WP_CLI::error("User not found: $user_identifier");
+            return;
+        }
+
+        // Generate tokens
+        $password = wp_generate_password();
+        $token    = sha1($password);
+
+        // Update user meta with the new token
+        update_user_meta( $user->ID, 'captaincore_login_token', $token );
+        // Construct the one-time login URL
+        $query_args = [
+            'user_id'                 => $user->ID,
+            'captaincore_login_token' => $token,
+        ];
+        $login_url    = wp_login_url();
+        $one_time_url = add_query_arg($query_args, $login_url);
+        // Output the URL to the CLI
+        WP_CLI::log("$one_time_url");
+    }
+
+    WP_CLI::add_command( 'user login', 'captaincore_generate_login_link' );
+}
+
+/**
+ * Disable auto-update email notifications for plugins.
+ */
+add_filter( 'auto_plugin_update_send_email', '__return_false' );
+
+/**
+ * Disable auto-update email notifications for themes.
+ */
+add_filter( 'auto_theme_update_send_email', '__return_false' );
+heredoc
+
+    local mu_plugins_dir="$public_dir/wp-content/mu-plugins"
+    mkdir -p "$mu_plugins_dir"
+    echo "$build_mu_plugin" > "$mu_plugins_dir/captaincore-helper.php"
+    echo "   - ✅ Injected one-time login MU-plugin."
+}
 
 # Load configuration from ~/Cove/config
 source_config() {
@@ -161,6 +325,7 @@ regenerate_caddyfile() {
         php_ini log_errors On
         php_ini error_log "$LOGS_DIR/errors.log"
         php_ini auto_prepend_file "$APP_DIR/whoops_bootstrap.php"
+        php_ini memory_limit 512M
         php_ini upload_max_filesize 512M
         php_ini post_max_size 512M
     }
@@ -225,12 +390,15 @@ EOM
         done
     fi
 
-    # Reload Caddy with the new configuration
-    if "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019; then
-        echo "✅ Caddy configuration reloaded."
-    else
-        gum style --foreground red "❌ Caddy configuration failed to reload. See error above."
-    fi
+    # Reload Caddy with the new configuration.
+    # We run this in the background (&) to prevent a deadlock when the GUI,
+    # which is run by Caddy/FrankenPHP, executes a command that tries to reload the server.
+    # The server can't wait for a command that it needs to process itself.
+    "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log" &
+    
+    # Because the command is backgrounded, we can't check its exit code directly.
+    # We'll assume success and let the user check 'cove status' or logs if needed.
+    echo "✅ Caddy configuration reload initiated."
 }
 
 # --- GUI Generation ---
@@ -302,39 +470,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'get_login_link':
             $response = ['success' => false, 'message' => 'An unknown error occurred.'];
             if (!empty($site_name)) {
-                $public_path = $sitedir . '/' . $site_name . '.localhost/public';
-                if (is_dir($public_path) && is_file($public_path . '/wp-config.php')) {
-                    $get_admin_cmd = sprintf(
-                        'cd %s && wp user list --role=administrator --field=user_login --format=json --skip-plugins --skip-themes 2>&1',
-                        escapeshellarg($public_path)
-                    );
-                    $admin_output_raw = shell_exec($get_admin_cmd);
-                    $admin_users = json_decode($admin_output_raw, true);
+                // Delegate to the 'cove login' command which has the self-healing logic.
+                $command = sprintf(
+                    'HOME=%s %s login %s 2>&1',
+                    escapeshellarg($user_home),
+                    escapeshellarg($cove_path),
+                    escapeshellarg($site_name)
+                );
 
-                    if (json_last_error() === JSON_ERROR_NONE && !empty($admin_users[0])) {
-                        $admin_login = $admin_users[0]; // Corrected line
-                        $login_link_cmd = sprintf(
-                            'cd %s && wp user login %s --skip-plugins --skip-themes 2>&1',
-                            escapeshellarg($public_path),
-                            escapeshellarg($admin_login)
-                        );
-                        exec($login_link_cmd, $output, $return_code);
-                        if ($return_code === 0) {
-                            $response = ['success' => true, 'url' => trim(implode("\n", $output))];
-                        } else {
-                            $response = ['success' => false, 'message' => 'Failed to generate login link.', 'output' => implode("\n", $output)];
-                        }
-                    } else {
-                        $response['message'] = 'Could not find an administrator user for this site.';
+                exec($command, $output_lines, $return_code);
+                $full_output = implode("\n", $output_lines);
+                $login_url = '';
+
+                // Parse the command's output to find the URL.
+                foreach ($output_lines as $line) {
+                    if (strpos($line, 'https://') !== false && strpos($line, '/wp-login.php') !== false) {
+                        // Clean the line from any "gum" box characters.
+                        $login_url = trim(preg_replace('/[│└┌]/u', '', $line));
+                        break;
                     }
-                } else {
-                    $response['message'] = 'This is not a valid WordPress site.';
                 }
+
+                if (!empty($login_url)) {
+                    $response = ['success' => true, 'url' => $login_url];
+                } else {
+                    $response = ['success' => false, 'message' => 'Failed to generate login link.', 'output' => $full_output];
+                }
+
             } else {
                 $response['message'] = 'Site name not provided for login link.';
             }
             echo json_encode($response);
-            exit; // Exit immediately after handling
+            exit; // Exit immediately
         case 'reload_server':
             // This command is run in the background to prevent deadlocking the server.
             // Output is redirected to /dev/null and the '&' backgrounds the process.
@@ -441,13 +608,13 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
                                         <small><code class="clickable-code" x-text="site.display_path"></code></small>
                                     </div>
                                 </td>
-                                <td style="text-align: right; width: 132px;">
-                                    <div style="margin-bottom: 0; display: inline-block;">
+                                <td style="width: 140px;">
+                                    <div style="display: flex; justify-content: flex-end; gap: 0.5rem; align-items: center;">
                                         <template x-if="site.type === 'WordPress'">
-                                            <button @click="getLoginLink(site.name)" :aria-busy="site.isLoggingIn" class="primay">Login</button>
+                                            <button @click="getLoginLink(site.name)" :aria-busy="site.isLoggingIn" style="min-width: 85px; margin: 0;">Login</button>
                                         </template>
-                                        <form @submit.prevent="deleteSite(site.name)" style="margin-bottom: 0; display: inline-block;">
-                                            <button type="submit" class="secondary outline" style="margin-bottom: 0;">🗑️</button>
+                                        <form @submit.prevent="deleteSite(site.name)" style="margin: 0;">
+                                            <button type="submit" class="secondary outline" style="margin: 0;">🗑️</button>
                                         </form>
                                     </div>
                                 </td>
@@ -985,169 +1152,7 @@ PHP
         fi
         
         # Generate must-use plugin
-read -r -d '' build_mu_plugin << 'heredoc'
-<?php
-/**
- * Plugin Name: CaptainCore Helper
- * Plugin URI: https://captaincore.io
- * Description: Collection of helper functions for CaptainCore
- * Version: 0.2.8
- * Author: CaptainCore
- * Author URI: https://captaincore.io
- * Text Domain: captaincore-helper
- */
-
-/**
- * Registers AJAX callback for quick logins
- */
-function captaincore_quick_login_action_callback() {
-
-	$post = json_decode( file_get_contents( 'php://input' ) );
-
-	// Error if token not valid
-	if ( ! isset( $post->token ) || $post->token != md5( AUTH_KEY ) ) {
-		return new WP_Error( 'token_invalid', 'Invalid Token', [ 'status' => 404 ] );
-		wp_die();
-	}
-
-	$post->user_login = str_replace( "%20", " ", $post->user_login );
-	$user     = get_user_by( 'login', $post->user_login );
-	$password = wp_generate_password();
-	$token    = sha1( $password );
-
-	update_user_meta( $user->ID, 'captaincore_login_token', $token );
-
-		$query_args = [
-			'user_id'                 => $user->ID,
-			'captaincore_login_token' => $token,
-		];
-        $login_url    = wp_login_url();
-		$one_time_url = add_query_arg( $query_args, $login_url );
-
-	echo $one_time_url;
-	wp_die();
-
-}
-
-add_action( 'wp_ajax_nopriv_captaincore_quick_login', 'captaincore_quick_login_action_callback' );
-
-/**
- * Login a request in as a user if the token is valid.
- */
-function captaincore_login_handle_token() {
-
-	global $pagenow;
-
-	if ( 'wp-login.php' !== $pagenow || empty( $_GET['user_id'] ) || empty( $_GET['captaincore_login_token'] ) ) {
-		return;
-	}
-
-	if ( is_user_logged_in() ) {
-		$error = sprintf( __( 'Invalid one-time login token, but you are logged in as \'%1$s\'. <a href="%2$s">Go to the dashboard instead</a>?', 'captaincore-login' ), wp_get_current_user()->user_login, admin_url() );
-	} else {
-		$error = sprintf( __( 'Invalid one-time login token. <a href="%s">Try signing in instead</a>?', 'captaincore-login' ), wp_login_url() );
-	}
-
-	// Use a generic error message to ensure user ids can't be sniffed
-	$user = get_user_by( 'id', (int) $_GET['user_id'] );
-	if ( ! $user ) {
-		wp_die( $error );
-	}
-
-	$token    = get_user_meta( $user->ID, 'captaincore_login_token', true );
-	$is_valid = false;
-		if ( hash_equals( $token, $_GET['captaincore_login_token'] ) ) {
-			$is_valid = true;
-	}
-
-	if ( ! $is_valid ) {
-		wp_die( $error );
-	}
-
-	delete_user_meta( $user->ID, 'captaincore_login_token' );
-	wp_set_auth_cookie( $user->ID, 1 );
-	wp_safe_redirect( admin_url() );
-	exit;
-
-}
-
-add_action( 'init', 'captaincore_login_handle_token' );
-
-if (defined('WP_CLI') && WP_CLI) {
-
-    /**
-     * Generates a one-time login link for a user based on user ID, email, or login.
-     *
-     * ## OPTIONS
-     *
-     * <user_identifier>
-     * : The user ID, email, or login of the user to generate the login link for.
-     *
-     * ## EXAMPLES
-     *
-     * wp user login 123
-     * wp user login user@example.com
-     * wp user login myusername
-     *
-     * @param array $args The command arguments.
-     */
-    function captaincore_generate_login_link( $args ) {
-
-        $user_identifier = $args[0];
-
-        // Determine if the identifier is a user ID, email, or login
-        if (is_numeric($user_identifier)) {
-            $user = get_user_by('ID', $user_identifier);
-        } elseif (is_email($user_identifier)) {
-            $user = get_user_by('email', $user_identifier);
-        } else {
-            $user = get_user_by('login', $user_identifier);
-        }
-
-        // Check if the user exists
-        if (!$user) {
-            WP_CLI::error("User not found: $user_identifier");
-            return;
-        }
-
-        // Generate tokens
-        $password = wp_generate_password();
-        $token    = sha1($password);
-
-        // Update user meta with the new token
-        update_user_meta( $user->ID, 'captaincore_login_token', $token );
-
-        // Construct the one-time login URL
-        $query_args = [
-            'user_id'                 => $user->ID,
-            'captaincore_login_token' => $token,
-        ];
-        $login_url    = wp_login_url();
-        $one_time_url = add_query_arg($query_args, $login_url);
-
-        // Output the URL to the CLI
-        WP_CLI::log("$one_time_url");
-
-    }
-
-    WP_CLI::add_command( 'user login', 'captaincore_generate_login_link' );
-}
-
-/**
- * Disable auto-update email notifications for plugins.
- */
-add_filter( 'auto_plugin_update_send_email', '__return_false' );
-
-/**
- * Disable auto-update email notifications for themes.
- */
-add_filter( 'auto_theme_update_send_email', '__return_false' );
-
-heredoc
-        wp_content="$site_dir/public/wp-content"
-        echo "Generating '$wp_content/mu-plugins/captaincore-helper.php'"
-        mkdir -p "$wp_content/mu-plugins/"
-        echo "$build_mu_plugin" > "$wp_content/mu-plugins/captaincore-helper.php"
+        inject_mu_plugin "$site_dir/public"
         one_time_login_url=$($wp_cmd user login "$admin_user" --path="$site_dir/public/")
     fi
 
@@ -1910,8 +1915,6 @@ cove_list() {
         echo "$php_output" | gum style --border normal --margin "1" --padding "1 2" --border-foreground 212
     fi
 }
-#!/bin/bash
-
 cove_login() {
     local site_name="$1"
     local user_identifier="$2" # Optional second argument for the user
@@ -1933,12 +1936,8 @@ cove_login() {
     fi
 
     local admin_to_login
-
     if [ -n "$user_identifier" ]; then
-        # A specific user was provided.
         echo "🔎 Verifying user '$user_identifier' for '$site_name.localhost'..."
-        
-        # Check if the specified user exists and has the 'administrator' role.
         local user_roles
         user_roles=$( (cd "$public_dir" && wp user get "$user_identifier" --field=roles --format=json --skip-plugins --skip-themes 2>/dev/null) )
 
@@ -1954,9 +1953,7 @@ cove_login() {
         
         admin_to_login="$user_identifier"
         echo "✅ User '$admin_to_login' verified."
-
     else
-        # No user was specified; fall back to finding the first admin.
         echo "🔎 Finding an administrator for '$site_name.localhost'..."
         admin_to_login=$( (cd "$public_dir" && wp user list --role=administrator --field=user_login --format=csv --skip-plugins --skip-themes | head -n 1) )
 
@@ -1967,16 +1964,36 @@ cove_login() {
         echo "✅ Found admin: '$admin_to_login'."
     fi
 
-    # 4. Generate the one-time login URL.
+    # 3. Attempt to generate the login URL.
     echo "   Generating login link..."
     local login_url
-    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) )
+    # Suppress stderr on the first try so we can handle the error gracefully.
+    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) 2>/dev/null )
+    local exit_code=$?
 
-    # 5. Display the final URL in a styled box.
+    # 4. If the command failed, check for the mu-plugin and retry.
+    if [ $exit_code -ne 0 ]; then
+        echo "   ⚠️ Login command failed. Checking for missing MU-plugin..."
+        local mu_plugin_path="$public_dir/wp-content/mu-plugins/captaincore-helper.php"
+        
+        if [ ! -f "$mu_plugin_path" ]; then
+            # The plugin is missing, so inject it.
+            inject_mu_plugin "$public_dir"
+            
+            echo "   - Retrying login link generation..."
+            # Run the command again, but this time, show errors if it fails.
+            login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) )
+        else
+            # The plugin exists, so the failure is for another reason.
+            echo "   - MU-plugin is already present. The issue may be with WP-CLI or the site's database."
+        fi
+    fi
+
+    # 5. Display the final URL or an error message.
     if [ -n "$login_url" ]; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🔗 One-Time Login URL for '$admin_to_login'" "$login_url"
     else
-        gum style --foreground red "❌ Error: Failed to generate the login link."
+        gum style --foreground red "❌ Error: Failed to generate the login link after all checks."
         exit 1
     fi
 }
