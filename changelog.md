@@ -14,8 +14,6 @@
 * **More Robust Dashboard Logins:** The web dashboard's "Login" button is now significantly more reliable. It delegates directly to the `cove login` command, inheriting its new self-healing capabilities and simplifying the dashboard's backend logic.
 * **Non-Blocking Server Reloads:** Server reloads triggered from the web UI (or the `cove reload` command) now run as a background process. This fixes a potential deadlock issue, preventing the dashboard from freezing and providing a much smoother user experience when adding, deleting, or modifying sites.
 
-***
-
 ## [1.3] - 2025-08-24
 
 ### ✨ New Features
