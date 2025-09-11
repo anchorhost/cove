@@ -325,6 +325,7 @@ regenerate_caddyfile() {
         php_ini log_errors On
         php_ini error_log "$LOGS_DIR/errors.log"
         php_ini auto_prepend_file "$APP_DIR/whoops_bootstrap.php"
+        php_ini memory_limit 512M
         php_ini upload_max_filesize 512M
         php_ini post_max_size 512M
     }
