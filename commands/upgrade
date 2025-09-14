@@ -1,3 +1,46 @@
+upgrade_frankenphp_binary() {
+    local BIN_DIR
+    local frankenphp_path
+
+    # First, try to find the path of the existing frankenphp command.
+    frankenphp_path=$(command -v frankenphp)
+
+    if [ -n "$frankenphp_path" ]; then
+        # If found, use its directory as the installation target.
+        BIN_DIR=$(dirname "$frankenphp_path")
+        echo "   - Detected existing FrankenPHP in '$BIN_DIR'. Using this as the installation target."
+    else
+        # If not found, fall back to architecture detection.
+        echo "   - FrankenPHP not found in PATH. Detecting default bin directory based on architecture."
+        BIN_DIR="/usr/local/bin" # Default for Intel
+        if [ "$(uname -m)" = "arm64" ]; then
+            BIN_DIR="/opt/homebrew/bin" # Override for Apple Silicon
+        fi
+    fi
+
+    echo "   - Downloading the latest FrankenPHP binary..."
+    if curl -sL https://frankenphp.dev/install.sh | sh; then
+        if [ -f "./frankenphp" ]; then
+            echo "   - Moving 'frankenphp' to $BIN_DIR/..."
+            if sudo mv ./frankenphp "$BIN_DIR/frankenphp"; then
+                echo "   - ✅ FrankenPHP reinstalled successfully."
+            else
+                gum style --foreground red "❌ Failed to move frankenphp." \
+                    "Please run this command manually from the directory you ran the installer:" \
+                    "mv ./frankenphp \"$BIN_DIR/frankenphp\""
+                return 1
+            fi
+        else
+            gum style --foreground red "❌ FrankenPHP download script failed to create the 'frankenphp' file."
+            return 1
+        fi
+    else
+        gum style --foreground red "❌ The FrankenPHP download script failed."
+        return 1
+    fi
+    return 0
+}
+
 cove_upgrade() {
     echo "🔎 Checking for the latest version of Cove..."
 
@@ -12,7 +55,7 @@ cove_upgrade() {
     fi
 
     # 1. Download the latest script
-    echo "   - Downloading latest version from GitHub..."
+    echo "   - Downloading latest Cove script from GitHub..."
     if ! curl -L --fail --progress-bar "$download_url" -o "$temp_script"; then
         echo "❌ Error: Failed to download the latest version. Please check your connection."
         rm -f "$temp_script" 2>/dev/null
@@ -34,39 +77,82 @@ cove_upgrade() {
 
     # 4. Get the current version from the running script
     local current_version="$COVE_VERSION"
-    echo "   - Current version:          $current_version"
-    echo "   - Latest available version: $new_version"
+    echo "   - Current Cove version:         $current_version"
+    echo "   - Latest available Cove version: $new_version"
 
     # 5. Compare versions
     local latest
     latest=$(printf '%s\n' "$current_version" "$new_version" | sort -V | tail -n1)
 
     if [[ "$latest" == "$current_version" ]] && [[ "$new_version" != "$current_version" ]]; then
-         echo "✅ Your current version ($current_version) is newer than the latest release ($new_version). No action taken."
+         echo "✅ Your current Cove version ($current_version) is newer than the latest release ($new_version). No action taken."
          rm -f "$temp_script" 2>/dev/null
-         return 0
     elif [[ "$latest" == "$current_version" ]]; then
         echo "✅ You are already using the latest version of Cove."
         rm -f "$temp_script" 2>/dev/null
+    else
+        # 6. Perform the Cove upgrade
+        echo "🚀 Upgrading Cove to version $new_version..."
+
+        if [ ! -w "$(dirname "$install_path")" ]; then
+            echo "❌ Error: No write permissions for '$(dirname "$install_path")'."
+            echo "   Please try running with sudo: 'sudo cove upgrade'"
+            rm -f "$temp_script" 2>/dev/null
+            return 1
+        fi
+
+        if ! mv "$temp_script" "$install_path"; then
+            echo "❌ Error: Failed to replace the old script at '$install_path'."
+            rm -f "$temp_script" 2>/dev/null
+        else
+            echo "✅ Cove has been successfully upgraded to version $new_version!"
+            echo "   Run 'cove version' to see the new version."
+        fi
+    fi
+
+    # --- New Section: FrankenPHP Upgrade Check ---
+    echo ""
+    echo "🔎 Checking for FrankenPHP updates..."
+
+    if ! command -v frankenphp &> /dev/null; then
+        echo "   - ⚠️ FrankenPHP not found. Skipping update check."
         return 0
     fi
 
-    # 6. Perform the upgrade
-    echo "🚀 Upgrading to version $new_version..."
-
-    if [ ! -w "$(dirname "$install_path")" ]; then
-        echo "❌ Error: No write permissions for '$(dirname "$install_path")'."
-        echo "   Please try running with sudo: 'sudo cove upgrade'"
-        rm -f "$temp_script" 2>/dev/null
+    # Get local version
+    local local_frankenphp_version
+    local_frankenphp_version=$(frankenphp version | awk '{print $2}')
+    if [ -z "$local_frankenphp_version" ]; then
+        echo "   - ❌ Could not determine local FrankenPHP version. Skipping update check."
         return 1
     fi
 
-    if ! mv "$temp_script" "$install_path"; then
-        echo "❌ Error: Failed to replace the old script at '$install_path'."
-        rm -f "$temp_script" 2>/dev/null
+    # Get latest version from GitHub redirect
+    local latest_frankenphp_version
+    latest_frankenphp_version=$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/php/frankenphp/releases/latest | sed 's/.*\/v//')
+
+    if [ -z "$latest_frankenphp_version" ]; then
+        echo "   - ❌ Could not determine the latest FrankenPHP version from GitHub. Skipping update check."
         return 1
+    fi
+
+    echo "   - Current FrankenPHP version:  $local_frankenphp_version"
+    echo "   - Latest available version:    $latest_frankenphp_version"
+
+    # Use PHP for robust version comparison
+    local needs_upgrade
+    needs_upgrade=$(LOCAL_V="$local_frankenphp_version" REMOTE_V="$latest_frankenphp_version" php -r '
+        if (version_compare(getenv("LOCAL_V"), getenv("REMOTE_V"), "<")) {
+            echo "true";
+        } else {
+            echo "false";
+        }
+    ')
+
+    if [ "$needs_upgrade" == "true" ]; then
+        echo "🚀 Upgrading FrankenPHP to version $latest_frankenphp_version..."
+        upgrade_frankenphp_binary
     else
-        echo "✅ Cove has been successfully upgraded to version $new_version!"
-        echo "   Run 'cove version' to see the new version."
+        echo "✅ FrankenPHP is already up to date."
     fi
 }
