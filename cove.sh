@@ -21,7 +21,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.4"
+COVE_VERSION="1.5"
 CADDY_CMD="frankenphp"
 
 # Set the correct binary installation directory based on architecture
@@ -371,17 +371,17 @@ EOM
                 echo "        output file \"$site_path/logs/caddy.log\"" >> "$CADDYFILE_PATH"
                 echo "    }" >> "$CADDYFILE_PATH"
                 
-                echo "    php_server" >> "$CADDYFILE_PATH"
-
-                if [ ! -f "$site_path/public/wp-config.php" ]; then
-                    echo "    file_server" >> "$CADDYFILE_PATH"
-                fi
-                
                 local custom_conf_file="$CUSTOM_CADDY_DIR/$site_name"
                 if [ -f "$custom_conf_file" ]; then
                     echo "" >> "$CADDYFILE_PATH"
                     sed 's/^/    /' "$custom_conf_file" >> "$CADDYFILE_PATH"
                     echo "" >> "$CADDYFILE_PATH"
+                fi
+
+                echo "    php_server" >> "$CADDYFILE_PATH"
+
+                if [ ! -f "$site_path/public/wp-config.php" ]; then
+                    echo "    file_server" >> "$CADDYFILE_PATH"
                 fi
 
                 echo "}" >> "$CADDYFILE_PATH"
@@ -778,6 +778,7 @@ show_general_help() {
     echo "  login            Generates a one-time login link for a WordPress site."
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
+    echo "  pull             Pulls a remote WordPress site into Cove via SSH."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
@@ -890,6 +891,19 @@ display_command_help() {
             echo "Arguments:"
             echo "  <name>         The name of the site."
             ;;
+        pull)
+            echo "Usage: cove pull [--proxy-uploads]"
+            echo ""
+            echo "Pulls a remote WordPress site into Cove via an interactive TUI."
+            echo "This command will guide you through providing SSH and path details for the remote site,"
+            echo "then it will create a backup, pull it down, and configure it to run locally."
+            echo "You can choose to create a new site or overwrite an existing one."
+            echo ""
+            echo "Flags:"
+            echo "  --proxy-uploads  Excludes the 'wp-content/uploads' directory from the backup and"
+            echo "                   configures the local site to proxy media requests to the live URL."
+            echo "                   This saves significant time and disk space for large sites."
+            ;;
         reload)
             echo "Usage: cove reload"
             echo ""
@@ -921,6 +935,15 @@ display_command_help() {
 
 # --- Main Command Router ---
 main() {
+
+    # Determine the path to the cove command
+    local COVE_CMD
+    if command -v cove &> /dev/null; then
+        COVE_CMD="cove"
+    else
+        COVE_CMD="$0"
+    fi
+
     # Check for a help flag anywhere in the arguments.
     for arg in "$@"; do
         if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
@@ -965,6 +988,10 @@ main() {
         path)
             check_dependencies
             cove_path "$@"
+            ;;
+        pull)
+            check_dependencies
+            cove_pull "$@"
             ;;
         install)
             cove_install
@@ -1377,21 +1404,29 @@ cove_delete() {
 
     echo "🔥 Deleting site: $site_name.localhost"
     if [ -f "$site_dir/public/wp-config.php" ]; then
-        local db_name; db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        local db_name
+        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
         echo "🗄️ Deleting database: $db_name"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
     fi
 
     rm -rf "$site_dir"
     echo "✅ Directory deleted."
+
+    # --- Delete Custom Caddy Directives ---
+    local custom_conf_file="$CUSTOM_CADDY_DIR/$site_name.localhost"
+    if [ -f "$custom_conf_file" ]; then
+        rm "$custom_conf_file"
+        echo "⚙️ Custom directives deleted."
+    fi
+
     echo "✅ Site '$site_name.localhost' has been removed."
 }
 cove_directive_add_or_update() {
     local site_name="$1"
-    if [ -z "$site_name" ];
- then
+    if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: Please provide a site name."
- echo "Usage: cove directive <add|update> <name>"
+        echo "Usage: cove directive <add|update> <name>"
         exit 1
     fi
     
@@ -1401,62 +1436,62 @@ cove_directive_add_or_update() {
 
     if [ ! -d "$site_dir" ]; then
         gum style --foreground red "❌ Error: Site '$site_hostname' not found."
- exit 1
+        exit 1
     fi
 
-    if [ -f "$custom_conf_file" ];
- then
-        echo "📝 Editing custom Caddy directives for $site_hostname..."
-    else
-        echo "📝 Adding new custom Caddy directives for $site_hostname..."
-    fi
-    echo "   Press Ctrl+D to save and exit, Ctrl+C to cancel."
- local existing_rules=""
-    if [ -f "$custom_conf_file" ];
- then
+    local existing_rules=""
+    if [ -f "$custom_conf_file" ]; then
         existing_rules=$(cat "$custom_conf_file")
     fi
     
     local custom_rules
-    custom_rules=$(gum write --value "$existing_rules" --placeholder "Enter custom Caddy directives here...")
+    # If stdin is a terminal (interactive), use gum. Otherwise, read from pipe.
+    if [ -t 0 ]; then
+        if [ -f "$custom_conf_file" ]; then
+            echo "📝 Editing custom Caddy directives for $site_hostname..."
+        else
+            echo "📝 Adding new custom Caddy directives for $site_hostname..."
+        fi
+        echo "   Press Ctrl+D to save and exit, Ctrl+C to cancel."
+        custom_rules=$(gum write --value "$existing_rules" --placeholder "Enter custom Caddy directives here...")
+    else
+        echo "📝 Reading custom directives from stdin for $site_hostname..."
+        custom_rules=$(cat) # Read from standard input
+    fi
 
-    if [ -n "$custom_rules" ];
- then
+    if [ -n "$custom_rules" ]; then
         mkdir -p "$CUSTOM_CADDY_DIR"
         echo "$custom_rules" > "$custom_conf_file"
         echo "✅ Custom directives saved for $site_hostname."
- regenerate_caddyfile
+        regenerate_caddyfile
     else
         echo "🚫 No input provided. Action cancelled."
- fi
+    fi
 }
 
 # This new function handles deleting directives
 cove_directive_delete() {
     local site_name="$1"
-    if [ -z "$site_name" ];
- then
+    if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: Please provide a site name."
- echo "Usage: cove directive delete <name>"
+        echo "Usage: cove directive delete <name>"
         exit 1
     fi
 
     local site_hostname="${site_name}.localhost"
     local custom_conf_file="$CUSTOM_CADDY_DIR/$site_hostname"
 
-    if [ -f "$custom_conf_file" ];
- then
-        if gum confirm "🚨 Are you sure you want to delete the custom directives for '$site_hostname'?";
- then
+    if [ -f "$custom_conf_file" ]; then
+        if gum confirm "🚨 Are you sure you want to delete the custom directives for '$site_hostname'?"; then
             rm "$custom_conf_file"
             echo "✅ Custom directives deleted for $site_hostname."
- regenerate_caddyfile
+            regenerate_caddyfile
         else
             echo "🚫 Deletion cancelled."
- fi
+        fi
     else
         echo "ℹ️ No custom directives found for $site_hostname."
- fi
+    fi
 }
 
 cove_directive_list() {
@@ -2016,6 +2051,168 @@ cove_path() {
     echo "$site_dir"
 }
 
+#!/bin/bash
+cove_pull() {
+    # --- UI/Logging Functions ---
+    log_step() { 
+        echo ""
+        gum style --bold --foreground "yellow" "➡️  $1"
+    }
+    log_success() { 
+        gum style --foreground "green" "✅ $1" 
+    }
+    log_error() {
+        gum style --foreground "red" "❌ ERROR: $1" >&2
+        exit 1
+    }
+
+    # --- Argument Parsing ---
+    local proxy_uploads=false
+    for arg in "$@"; do
+        if [ "$arg" == "--proxy-uploads" ]; then
+            proxy_uploads=true
+            break
+        fi
+    done
+
+    # Define quiet SSH options to prevent host key warnings
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pulling a remote WordPress site into Cove."
+    # --- 1. Gather Remote Info ---
+    log_step "Enter remote server details"
+    local remote_ssh
+    remote_ssh=$(gum input --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    if [ -z "$remote_ssh" ]; then log_error "SSH connection cannot be empty."; fi
+
+    # Trim the "ssh " prefix if the user includes it.
+    remote_ssh="${remote_ssh##ssh }"
+
+    local remote_path
+    remote_path=$(gum input --value "public/" --prompt "Path to WordPress Root: ")
+    if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
+    
+    # --- 2. Validate Remote Site ---
+    log_step "Validating remote WordPress site..."
+    local remote_url
+    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path && wp option get home 2>/dev/null")
+    domain=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//')
+    
+    if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
+        log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
+    fi
+    log_success "Found WordPress site: $remote_url"
+
+    # --- 3. Choose Destination ---
+    log_step "Choose a destination for the pulled site"
+    
+    local wp_sites=()
+    for site_dir in "$SITES_DIR"/*.localhost; do
+        if [ -f "$site_dir/public/wp-config.php" ]; then
+            wp_sites+=("$(basename "$site_dir" .localhost)")
+        fi
+    done
+    
+    local destination_choice
+    destination_choice=$(gum choose "New Site" "${wp_sites[@]}")
+
+    local site_name
+    local dest_path
+    local local_url
+    local db_name
+
+    if [ "$destination_choice" == "New Site" ]; then
+        local proposed_name
+        proposed_name=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//; s/\./-/g')
+        site_name=$(gum input --value "$proposed_name" --prompt "Enter a name for the new local site: ")
+        if [ -z "$site_name" ]; then log_error "Site name cannot be empty."; fi
+
+        log_step "Creating new placeholder site: ${site_name}.localhost"
+        "$COVE_CMD" add "$site_name"
+        if [ $? -ne 0 ]; then log_error "Failed to create placeholder site. Does it already exist?"; fi
+        
+    else
+        site_name="$destination_choice"
+        if ! gum confirm "Are you sure you want to overwrite '${site_name}'? All its files and database content will be replaced."; then
+            echo "🚫 Pull cancelled."
+            exit 0
+        fi
+        
+        log_step "Preparing to overwrite existing site: ${site_name}.localhost"
+        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\`;"
+    fi
+
+    dest_path="$SITES_DIR/$site_name.localhost/public"
+    local_url="https://$site_name.localhost"
+
+    # --- 4. Perform Migration ---
+    log_step "Generating backup for ${remote_url}..."
+    local backup_extra_args=""
+    if [ "$proxy_uploads" = true ]; then
+        log_success "Uploads will be excluded from the backup and proxied instead."
+        backup_extra_args="--exclude=\"wp-content/uploads\""
+    fi
+
+    local backup_url
+    backup_url=$(ssh $ssh_opts $remote_ssh "curl -sL https://captaincore.io/do | bash -s -- backup $remote_path --quiet $backup_extra_args")
+
+    if [[ -z "$backup_url" || ! "$backup_url" == *.zip ]]; then
+        log_error "Failed to generate backup or received an invalid backup URL."
+    fi
+    log_success "Backup created: ${backup_url}"
+
+    log_step "Restoring backup to ${site_name}.localhost..."
+    # Execute the migration script directly instead of using a variable with a pipe
+    if ! (cd "$dest_path" && curl -sL https://captaincore.io/do | bash -s -- migrate --url="$backup_url" --update-urls); then
+        log_error "The migration script failed to execute correctly."
+    fi
+    log_success "Restore complete."
+
+    # --- 5. Post-Migration Configuration ---
+    log_step "Configuring local site..."
+    source_config
+    inject_mu_plugin "$dest_path"
+
+    # --- 6. Add Proxy Directive if Flag is Set ---
+    if [ "$proxy_uploads" = true ]; then
+        log_step "Adding upload proxy directive..."
+        local new_directive
+        # Use a heredoc to create the multi-line directive string
+        read -r -d '' new_directive << EOM
+@local_upload {
+    path /wp-content/uploads/*
+    file {path}
+}
+handle @local_upload {
+    # If the file exists, serve it and stop processing.
+    file_server
+}
+
+handle /wp-content/uploads/* {
+    # Proxy the request to the live site.
+    reverse_proxy ${remote_url} {
+        header_up Host ${domain}
+        flush_interval -1
+    }
+}
+EOM
+        # Pipe the new directive into the add command
+        echo "$new_directive" | "$COVE_CMD" directive add "$site_name"
+        log_success "Upload proxy directive added."
+    fi
+
+    # --- 7. Cleanup ---
+    log_step "Cleaning up remote backup file..."
+    local filename="${backup_url##*/}"
+    ssh $ssh_opts $remote_ssh "rm -f $remote_path/${filename}" 2>/dev/null
+    log_success "Cleanup complete."
+ 
+    # --- 8. Finalize ---
+    regenerate_caddyfile
+    
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✨ All done! Your site is ready." "URL: ${local_url}"
+}
 cove_reload() {
     create_gui_file
     regenerate_caddyfile
@@ -2155,6 +2352,49 @@ cove_status() {
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" "ℹ️ Some services are stopped." "Run 'cove enable' to start them."
     fi
 }
+upgrade_frankenphp_binary() {
+    local BIN_DIR
+    local frankenphp_path
+
+    # First, try to find the path of the existing frankenphp command.
+    frankenphp_path=$(command -v frankenphp)
+
+    if [ -n "$frankenphp_path" ]; then
+        # If found, use its directory as the installation target.
+        BIN_DIR=$(dirname "$frankenphp_path")
+        echo "   - Detected existing FrankenPHP in '$BIN_DIR'. Using this as the installation target."
+    else
+        # If not found, fall back to architecture detection.
+        echo "   - FrankenPHP not found in PATH. Detecting default bin directory based on architecture."
+        BIN_DIR="/usr/local/bin" # Default for Intel
+        if [ "$(uname -m)" = "arm64" ]; then
+            BIN_DIR="/opt/homebrew/bin" # Override for Apple Silicon
+        fi
+    fi
+
+    echo "   - Downloading the latest FrankenPHP binary..."
+    if curl -sL https://frankenphp.dev/install.sh | sh; then
+        if [ -f "./frankenphp" ]; then
+            echo "   - Moving 'frankenphp' to $BIN_DIR/..."
+            if sudo mv ./frankenphp "$BIN_DIR/frankenphp"; then
+                echo "   - ✅ FrankenPHP reinstalled successfully."
+            else
+                gum style --foreground red "❌ Failed to move frankenphp." \
+                    "Please run this command manually from the directory you ran the installer:" \
+                    "mv ./frankenphp \"$BIN_DIR/frankenphp\""
+                return 1
+            fi
+        else
+            gum style --foreground red "❌ FrankenPHP download script failed to create the 'frankenphp' file."
+            return 1
+        fi
+    else
+        gum style --foreground red "❌ The FrankenPHP download script failed."
+        return 1
+    fi
+    return 0
+}
+
 cove_upgrade() {
     echo "🔎 Checking for the latest version of Cove..."
 
@@ -2169,7 +2409,7 @@ cove_upgrade() {
     fi
 
     # 1. Download the latest script
-    echo "   - Downloading latest version from GitHub..."
+    echo "   - Downloading latest Cove script from GitHub..."
     if ! curl -L --fail --progress-bar "$download_url" -o "$temp_script"; then
         echo "❌ Error: Failed to download the latest version. Please check your connection."
         rm -f "$temp_script" 2>/dev/null
@@ -2191,40 +2431,83 @@ cove_upgrade() {
 
     # 4. Get the current version from the running script
     local current_version="$COVE_VERSION"
-    echo "   - Current version:          $current_version"
-    echo "   - Latest available version: $new_version"
+    echo "   - Current Cove version:         $current_version"
+    echo "   - Latest available Cove version: $new_version"
 
     # 5. Compare versions
     local latest
     latest=$(printf '%s\n' "$current_version" "$new_version" | sort -V | tail -n1)
 
     if [[ "$latest" == "$current_version" ]] && [[ "$new_version" != "$current_version" ]]; then
-         echo "✅ Your current version ($current_version) is newer than the latest release ($new_version). No action taken."
+         echo "✅ Your current Cove version ($current_version) is newer than the latest release ($new_version). No action taken."
          rm -f "$temp_script" 2>/dev/null
-         return 0
     elif [[ "$latest" == "$current_version" ]]; then
         echo "✅ You are already using the latest version of Cove."
         rm -f "$temp_script" 2>/dev/null
+    else
+        # 6. Perform the Cove upgrade
+        echo "🚀 Upgrading Cove to version $new_version..."
+
+        if [ ! -w "$(dirname "$install_path")" ]; then
+            echo "❌ Error: No write permissions for '$(dirname "$install_path")'."
+            echo "   Please try running with sudo: 'sudo cove upgrade'"
+            rm -f "$temp_script" 2>/dev/null
+            return 1
+        fi
+
+        if ! mv "$temp_script" "$install_path"; then
+            echo "❌ Error: Failed to replace the old script at '$install_path'."
+            rm -f "$temp_script" 2>/dev/null
+        else
+            echo "✅ Cove has been successfully upgraded to version $new_version!"
+            echo "   Run 'cove version' to see the new version."
+        fi
+    fi
+
+    # --- New Section: FrankenPHP Upgrade Check ---
+    echo ""
+    echo "🔎 Checking for FrankenPHP updates..."
+
+    if ! command -v frankenphp &> /dev/null; then
+        echo "   - ⚠️ FrankenPHP not found. Skipping update check."
         return 0
     fi
 
-    # 6. Perform the upgrade
-    echo "🚀 Upgrading to version $new_version..."
-
-    if [ ! -w "$(dirname "$install_path")" ]; then
-        echo "❌ Error: No write permissions for '$(dirname "$install_path")'."
-        echo "   Please try running with sudo: 'sudo cove upgrade'"
-        rm -f "$temp_script" 2>/dev/null
+    # Get local version
+    local local_frankenphp_version
+    local_frankenphp_version=$(frankenphp version | awk '{print $2}')
+    if [ -z "$local_frankenphp_version" ]; then
+        echo "   - ❌ Could not determine local FrankenPHP version. Skipping update check."
         return 1
     fi
 
-    if ! mv "$temp_script" "$install_path"; then
-        echo "❌ Error: Failed to replace the old script at '$install_path'."
-        rm -f "$temp_script" 2>/dev/null
+    # Get latest version from GitHub redirect
+    local latest_frankenphp_version
+    latest_frankenphp_version=$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/php/frankenphp/releases/latest | sed 's/.*\/v//')
+
+    if [ -z "$latest_frankenphp_version" ]; then
+        echo "   - ❌ Could not determine the latest FrankenPHP version from GitHub. Skipping update check."
         return 1
+    fi
+
+    echo "   - Current FrankenPHP version:  $local_frankenphp_version"
+    echo "   - Latest available version:    $latest_frankenphp_version"
+
+    # Use PHP for robust version comparison
+    local needs_upgrade
+    needs_upgrade=$(LOCAL_V="$local_frankenphp_version" REMOTE_V="$latest_frankenphp_version" php -r '
+        if (version_compare(getenv("LOCAL_V"), getenv("REMOTE_V"), "<")) {
+            echo "true";
+        } else {
+            echo "false";
+        }
+    ')
+
+    if [ "$needs_upgrade" == "true" ]; then
+        echo "🚀 Upgrading FrankenPHP to version $latest_frankenphp_version..."
+        upgrade_frankenphp_binary
     else
-        echo "✅ Cove has been successfully upgraded to version $new_version!"
-        echo "   Run 'cove version' to see the new version."
+        echo "✅ FrankenPHP is already up to date."
     fi
 }
 cove_url() {

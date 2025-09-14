@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.5] - 2025-09-14
+
+### ✨ New Features
+
+* **Remote Site Pulling:** A new `cove pull` command has been introduced to migrate a remote WordPress site into Cove via SSH.
+    * It features an interactive TUI to guide you through providing remote credentials.
+    * It can create a new local site or overwrite an existing one.
+    * Includes a powerful `--proxy-uploads` flag that skips downloading the `wp-content/uploads` directory and instead configures Caddy to `reverse_proxy` media requests to the live site, saving significant time and disk space.
+* **Piped Directives:** The `cove directive add <site>` command now accepts input from `stdin`, allowing you to pipe complex, multi-line Caddy rules directly into a site's configuration. This is ideal for scripting and is used by the new `pull` command to set up the upload proxy.
+
+### 🛠️ Improvements & Changes
+
+* **FrankenPHP Auto-Upgrade:** The `cove upgrade` command is now more powerful. In addition to upgrading the Cove script itself, it now also checks for the latest version of the FrankenPHP binary on GitHub and will automatically download and install it if a newer version is available.
+* **Correct Directive Order:** The Caddyfile generation logic has been updated to place custom directives *before* the `php_server` directive. This ensures that custom rules like `reverse_proxy` are evaluated first, which is critical for the new upload proxy feature to function correctly.
+* **Automatic Directive Cleanup:** When a site is deleted using `cove delete`, any associated custom Caddy directive file is now also automatically removed, ensuring no orphaned configuration files are left behind.
+
 ## [1.4] - 2025-09-11
 
 ### ✨ New Features
