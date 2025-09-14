@@ -1,0 +1,119 @@
+#!/bin/bash
+cove_pull() {
+    # --- UI/Logging Functions ---
+    log_step() { 
+        echo ""
+        gum style --bold --foreground "yellow" "➡️  $1"
+    }
+    log_success() { 
+        gum style --foreground "green" "✅ $1" 
+    }
+    log_error() {
+        gum style --foreground "red" "❌ ERROR: $1" >&2
+        exit 1
+    }
+
+    # Define quiet SSH options to prevent host key warnings
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pulling a remote WordPress site into Cove."
+
+    # --- 1. Gather Remote Info ---
+    log_step "Enter remote server details"
+    local remote_ssh
+    remote_ssh=$(gum input --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    if [ -z "$remote_ssh" ]; then log_error "SSH connection cannot be empty."; fi
+
+    # Trim the "ssh " prefix if the user includes it.
+    remote_ssh="${remote_ssh##ssh }"
+
+    local remote_path
+    remote_path=$(gum input --value "public/" --prompt "Path to WordPress Root: ")
+    if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
+    
+    # --- 2. Validate Remote Site ---
+    log_step "Validating remote WordPress site..."
+    local remote_url
+    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path && wp option get home 2>/dev/null")
+    
+    if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
+        log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
+    fi
+    log_success "Found WordPress site: $remote_url"
+
+    # --- 3. Choose Destination ---
+    log_step "Choose a destination for the pulled site"
+    
+    local wp_sites=()
+    for site_dir in "$SITES_DIR"/*.localhost; do
+        if [ -f "$site_dir/public/wp-config.php" ]; then
+            wp_sites+=("$(basename "$site_dir" .localhost)")
+        fi
+    done
+    
+    local destination_choice
+    destination_choice=$(gum choose "New Site" "${wp_sites[@]}")
+
+    local site_name
+    local dest_path
+    local local_url
+    local db_name
+
+    if [ "$destination_choice" == "New Site" ]; then
+        local proposed_name
+        proposed_name=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//; s/\./-/g')
+        site_name=$(gum input --value "$proposed_name" --prompt "Enter a name for the new local site: ")
+        if [ -z "$site_name" ]; then log_error "Site name cannot be empty."; fi
+
+        log_step "Creating new placeholder site: ${site_name}.localhost"
+        "$COVE_CMD" add "$site_name"
+        if [ $? -ne 0 ]; then log_error "Failed to create placeholder site. Does it already exist?"; fi
+        
+    else
+        site_name="$destination_choice"
+        if ! gum confirm "Are you sure you want to overwrite '${site_name}'? All its files and database content will be replaced."; then
+            echo "🚫 Pull cancelled."
+            exit 0
+        fi
+        
+        log_step "Preparing to overwrite existing site: ${site_name}.localhost"
+        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\`;"
+    fi
+
+    dest_path="$SITES_DIR/$site_name.localhost/public"
+    local_url="https://$site_name.localhost"
+
+    # --- 4. Perform Migration ---
+    log_step "Generating backup for ${remote_url}..."
+    local backup_url
+    backup_url=$(ssh $ssh_opts $remote_ssh "curl -sL https://captaincore.io/do | bash -s -- backup $remote_path --quiet")
+
+    if [[ -z "$backup_url" || ! "$backup_url" == *.zip ]]; then
+        log_error "Failed to generate backup or received an invalid backup URL."
+    fi
+    log_success "Backup created: ${backup_url}"
+
+    log_step "Restoring backup to ${site_name}.localhost..."
+    # Execute the migration script directly instead of using a variable with a pipe
+    if ! (cd "$dest_path" && curl -sL https://captaincore.io/do | bash -s -- migrate --url="$backup_url" --update-urls); then
+        log_error "The migration script failed to execute correctly."
+    fi
+    log_success "Restore complete."
+
+    # --- 5. Post-Migration Configuration ---
+    log_step "Configuring local site..."
+    source_config
+    inject_mu_plugin "$dest_path"
+
+    # --- 6. Cleanup ---
+    log_step "Cleaning up remote backup file..."
+    local filename="${backup_url##*/}"
+    ssh $ssh_opts $remote_ssh "rm -f $remote_path/${filename}" 2>/dev/null
+    log_success "Cleanup complete."
+
+    # --- 7. Finalize ---
+    regenerate_caddyfile
+    
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✨ All done! Your site is ready." "URL: ${local_url}"
+}

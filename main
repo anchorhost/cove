@@ -778,6 +778,7 @@ show_general_help() {
     echo "  login            Generates a one-time login link for a WordPress site."
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
+    echo "  pull             Pulls a remote WordPress site into Cove via SSH."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
@@ -890,6 +891,14 @@ display_command_help() {
             echo "Arguments:"
             echo "  <name>         The name of the site."
             ;;
+        pull)
+            echo "Usage: cove pull"
+            echo ""
+            echo "Pulls a remote WordPress site into Cove via an interactive TUI."
+            echo "This command will guide you through providing SSH and path details for the remote site,"
+            echo "then it will create a backup, pull it down, and configure it to run locally."
+            echo "You can choose to create a new site or overwrite an existing one."
+            ;;
         reload)
             echo "Usage: cove reload"
             echo ""
@@ -921,6 +930,15 @@ display_command_help() {
 
 # --- Main Command Router ---
 main() {
+
+    # Determine the path to the cove command
+    local COVE_CMD
+    if command -v cove &> /dev/null; then
+        COVE_CMD="cove"
+    else
+        COVE_CMD="$0"
+    fi
+
     # Check for a help flag anywhere in the arguments.
     for arg in "$@"; do
         if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
@@ -965,6 +983,10 @@ main() {
         path)
             check_dependencies
             cove_path "$@"
+            ;;
+        pull)
+            check_dependencies
+            cove_pull "$@"
             ;;
         install)
             cove_install
