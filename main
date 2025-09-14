@@ -371,17 +371,17 @@ EOM
                 echo "        output file \"$site_path/logs/caddy.log\"" >> "$CADDYFILE_PATH"
                 echo "    }" >> "$CADDYFILE_PATH"
                 
-                echo "    php_server" >> "$CADDYFILE_PATH"
-
-                if [ ! -f "$site_path/public/wp-config.php" ]; then
-                    echo "    file_server" >> "$CADDYFILE_PATH"
-                fi
-                
                 local custom_conf_file="$CUSTOM_CADDY_DIR/$site_name"
                 if [ -f "$custom_conf_file" ]; then
                     echo "" >> "$CADDYFILE_PATH"
                     sed 's/^/    /' "$custom_conf_file" >> "$CADDYFILE_PATH"
                     echo "" >> "$CADDYFILE_PATH"
+                fi
+
+                echo "    php_server" >> "$CADDYFILE_PATH"
+
+                if [ ! -f "$site_path/public/wp-config.php" ]; then
+                    echo "    file_server" >> "$CADDYFILE_PATH"
                 fi
 
                 echo "}" >> "$CADDYFILE_PATH"
@@ -892,12 +892,17 @@ display_command_help() {
             echo "  <name>         The name of the site."
             ;;
         pull)
-            echo "Usage: cove pull"
+            echo "Usage: cove pull [--proxy-uploads]"
             echo ""
             echo "Pulls a remote WordPress site into Cove via an interactive TUI."
             echo "This command will guide you through providing SSH and path details for the remote site,"
             echo "then it will create a backup, pull it down, and configure it to run locally."
             echo "You can choose to create a new site or overwrite an existing one."
+            echo ""
+            echo "Flags:"
+            echo "  --proxy-uploads  Excludes the 'wp-content/uploads' directory from the backup and"
+            echo "                   configures the local site to proxy media requests to the live URL."
+            echo "                   This saves significant time and disk space for large sites."
             ;;
         reload)
             echo "Usage: cove reload"

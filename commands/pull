@@ -13,11 +13,19 @@ cove_pull() {
         exit 1
     }
 
+    # --- Argument Parsing ---
+    local proxy_uploads=false
+    for arg in "$@"; do
+        if [ "$arg" == "--proxy-uploads" ]; then
+            proxy_uploads=true
+            break
+        fi
+    done
+
     # Define quiet SSH options to prevent host key warnings
     local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pulling a remote WordPress site into Cove."
-
     # --- 1. Gather Remote Info ---
     log_step "Enter remote server details"
     local remote_ssh
@@ -35,6 +43,7 @@ cove_pull() {
     log_step "Validating remote WordPress site..."
     local remote_url
     remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path && wp option get home 2>/dev/null")
+    domain=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//')
     
     if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
         log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
@@ -86,8 +95,14 @@ cove_pull() {
 
     # --- 4. Perform Migration ---
     log_step "Generating backup for ${remote_url}..."
+    local backup_extra_args=""
+    if [ "$proxy_uploads" = true ]; then
+        log_success "Uploads will be excluded from the backup and proxied instead."
+        backup_extra_args="--exclude=\"wp-content/uploads\""
+    fi
+
     local backup_url
-    backup_url=$(ssh $ssh_opts $remote_ssh "curl -sL https://captaincore.io/do | bash -s -- backup $remote_path --quiet")
+    backup_url=$(ssh $ssh_opts $remote_ssh "curl -sL https://captaincore.io/do | bash -s -- backup $remote_path --quiet $backup_extra_args")
 
     if [[ -z "$backup_url" || ! "$backup_url" == *.zip ]]; then
         log_error "Failed to generate backup or received an invalid backup URL."
@@ -106,13 +121,41 @@ cove_pull() {
     source_config
     inject_mu_plugin "$dest_path"
 
-    # --- 6. Cleanup ---
+    # --- 6. Add Proxy Directive if Flag is Set ---
+    if [ "$proxy_uploads" = true ]; then
+        log_step "Adding upload proxy directive..."
+        local new_directive
+        # Use a heredoc to create the multi-line directive string
+        read -r -d '' new_directive << EOM
+@local_upload {
+    path /wp-content/uploads/*
+    file {path}
+}
+handle @local_upload {
+    # If the file exists, serve it and stop processing.
+    file_server
+}
+
+handle /wp-content/uploads/* {
+    # Proxy the request to the live site.
+    reverse_proxy ${remote_url} {
+        header_up Host ${domain}
+        flush_interval -1
+    }
+}
+EOM
+        # Pipe the new directive into the add command
+        echo "$new_directive" | "$COVE_CMD" directive add "$site_name"
+        log_success "Upload proxy directive added."
+    fi
+
+    # --- 7. Cleanup ---
     log_step "Cleaning up remote backup file..."
     local filename="${backup_url##*/}"
     ssh $ssh_opts $remote_ssh "rm -f $remote_path/${filename}" 2>/dev/null
     log_success "Cleanup complete."
-
-    # --- 7. Finalize ---
+ 
+    # --- 8. Finalize ---
     regenerate_caddyfile
     
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✨ All done! Your site is ready." "URL: ${local_url}"
