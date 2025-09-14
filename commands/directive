@@ -1,9 +1,8 @@
 cove_directive_add_or_update() {
     local site_name="$1"
-    if [ -z "$site_name" ];
- then
+    if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: Please provide a site name."
- echo "Usage: cove directive <add|update> <name>"
+        echo "Usage: cove directive <add|update> <name>"
         exit 1
     fi
     
@@ -13,62 +12,62 @@ cove_directive_add_or_update() {
 
     if [ ! -d "$site_dir" ]; then
         gum style --foreground red "❌ Error: Site '$site_hostname' not found."
- exit 1
+        exit 1
     fi
 
-    if [ -f "$custom_conf_file" ];
- then
-        echo "📝 Editing custom Caddy directives for $site_hostname..."
-    else
-        echo "📝 Adding new custom Caddy directives for $site_hostname..."
-    fi
-    echo "   Press Ctrl+D to save and exit, Ctrl+C to cancel."
- local existing_rules=""
-    if [ -f "$custom_conf_file" ];
- then
+    local existing_rules=""
+    if [ -f "$custom_conf_file" ]; then
         existing_rules=$(cat "$custom_conf_file")
     fi
     
     local custom_rules
-    custom_rules=$(gum write --value "$existing_rules" --placeholder "Enter custom Caddy directives here...")
+    # If stdin is a terminal (interactive), use gum. Otherwise, read from pipe.
+    if [ -t 0 ]; then
+        if [ -f "$custom_conf_file" ]; then
+            echo "📝 Editing custom Caddy directives for $site_hostname..."
+        else
+            echo "📝 Adding new custom Caddy directives for $site_hostname..."
+        fi
+        echo "   Press Ctrl+D to save and exit, Ctrl+C to cancel."
+        custom_rules=$(gum write --value "$existing_rules" --placeholder "Enter custom Caddy directives here...")
+    else
+        echo "📝 Reading custom directives from stdin for $site_hostname..."
+        custom_rules=$(cat) # Read from standard input
+    fi
 
-    if [ -n "$custom_rules" ];
- then
+    if [ -n "$custom_rules" ]; then
         mkdir -p "$CUSTOM_CADDY_DIR"
         echo "$custom_rules" > "$custom_conf_file"
         echo "✅ Custom directives saved for $site_hostname."
- regenerate_caddyfile
+        regenerate_caddyfile
     else
         echo "🚫 No input provided. Action cancelled."
- fi
+    fi
 }
 
 # This new function handles deleting directives
 cove_directive_delete() {
     local site_name="$1"
-    if [ -z "$site_name" ];
- then
+    if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: Please provide a site name."
- echo "Usage: cove directive delete <name>"
+        echo "Usage: cove directive delete <name>"
         exit 1
     fi
 
     local site_hostname="${site_name}.localhost"
     local custom_conf_file="$CUSTOM_CADDY_DIR/$site_hostname"
 
-    if [ -f "$custom_conf_file" ];
- then
-        if gum confirm "🚨 Are you sure you want to delete the custom directives for '$site_hostname'?";
- then
+    if [ -f "$custom_conf_file" ]; then
+        if gum confirm "🚨 Are you sure you want to delete the custom directives for '$site_hostname'?"; then
             rm "$custom_conf_file"
             echo "✅ Custom directives deleted for $site_hostname."
- regenerate_caddyfile
+            regenerate_caddyfile
         else
             echo "🚫 Deletion cancelled."
- fi
+        fi
     else
         echo "ℹ️ No custom directives found for $site_hostname."
- fi
+    fi
 }
 
 cove_directive_list() {
