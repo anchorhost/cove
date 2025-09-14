@@ -28,12 +28,21 @@ cove_delete() {
 
     echo "🔥 Deleting site: $site_name.localhost"
     if [ -f "$site_dir/public/wp-config.php" ]; then
-        local db_name; db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        local db_name
+        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
         echo "🗄️ Deleting database: $db_name"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
     fi
 
     rm -rf "$site_dir"
     echo "✅ Directory deleted."
+
+    # --- Delete Custom Caddy Directives ---
+    local custom_conf_file="$CUSTOM_CADDY_DIR/$site_name.localhost"
+    if [ -f "$custom_conf_file" ]; then
+        rm "$custom_conf_file"
+        echo "⚙️ Custom directives deleted."
+    fi
+
     echo "✅ Site '$site_name.localhost' has been removed."
 }
