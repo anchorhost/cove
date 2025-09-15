@@ -27,6 +27,7 @@ Cove is a command-line tool that simplifies the creation and management of local
 ## Installation
 
 Run the following in your terminal to install `cove`.
+
 ```bash
 bash <(curl -sL https://cove.run/cove-install.sh)
 ```
@@ -44,6 +45,7 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove login <site> [<user>]` | 🔑 Generates a one-time login link for a WordPress site. |
 | `cove path <name>` | 📁 Outputs the full system path to a site's public directory. |
 | `cove url <name>` | 🌐 Prints the full `https://<name>.localhost` URL for a site. |
+| `cove pull [--proxy-uploads]` | 🔽 Pulls a remote WordPress site into Cove via SSH. Use `--proxy-uploads` to proxy media instead of downloading. |
 | `cove enable` | ✅ Starts the Caddy, MariaDB, and Mailpit background services. |
 | `cove disable` | 🛑 Stops all Cove background services. |
 | `cove status` | 🔎 Checks the status of all background services. |
@@ -51,7 +53,7 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove db <backup\|list>` | 💾 `backup` creates a `.sql` backup for every WordPress site. `list` shows database credentials. |
 | `cove directive <add\|update\|delete\|list>` | ⚙️ Manages custom Caddyfile rules for a specific site. |
 | `cove install` | 🛠️ Installs and configures all required dependencies. |
-| `cove upgrade` | ⬆️ Upgrades Cove to the latest available version from GitHub. |
+| `cove upgrade` | ⬆️ Upgrades the Cove script and the FrankenPHP binary to the latest versions. |
 | `cove version` | ℹ️ Displays the current version of Cove. |
 
 *You can get help for any command by running `cove <command> --help`.*
