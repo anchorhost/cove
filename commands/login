@@ -51,7 +51,7 @@ cove_login() {
     echo "   Generating login link..."
     local login_url
     # Suppress stderr on the first try so we can handle the error gracefully.
-    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) 2>/dev/null )
+    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" ) 2>/dev/null )
     local exit_code=$?
 
     # 4. If the command failed, check for the mu-plugin and retry.
