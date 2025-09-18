@@ -779,6 +779,7 @@ show_general_help() {
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
     echo "  pull             Pulls a remote WordPress site into Cove via SSH."
+    echo "  push             Pushes a local Cove site to a remote WordPress site via SSH."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
@@ -904,6 +905,14 @@ display_command_help() {
             echo "                   configures the local site to proxy media requests to the live URL."
             echo "                   This saves significant time and disk space for large sites."
             ;;
+        push)
+            echo "Usage: cove push"
+            echo ""
+            echo "Pushes a local Cove site to a remote server via an interactive TUI."
+            echo "This command will guide you through selecting a local site, providing SSH and path"
+            echo "details for the remote site, then it will create a local backup, upload it, and"
+            echo "run a migration script on the remote server to overwrite its contents."
+            ;;
         reload)
             echo "Usage: cove reload"
             echo ""
@@ -992,6 +1001,10 @@ main() {
         pull)
             check_dependencies
             cove_pull "$@"
+            ;;
+        push)
+            check_dependencies
+            cove_push "$@"
             ;;
         install)
             cove_install
