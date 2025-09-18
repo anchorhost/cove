@@ -1,4 +1,3 @@
-#!/bin/bash
 cove_pull() {
     # --- UI/Logging Functions ---
     log_step() { 
