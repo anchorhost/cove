@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6] - 2025-09-18
+
+### ✨ New Features
+
+* **Remote Site Pushing:** A new `cove push` command has been introduced to migrate a local Cove site to a remote server via SSH.
+    * It features an interactive TUI to guide you through selecting a local site and providing remote credentials.
+    * The command creates a local backup, securely uploads it, and then executes a migration script on the remote server to overwrite the destination site's content.
+
 ## [1.5] - 2025-09-14
 
 ### ✨ New Features

@@ -21,7 +21,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.5"
+COVE_VERSION="1.6"
 CADDY_CMD="frankenphp"
 
 # Set the correct binary installation directory based on architecture
@@ -779,6 +779,7 @@ show_general_help() {
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
     echo "  pull             Pulls a remote WordPress site into Cove via SSH."
+    echo "  push             Pushes a local Cove site to a remote WordPress site via SSH."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
@@ -904,6 +905,14 @@ display_command_help() {
             echo "                   configures the local site to proxy media requests to the live URL."
             echo "                   This saves significant time and disk space for large sites."
             ;;
+        push)
+            echo "Usage: cove push"
+            echo ""
+            echo "Pushes a local Cove site to a remote server via an interactive TUI."
+            echo "This command will guide you through selecting a local site, providing SSH and path"
+            echo "details for the remote site, then it will create a local backup, upload it, and"
+            echo "run a migration script on the remote server to overwrite its contents."
+            ;;
         reload)
             echo "Usage: cove reload"
             echo ""
@@ -992,6 +1001,10 @@ main() {
         pull)
             check_dependencies
             cove_pull "$@"
+            ;;
+        push)
+            check_dependencies
+            cove_push "$@"
             ;;
         install)
             cove_install
@@ -2003,7 +2016,7 @@ cove_login() {
     echo "   Generating login link..."
     local login_url
     # Suppress stderr on the first try so we can handle the error gracefully.
-    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) 2>/dev/null )
+    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" ) 2>/dev/null )
     local exit_code=$?
 
     # 4. If the command failed, check for the mu-plugin and retry.
@@ -2051,7 +2064,6 @@ cove_path() {
     echo "$site_dir"
 }
 
-#!/bin/bash
 cove_pull() {
     # --- UI/Logging Functions ---
     log_step() { 
@@ -2212,6 +2224,111 @@ EOM
     regenerate_caddyfile
     
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✨ All done! Your site is ready." "URL: ${local_url}"
+}
+cove_push() {
+    # --- UI/Logging Functions ---
+    log_step() { 
+        echo ""
+        gum style --bold --foreground "yellow" "➡️  $1"
+    }
+    log_success() { 
+        gum style --foreground "green" "✅ $1" 
+    }
+    log_error() {
+        gum style --foreground "red" "❌ ERROR: $1" 
+        >&2
+        exit 1
+    }
+
+    # Define quiet SSH options to prevent host key warnings
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pushing a local Cove site to a remote server."
+
+    # --- 1. Choose Local Site ---
+    log_step "Choose a local site to push"
+    local wp_sites=()
+    for site_dir in "$SITES_DIR"/*.localhost; do
+        if [ -f "$site_dir/public/wp-config.php" ]; then
+            wp_sites+=("$(basename "$site_dir" .localhost)")
+        fi
+    done
+
+    if [ ${#wp_sites[@]} -eq 0 ]; then
+        log_error "No local WordPress sites found to push."
+    fi
+
+    local site_name
+    site_name=$(gum choose "${wp_sites[@]}")
+    if [ -z "$site_name" ]; then log_error "No site selected."; fi
+
+    local local_path="$SITES_DIR/$site_name.localhost/public"
+    
+    # --- 2. Gather Remote Info ---
+    log_step "Enter remote server details"
+    local remote_ssh
+    remote_ssh=$(gum input --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    if [ -z "$remote_ssh" ]; then log_error "SSH connection cannot be empty."; fi
+
+    # Trim the "ssh " prefix if the user includes it.
+    remote_ssh="${remote_ssh##ssh }"
+
+    local remote_path
+    remote_path=$(gum input --value "public/" --prompt "Path to Remote WordPress Root: ")
+    if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
+    
+    # --- 3. Validate Remote Site ---
+    log_step "Validating remote WordPress site..."
+    local remote_url
+    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path && wp option get home 2>/dev/null")
+    
+    if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
+        log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
+    fi
+    log_success "Found remote site to overwrite: $remote_url"
+
+    # --- 4. Confirmation ---
+    if ! gum confirm "🚨 Are you sure you want to push '${site_name}' to '${remote_url}'? This will completely overwrite the remote site's files and database."; then
+        echo "🚫 Push cancelled."
+        exit 0
+    fi
+
+    # --- 5. Perform Local Backup ---
+    log_step "Generating local backup for ${site_name}..."
+    local backup_filename
+    backup_filename=$( (cd "$local_path" && curl -sL https://captaincore.io/do | bash -s -- backup . --quiet --format=filename) )
+    
+    if [[ ! -f "$backup_filename" || ! "$backup_filename" == *".zip" ]]; then
+        log_error "Failed to generate local backup. The captaincore script might have failed."
+    fi
+    
+    size=$(ls -lh "$backup_filename" | awk '{print $5}')
+    log_success "Local backup created: ${backup_filename} ($size)"
+
+    # --- 6. Upload Backup ---
+    log_step "Uploading backup to remote server..."
+    if ! cat "$backup_filename" | ssh $ssh_opts $remote_ssh "cat > '$remote_path/$backup_filename'"; then
+        # Clean up local backup on failure
+        rm -f "$backup_filename"
+        log_error "Failed to upload backup."
+    fi
+    log_success "Upload complete."
+
+    # --- 7. Remote Restore ---
+    log_step "Restoring backup on remote server..."
+    if ! ssh $ssh_opts $remote_ssh "cd '$remote_path' && curl -sL https://captaincore.io/do | bash -s -- migrate --url='$backup_filename' --update-urls"; then
+        log_error "The remote migration script failed to execute correctly."
+    fi
+    log_success "Remote restore complete."
+
+    # --- 8. Cleanup ---
+    log_step "Cleaning up backup files..."
+    rm -f "$backup_filename"
+    ssh $ssh_opts $remote_ssh "rm -f '$remote_path/$backup_filename'"
+    log_success "Cleanup complete."
+
+    # --- 9. Finalize ---
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✨ All done! Your site has been pushed successfully." "Remote URL: ${remote_url}"
 }
 cove_reload() {
     create_gui_file
