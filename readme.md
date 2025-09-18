@@ -46,6 +46,7 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove path <name>` | 📁 Outputs the full system path to a site's public directory. |
 | `cove url <name>` | 🌐 Prints the full `https://<name>.localhost` URL for a site. |
 | `cove pull [--proxy-uploads]` | 🔽 Pulls a remote WordPress site into Cove via SSH. Use `--proxy-uploads` to proxy media instead of downloading. |
+| `cove push` | 🔼 Pushes a local Cove site to a remote WordPress site via SSH. |
 | `cove enable` | ✅ Starts the Caddy, MariaDB, and Mailpit background services. |
 | `cove disable` | 🛑 Stops all Cove background services. |
 | `cove status` | 🔎 Checks the status of all background services. |
