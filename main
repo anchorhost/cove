@@ -415,7 +415,7 @@ EOM
     # We run this in the background (&) to prevent a deadlock when the GUI,
     # which is run by Caddy/FrankenPHP, executes a command that tries to reload the server.
     # The server can't wait for a command that it needs to process itself.
-    "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log" &
+    $SUDO_CMD "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log" &
     
     # Because the command is backgrounded, we can't check its exit code directly.
     # We'll assume success and let the user check 'cove status' or logs if needed.
