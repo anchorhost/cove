@@ -280,6 +280,16 @@ update_etc_hosts() {
         for site_path in "$SITES_DIR"/*; do
             if [ -d "$site_path" ]; then
                 required_hosts+=("$(basename "$site_path")")
+
+                # Check for additional mappings
+                if [ -f "$site_path/mappings" ]; then
+                    while IFS= read -r mapping || [ -n "$mapping" ]; do
+                        # Skip empty lines
+                        if [ -n "$mapping" ]; then
+                            required_hosts+=("$mapping")
+                        fi
+                    done < "$site_path/mappings"
+                fi
             fi
         done
     fi
@@ -361,7 +371,18 @@ EOM
                 local site_name
                 site_name=$(basename "$site_path")
                 
-                echo "$site_name {" >> "$CADDYFILE_PATH"
+                # Build the list of domains
+                local site_domains="$site_name"
+                
+                if [ -f "$site_path/mappings" ]; then
+                    while IFS= read -r mapping || [ -n "$mapping" ]; do
+                         if [ -n "$mapping" ]; then
+                            site_domains="$site_domains, $mapping"
+                         fi
+                    done < "$site_path/mappings"
+                fi
+
+                echo "$site_domains {" >> "$CADDYFILE_PATH"
                 
                 echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
                 echo "    encode gzip" >> "$CADDYFILE_PATH"
@@ -884,6 +905,12 @@ display_command_help() {
             echo "  <site>         The name of the WordPress site."
             echo "  <user>         (Optional) The user ID, email, or login of the admin to use."
             ;;
+        mappings)
+            echo "Usage: cove mappings <site> [add|remove] [domain]"
+            echo ""
+            echo "Manage additional domain mappings for a site."
+            echo "Mappings allow a single site to be served from multiple domains."
+            ;;
         path)
             echo "Usage: cove path <name>"
             echo ""
@@ -1066,6 +1093,10 @@ main() {
                     exit 0
                     ;;
             esac
+            ;;
+        mappings)
+            check_dependencies
+            cove_mappings "$@"
             ;;
         url)
             cove_url "$@"

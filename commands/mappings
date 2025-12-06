@@ -1,0 +1,86 @@
+cove_mappings() {
+    local site_name="$1"
+    local action="$2"
+    local domain="$3"
+
+    # --- 1. Validation ---
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove mappings <site> [add|remove] [domain]"
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    local mappings_file="$site_dir/mappings"
+
+    if [ ! -d "$site_dir" ]; then
+        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    # --- 2. List Mappings (Default Action) ---
+    if [ -z "$action" ] || [ "$action" == "list" ]; then
+        echo "🔎 Checking domain mappings for $site_name..."
+        
+        if [ ! -f "$mappings_file" ] || [ ! -s "$mappings_file" ]; then
+             gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "ℹ️  No additional mappings found." "Main domain: $site_name.localhost"
+        else
+            local content
+            content=$(cat "$mappings_file")
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "📂 Domain Mappings ($site_name)" "" "$content"
+        fi
+        return 0
+    fi
+
+    # --- 3. Add Mapping ---
+    if [ "$action" == "add" ]; then
+        if [ -z "$domain" ]; then
+            gum style --foreground red "❌ Error: Please specify a domain to add."
+            exit 1
+        fi
+
+        # Simple validation: prevent duplicates
+        if [ -f "$mappings_file" ] && grep -Fxq "$domain" "$mappings_file"; then
+            gum style --foreground yellow "⚠️  Domain '$domain' is already mapped to this site."
+            exit 0
+        fi
+
+        # Create file if not exists and append
+        echo "$domain" >> "$mappings_file"
+        echo "✅ Added mapping: $domain"
+        
+        regenerate_caddyfile
+        update_etc_hosts
+        return 0
+    fi
+
+    # --- 4. Remove Mapping ---
+    if [ "$action" == "remove" ]; then
+        if [ -z "$domain" ]; then
+            gum style --foreground red "❌ Error: Please specify a domain to remove."
+            exit 1
+        fi
+
+        if [ -f "$mappings_file" ]; then
+            # Use grep to filter out the domain and write to a temp file
+            if grep -Fxq "$domain" "$mappings_file"; then
+                grep -Fxv "$domain" "$mappings_file" > "${mappings_file}.tmp"
+                mv "${mappings_file}.tmp" "$mappings_file"
+                echo "✅ Removed mapping: $domain"
+                
+                regenerate_caddyfile
+                update_etc_hosts
+            else
+                gum style --foreground red "❌ Error: Mapping '$domain' not found."
+            fi
+        else
+             gum style --foreground red "❌ Error: No mappings exist for this site."
+        fi
+        return 0
+    fi
+
+    # --- 5. Unknown Action ---
+    gum style --foreground red "❌ Error: Unknown action '$action'."
+    echo "Usage: cove mappings <site> [add|remove] [domain]"
+    exit 1
+}
