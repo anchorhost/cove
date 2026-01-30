@@ -1,0 +1,83 @@
+cove_log() {
+    local site_name=""
+    local follow_flag=""
+
+    # Parse arguments
+    for arg in "$@"; do
+        case "$arg" in
+            -f|--follow)
+                follow_flag="-f"
+                ;;
+            *)
+                if [[ -z "$site_name" ]]; then
+                    site_name="$arg"
+                fi
+                ;;
+        esac
+    done
+
+    # If no site specified, show the global error log
+    if [[ -z "$site_name" ]]; then
+        local log_file="$LOGS_DIR/errors.log"
+        if [[ ! -f "$log_file" ]]; then
+            echo "No global error log found at $log_file"
+            exit 1
+        fi
+
+        if [[ -n "$follow_flag" ]]; then
+            echo "Following global error log (Ctrl+C to stop)..."
+            tail -f "$log_file"
+        else
+            echo "Global error log (last 50 lines):"
+            echo ""
+            tail -50 "$log_file"
+        fi
+        exit 0
+    fi
+
+    # Normalize site name
+    local site_dir
+    if [[ "$site_name" == *.localhost ]]; then
+        site_dir="$SITES_DIR/$site_name"
+    else
+        site_dir="$SITES_DIR/${site_name}.localhost"
+        site_name="${site_name}.localhost"
+    fi
+
+    if [[ ! -d "$site_dir" ]]; then
+        echo "Site '$site_name' not found."
+        exit 1
+    fi
+
+    local logs_dir="$site_dir/logs"
+    if [[ ! -d "$logs_dir" ]]; then
+        echo "No logs directory found for '$site_name'."
+        exit 1
+    fi
+
+    # Find available log files
+    local caddy_log="$logs_dir/caddy.log"
+    local caddy_lan_log="$logs_dir/caddy-lan.log"
+
+    # Determine which logs exist
+    local available_logs=()
+    [[ -f "$caddy_log" ]] && available_logs+=("$caddy_log")
+    [[ -f "$caddy_lan_log" ]] && available_logs+=("$caddy_lan_log")
+
+    if [[ ${#available_logs[@]} -eq 0 ]]; then
+        echo "No log files found for '$site_name'."
+        exit 1
+    fi
+
+    if [[ -n "$follow_flag" ]]; then
+        echo "Following logs for $site_name (Ctrl+C to stop)..."
+        tail -f "${available_logs[@]}"
+    else
+        echo "Logs for $site_name (last 50 lines each):"
+        for log in "${available_logs[@]}"; do
+            echo ""
+            echo "--- $(basename "$log") ---"
+            tail -50 "$log"
+        done
+    fi
+}
