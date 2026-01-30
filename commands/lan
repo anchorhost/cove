@@ -1,0 +1,334 @@
+# --- LAN Access Commands ---
+# Enables local network access to Cove sites for mobile app sync
+
+LAN_PORTS_FILE="$COVE_DIR/lan_ports"
+LAN_START_PORT=8443
+
+# Get the next available LAN port
+get_next_lan_port() {
+    local port=$LAN_START_PORT
+    if [ -f "$LAN_PORTS_FILE" ]; then
+        # Find the highest port in use and add 1
+        local max_port
+        max_port=$(cut -d'=' -f2 "$LAN_PORTS_FILE" | sort -n | tail -1)
+        if [ -n "$max_port" ]; then
+            port=$((max_port + 1))
+        fi
+    fi
+    echo "$port"
+}
+
+# Get the assigned port for a site
+get_site_lan_port() {
+    local site_name="$1"
+    if [ -f "$LAN_PORTS_FILE" ]; then
+        grep "^${site_name}=" "$LAN_PORTS_FILE" | cut -d'=' -f2
+    fi
+}
+
+# Get local network IP address
+get_lan_ip() {
+    if [ "$OS" == "macos" ]; then
+        ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "unknown"
+    else
+        hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown"
+    fi
+}
+
+# Create Bonjour advertisement LaunchAgent
+create_bonjour_service() {
+    local site_name="$1"
+    local port="$2"
+    local service_name="com.cove.${site_name}.lan"
+    local plist_path="$HOME/Library/LaunchAgents/${service_name}.plist"
+    
+    # Only supported on macOS
+    if [ "$OS" != "macos" ]; then
+        echo "   - Bonjour advertisement not supported on Linux (skipping)"
+        return 0
+    fi
+    
+    echo "   - Creating Bonjour advertisement for ${site_name}..."
+    
+    mkdir -p "$HOME/Library/LaunchAgents"
+    
+    cat > "$plist_path" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${service_name}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/dns-sd</string>
+        <string>-R</string>
+        <string>${site_name}</string>
+        <string>_beckon._tcp</string>
+        <string>local</string>
+        <string>${port}</string>
+        <string>path=/</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+EOM
+    
+    # Load and start the service
+    launchctl unload "$plist_path" &>/dev/null
+    launchctl load "$plist_path"
+    launchctl start "$service_name"
+    
+    echo "   - Bonjour service started: _beckon._tcp (${site_name})"
+}
+
+# Remove Bonjour advertisement LaunchAgent
+remove_bonjour_service() {
+    local site_name="$1"
+    local service_name="com.cove.${site_name}.lan"
+    local plist_path="$HOME/Library/LaunchAgents/${service_name}.plist"
+    
+    if [ "$OS" != "macos" ]; then
+        return 0
+    fi
+    
+    if [ -f "$plist_path" ]; then
+        echo "   - Stopping Bonjour advertisement..."
+        launchctl unload "$plist_path" &>/dev/null
+        rm -f "$plist_path"
+    fi
+}
+
+cove_lan_enable() {
+    local site_name="$1"
+    
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "Error: Site name is required."
+        echo "Usage: cove lan enable <site>"
+        exit 1
+    fi
+    
+    # Normalize site name (remove .localhost suffix if present)
+    site_name="${site_name%.localhost}"
+    
+    local site_dir="$SITES_DIR/${site_name}.localhost"
+    
+    if [ ! -d "$site_dir" ]; then
+        gum style --foreground red "Error: Site '${site_name}' not found."
+        exit 1
+    fi
+    
+    local lan_config="$site_dir/lan_config"
+    
+    if [ -f "$lan_config" ]; then
+        local existing_port
+        existing_port=$(grep "^port=" "$lan_config" | cut -d'=' -f2)
+        gum style --foreground yellow "Site '${site_name}' already has LAN access enabled on port ${existing_port}."
+        exit 0
+    fi
+    
+    echo "Enabling LAN access for ${site_name}..."
+    
+    # Assign a port
+    local port
+    port=$(get_next_lan_port)
+    
+    # Save to lan_ports file
+    echo "${site_name}=${port}" >> "$LAN_PORTS_FILE"
+    
+    # Create lan_config file in site directory
+    echo "port=${port}" > "$lan_config"
+    echo "enabled_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$lan_config"
+    
+    # Create Bonjour advertisement
+    create_bonjour_service "$site_name" "$port"
+    
+    # Regenerate Caddyfile to include LAN binding
+    regenerate_caddyfile
+    
+    local lan_ip
+    lan_ip=$(get_lan_ip)
+    
+    echo ""
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "LAN Access Enabled for ${site_name}" \
+        "" \
+        "Port: ${port}" \
+        "Local URL: https://${site_name}.localhost" \
+        "LAN URL: https://${lan_ip}:${port}" \
+        "" \
+        "Bonjour: _beckon._tcp (discoverable by iOS apps)" \
+        "" \
+        "Note: Mobile devices need to trust Caddy's CA certificate." \
+        "Run 'cove lan trust' for instructions."
+}
+
+cove_lan_disable() {
+    local site_name="$1"
+    
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "Error: Site name is required."
+        echo "Usage: cove lan disable <site>"
+        exit 1
+    fi
+    
+    # Normalize site name
+    site_name="${site_name%.localhost}"
+    
+    local site_dir="$SITES_DIR/${site_name}.localhost"
+    local lan_config="$site_dir/lan_config"
+    
+    if [ ! -f "$lan_config" ]; then
+        gum style --foreground yellow "Site '${site_name}' does not have LAN access enabled."
+        exit 0
+    fi
+    
+    echo "Disabling LAN access for ${site_name}..."
+    
+    # Remove Bonjour service
+    remove_bonjour_service "$site_name"
+    
+    # Remove from lan_ports file
+    if [ -f "$LAN_PORTS_FILE" ]; then
+        grep -v "^${site_name}=" "$LAN_PORTS_FILE" > "${LAN_PORTS_FILE}.tmp"
+        mv "${LAN_PORTS_FILE}.tmp" "$LAN_PORTS_FILE"
+    fi
+    
+    # Remove lan_config file
+    rm -f "$lan_config"
+    
+    # Regenerate Caddyfile
+    regenerate_caddyfile
+    
+    gum style --foreground green "LAN access disabled for ${site_name}."
+}
+
+cove_lan_status() {
+    echo "LAN Access Status"
+    echo "================="
+    echo ""
+    
+    local lan_ip
+    lan_ip=$(get_lan_ip)
+    echo "Your LAN IP: ${lan_ip}"
+    echo ""
+    
+    local found_any=false
+    
+    if [ -d "$SITES_DIR" ]; then
+        for site_path in "$SITES_DIR"/*; do
+            if [ -d "$site_path" ]; then
+                local site_name
+                site_name=$(basename "$site_path")
+                site_name="${site_name%.localhost}"
+                
+                local lan_config="$site_path/lan_config"
+                if [ -f "$lan_config" ]; then
+                    found_any=true
+                    local port
+                    port=$(grep "^port=" "$lan_config" | cut -d'=' -f2)
+                    echo "  ${site_name}"
+                    echo "    Port: ${port}"
+                    echo "    LAN URL: https://${lan_ip}:${port}"
+                    echo "    Bonjour: _beckon._tcp (${site_name})"
+                    echo ""
+                fi
+            fi
+        done
+    fi
+    
+    if [ "$found_any" = false ]; then
+        echo "  No sites have LAN access enabled."
+        echo ""
+        echo "  Enable LAN access for a site with:"
+        echo "    cove lan enable <site>"
+    fi
+}
+
+cove_lan_trust() {
+    echo "Trusting Caddy's CA Certificate on Mobile Devices"
+    echo "================================================="
+    echo ""
+    
+    local ca_cert=""
+    
+    # Find Caddy's root CA certificate
+    if [ "$OS" == "macos" ]; then
+        ca_cert="$HOME/Library/Application Support/Caddy/pki/authorities/local/root.crt"
+    else
+        ca_cert="$HOME/.local/share/caddy/pki/authorities/local/root.crt"
+    fi
+    
+    if [ ! -f "$ca_cert" ]; then
+        gum style --foreground red "Error: Caddy's root CA certificate not found."
+        echo "Expected location: $ca_cert"
+        echo ""
+        echo "Make sure Caddy has been started at least once with 'cove enable'."
+        exit 1
+    fi
+    
+    echo "Caddy's root CA certificate is located at:"
+    echo "  $ca_cert"
+    echo ""
+    
+    if [ "$OS" == "macos" ]; then
+        echo "To trust this certificate on your iPhone/iPad:"
+        echo ""
+        echo "  1. AirDrop the certificate to your device:"
+        gum style --foreground cyan "     Opening certificate location in Finder..."
+        open -R "$ca_cert"
+        echo ""
+        echo "  2. On your iOS device, go to:"
+        echo "     Settings > General > VPN & Device Management"
+        echo "     Tap the certificate profile and install it."
+        echo ""
+        echo "  3. Then go to:"
+        echo "     Settings > General > About > Certificate Trust Settings"
+        echo "     Enable full trust for the Caddy root certificate."
+        echo ""
+    else
+        echo "To trust this certificate on your mobile device:"
+        echo ""
+        echo "  1. Copy the certificate to your device (email, file transfer, etc.)"
+        echo "  2. Install and trust the certificate in your device's settings"
+        echo ""
+    fi
+    
+    echo "Alternative: The Beckon iOS app can be configured to accept"
+    echo "the self-signed certificate without system-wide trust."
+}
+
+cove_lan() {
+    local action="$1"
+    shift
+    
+    case "$action" in
+        enable)
+            cove_lan_enable "$@"
+            ;;
+        disable)
+            cove_lan_disable "$@"
+            ;;
+        status)
+            cove_lan_status "$@"
+            ;;
+        trust)
+            cove_lan_trust "$@"
+            ;;
+        *)
+            echo "Usage: cove lan <subcommand>"
+            echo ""
+            echo "Manage LAN access to Cove sites for mobile app sync."
+            echo ""
+            echo "Subcommands:"
+            echo "  enable <site>    Enable LAN access for a site"
+            echo "  disable <site>   Disable LAN access for a site"
+            echo "  status           Show which sites have LAN access enabled"
+            echo "  trust            Instructions for trusting Caddy's CA on mobile"
+            exit 0
+            ;;
+    esac
+}

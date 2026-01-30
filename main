@@ -407,6 +407,43 @@ EOM
 
                 echo "}" >> "$CADDYFILE_PATH"
                 echo "" >> "$CADDYFILE_PATH"
+                
+                # Check if LAN access is enabled for this site
+                local lan_config="$site_path/lan_config"
+                if [ -f "$lan_config" ]; then
+                    local lan_port
+                    lan_port=$(grep "^port=" "$lan_config" | cut -d'=' -f2)
+
+                    if [ -n "$lan_port" ]; then
+                        local lan_ip
+                        lan_ip=$(get_lan_ip)
+                        echo "# LAN access for $site_name on port $lan_port" >> "$CADDYFILE_PATH"
+                        echo "https://${lan_ip}:${lan_port} {" >> "$CADDYFILE_PATH"
+                        echo "    bind 0.0.0.0" >> "$CADDYFILE_PATH"
+                        echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
+                        echo "    encode gzip" >> "$CADDYFILE_PATH"
+                        echo "    tls internal" >> "$CADDYFILE_PATH"
+                        
+                        echo "    log {" >> "$CADDYFILE_PATH"
+                        echo "        output file \"$site_path/logs/caddy-lan.log\"" >> "$CADDYFILE_PATH"
+                        echo "    }" >> "$CADDYFILE_PATH"
+                        
+                        if [ -f "$custom_conf_file" ]; then
+                            echo "" >> "$CADDYFILE_PATH"
+                            sed 's/^/    /' "$custom_conf_file" >> "$CADDYFILE_PATH"
+                            echo "" >> "$CADDYFILE_PATH"
+                        fi
+
+                        echo "    php_server" >> "$CADDYFILE_PATH"
+
+                        if [ ! -f "$site_path/public/wp-config.php" ]; then
+                            echo "    file_server" >> "$CADDYFILE_PATH"
+                        fi
+
+                        echo "}" >> "$CADDYFILE_PATH"
+                        echo "" >> "$CADDYFILE_PATH"
+                    fi
+                fi
             fi
         done
     fi
@@ -803,6 +840,7 @@ show_general_help() {
     echo "  push             Pushes a local Cove site to a remote WordPress site via SSH."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  db               Manage databases (e.g., 'cove db backup')."
+    echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
     echo "  url              Prints the HTTPS URL for a given site."
     echo "  upgrade          Upgrades Cove to the latest available version."
@@ -910,6 +948,18 @@ display_command_help() {
             echo ""
             echo "Manage additional domain mappings for a site."
             echo "Mappings allow a single site to be served from multiple domains."
+            ;;
+        lan)
+            echo "Usage: cove lan <subcommand>"
+            echo ""
+            echo "Enable LAN access to Cove sites for mobile app sync."
+            echo "This allows devices on your local network to connect to your sites."
+            echo ""
+            echo "Subcommands:"
+            echo "  enable <site>    Enable LAN access for a site (assigns a port, starts Bonjour)"
+            echo "  disable <site>   Disable LAN access for a site"
+            echo "  status           Show which sites have LAN access enabled"
+            echo "  trust            Instructions for trusting Caddy's CA on mobile devices"
             ;;
         path)
             echo "Usage: cove path <name>"
@@ -1097,6 +1147,10 @@ main() {
         mappings)
             check_dependencies
             cove_mappings "$@"
+            ;;
+        lan)
+            check_dependencies
+            cove_lan "$@"
             ;;
         url)
             cove_url "$@"
