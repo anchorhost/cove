@@ -67,11 +67,20 @@ cove_share() {
     public_url_file=$(mktemp)
     
     # --- 5. Cleanup function ---
+    local cleanup_triggered=""
     cleanup() {
+        cleanup_triggered=1
         echo ""
         echo "Stopping tunnel..."
-        [ -n "$proxy_pid" ] && kill $proxy_pid 2>/dev/null
-        [ -n "$ssh_pid" ] && kill $ssh_pid 2>/dev/null
+        # Kill processes and suppress job termination messages
+        if [ -n "$proxy_pid" ]; then
+            kill $proxy_pid 2>/dev/null
+            wait $proxy_pid 2>/dev/null
+        fi
+        if [ -n "$ssh_pid" ]; then
+            kill $ssh_pid 2>/dev/null
+            wait $ssh_pid 2>/dev/null
+        fi
         rm -f "$ssh_output" "$public_url_file"
         echo "Done."
     }
@@ -154,7 +163,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     
     def log_message(self, format, *args):
-        pass  # Suppress logging
+        # Log requests in a nice format
+        import datetime
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S')
+        # Get client IP from X-Forwarded-For header (set by localhost.run)
+        client_ip = self.headers.get('X-Forwarded-For', self.client_address[0])
+        # If multiple IPs in X-Forwarded-For, take the first (original client)
+        if ',' in client_ip:
+            client_ip = client_ip.split(',')[0].strip()
+        # args[0] is typically "METHOD /path HTTP/1.1", args[1] is status code
+        if len(args) >= 2:
+            request_line = args[0]
+            status_code = args[1]
+            # Parse method and path from request line
+            parts = request_line.split(' ')
+            if len(parts) >= 2:
+                method = parts[0]
+                path = parts[1]
+                # Color code status
+                if str(status_code).startswith('2'):
+                    status_color = '\033[32m'  # Green
+                elif str(status_code).startswith('3'):
+                    status_color = '\033[33m'  # Yellow
+                elif str(status_code).startswith('4'):
+                    status_color = '\033[31m'  # Red
+                elif str(status_code).startswith('5'):
+                    status_color = '\033[35m'  # Magenta
+                else:
+                    status_color = '\033[0m'
+                reset = '\033[0m'
+                dim = '\033[2m'
+                print(f"{dim}{timestamp}{reset} {status_color}{status_code}{reset} {client_ip} {method} {path}", flush=True)
+                return
+        # Fallback for other log messages
+        print(format % args, flush=True)
     
     def do_request(self):
         target_url = f"https://{TARGET_HOST}{self.path}"
@@ -226,6 +268,15 @@ PYTHON_PROXY
     echo "Tunnel is active. Press Ctrl+C to stop."
     echo ""
     
-    # Keep running until user presses Ctrl+C
-    wait $ssh_pid
+    # Monitor SSH connection - check every 5 seconds
+    while kill -0 $ssh_pid 2>/dev/null; do
+        sleep 5
+    done
+    
+    # SSH process ended - check if it was unexpected
+    if [ -z "$cleanup_triggered" ]; then
+        echo ""
+        gum style --foreground yellow "Connection to localhost.run lost. Reconnecting..."
+        # Could add reconnection logic here in the future
+    fi
 }
