@@ -8,7 +8,8 @@ cove_tailscale_enable() {
     if [ -z "$hostname" ]; then
         if command -v tailscale &> /dev/null; then
             echo "🔎 Detecting Tailscale hostname..."
-            hostname=$(tailscale status --json 2>/dev/null | grep -o '"DNSName":"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\.$//')
+            # Extract DNSName from Self section (handles both "key": "value" and "key":"value" formats)
+            hostname=$(tailscale status --json 2>/dev/null | grep -m1 '"DNSName"' | sed 's/.*"DNSName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | sed 's/\.$//')
         fi
     fi
 
@@ -129,17 +130,17 @@ cove_tailscale() {
             echo "This allows devices on your Tailnet (like your iPhone) to access"
             echo "your local development sites."
             echo ""
+            echo "Your Tailscale hostname is automatically detected when you run 'enable'."
             echo "Each site gets a unique port (starting at 9001), so you can access them at:"
             echo "  https://<your-tailscale-hostname>:<port>"
             echo ""
             echo "Subcommands:"
-            echo "  enable [hostname]    Enable Tailscale access (auto-detects hostname if omitted)"
-            echo "  disable              Disable Tailscale access"
-            echo "  status               Show current Tailscale configuration and URLs"
+            echo "  enable     Enable Tailscale access (auto-detects hostname)"
+            echo "  disable    Disable Tailscale access"
+            echo "  status     Show current Tailscale configuration and URLs"
             echo ""
             echo "Examples:"
             echo "  cove tailscale enable"
-            echo "  cove tailscale enable mycomputer.tail1234.ts.net"
             echo "  cove tailscale status"
             echo "  cove tailscale disable"
             exit 0
