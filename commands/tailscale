@@ -1,0 +1,148 @@
+# --- Tailscale Configuration ---
+TAILSCALE_CONFIG="$APP_DIR/tailscale"
+
+cove_tailscale_enable() {
+    local hostname="$1"
+
+    # Try to auto-detect hostname if not provided
+    if [ -z "$hostname" ]; then
+        if command -v tailscale &> /dev/null; then
+            echo "🔎 Detecting Tailscale hostname..."
+            hostname=$(tailscale status --json 2>/dev/null | grep -o '"DNSName":"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\.$//')
+        fi
+    fi
+
+    # Interactive mode if still no hostname
+    if [ -z "$hostname" ]; then
+        echo "📝 Enter your Tailscale machine hostname"
+        echo "   (e.g., mycomputer.tail1234.ts.net)"
+        hostname=$(gum input --placeholder "your-machine.tailnet.ts.net")
+    fi
+
+    if [ -z "$hostname" ]; then
+        gum style --foreground red "❌ Error: Tailscale hostname is required."
+        exit 1
+    fi
+
+    # Remove any trailing dot
+    hostname="${hostname%.}"
+
+    # Validate it looks like a hostname
+    if [[ ! "$hostname" =~ \. ]]; then
+        gum style --foreground red "❌ Error: Invalid hostname. Expected format: machine.tailnet.ts.net"
+        exit 1
+    fi
+
+    # Save the configuration
+    mkdir -p "$APP_DIR"
+    echo "$hostname" > "$TAILSCALE_CONFIG"
+
+    echo "✅ Tailscale access enabled!"
+    echo "   Hostname: $hostname"
+    echo ""
+    echo "   Regenerating Caddyfile with port-based routing..."
+    echo ""
+    regenerate_caddyfile
+    
+    echo ""
+    echo "   Run 'cove tailscale status' to see all URLs."
+}
+
+cove_tailscale_disable() {
+    if [ -f "$TAILSCALE_CONFIG" ]; then
+        rm "$TAILSCALE_CONFIG"
+        
+        # Clean up port files
+        if [ -d "$SITES_DIR" ]; then
+            for site_path in "$SITES_DIR"/*; do
+                if [ -f "$site_path/tailscale_port" ]; then
+                    rm "$site_path/tailscale_port"
+                fi
+            done
+        fi
+        
+        echo "✅ Tailscale access disabled."
+        regenerate_caddyfile
+    else
+        echo "ℹ️ Tailscale access is not currently enabled."
+    fi
+}
+
+cove_tailscale_status() {
+    echo "🔎 Tailscale Access Status"
+    echo ""
+    
+    if [ -f "$TAILSCALE_CONFIG" ]; then
+        local hostname
+        hostname=$(cat "$TAILSCALE_CONFIG")
+        gum style --foreground green "✅ Enabled"
+        echo "   Hostname: $hostname"
+        echo ""
+        echo "   Your sites are accessible at:"
+        
+        if [ -d "$SITES_DIR" ]; then
+            for site_path in "$SITES_DIR"/*; do
+                if [ -d "$site_path" ]; then
+                    local site_name
+                    site_name=$(basename "$site_path" | sed 's/\.localhost$//')
+                    local port=""
+                    if [ -f "$site_path/tailscale_port" ]; then
+                        port=$(cat "$site_path/tailscale_port")
+                    fi
+                    if [ -n "$port" ]; then
+                        echo "   - https://${hostname}:${port}  (${site_name})"
+                    fi
+                fi
+            done
+        fi
+        
+        echo ""
+        echo "   Global services:"
+        echo "   - https://${hostname}:9900  (Dashboard)"
+        echo "   - https://${hostname}:9901  (Mailpit)"
+        echo "   - https://${hostname}:9902  (Adminer)"
+    else
+        gum style --foreground yellow "❌ Disabled"
+        echo ""
+        echo "   Enable with: cove tailscale enable [hostname]"
+    fi
+}
+
+cove_tailscale() {
+    local action="$1"
+    shift 2>/dev/null || true
+
+    case "$action" in
+        enable)
+            cove_tailscale_enable "$@"
+            ;;
+        disable)
+            cove_tailscale_disable
+            ;;
+        status)
+            cove_tailscale_status
+            ;;
+        *)
+            echo "Usage: cove tailscale <subcommand>"
+            echo ""
+            echo "Expose all Cove sites to your Tailscale network via port-based routing."
+            echo "This allows devices on your Tailnet (like your iPhone) to access"
+            echo "your local development sites."
+            echo ""
+            echo "Each site gets a unique port (starting at 9001), so you can access them at:"
+            echo "  https://<your-tailscale-hostname>:<port>"
+            echo ""
+            echo "Subcommands:"
+            echo "  enable [hostname]    Enable Tailscale access (auto-detects hostname if omitted)"
+            echo "  disable              Disable Tailscale access"
+            echo "  status               Show current Tailscale configuration and URLs"
+            echo ""
+            echo "Examples:"
+            echo "  cove tailscale enable"
+            echo "  cove tailscale enable mycomputer.tail1234.ts.net"
+            echo "  cove tailscale status"
+            echo "  cove tailscale disable"
+            exit 0
+            ;;
+    esac
+}

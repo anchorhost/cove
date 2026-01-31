@@ -364,6 +364,13 @@ cove.localhost {
 # --- Cove Managed Sites ---
 EOM
 
+    # Check if Tailscale is enabled
+    local tailscale_hostname=""
+    local tailscale_config="$APP_DIR/tailscale"
+    if [ -f "$tailscale_config" ]; then
+        tailscale_hostname=$(cat "$tailscale_config")
+    fi
+
     # Append blocks for each site dynamically
     if [ -d "$SITES_DIR" ]; then
         for site_path in "$SITES_DIR"/*; do
@@ -446,6 +453,91 @@ EOM
                 fi
             fi
         done
+    fi
+    # Add Tailscale port-based routing if enabled
+    if [ -n "$tailscale_hostname" ]; then
+        echo "# --- Tailscale Port-Based Access ---" >> "$CADDYFILE_PATH"
+        echo "" >> "$CADDYFILE_PATH"
+        
+        local ts_port=9001
+        
+        # Add a server block for each site on a unique port
+        if [ -d "$SITES_DIR" ]; then
+            for site_path in "$SITES_DIR"/*; do
+                if [ -d "$site_path" ]; then
+                    local site_name
+                    site_name=$(basename "$site_path")
+                    local site_base_name
+                    site_base_name=$(echo "$site_name" | sed 's/\.localhost$//')
+                    
+                    # Check if this site has a simple reverse_proxy directive
+                    local directive_file="$CUSTOM_CADDY_DIR/$site_name"
+                    local direct_proxy_target=""
+                    if [ -f "$directive_file" ]; then
+                        # Extract target if directive is just "reverse_proxy <target>"
+                        direct_proxy_target=$(grep -E '^reverse_proxy [0-9a-zA-Z.:]+$' "$directive_file" 2>/dev/null | awk '{print $2}')
+                    fi
+                    
+                    echo "# Tailscale: ${site_base_name} -> port ${ts_port}" >> "$CADDYFILE_PATH"
+                    echo "https://${tailscale_hostname}:${ts_port} {" >> "$CADDYFILE_PATH"
+                    echo "    tls internal" >> "$CADDYFILE_PATH"
+                    if [ -n "$direct_proxy_target" ]; then
+                        # Proxy directly to the backend target
+                        echo "    reverse_proxy ${direct_proxy_target}" >> "$CADDYFILE_PATH"
+                    else
+                        # Proxy through the local site
+                        echo "    reverse_proxy https://${site_name} {" >> "$CADDYFILE_PATH"
+                        echo "        header_up Host ${site_name}" >> "$CADDYFILE_PATH"
+                        echo "        transport http {" >> "$CADDYFILE_PATH"
+                        echo "            tls_insecure_skip_verify" >> "$CADDYFILE_PATH"
+                        echo "        }" >> "$CADDYFILE_PATH"
+                        echo "    }" >> "$CADDYFILE_PATH"
+                    fi
+                    echo "}" >> "$CADDYFILE_PATH"
+                    echo "" >> "$CADDYFILE_PATH"
+                    
+                    # Store port mapping for this site
+                    echo "${ts_port}" > "$site_path/tailscale_port"
+                    
+                    ((ts_port++))
+                fi
+            done
+        fi
+        
+        # Global services on fixed ports
+        # Mail on port 9901
+        echo "# Tailscale: mail -> port 9901" >> "$CADDYFILE_PATH"
+        echo "https://${tailscale_hostname}:9901 {" >> "$CADDYFILE_PATH"
+        echo "    tls internal" >> "$CADDYFILE_PATH"
+        echo "    reverse_proxy 127.0.0.1:8025" >> "$CADDYFILE_PATH"
+        echo "}" >> "$CADDYFILE_PATH"
+        echo "" >> "$CADDYFILE_PATH"
+        
+        # DB on port 9902
+        echo "# Tailscale: db -> port 9902" >> "$CADDYFILE_PATH"
+        echo "https://${tailscale_hostname}:9902 {" >> "$CADDYFILE_PATH"
+        echo "    tls internal" >> "$CADDYFILE_PATH"
+        echo "    reverse_proxy https://db.cove.localhost {" >> "$CADDYFILE_PATH"
+        echo "        header_up Host db.cove.localhost" >> "$CADDYFILE_PATH"
+        echo "        transport http {" >> "$CADDYFILE_PATH"
+        echo "            tls_insecure_skip_verify" >> "$CADDYFILE_PATH"
+        echo "        }" >> "$CADDYFILE_PATH"
+        echo "    }" >> "$CADDYFILE_PATH"
+        echo "}" >> "$CADDYFILE_PATH"
+        echo "" >> "$CADDYFILE_PATH"
+        
+        # Dashboard on port 9900
+        echo "# Tailscale: cove dashboard -> port 9900" >> "$CADDYFILE_PATH"
+        echo "https://${tailscale_hostname}:9900 {" >> "$CADDYFILE_PATH"
+        echo "    tls internal" >> "$CADDYFILE_PATH"
+        echo "    reverse_proxy https://cove.localhost {" >> "$CADDYFILE_PATH"
+        echo "        header_up Host cove.localhost" >> "$CADDYFILE_PATH"
+        echo "        transport http {" >> "$CADDYFILE_PATH"
+        echo "            tls_insecure_skip_verify" >> "$CADDYFILE_PATH"
+        echo "        }" >> "$CADDYFILE_PATH"
+        echo "    }" >> "$CADDYFILE_PATH"
+        echo "}" >> "$CADDYFILE_PATH"
+        echo "" >> "$CADDYFILE_PATH"
     fi
 
     # Reload Caddy with the new configuration.
@@ -839,6 +931,7 @@ show_general_help() {
     echo "  pull             Pulls a remote WordPress site into Cove via SSH."
     echo "  push             Pushes a local Cove site to a remote WordPress site via SSH."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
+    echo "  tailscale        Expose all sites to your Tailscale network."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  log              View logs for a site or the global error log."
@@ -924,6 +1017,26 @@ display_command_help() {
             echo "  update      Updates a rule in the Caddyfile for the specified site."
             echo "  delete      Deletes custom rules from the Caddyfile for the specified site."
             echo "  list        Lists all custom directives for all managed sites."
+            ;;
+        tailscale)
+            echo "Usage: cove tailscale <subcommand>"
+            echo ""
+            echo "Expose all Cove sites to your Tailscale network."
+            echo "This allows devices on your Tailnet (like your iPhone) to access"
+            echo "your local development sites via their Tailscale hostname."
+            echo ""
+            echo "Subcommands:"
+            echo "  enable [hostname]    Enable Tailscale access (auto-detects if omitted)"
+            echo "  disable              Disable Tailscale access"
+            echo "  status               Show current Tailscale configuration"
+            echo ""
+            echo "After enabling, your sites will be accessible at:"
+            echo "  https://<site>.<your-tailscale-hostname>"
+            echo ""
+            echo "Examples:"
+            echo "  cove tailscale enable"
+            echo "  cove tailscale enable mycomputer.tail1234.ts.net"
+            echo "  cove tailscale status"
             ;;
         db)
             echo "Usage: cove db <subcommand>"
@@ -1160,6 +1273,10 @@ main() {
                     exit 0
                     ;;
             esac
+            ;;
+        tailscale)
+            check_dependencies
+            cove_tailscale "$@"
             ;;
         mappings)
             check_dependencies
