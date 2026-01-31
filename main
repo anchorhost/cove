@@ -454,6 +454,45 @@ EOM
             fi
         done
     fi
+
+    # Append custom proxy entries
+    local proxy_dir="$APP_DIR/proxies"
+    if [ -d "$proxy_dir" ] && [ -n "$(ls -A "$proxy_dir" 2>/dev/null)" ]; then
+        echo "# --- Custom Reverse Proxies ---" >> "$CADDYFILE_PATH"
+        echo "" >> "$CADDYFILE_PATH"
+        
+        for proxy_file in "$proxy_dir"/*; do
+            if [ -f "$proxy_file" ]; then
+                local proxy_name
+                proxy_name=$(basename "$proxy_file")
+                
+                local proxy_domain=""
+                local proxy_target=""
+                local proxy_tls="internal"
+
+                # Read the config file
+                while IFS='=' read -r key value; do
+                    case "$key" in
+                        domain) proxy_domain="$value" ;;
+                        target) proxy_target="$value" ;;
+                        tls) proxy_tls="$value" ;;
+                    esac
+                done < "$proxy_file"
+
+                if [ -n "$proxy_domain" ] && [ -n "$proxy_target" ]; then
+                    echo "# Proxy: $proxy_name" >> "$CADDYFILE_PATH"
+                    echo "$proxy_domain {" >> "$CADDYFILE_PATH"
+                    echo "    reverse_proxy $proxy_target" >> "$CADDYFILE_PATH"
+                    if [ "$proxy_tls" = "internal" ]; then
+                        echo "    tls internal" >> "$CADDYFILE_PATH"
+                    fi
+                    echo "}" >> "$CADDYFILE_PATH"
+                    echo "" >> "$CADDYFILE_PATH"
+                fi
+            fi
+        done
+    fi
+
     # Add Tailscale port-based routing if enabled
     if [ -n "$tailscale_hostname" ]; then
         echo "# --- Tailscale Port-Based Access ---" >> "$CADDYFILE_PATH"
@@ -931,6 +970,7 @@ show_general_help() {
     echo "  pull             Pulls a remote WordPress site into Cove via SSH."
     echo "  push             Pushes a local Cove site to a remote WordPress site via SSH."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
+    echo "  proxy            Manage standalone reverse proxy entries."
     echo "  tailscale        Expose all sites to your Tailscale network."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  lan              Enable LAN access to sites for mobile app sync."
@@ -1017,6 +1057,26 @@ display_command_help() {
             echo "  update      Updates a rule in the Caddyfile for the specified site."
             echo "  delete      Deletes custom rules from the Caddyfile for the specified site."
             echo "  list        Lists all custom directives for all managed sites."
+            ;;
+        proxy)
+            echo "Usage: cove proxy <subcommand>"
+            echo ""
+            echo "Manage standalone reverse proxy entries in the Caddyfile."
+            echo "These are top-level server blocks, useful for exposing local services"
+            echo "via Tailscale or other external domains."
+            echo ""
+            echo "Subcommands:"
+            echo "  add <name> <domain> <target>   Add a new reverse proxy entry"
+            echo "  list                           List all proxy entries"
+            echo "  delete <name>                  Delete a proxy entry"
+            echo ""
+            echo "Options:"
+            echo "  --no-tls     Disable TLS for this proxy (default uses internal TLS)"
+            echo ""
+            echo "Examples:"
+            echo "  cove proxy add opencode myhost.tailnet.ts.net 127.0.0.1:4096"
+            echo "  cove proxy list"
+            echo "  cove proxy delete opencode"
             ;;
         tailscale)
             echo "Usage: cove tailscale <subcommand>"
@@ -1273,6 +1333,10 @@ main() {
                     exit 0
                     ;;
             esac
+            ;;
+        proxy)
+            check_dependencies
+            cove_proxy "$@"
             ;;
         tailscale)
             check_dependencies

@@ -1,0 +1,214 @@
+# --- Proxy Storage Directory ---
+PROXY_DIR="$APP_DIR/proxies"
+
+# --- Helper to get LAN IP (may already exist in main, but define here for safety) ---
+get_lan_ip() {
+    if [ "$OS" == "macos" ]; then
+        ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "127.0.0.1"
+    else
+        hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1"
+    fi
+}
+
+cove_proxy_add() {
+    local name=""
+    local domain=""
+    local target=""
+    local tls_mode="internal"
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-tls)
+                tls_mode="none"
+                shift
+                ;;
+            *)
+                if [ -z "$name" ]; then
+                    name="$1"
+                elif [ -z "$domain" ]; then
+                    domain="$1"
+                elif [ -z "$target" ]; then
+                    target="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Interactive mode if arguments not provided
+    if [ -z "$name" ]; then
+        echo "📝 Adding a new reverse proxy entry..."
+        name=$(gum input --placeholder "Proxy name (e.g., opencode)")
+    fi
+
+    if [ -z "$name" ]; then
+        gum style --foreground red "❌ Error: Proxy name is required."
+        exit 1
+    fi
+
+    # Validate name (alphanumeric and hyphens only)
+    if ! [[ "$name" =~ ^[a-zA-Z0-9-]+$ ]]; then
+        gum style --foreground red "❌ Error: Proxy name must contain only letters, numbers, and hyphens."
+        exit 1
+    fi
+
+    local proxy_file="$PROXY_DIR/$name"
+
+    # Check if proxy already exists
+    if [ -f "$proxy_file" ]; then
+        if ! gum confirm "⚠️ Proxy '$name' already exists. Overwrite?"; then
+            echo "🚫 Cancelled."
+            exit 0
+        fi
+    fi
+
+    if [ -z "$domain" ]; then
+        domain=$(gum input --placeholder "Domain to listen on (e.g., myhost.tailnet.ts.net)")
+    fi
+
+    if [ -z "$domain" ]; then
+        gum style --foreground red "❌ Error: Domain is required."
+        exit 1
+    fi
+
+    if [ -z "$target" ]; then
+        target=$(gum input --placeholder "Target to proxy to (e.g., 127.0.0.1:4096)")
+    fi
+
+    if [ -z "$target" ]; then
+        gum style --foreground red "❌ Error: Target is required."
+        exit 1
+    fi
+
+    # Create proxy directory if it doesn't exist
+    mkdir -p "$PROXY_DIR"
+
+    # Save the proxy configuration
+    cat > "$proxy_file" << EOF
+domain=$domain
+target=$target
+tls=$tls_mode
+EOF
+
+    echo "✅ Proxy '$name' created:"
+    echo "   Domain: $domain"
+    echo "   Target: $target"
+    echo "   TLS: $tls_mode"
+
+    regenerate_caddyfile
+}
+
+cove_proxy_list() {
+    echo "🔎 Listing all reverse proxy entries..."
+    echo ""
+
+    if [ ! -d "$PROXY_DIR" ] || [ -z "$(ls -A "$PROXY_DIR" 2>/dev/null)" ]; then
+        gum style --foreground "yellow" "ℹ️ No proxy entries found."
+        echo ""
+        echo "Add one with: cove proxy add <name> <domain> <target>"
+        exit 0
+    fi
+
+    # Print header
+    printf "%-15s %-40s %-25s %-10s\n" "NAME" "DOMAIN" "TARGET" "TLS"
+    printf "%-15s %-40s %-25s %-10s\n" "----" "------" "------" "---"
+
+    for proxy_file in "$PROXY_DIR"/*; do
+        if [ -f "$proxy_file" ]; then
+            local name
+            name=$(basename "$proxy_file")
+            
+            local domain=""
+            local target=""
+            local tls="internal"
+
+            # Read the config file
+            while IFS='=' read -r key value; do
+                case "$key" in
+                    domain) domain="$value" ;;
+                    target) target="$value" ;;
+                    tls) tls="$value" ;;
+                esac
+            done < "$proxy_file"
+
+            printf "%-15s %-40s %-25s %-10s\n" "$name" "$domain" "$target" "$tls"
+        fi
+    done
+}
+
+cove_proxy_delete() {
+    local name="$1"
+
+    if [ -z "$name" ]; then
+        # Interactive mode - let user select from existing proxies
+        if [ ! -d "$PROXY_DIR" ] || [ -z "$(ls -A "$PROXY_DIR" 2>/dev/null)" ]; then
+            gum style --foreground "yellow" "ℹ️ No proxy entries to delete."
+            exit 0
+        fi
+
+        echo "🗑️ Select a proxy to delete:"
+        name=$(ls "$PROXY_DIR" | gum choose)
+        
+        if [ -z "$name" ]; then
+            echo "🚫 Cancelled."
+            exit 0
+        fi
+    fi
+
+    local proxy_file="$PROXY_DIR/$name"
+
+    if [ ! -f "$proxy_file" ]; then
+        gum style --foreground red "❌ Error: Proxy '$name' not found."
+        exit 1
+    fi
+
+    # Show what will be deleted
+    echo "Proxy '$name' configuration:"
+    cat "$proxy_file"
+    echo ""
+
+    if gum confirm "🚨 Are you sure you want to delete proxy '$name'?"; then
+        rm "$proxy_file"
+        echo "✅ Proxy '$name' deleted."
+        regenerate_caddyfile
+    else
+        echo "🚫 Deletion cancelled."
+    fi
+}
+
+cove_proxy() {
+    local action="$1"
+    shift 2>/dev/null || true
+
+    case "$action" in
+        add)
+            cove_proxy_add "$@"
+            ;;
+        list|ls)
+            cove_proxy_list
+            ;;
+        delete|rm)
+            cove_proxy_delete "$@"
+            ;;
+        *)
+            echo "Usage: cove proxy <subcommand>"
+            echo ""
+            echo "Manage standalone reverse proxy entries in the Caddyfile."
+            echo "These are top-level server blocks, useful for exposing local services"
+            echo "via Tailscale or other external domains."
+            echo ""
+            echo "Subcommands:"
+            echo "  add <name> <domain> <target>   Add a new reverse proxy entry"
+            echo "  list                           List all proxy entries"
+            echo "  delete <name>                  Delete a proxy entry"
+            echo ""
+            echo "Examples:"
+            echo "  cove proxy add opencode myhost.tailnet.ts.net 127.0.0.1:4096"
+            echo "  cove proxy add api api.example.com localhost:3000 --no-tls"
+            echo "  cove proxy list"
+            echo "  cove proxy delete opencode"
+            exit 0
+            ;;
+    esac
+}
