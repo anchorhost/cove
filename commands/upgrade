@@ -152,4 +152,72 @@ cove_upgrade() {
     else
         echo "✅ FrankenPHP is already up to date."
     fi
+    
+    # --- Adminer Upgrade Check ---
+    echo ""
+    echo "🔎 Checking for Adminer updates..."
+    
+    local adminer_file="$ADMINER_DIR/adminer-core.php"
+    if [ ! -f "$adminer_file" ]; then
+        echo "   - ⚠️ Adminer not found. Skipping update check."
+        return 0
+    fi
+    
+    # Get current Adminer version from the file
+    local current_adminer_version
+    current_adminer_version=$(grep -oP "version\s*=\s*['\"]?\K[0-9]+\.[0-9]+\.[0-9]+" "$adminer_file" 2>/dev/null | head -1)
+    if [ -z "$current_adminer_version" ]; then
+        # Try alternative pattern
+        current_adminer_version=$(grep -oP "Adminer\s+\K[0-9]+\.[0-9]+\.[0-9]+" "$adminer_file" 2>/dev/null | head -1)
+    fi
+    
+    if [ -z "$current_adminer_version" ]; then
+        echo "   - ⚠️ Could not determine current Adminer version."
+        current_adminer_version="unknown"
+    fi
+    
+    # Get latest version from GitHub
+    local latest_adminer_version
+    latest_adminer_version=$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/vrana/adminer/releases/latest | sed 's/.*\/v//')
+    
+    if [ -z "$latest_adminer_version" ]; then
+        echo "   - ❌ Could not determine the latest Adminer version from GitHub."
+        return 0
+    fi
+    
+    echo "   - Current Adminer version:  $current_adminer_version"
+    echo "   - Latest available version: $latest_adminer_version"
+    
+    # Compare versions (skip if current is unknown)
+    if [ "$current_adminer_version" != "unknown" ]; then
+        local adminer_needs_upgrade
+        adminer_needs_upgrade=$(LOCAL_V="$current_adminer_version" REMOTE_V="$latest_adminer_version" php -r '
+            if (version_compare(getenv("LOCAL_V"), getenv("REMOTE_V"), "<")) {
+                echo "true";
+            } else {
+                echo "false";
+            }
+        ')
+        
+        if [ "$adminer_needs_upgrade" == "true" ]; then
+            echo "🚀 Upgrading Adminer to version $latest_adminer_version..."
+            if curl -sL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file"; then
+                echo "✅ Adminer upgraded successfully."
+            else
+                echo "❌ Failed to download Adminer $latest_adminer_version."
+            fi
+        else
+            echo "✅ Adminer is already up to date."
+        fi
+    else
+        # If version unknown, offer to upgrade anyway
+        if gum confirm "Current version unknown. Would you like to download the latest Adminer ($latest_adminer_version)?"; then
+            echo "🚀 Downloading Adminer $latest_adminer_version..."
+            if curl -sL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file"; then
+                echo "✅ Adminer downloaded successfully."
+            else
+                echo "❌ Failed to download Adminer $latest_adminer_version."
+            fi
+        fi
+    fi
 }
