@@ -1,0 +1,231 @@
+# --- Share Command ---
+# Creates a temporary public tunnel to share a local site via localhost.run
+# No downloads, no signups - just SSH
+
+SHARE_PROXY_PORT=19876
+
+cove_share() {
+    local site_name="$1"
+    
+    # --- 1. Validate Site ---
+    if [ -z "$site_name" ]; then
+        # Interactive mode: let user select a site
+        local all_sites=()
+        for site_dir in "$SITES_DIR"/*.localhost; do
+            if [ -d "$site_dir" ]; then
+                all_sites+=("$(basename "$site_dir" .localhost)")
+            fi
+        done
+        
+        if [ ${#all_sites[@]} -eq 0 ]; then
+            gum style --foreground red "Error: No sites found. Create one with 'cove add <name>'."
+            exit 1
+        fi
+        
+        echo "Select a site to share:"
+        site_name=$(gum choose "${all_sites[@]}")
+        
+        if [ -z "$site_name" ]; then
+            echo "Cancelled."
+            exit 0
+        fi
+    fi
+    
+    # Normalize site name (remove .localhost suffix if present)
+    site_name="${site_name%.localhost}"
+    
+    local site_dir="$SITES_DIR/${site_name}.localhost"
+    
+    if [ ! -d "$site_dir" ]; then
+        gum style --foreground red "Error: Site '${site_name}.localhost' not found."
+        exit 1
+    fi
+    
+    local local_hostname="${site_name}.localhost"
+    
+    # --- 2. Check for SSH ---
+    if ! command -v ssh &> /dev/null; then
+        gum style --foreground red "Error: SSH client not found. Please install OpenSSH."
+        exit 1
+    fi
+    
+    # --- 3. Check for Python (needed for the HTTP proxy) ---
+    local python_cmd=""
+    if command -v python3 &> /dev/null; then
+        python_cmd="python3"
+    elif command -v python &> /dev/null; then
+        python_cmd="python"
+    else
+        gum style --foreground red "Error: Python is required for cove share."
+        exit 1
+    fi
+    
+    # --- 4. Create temp files ---
+    local ssh_output
+    ssh_output=$(mktemp)
+    local public_url_file
+    public_url_file=$(mktemp)
+    
+    # --- 5. Cleanup function ---
+    cleanup() {
+        echo ""
+        echo "Stopping tunnel..."
+        [ -n "$proxy_pid" ] && kill $proxy_pid 2>/dev/null
+        [ -n "$ssh_pid" ] && kill $ssh_pid 2>/dev/null
+        rm -f "$ssh_output" "$public_url_file"
+        echo "Done."
+    }
+    trap cleanup EXIT
+    
+    # --- 6. Display initial message ---
+    echo ""
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "Starting public tunnel for ${site_name}" \
+        "" \
+        "Local: https://${local_hostname}" \
+        "" \
+        "Press Ctrl+C to stop sharing."
+    echo ""
+    
+    echo "Connecting to localhost.run..."
+    
+    # --- 7. Start SSH to get the public URL first ---
+    ssh -o StrictHostKeyChecking=accept-new \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=3 \
+        -R 80:localhost:${SHARE_PROXY_PORT} \
+        nokey@localhost.run > "$ssh_output" 2>&1 &
+    ssh_pid=$!
+    
+    # Wait for the URL to appear in the output
+    local public_url=""
+    local attempts=0
+    local max_attempts=30
+    
+    while [ -z "$public_url" ] && [ $attempts -lt $max_attempts ]; do
+        sleep 1
+        ((attempts++))
+        
+        if ! kill -0 $ssh_pid 2>/dev/null; then
+            gum style --foreground red "Error: SSH connection failed."
+            cat "$ssh_output"
+            exit 1
+        fi
+        
+        public_url=$(grep -oE 'https://[a-z0-9]+\.lhr\.life' "$ssh_output" 2>/dev/null | head -1)
+    done
+    
+    if [ -z "$public_url" ]; then
+        gum style --foreground red "Error: Could not get public URL from localhost.run"
+        exit 1
+    fi
+    
+    # Extract just the hostname from the URL
+    local public_host="${public_url#https://}"
+    
+    gum style --foreground 212 --bold "Public URL: $public_url"
+    echo ""
+    echo "Share this URL with anyone to give them access to your site."
+    echo ""
+    
+    # --- 8. Start Python HTTP proxy that rewrites URLs ---
+    echo "Starting local proxy with URL rewriting..."
+    
+    $python_cmd - "$local_hostname" "$SHARE_PROXY_PORT" "$public_host" << 'PYTHON_PROXY' &
+import sys
+import ssl
+import re
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.request import Request, urlopen
+
+TARGET_HOST = sys.argv[1]  # e.g., anchordev.localhost
+LISTEN_PORT = int(sys.argv[2])
+PUBLIC_HOST = sys.argv[3]  # e.g., abc123.lhr.life
+
+# Create SSL context that doesn't verify certificates (for self-signed)
+ssl_ctx = ssl.create_default_context()
+ssl_ctx.check_hostname = False
+ssl_ctx.verify_mode = ssl.CERT_NONE
+
+# Content types that should have URL rewriting
+REWRITABLE_TYPES = ('text/html', 'text/css', 'application/javascript', 'application/json', 'text/javascript')
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    
+    def log_message(self, format, *args):
+        pass  # Suppress logging
+    
+    def do_request(self):
+        target_url = f"https://{TARGET_HOST}{self.path}"
+        
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length) if content_length > 0 else None
+        
+        req = Request(target_url, data=body, method=self.command)
+        
+        for key, value in self.headers.items():
+            if key.lower() not in ('host', 'connection', 'accept-encoding'):
+                req.add_header(key, value)
+        req.add_header('Host', TARGET_HOST)
+        
+        try:
+            with urlopen(req, context=ssl_ctx, timeout=60) as response:
+                response_body = response.read()
+                content_type = response.headers.get('Content-Type', '')
+                
+                # Rewrite URLs in text responses
+                if any(ct in content_type for ct in REWRITABLE_TYPES):
+                    try:
+                        text = response_body.decode('utf-8')
+                        # Replace https://site.localhost with https://public-url
+                        text = text.replace(f'https://{TARGET_HOST}', f'https://{PUBLIC_HOST}')
+                        # Also replace http:// version just in case
+                        text = text.replace(f'http://{TARGET_HOST}', f'https://{PUBLIC_HOST}')
+                        # Replace escaped versions (for JSON)
+                        text = text.replace(f'https:\\/\\/{TARGET_HOST}', f'https:\\/\\/{PUBLIC_HOST}')
+                        response_body = text.encode('utf-8')
+                    except:
+                        pass  # If decode fails, send original
+                
+                self.send_response(response.status)
+                for key, value in response.headers.items():
+                    if key.lower() not in ('transfer-encoding', 'connection', 'content-length', 'content-encoding'):
+                        self.send_header(key, value)
+                self.send_header('Content-Length', len(response_body))
+                self.end_headers()
+                self.wfile.write(response_body)
+        except Exception as e:
+            error_msg = f"Proxy Error: {e}".encode()
+            self.send_response(502)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', len(error_msg))
+            self.end_headers()
+            self.wfile.write(error_msg)
+    
+    def do_GET(self): self.do_request()
+    def do_POST(self): self.do_request()
+    def do_PUT(self): self.do_request()
+    def do_DELETE(self): self.do_request()
+    def do_HEAD(self): self.do_request()
+    def do_OPTIONS(self): self.do_request()
+    def do_PATCH(self): self.do_request()
+
+server = HTTPServer(('127.0.0.1', LISTEN_PORT), ProxyHandler)
+server.serve_forever()
+PYTHON_PROXY
+    proxy_pid=$!
+    
+    sleep 1
+    
+    if ! kill -0 $proxy_pid 2>/dev/null; then
+        gum style --foreground red "Error: Failed to start local proxy."
+        exit 1
+    fi
+    
+    echo "Tunnel is active. Press Ctrl+C to stop."
+    echo ""
+    
+    # Keep running until user presses Ctrl+C
+    wait $ssh_pid
+}

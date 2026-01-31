@@ -975,6 +975,7 @@ show_general_help() {
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  log              View logs for a site or the global error log."
+    echo "  share            Create a temporary public tunnel to share a site."
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
     echo "  url              Prints the HTTPS URL for a given site."
     echo "  upgrade          Upgrades Cove to the latest available version."
@@ -1150,6 +1151,22 @@ display_command_help() {
             echo "  cove log              Show last 50 lines of global error log"
             echo "  cove log beckon       Show last 50 lines of beckon site logs"
             echo "  cove log beckon -f    Follow beckon site logs in real-time"
+            ;;
+        share)
+            echo "Usage: cove share [site]"
+            echo ""
+            echo "Creates a temporary public tunnel to share a local site with anyone on the internet."
+            echo "Powered by localhost.run - no downloads or signups required, just SSH."
+            echo ""
+            echo "Arguments:"
+            echo "  [site]    The site name (optional). If omitted, prompts for selection."
+            echo ""
+            echo "Examples:"
+            echo "  cove share           Interactive site selection"
+            echo "  cove share mysite    Share mysite.localhost publicly"
+            echo ""
+            echo "You'll receive a random URL like https://abc123.localhost.run"
+            echo "The URL is temporary and stops working when you press Ctrl+C."
             ;;
         path)
             echo "Usage: cove path <name>"
@@ -1352,6 +1369,10 @@ main() {
             ;;
         log)
             cove_log "$@"
+            ;;
+        share)
+            check_dependencies
+            cove_share "$@"
             ;;
         url)
             cove_url "$@"
