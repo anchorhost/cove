@@ -357,8 +357,8 @@ function adminer_object() {
 include "./adminer-core.php";
 EOM
 
-    echo "🎨 Downloading Adminer Material theme..."
-    curl -sL "https://raw.githubusercontent.com/arcs-/Adminer-Material-Theme/master/adminer.css" -o "$ADMINER_DIR/adminer.css"
+    echo "🎨 Downloading Adminer Catppuccin theme..."
+    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.css" -o "$ADMINER_DIR/adminer.css"
 
     echo "✨ Downloading Whoops error handler..."
     rm -rf "$APP_DIR/whoops" # Remove any old versions first
