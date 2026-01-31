@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.7] - 2026-01-31
+
+### ✨ New Features
+
+* **Linux & WSL Support:** Cove now runs natively on Linux distributions including Ubuntu, Debian, Fedora, CentOS, and RHEL. It also includes full support for Windows Subsystem for Linux (WSL).
+    * Automatic OS and package manager detection (`apt`/`dnf`/`brew`).
+    * Smart MariaDB service name detection across different distros.
+    * WP-CLI `--allow-root` support for Docker and WSL environments where running as root is common.
+* **LAN Access for Mobile Sync:** A new `cove lan` command enables LAN access to your sites for mobile app testing and sync.
+    * Assigns a unique port and broadcasts via Bonjour/mDNS for easy device discovery.
+    * Includes `cove lan trust` instructions for installing Caddy's CA certificate on mobile devices.
+* **Log Viewer:** A new `cove log` command provides quick access to site logs or the global error log.
+    * Supports `--follow` (`-f`) flag for real-time log tailing.
+* **Public Site Sharing:** A new `cove share` command creates temporary public tunnels using localhost.run.
+    * No downloads or signups required—just SSH.
+    * Generates a random public URL that works until you press Ctrl+C.
+* **Tailscale Integration:** A new `cove tailscale` command exposes all Cove sites to your Tailscale network.
+    * Auto-detects your Tailscale hostname or accepts a manual override.
+    * Assigns unique ports to each site, plus fixed ports for Mailpit (9901), Adminer (9902), and the dashboard (9900).
+* **Reverse Proxy Management:** A new `cove proxy` command manages standalone reverse proxy entries.
+    * Useful for exposing local services (like AI coding tools) via Tailscale or custom domains.
+* **Domain Mappings:** A new `cove mappings` command allows a single site to be served from multiple domains.
+    * Mappings are automatically added to `/etc/hosts` and the Caddyfile on reload.
+* **WSL Hosts Helper:** A new `cove wsl-hosts` command (WSL only) displays PowerShell commands for updating the Windows hosts file so you can access Cove sites from your Windows browser.
+
+### 🛠️ Improvements & Changes
+
+* **Catppuccin Adminer Theme:** A new custom Adminer theme has been bundled with Cove, featuring the beautiful Catppuccin color palette.
+    * Automatic light/dark mode switching based on system preferences (Latte for light, Mocha for dark).
+    * Full SQL syntax highlighting with Catppuccin colors.
+    * Modern UI with improved typography, spacing, and styled action buttons.
+* **Adminer Auto-Upgrade:** The `cove upgrade` command now also checks for and installs the latest version of Adminer.
+* **Improved Site Listing:** The `cove list` command output has been refined for better readability.
+* **Smarter Tailscale Detection:** Tailscale hostname auto-detection has been improved for more reliable setup.
+* **Cleaner Error Display:** PHP's `display_errors` is now disabled by default. The Whoops error handler has been refined to silence noisy `E_DEPRECATED` and `E_NOTICE` warnings (common in older plugins) while still displaying fatal errors with full stack traces.
+* **Enhanced Share Command:** The `cove share` command now displays a real-time access log showing timestamp, HTTP status (color-coded), client IP address, method, and path for each request. Connection loss is now detected and reported, and shutdown no longer displays terminal noise.
+
 ## [1.6] - 2025-09-18
 
 ### ✨ New Features
