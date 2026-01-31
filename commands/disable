@@ -1,7 +1,28 @@
 cove_disable() {
     echo "🛑 Disabling Cove services..."
-    "$CADDY_CMD" stop --config "$CADDYFILE_PATH"
-    brew services stop mariadb
-    pkill -f mailpit &> /dev/null
+    
+    echo "   - Stopping Caddy/FrankenPHP..."
+    $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null
+    
+    # Stop services on MacOS
+    if [ "$OS" == "macos" ]; then
+        echo "   - Stopping MariaDB..."
+        brew services stop mariadb &>/dev/null
+        echo "   - Stopping Mailpit..."
+        launchctl unload "$COVE_DIR/com.cove.mailpit.plist" &>/dev/null
+    fi
+
+    # Stop services on Linux
+    if [ "$OS" == "linux" ]; then
+        # Get the correct MariaDB service name
+        local mariadb_service
+        mariadb_service=$(get_mariadb_service_name)
+        
+        echo "   - Stopping MariaDB ($mariadb_service)..."
+        $SUDO_CMD systemctl stop "$mariadb_service" &>/dev/null
+        echo "   - Stopping Mailpit..."
+        $SUDO_CMD systemctl stop mailpit &>/dev/null
+    fi
+    
     echo "✅ Services stopped."
 }

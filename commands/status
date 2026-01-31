@@ -4,37 +4,62 @@ cove_status() {
     local caddy_status="❌ Stopped"
     local mariadb_status="❌ Stopped"
     local mailpit_status="❌ Stopped"
-    local all_running=false
 
-    # Check Caddy status by looking for the PID file and checking if the process is running.
-    if [ -f "$COVE_DIR/caddy.pid" ] && ps -p "$(cat "$COVE_DIR/caddy.pid")" > /dev/null; then
-        caddy_status="✅ Running"
+    # Check Caddy status by PID file
+    if [ -f "$COVE_DIR/caddy.pid" ]; then
+        local caddy_pid
+        caddy_pid=$(cat "$COVE_DIR/caddy.pid" 2>/dev/null)
+        if [ -n "$caddy_pid" ] && ps -p "$caddy_pid" > /dev/null 2>&1; then
+            caddy_status="✅ Running"
+        fi
     fi
 
-    # Check the status of Homebrew services.
-    if brew services list | grep -q "mariadb.*started"; then
-        mariadb_status="✅ Running"
+    # Check MariaDB and Mailpit status on MacOS
+    if [ "$OS" == "macos" ]; then
+        if brew services list 2>/dev/null | grep -q "mariadb.*started"; then 
+            mariadb_status="✅ Running"
+        fi
+        if launchctl list 2>/dev/null | grep -q "com.cove.mailpit"; then 
+            mailpit_status="✅ Running"
+        fi
     fi
-
-    # Check for a running mailpit process directly.
-    if pgrep -f mailpit > /dev/null; then
-        mailpit_status="✅ Running"
+    
+    # Check MariaDB and Mailpit status on Linux
+    if [ "$OS" == "linux" ]; then
+        # Check all possible MariaDB service names
+        local mariadb_service
+        mariadb_service=$(get_mariadb_service_name)
+        if systemctl is-active --quiet "$mariadb_service" 2>/dev/null; then 
+            mariadb_status="✅ Running"
+        fi
+        if systemctl is-active --quiet mailpit 2>/dev/null; then 
+            mailpit_status="✅ Running"
+        fi
     fi
-
-    # Print the status of each individual service.
-    echo "  - Caddy Server: $caddy_status"
-    echo "  - MariaDB:      $mariadb_status"
-    echo "  - Mailpit:      $mailpit_status"
+    
+    echo ""
+    echo "  Caddy Server: $caddy_status"
+    echo "  MariaDB:      $mariadb_status"
+    echo "  Mailpit:      $mailpit_status"
+    echo ""
 
     if [[ "$caddy_status" == "✅ Running" && "$mariadb_status" == "✅ Running" && "$mailpit_status" == "✅ Running" ]]; then
-        all_running=true
-    fi
-
-    echo "" # Add a blank line for spacing.
-    # Display the final summary message using gum.
-    if $all_running; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: https://cove.localhost" "Adminer:   https://db.cove.localhost" "Mailpit:   https://mail.cove.localhost"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ All services are running" \
+            "Dashboard: https://cove.localhost" \
+            "Adminer:   https://db.cove.localhost" \
+            "Mailpit:   https://mail.cove.localhost"
+        
+        # Show WSL-specific info
+        if [ "$IS_WSL" = true ]; then
+            local wsl_ip
+            wsl_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+            echo ""
+            echo "  WSL IP: $wsl_ip"
+        fi
     else
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" "ℹ️ Some services are stopped." "Run 'cove enable' to start them."
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
+            "⚠️  Some services are stopped." \
+            "Run 'cove enable' to start them."
     fi
 }

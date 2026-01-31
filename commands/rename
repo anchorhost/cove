@@ -51,6 +51,11 @@ cove_rename() {
     # --- Handle WordPress Specifics ---
     if [ -f "$new_site_dir/public/wp-config.php" ]; then
         source_config
+        
+        # Get WP-CLI command (adds --allow-root if running as root)
+        local wp_cmd
+        wp_cmd=$(get_wp_cmd)
+        
         local old_db_name
         old_db_name=$(echo "cove_$old_name" | tr -c '[:alnum:]_' '_')
         local new_db_name
@@ -70,10 +75,10 @@ cove_rename() {
         rm "$temp_sql_dump"
 
         echo "   - Updating wp-config.php..."
-        (cd "$new_site_dir/public" && wp config set DB_NAME "$new_db_name" --quiet)
+        (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet)
 
         echo "   - Running search-replace for site URL..."
-        (cd "$new_site_dir/public" && wp search-replace "https://$old_name.localhost" "https://$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet)
+        (cd "$new_site_dir/public" && $wp_cmd search-replace "https://$old_name.localhost" "https://$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet)
 
         echo "   - Dropping old database '$old_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"

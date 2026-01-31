@@ -33,16 +33,20 @@ cove_db_backup() {
             (
                 cd "$public_dir" || return 1
                 
+                # Get WP-CLI command (adds --allow-root if running as root)
+                local wp_cmd
+                wp_cmd=$(get_wp_cmd)
+                
                 # Check if wp-cli can connect
-                if ! wp core is-installed --skip-plugins --skip-themes &> /dev/null; then
+                if ! $wp_cmd core is-installed --skip-plugins --skip-themes &> /dev/null; then
                     echo "   ❌ Error: wp-cli cannot connect to the database for this site. Skipping."
                     return 1 # This exits the subshell, not the main script
                 fi
 
                 local db_name db_user db_pass
-                db_name=$(wp config get DB_NAME --skip-plugins --skip-themes)
-                db_user=$(wp config get DB_USER --skip-plugins --skip-themes)
-                db_pass=$(wp config get DB_PASSWORD --skip-plugins --skip-themes)
+                db_name=$($wp_cmd config get DB_NAME --skip-plugins --skip-themes)
+                db_user=$($wp_cmd config get DB_USER --skip-plugins --skip-themes)
+                db_pass=$($wp_cmd config get DB_PASSWORD --skip-plugins --skip-themes)
 
                 if [ -z "$db_name" ] || [ -z "$db_user" ]; then
                     echo "   ❌ Error: Could not retrieve database credentials from wp-config.php. Skipping."
@@ -92,9 +96,15 @@ cove_db_list() {
         exit 0
     fi
 
+    # Determine if we need --allow-root for wp-cli (running as root in WSL/Docker)
+    local wp_root_flag=""
+    if [ "$(id -u)" -eq 0 ]; then
+        wp_root_flag="--allow-root"
+    fi
+
     # This heredoc contains a PHP script to find, connect, and format the database list.
     local php_output
-    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" php -r '
+    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" WP_ROOT_FLAG="$wp_root_flag" php -r '
         function formatSize(int $bytes): string {
             if ($bytes === 0) return "0 B";
             $units = ["B", "KB", "MB", "GB", "TB"];
@@ -105,6 +115,7 @@ cove_db_list() {
         $sites_dir = getenv("SITES_DIR");
         $db_user = getenv("DB_USER");
         $db_pass = getenv("DB_PASSWORD");
+        $wp_root_flag = getenv("WP_ROOT_FLAG");
 
         if (!is_dir($sites_dir)) { exit; }
 
@@ -119,7 +130,7 @@ cove_db_list() {
             if (is_file($public_dir . "/wp-config.php")) {
                 $site_name = str_replace(".localhost", "", $item);
                 $public_dir_esc = escapeshellarg($public_dir);
-                $cmd_suffix = " --skip-plugins --skip-themes --quiet 2>/dev/null";
+                $cmd_suffix = " " . $wp_root_flag . " --skip-plugins --skip-themes --quiet 2>/dev/null";
                 
                 $name_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_NAME" . $cmd_suffix);
                 if (is_null($name_raw)) { continue; }

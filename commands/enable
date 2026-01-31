@@ -1,41 +1,122 @@
 cove_enable() {
     echo "🚀 Enabling Cove services..."
-    brew services restart mariadb &> /dev/null
+    
+    # Ensure log directory exists
+    mkdir -p "$LOGS_DIR"
 
-    # Stop any running Mailpit instance (from brew or manual) before starting our own.
-    pkill -f mailpit &> /dev/null
-    brew services stop mailpit &> /dev/null
+    if [ "$OS" == "macos" ]; then
+        echo "   - Starting MariaDB..."
+        brew services start mariadb
 
-    # Start Mailpit directly with a persistent database file.
-    local mailpit_path
-    mailpit_path="$(brew --prefix mailpit)/bin/mailpit"
-    if [ -x "$mailpit_path" ]; then
-        echo "   - Starting Mailpit with persistent storage..."
-        # --- CORRECTED FLAG ---
-        nohup "$mailpit_path" --database "$COVE_DIR/mailpit.db" > "$LOGS_DIR/mailpit.log" 2>&1 &
+        local plist_path="$COVE_DIR/com.cove.mailpit.plist"
+        local mailpit_bin
+        mailpit_bin=$(command -v mailpit)
 
-        # --- Verify Mailpit has started ---
-        echo "   - Waiting for Mailpit to initialize..."
-        local i=0
-        while ! lsof -i :8025 -sTCP:LISTEN -t >/dev/null; do
-            sleep 1
-            i=$((i+1))
-            if [ $i -ge 10 ]; then
-                gum style --foreground red "❌ Mailpit failed to start within 10 seconds." \
-                          "Check the log for errors: ~/Cove/Logs/mailpit.log"
-                exit 1
-            fi
-        done
-        echo "   - Mailpit started successfully."
+        # Stop and unload any existing service to ensure our custom one is used.
+        launchctl unload "$plist_path" &>/dev/null
+        brew services stop mailpit &>/dev/null
+
+        echo "   - Generating custom Mailpit service file..."
+        cat > "$plist_path" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>KeepAlive</key>
+        <true/>
+        <key>Label</key>
+        <string>com.cove.mailpit</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>$mailpit_bin</string>
+                <string>--database</string>
+                <string>$COVE_DIR/mailpit.db</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>$LOGS_DIR/mailpit.log</string>
+        <key>StandardOutPath</key>
+        <string>$LOGS_DIR/mailpit.log</string>
+</dict>
+</plist>
+EOM
+        # Load and start the new service.
+        launchctl load "$plist_path"
+        launchctl start com.cove.mailpit
     fi
     
-    "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
+    if [ "$OS" == "linux" ]; then
+        # Get the correct MariaDB service name for this distro
+        local mariadb_service
+        mariadb_service=$(get_mariadb_service_name)
+        
+        echo "   - Starting MariaDB ($mariadb_service)..."
+        $SUDO_CMD systemctl enable "$mariadb_service" &>/dev/null
+        $SUDO_CMD systemctl restart "$mariadb_service"
+        
+        local service_path="/etc/systemd/system/mailpit.service"
+        local mailpit_bin
+        mailpit_bin=$(command -v mailpit)
+        local current_user
+        current_user=$(whoami)
+
+        echo "   - Generating custom Mailpit service file..."
+        # Note: Using a temp file approach to avoid issues with heredoc and sudo
+        local temp_service
+        temp_service=$(mktemp)
+        cat > "$temp_service" << EOM
+[Unit]
+Description=Mailpit Service for Cove
+After=network.target
+
+[Service]
+ExecStart=$mailpit_bin --database $COVE_DIR/mailpit.db
+Restart=always
+User=$current_user
+
+[Install]
+WantedBy=multi-user.target
+EOM
+        
+        $SUDO_CMD mv "$temp_service" "$service_path"
+        $SUDO_CMD chmod 644 "$service_path"
+        
+        # Reload systemd, then enable and start the service
+        $SUDO_CMD systemctl daemon-reload
+        $SUDO_CMD systemctl enable mailpit &>/dev/null
+        $SUDO_CMD systemctl restart mailpit
+    fi
     
-    "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid"
+    echo "   - Starting Caddy/FrankenPHP..."
+    $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
+    $SUDO_CMD "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
 
     if [ $? -eq 0 ]; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Services are running" "Dashboard: https://cove.localhost" "Adminer:   https://db.cove.localhost" "Mailpit:   https://mail.cove.localhost"
+        echo ""
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Services are running" \
+            "Dashboard: https://cove.localhost" \
+            "Adminer:   https://db.cove.localhost" \
+            "Mailpit:   https://mail.cove.localhost"
+        
+        # Show WSL-specific info
+        if [ "$IS_WSL" = true ]; then
+            local wsl_ip
+            wsl_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+            echo ""
+            gum style --foreground yellow "WSL Note: To access sites from Windows browser, update Windows hosts file."
+            echo ""
+            echo "  Run this in PowerShell (as Administrator):"
+            echo ""
+            echo "  Add-Content -Path C:\\Windows\\System32\\drivers\\etc\\hosts -Value \"\`n$wsl_ip cove.localhost db.cove.localhost mail.cove.localhost\""
+            echo ""
+            echo "  Or manually add this line to C:\\Windows\\System32\\drivers\\etc\\hosts:"
+            echo "  $wsl_ip cove.localhost db.cove.localhost mail.cove.localhost"
+            echo ""
+            echo "  Note: WSL IP may change on restart. Run 'cove wsl-hosts' to get updated commands."
+        fi
     else
-        gum style --foreground red "❌ Caddy server failed to start. Check for errors above, or try running 'cove reload'."
+        gum style --foreground red "❌ Caddy server failed to start. Check $LOGS_DIR/caddy-process.log for errors."
     fi
 }

@@ -1,5 +1,5 @@
 upgrade_frankenphp_binary() {
-    local BIN_DIR
+    local target_bin_dir
     local frankenphp_path
 
     # First, try to find the path of the existing frankenphp command.
@@ -7,27 +7,24 @@ upgrade_frankenphp_binary() {
 
     if [ -n "$frankenphp_path" ]; then
         # If found, use its directory as the installation target.
-        BIN_DIR=$(dirname "$frankenphp_path")
-        echo "   - Detected existing FrankenPHP in '$BIN_DIR'. Using this as the installation target."
+        target_bin_dir=$(dirname "$frankenphp_path")
+        echo "   - Detected existing FrankenPHP in '$target_bin_dir'. Using this as the installation target."
     else
-        # If not found, fall back to architecture detection.
-        echo "   - FrankenPHP not found in PATH. Detecting default bin directory based on architecture."
-        BIN_DIR="/usr/local/bin" # Default for Intel
-        if [ "$(uname -m)" = "arm64" ]; then
-            BIN_DIR="/opt/homebrew/bin" # Override for Apple Silicon
-        fi
+        # If not found, use the global BIN_DIR (set in setup_environment)
+        echo "   - FrankenPHP not found in PATH. Using default bin directory: $BIN_DIR"
+        target_bin_dir="$BIN_DIR"
     fi
 
     echo "   - Downloading the latest FrankenPHP binary..."
-    if curl -sL https://frankenphp.dev/install.sh | sh; then
+    if curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash; then
         if [ -f "./frankenphp" ]; then
-            echo "   - Moving 'frankenphp' to $BIN_DIR/..."
-            if sudo mv ./frankenphp "$BIN_DIR/frankenphp"; then
+            echo "   - Moving 'frankenphp' to $target_bin_dir/..."
+            if $SUDO_CMD mv ./frankenphp "$target_bin_dir/frankenphp"; then
                 echo "   - ✅ FrankenPHP reinstalled successfully."
             else
                 gum style --foreground red "❌ Failed to move frankenphp." \
                     "Please run this command manually from the directory you ran the installer:" \
-                    "mv ./frankenphp \"$BIN_DIR/frankenphp\""
+                    "sudo mv ./frankenphp \"$target_bin_dir/frankenphp\""
                 return 1
             fi
         else

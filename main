@@ -6,6 +6,73 @@
 #  and the main command routing logic.
 # ====================================================
 
+# --- OS & Package Manager Detection ---
+OS=""
+PKG_MANAGER=""
+SUDO_CMD="sudo"
+IS_WSL=false
+BIN_DIR="/usr/local/bin"
+
+setup_environment() {
+    local os_name
+    os_name=$(uname -s)
+
+    # --- Check for MacOS ---
+    if [ "$os_name" = "Darwin" ]; then
+        OS="macos"
+        PKG_MANAGER="brew"
+        SUDO_CMD=""
+        
+        # Architecture detection for MacOS Homebrew paths
+        if [ "$(uname -m)" = "arm64" ]; then
+            BIN_DIR="/opt/homebrew/bin"
+        else
+            BIN_DIR="/usr/local/bin"
+        fi
+        
+        return 0 # Success, exit function
+    fi
+
+    # --- Check for Linux ---
+    if [ "$os_name" = "Linux" ]; then
+        OS="linux"
+        BIN_DIR="/usr/local/bin" # Standard for Linux
+        
+        # Check if running in WSL
+        if grep -qEi "(Microsoft|WSL)" /proc/version 2>/dev/null; then
+            IS_WSL=true
+        fi
+        
+        if [ ! -f /etc/os-release ]; then
+            echo "❌ ERROR: Cannot detect Linux distribution." >&2
+            exit 1
+        fi
+        # shellcheck source=/dev/null
+        . /etc/os-release
+        if [[ "$ID" == "ubuntu" || "$ID" == "debian" || "$ID_LIKE" == *"debian"* ]]; then
+            PKG_MANAGER="apt"
+        elif [[ "$ID" == "fedora" || "$ID" == "centos" || "$ID" == "rhel" || "$ID_LIKE" == *"fedora"* || "$ID_LIKE" == *"rhel"* ]]; then
+            PKG_MANAGER="dnf"
+        else
+            echo "❌ ERROR: Unsupported Linux distribution: $ID." >&2
+            echo "Supported: Ubuntu, Debian, Fedora, CentOS, RHEL and derivatives." >&2
+            exit 1
+        fi
+        
+        if [ "$(id -u)" -eq 0 ]; then
+            SUDO_CMD=""
+        fi
+        return 0 # Success, exit function
+    fi
+    
+    # --- If neither of the above, it's an unsupported OS ---
+    echo "❌ ERROR: Unsupported OS: $os_name" >&2
+    exit 1
+}
+
+setup_environment
+# --- End OS Detection ---
+
 # --- Configuration ---
 COVE_DIR="$HOME/Cove"
 CONFIG_FILE="$COVE_DIR/config"
@@ -24,11 +91,7 @@ PROTECTED_NAMES="cove"
 COVE_VERSION="1.6"
 CADDY_CMD="frankenphp"
 
-# Set the correct binary installation directory based on architecture
-BIN_DIR="/usr/local/bin" # Default for Intel
-if [ "$(uname -m)" = "arm64" ]; then
-    BIN_DIR="/opt/homebrew/bin" # Override for Apple Silicon
-fi
+# Note: BIN_DIR is set in setup_environment() based on OS and architecture
 
 # --- Whoops Bootstrap Generation ---
 create_whoops_bootstrap() {
@@ -57,11 +120,12 @@ spl_autoload_register(function ($class) {
 
 $whoops = new \Whoops\Run;
 
-// Using the built-in method from the API docs to silence non-fatal errors.
-// We are silencing every level except for fatal errors across all files.
+// We want to see all errors *except* for the noisy Deprecated and Notice warnings,
+// which are common with older plugins on modern PHP.
+// E_USER_NOTICE is used by WordPress's _doing_it_wrong() function.
 $whoops->silenceErrorsInPaths(
     '/.*/', // A regex that matches all file paths
-    E_ALL & ~E_ERROR & ~E_PARSE & ~E_CORE_ERROR & ~E_COMPILE_ERROR & ~E_USER_ERROR
+    E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE
 );
 
 // The PrettyPageHandler will now only be triggered for fatal errors.
@@ -268,6 +332,38 @@ check_dependencies() {
 
 # --- Helper Functions ---
 
+# Helper function to get WP-CLI command with --allow-root if running as root
+# This is needed for WSL/Docker environments where root is common
+get_wp_cmd() {
+    local wp_path
+    wp_path=$(command -v wp)
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "$wp_path --allow-root"
+    else
+        echo "$wp_path"
+    fi
+}
+
+# Helper function to get the correct MariaDB service name on Linux
+# Different distros may use 'mariadb', 'mysql', or 'mysqld' as the service name
+get_mariadb_service_name() {
+    if [ "$OS" == "macos" ]; then
+        echo "mariadb"
+        return
+    fi
+    # Check which service name exists on this system
+    if systemctl list-unit-files mariadb.service 2>/dev/null | grep -q mariadb; then
+        echo "mariadb"
+    elif systemctl list-unit-files mysql.service 2>/dev/null | grep -q mysql; then
+        echo "mysql"
+    elif systemctl list-unit-files mysqld.service 2>/dev/null | grep -q mysqld; then
+        echo "mysqld"
+    else
+        # Default to mariadb
+        echo "mariadb"
+    fi
+}
+
 # Manage /etc/hosts file for local domains
 update_etc_hosts() {
     echo "🔎 Checking /etc/hosts for required entries..."
@@ -325,7 +421,7 @@ regenerate_caddyfile() {
         return 1
     fi
     local mailpit_path
-    mailpit_path="$(brew --prefix mailpit)/bin/mailpit"
+    mailpit_path=$(command -v mailpit)
 
     # Write the static header of the Caddyfile
     cat > "$CADDYFILE_PATH" <<- EOM
@@ -333,6 +429,7 @@ regenerate_caddyfile() {
     frankenphp {
         php_ini sendmail_path "$mailpit_path sendmail -t"
         php_ini log_errors On
+        php_ini display_errors Off
         php_ini error_log "$LOGS_DIR/errors.log"
         php_ini auto_prepend_file "$APP_DIR/whoops_bootstrap.php"
         php_ini memory_limit 512M

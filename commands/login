@@ -11,6 +11,10 @@ cove_login() {
 
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
+    
+    # Get WP-CLI command (adds --allow-root if running as root)
+    local wp_cmd
+    wp_cmd=$(get_wp_cmd)
 
     # 2. Check if the site exists and is a WordPress installation.
     if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
@@ -22,7 +26,7 @@ cove_login() {
     if [ -n "$user_identifier" ]; then
         echo "🔎 Verifying user '$user_identifier' for '$site_name.localhost'..."
         local user_roles
-        user_roles=$( (cd "$public_dir" && wp user get "$user_identifier" --field=roles --format=json --skip-plugins --skip-themes 2>/dev/null) )
+        user_roles=$( (cd "$public_dir" && $wp_cmd user get "$user_identifier" --field=roles --format=json --skip-plugins --skip-themes 2>/dev/null) )
 
         if [ -z "$user_roles" ]; then
             gum style --foreground red "❌ Error: User '$user_identifier' not found on this site."
@@ -38,7 +42,7 @@ cove_login() {
         echo "✅ User '$admin_to_login' verified."
     else
         echo "🔎 Finding an administrator for '$site_name.localhost'..."
-        admin_to_login=$( (cd "$public_dir" && wp user list --role=administrator --field=user_login --format=csv --skip-plugins --skip-themes | head -n 1) )
+        admin_to_login=$( (cd "$public_dir" && $wp_cmd user list --role=administrator --field=user_login --format=csv --skip-plugins --skip-themes | head -n 1) )
 
         if [ -z "$admin_to_login" ]; then
             gum style --foreground red "❌ Error: Could not find any administrator users for this site."
@@ -51,7 +55,7 @@ cove_login() {
     echo "   Generating login link..."
     local login_url
     # Suppress stderr on the first try so we can handle the error gracefully.
-    login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" ) 2>/dev/null )
+    login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" ) 2>/dev/null )
     local exit_code=$?
 
     # 4. If the command failed, check for the mu-plugin and retry.
@@ -65,7 +69,7 @@ cove_login() {
             
             echo "   - Retrying login link generation..."
             # Run the command again, but this time, show errors if it fails.
-            login_url=$( (cd "$public_dir" && wp user login "$admin_to_login" --skip-plugins --skip-themes) )
+            login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" --skip-plugins --skip-themes) )
         else
             # The plugin exists, so the failure is for another reason.
             echo "   - MU-plugin is already present. The issue may be with WP-CLI or the site's database."

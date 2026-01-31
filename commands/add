@@ -65,8 +65,9 @@ cove_add() {
         echo "Installing WordPress..."
         admin_pass=$(openssl rand -base64 12)
         
-        # Use a variable for the WP-CLI command to increase memory limit
-        local wp_cmd="php -d memory_limit=512M $(command -v wp)"
+        # Use a variable for the WP-CLI command with increased memory limit
+        # get_wp_cmd adds --allow-root if running as root (common in WSL/Docker)
+        local wp_cmd="php -d memory_limit=512M $(get_wp_cmd)"
 
         (
             cd "$site_dir/public" || exit 1

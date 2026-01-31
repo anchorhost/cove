@@ -1,32 +1,277 @@
+# A robust function to check, validate, and install a given dependency.
+install_dependency() {
+    local cmd_name="$1"      # The command to check for (e.g., "gum")
+    local brew_pkg="$2"      # The package name for Homebrew (e.g., "gum")
+    local apt_pkg="$3"       # The package name for apt (Debian/Ubuntu)
+    local dnf_pkg="$4"       # The package name for dnf (Fedora/RHEL) - can differ from apt
+    local binary_url="$5"    # Optional URL to a binary/tarball for fallback
+
+    # If dnf_pkg not specified, default to apt_pkg
+    if [ -z "$dnf_pkg" ]; then
+        dnf_pkg="$apt_pkg"
+    fi
+
+    # 1. Validate the command. If it runs, we're done.
+    if command -v "$cmd_name" &>/dev/null; then
+        # Special case: some commands don't support --version
+        if [[ "$cmd_name" == "mariadb" ]] || "$cmd_name" --version &>/dev/null 2>&1; then
+            echo "✅ $cmd_name is already installed and valid."
+            return 0
+        fi
+    fi
+
+    # If gum isn't installed yet, we can't use it for styling this first message.
+    if ! command -v gum &>/dev/null; then
+        echo "--- Installing Dependency: $cmd_name ---"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: $cmd_name"
+    fi
+
+    local installed_successfully=false
+    local pkg_name=""
+
+    # 2. Attempt installation with the native package manager.
+    if [ "$OS" == "macos" ]; then
+        if brew install "$brew_pkg"; then
+            installed_successfully=true
+        fi
+    else # For Linux (apt/dnf)
+        # Determine the correct package name for this distro
+        if [ "$PKG_MANAGER" == "apt" ]; then
+            pkg_name="$apt_pkg"
+        else
+            pkg_name="$dnf_pkg"
+        fi
+        
+        # Only try native package manager if a name is provided
+        if [ -n "$pkg_name" ]; then
+            echo "   - Updating package cache..."
+            if [ "$PKG_MANAGER" == "apt" ]; then
+                $SUDO_CMD apt-get update -qq >/dev/null 2>&1
+            else
+                $SUDO_CMD dnf makecache -q >/dev/null 2>&1 || true
+            fi
+            
+            echo "   - Installing $pkg_name via $PKG_MANAGER..."
+            if [ "$PKG_MANAGER" == "apt" ]; then
+                if $SUDO_CMD apt-get install -y "$pkg_name" >/dev/null 2>&1; then
+                    installed_successfully=true
+                fi
+            else
+                if $SUDO_CMD dnf install -y "$pkg_name" >/dev/null 2>&1; then
+                    installed_successfully=true
+                fi
+            fi
+        fi
+        
+        # 3. If native package fails or isn't specified, and a binary URL is provided, try that.
+        if [ "$installed_successfully" = false ] && [ -n "$binary_url" ]; then
+            if ! command -v gum &>/dev/null; then
+                 echo "   - Native package not available. Falling back to binary download."
+            else
+                gum style --foreground "yellow" "   - Native package not available. Falling back to binary download."
+            fi
+            
+            local temp_dir
+            temp_dir=$(mktemp -d)
+            
+            # Check if URL is a tarball or direct binary
+            if [[ "$binary_url" == *.tar.gz ]] || [[ "$binary_url" == *.tgz ]]; then
+                echo "   - Downloading and extracting tarball..."
+                if curl -sL "$binary_url" | tar -xz -C "$temp_dir" 2>/dev/null; then
+                    # Find the binary in extracted contents
+                    local binary_file
+                    binary_file=$(find "$temp_dir" -name "$cmd_name" -type f -executable 2>/dev/null | head -1)
+                    if [ -z "$binary_file" ]; then
+                        # Try without executable flag (might need chmod)
+                        binary_file=$(find "$temp_dir" -name "$cmd_name" -type f 2>/dev/null | head -1)
+                    fi
+                    if [ -n "$binary_file" ]; then
+                        chmod +x "$binary_file"
+                        if $SUDO_CMD mv "$binary_file" "$BIN_DIR/$cmd_name"; then
+                            installed_successfully=true
+                        fi
+                    fi
+                fi
+            else
+                # Direct binary download
+                echo "   - Downloading binary..."
+                if curl -sL "$binary_url" -o "$temp_dir/$cmd_name"; then
+                    chmod +x "$temp_dir/$cmd_name"
+                    if $SUDO_CMD mv "$temp_dir/$cmd_name" "$BIN_DIR/$cmd_name"; then
+                        installed_successfully=true
+                    fi
+                fi
+            fi
+            rm -rf "$temp_dir"
+        fi
+    fi
+
+    # 4. Final verification and cache clearing.
+    if [ "$installed_successfully" = true ]; then
+        hash -r # Clear the shell's command cache for this script session.
+        if command -v "$cmd_name" &>/dev/null; then
+            echo "✅ $cmd_name installed successfully."
+            return 0
+        else
+            echo "⚠️  $cmd_name installed but not found in PATH. You may need to restart your shell."
+            return 0
+        fi
+    else
+        if command -v gum &>/dev/null; then
+            gum style --foreground red "❌ Failed to install $cmd_name."
+        else
+            echo "❌ Failed to install $cmd_name."
+        fi
+        exit 1
+    fi
+}
+
+# Install PHP with required extensions for WordPress development
+install_php_with_extensions() {
+    echo "📦 Installing PHP with required extensions..."
+    
+    if [ "$OS" == "macos" ]; then
+        # macOS: PHP from Homebrew includes most extensions
+        if ! command -v php &>/dev/null; then
+            brew install php
+        fi
+        echo "✅ PHP installed via Homebrew."
+        return 0
+    fi
+    
+    # Linux: Need to install PHP and extensions separately
+    local php_packages=""
+    
+    if [ "$PKG_MANAGER" == "apt" ]; then
+        # Note: php-mysql is a metapackage, php-mysqli is the actual extension
+        php_packages="php php-cli php-fpm php-mysql php-mysqli php-xml php-mbstring php-curl php-gd php-zip php-intl php-bcmath php-soap"
+        echo "   - Updating package cache..."
+        $SUDO_CMD apt-get update -qq
+        echo "   - Installing PHP and extensions..."
+        # Show output so we can see what's happening
+        if $SUDO_CMD apt-get install -y $php_packages; then
+            echo "✅ PHP and extensions installed successfully."
+        else
+            echo "⚠️  Some PHP packages may have failed. Trying individual packages..."
+            # Try installing core packages individually
+            for pkg in php php-cli php-mysql php-mysqli php-xml php-mbstring php-curl; do
+                $SUDO_CMD apt-get install -y "$pkg" 2>/dev/null || true
+            done
+        fi
+    else
+        # Fedora/RHEL - package names differ slightly
+        php_packages="php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-gd php-zip php-intl php-bcmath php-soap"
+        echo "   - Installing PHP and extensions..."
+        if $SUDO_CMD dnf install -y $php_packages; then
+            echo "✅ PHP and extensions installed successfully."
+        else
+            echo "⚠️  Some PHP packages may have failed. Trying individual packages..."
+            for pkg in php php-cli php-mysqlnd php-xml php-mbstring php-curl; do
+                $SUDO_CMD dnf install -y "$pkg" 2>/dev/null || true
+            done
+        fi
+    fi
+    
+    # Verify mysqli extension is available
+    echo "   - Verifying PHP mysqli extension..."
+    if php -m 2>/dev/null | grep -qi mysqli; then
+        echo "✅ PHP mysqli extension is available."
+    else
+        echo ""
+        gum style --foreground red "⚠️  WARNING: PHP mysqli extension not found!"
+        echo "   WordPress and Adminer require mysqli to connect to MySQL/MariaDB."
+        echo ""
+        echo "   Try installing it manually:"
+        if [ "$PKG_MANAGER" == "apt" ]; then
+            echo "     sudo apt-get install php-mysqli"
+        else
+            echo "     sudo dnf install php-mysqlnd"
+        fi
+        echo ""
+    fi
+    
+    return 0
+}
+
 cove_install() {
     echo "🚀 Starting Cove installation..."
 
-    # Check for services using standard web ports
-    if lsof -i :80 -i :443 | grep -q 'LISTEN'; then
-        local listening_app
-        listening_app=$(lsof -i :80 -i :443 | grep 'LISTEN' | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')
-
-        # If the listening app is the one Cove uses, don't show a warning.
-        if [[ "$listening_app" == "$CADDY_CMD" || "$listening_app" == "frankenph" ]]; then
-            echo "✅ Detected that FrankenPHP is already running."
-        else
-            # Otherwise, show the original warning for other apps like Nginx.
-            gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
-                "⚠️  Warning: A conflicting web server may be running!" \
-                "" \
-                "Cove has detected that another program ('${listening_app}') is already using" \
-                "the standard web ports (80/443). Cove needs these ports to function." \
-                "" \
-                "To resolve this, you must stop the conflicting service before using Cove." \
-                "For NGINX, you can often use 'sudo brew services stop nginx' or 'sudo nginx -s stop'."
-            if ! gum confirm "Do you want to proceed with the installation anyway?"; then
-                echo "🚫 Installation cancelled."
-                exit 0
+    # --- WSL/Systemd Check ---
+    if [ "$OS" == "linux" ]; then
+        if [ "$IS_WSL" = true ]; then
+            echo "🐧 WSL environment detected."
+            # Check if systemd is running
+            if ! pidof systemd >/dev/null 2>&1; then
+                echo ""
+                echo "⚠️  WARNING: systemd is not running in WSL."
+                echo "   Cove requires systemd for service management."
+                echo ""
+                echo "   To enable systemd in WSL2, add to /etc/wsl.conf:"
+                echo "   [boot]"
+                echo "   systemd=true"
+                echo ""
+                echo "   Then restart WSL with: wsl --shutdown"
+                echo ""
+                read -p "Do you want to continue anyway? (y/N) " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                    echo "🚫 Installation cancelled."
+                    exit 0
+                fi
             fi
-       fi
+        fi
     fi
 
-    if ! command -v gum &> /dev/null; then brew install gum; fi
+    # Check for services using standard web ports
+    # Use ss as fallback if lsof is not available (common on minimal Linux installs)
+    local port_check_cmd=""
+    if command -v lsof &>/dev/null; then
+        port_check_cmd="lsof"
+    elif command -v ss &>/dev/null; then
+        port_check_cmd="ss"
+    fi
+    
+    if [ -n "$port_check_cmd" ]; then
+        local ports_in_use=false
+        local listening_app=""
+        
+        if [ "$port_check_cmd" == "lsof" ]; then
+            if lsof -i :80 -i :443 2>/dev/null | grep -q 'LISTEN'; then
+                ports_in_use=true
+                listening_app=$(lsof -i :80 -i :443 2>/dev/null | grep 'LISTEN' | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')
+            fi
+        else
+            # Use ss for port checking
+            if ss -tlnp 2>/dev/null | grep -qE ':80\s|:443\s'; then
+                ports_in_use=true
+                listening_app=$(ss -tlnp 2>/dev/null | grep -E ':80\s|:443\s' | sed 's/.*users:(("\([^"]*\)".*/\1/' | sort -u | tr '\n' ' ')
+            fi
+        fi
+        
+        if [ "$ports_in_use" = true ]; then
+            if [[ "$listening_app" != *"$CADDY_CMD"* && "$listening_app" != *"frankenph"* ]]; then
+                echo "⚠️  Warning: A conflicting web server ('${listening_app}') may be running!"
+                echo "Cove needs ports 80/443 to function."
+                read -p "Do you want to proceed with the installation anyway? (y/N) " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                    echo "🚫 Installation cancelled."
+                    exit 0
+                fi
+            fi
+        fi
+    fi
+    
+    # --- Dependency Installation ---
+    # Gum - Terminal UI library (needed first for nice prompts)
+    # Note: gum releases use format: gum_VERSION_Linux_x86_64.tar.gz
+    local gum_arch="x86_64"
+    if [ "$(uname -m)" == "aarch64" ] || [ "$(uname -m)" == "arm64" ]; then
+        gum_arch="arm64"
+    fi
+    local gum_url="https://github.com/charmbracelet/gum/releases/download/v0.14.1/gum_0.14.1_Linux_${gum_arch}.tar.gz"
+    install_dependency "gum" "gum" "gum" "gum" "$gum_url"
 
     # --- Pre-install Checks ---
     if [ -d "$COVE_DIR" ]; then
@@ -35,28 +280,13 @@ cove_install() {
             exit 0
         fi
     fi
-
-    # --- Dependency Installation ---
-    # Handle FrankenPHP separately as it's not in Homebrew core.
+    
+    # FrankenPHP uses its own universal installer
     if ! command -v frankenphp &> /dev/null; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Missing Dependency: frankenphp"
-        echo "   Using the official installer (this may take a moment)..."
-        
-        if curl -sL https://frankenphp.dev/install.sh | sh; then
-            if [ -f "./frankenphp" ]; then
-                echo "   Moving 'frankenphp' to $BIN_DIR/..."
-                if mv ./frankenphp "$BIN_DIR/frankenphp"; then
-                    echo "✅ FrankenPHP installed successfully."
-                else
-                    gum style --foreground red "❌ Failed to move frankenphp." \
-                        "Please run this command manually from the directory you ran the installer:" \
-                        "mv ./frankenphp \"$BIN_DIR/frankenphp\""
-                    exit 1
-                fi
-            else
-                gum style --foreground red "❌ FrankenPHP download script failed to create the 'frankenphp' file."
-                exit 1
-            fi
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: frankenphp"
+        echo "   - Using the official FrankenPHP installer..."
+        if curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash; then
+             echo "✅ FrankenPHP installed successfully."
         else
             gum style --foreground red "❌ The FrankenPHP download script failed."
             exit 1
@@ -65,148 +295,94 @@ cove_install() {
         echo "✅ FrankenPHP is already installed."
     fi
 
-    local packages_to_install=()
+    # MariaDB - Database server
+    install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" ""
+    
+    # PHP with extensions (uses dedicated function for Linux)
+    if [ "$OS" == "macos" ]; then
+        install_dependency "php" "php" "" "" ""
+    else
+        install_php_with_extensions
+    fi
 
-    for pkg_cmd in mariadb mailpit "wp:wp-cli" gum; do
-        local pkg=${pkg_cmd##*:}
-        local cmd=${pkg_cmd%%:*}
-        if ! brew list "$pkg" &> /dev/null; then
-            packages_to_install+=("$pkg")
-        fi
-    done
-
-    if [ ${#packages_to_install[@]} -gt 0 ]; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Missing Dependencies: ${packages_to_install[*]}"
-        brew install "${packages_to_install[@]}"
-        if [ $? -ne 0 ]; then
-            gum style --foreground red "❌ Dependency installation failed. Please check Homebrew errors."
+    # Mailpit - Email testing tool (uses its own universal installer)
+    if ! command -v mailpit &> /dev/null; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: mailpit"
+        echo "   - Using the official Mailpit installer..."
+        if curl -sL https://raw.githubusercontent.com/axllent/mailpit/develop/install.sh | $SUDO_CMD bash; then
+            echo "✅ Mailpit installed successfully."
+        else
+            gum style --foreground red "❌ The Mailpit download script failed."
             exit 1
         fi
     else
-        echo "✅ All dependencies are already installed."
+        echo "✅ Mailpit is already installed."
     fi
 
-    # --- Directory and Service Setup ---
+    # WP-CLI - WordPress command line tool
+    # Not in default Linux repos, so we use the phar download as fallback
+    install_dependency "wp" "wp-cli" "" "" "https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar"
+
+    # --- Directory and Service Setup (Copied from original file) ---
     echo "📁 Creating Cove directory structure..."
     mkdir -p "$SITES_DIR" "$LOGS_DIR" "$GUI_DIR" "$ADMINER_DIR" "$CUSTOM_CADDY_DIR"
-    echo "🗃️ Downloading Adminer 5.3.0..."
-    curl -sL "https://github.com/vrana/adminer/releases/download/v5.3.0/adminer-5.3.0.php" -o "$ADMINER_DIR/adminer-core.php"
+    echo "🗃️ Downloading Adminer 5.4.1..."
+    curl -sL "https://github.com/vrana/adminer/releases/download/v5.4.1/adminer-5.4.1.php" -o "$ADMINER_DIR/adminer-core.php"
     echo "⚙️ Creating Adminer autologin..."
     # Create a custom index.php to handle autologin
+    # Note: Adminer 5.x uses the Adminer\Adminer namespace
     cat > "$ADMINER_DIR/index.php" << 'EOM'
 <?php
 // This is the custom entry point for Adminer with autologin.
-
 function adminer_object() {
-    // This class extends the namespaced Adminer class.
+    // Adminer 5.x uses the Adminer namespace
     class AdminerCoveLogin extends Adminer\Adminer {
-        /**
-         * Returns the friendly name of the server.
-         * @return string
-         */
-        function name() {
-            return 'Cove DB Manager';
-        }
-
-        /**
-         * Returns a fixed key to enable the permanent login feature.
-         * This signature must match the parent class exactly.
-         * @return string
-         */
-        function permanentLogin($i = false) {
-            return "cove-local-development-key";
-        }
-
-        /**
-         * Reads credentials from the Cove config file.
-         * @return array
-         */
+        function name() { return 'Cove DB Manager'; }
+        function permanentLogin($i = false) { return "cove-local-development-key"; }
         function credentials() {
             $configFile = getenv('HOME') . '/Cove/config';
             if (file_exists($configFile)) {
                 $config = parse_ini_file($configFile);
                 $db_user = $config['DB_USER'] ?? null;
                 $db_pass = $config['DB_PASSWORD'] ?? null;
-                // Return server, username, and password
                 return ['localhost', $db_user, $db_pass];
             }
-            // Fallback if config is missing
             return ['localhost', null, null];
         }
-
-        function loginForm() {
-            $html = <<<HTML
-        <table class="layout" style="display:none;">
-        <tbody><tr><th>System</th><td><select name="auth[driver]"><option value="server" selected="">MySQL / MariaDB</option><option value="sqlite">SQLite</option><option value="pgsql">PostgreSQL</option><option value="oracle">Oracle (beta)</option><option value="mssql">MS SQL</option></select><script nonce="">qsl('select').onchange = function () { loginDriver(this); };</script>
-        </td></tr><tr><th>Server</th><td><input name="auth[server]" value="" title="hostname[:port]" placeholder="localhost" autocapitalize="off">
-        </td></tr><tr><th>Username</th><td><input name="auth[username]" id="username" autofocus="" value="" autocomplete="username" autocapitalize="off"><script nonce="">const authDriver = qs('#username').form['auth[driver]']; authDriver && authDriver.onchange();</script>
-
-        </td></tr><tr><th>Password</th><td><input type="password" name="auth[password]" autocomplete="current-password">
-        </td></tr><tr><th>Database</th><td><input name="auth[db]" value="" autocapitalize="off">
-        </td></tr></tbody></table>
-        <p><input type="submit" value="Login" class="">
-        <label><input type="checkbox" name="auth[permanent]" value="1">Permanent login</label>
-        </p>
-        HTML;
-            echo $html;
-            return false;
-        }
-
-        /**
-         * Bypasses the login form by always returning true.
-         * @return bool
-         */
-        function login($login, $password) {
-            return true;
-        }
-
-        /**
-         * Optionally specifies a default database to connect to.
-         * @return string
-         */
-        function database() {
-            return '';
-        }
+        function login($login, $password) { return true; }
     }
-
     return new AdminerCoveLogin();
 }
-
 // Include the original Adminer core file to run the application.
 include "./adminer-core.php";
 EOM
 
-    echo "🎨 Injecting custom Adminer theme..."
-    cat > "$ADMINER_DIR/adminer.css" << 'EOM'
-/*!
- * Material Design for Adminer, version 1.1.4
- * https://github.com/arcs-/Adminer-Material-Theme
- */@import url(https://fonts.googleapis.com/css?family=Noto+Sans:400,700);body{display:flex;height:100vh;background:#FAFAFA;font-family:"Noto Sans",sans-serif;text-rendering:optimizeLegibility !important}*{outline-color:#1E88E5}::selection{background:#4ca0ea;color:#fff}::-moz-selection{background:#4ca0ea;color:#fff}::-webkit-scrollbar{width:9px;height:12px;background-color:#CCC}::-webkit-scrollbar-corner{background-color:#CCC}::-webkit-scrollbar-thumb{background-color:#263238}::-webkit-scrollbar-corner{background-color:#263238;width:8px;height:8px}.scrollable{overflow-x:visible}#lang{position:fixed;top:auto;bottom:0;z-index:3;padding:.8em 1em;width:245px;border-top:1px solid #ccc;background:#fff}#lang select{width:66%}#menu{position:fixed;top:0;z-index:2;display:flex;margin:0;padding:0;height:100%;background:#fff;box-shadow:0 85px 5px 0 rgba(0,0,0,0.14),0 85px 10px 0 rgba(0,0,0,0.12),0 85px 4px -1px rgba(0,0,0,0.2);flex-flow:column}#menu h1{position:fixed;right:54px;border-bottom:none;font-size:12px;background:transparent;padding:4px 0}#menu select{width:86%}#menu #logins{padding:10px 14px 0;height:100%}#menu #logins:before{content:'Saved Logins';display:block;font-size:1.2em;margin:40px 0 10px}#menu #logins a{display:inline-block;margin:4px 0;padding:6px 12px;height:36px;width:86%;border-radius:2px;color:#fff;background:#1E88E5;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12);text-decoration:none;transition:all .2s;border-radius:2px;text-align:center;font-weight:bold;font-size:13px;line-height:30px}#menu #logins a:hover{background:#10538d}#menu.active{background:#1E88E5 !important;color:#fff !important;font-weight:auto}#menu .links a{display:inline-block;margin:4px 2px;padding:5px;width:42%;border-radius:2px;background:#fff;color:#1E88E5;text-align:center;text-transform:uppercase;font-weight:bold;font-size:13px;line-height:24px;transition:all .2s}#menu .links a:hover{background:#1E88E5;color:#fff;text-decoration:none;font-weight:auto}a #h1{color:#AFB3B5}.version{color:#AFB3B5}#tables{overflow-x:hidden !important;margin-bottom:47px;padding:9px 12px 0 6px;flex:1}#tables .select:hover{background:#1E88E5;color:#fff;text-decoration:none;font-weight:auto}#tables a{display:inline-block;overflow:hidden;padding:6px 0 6px 8px;width:175px;border-radius:2px;text-overflow:ellipsis;transition:all .2s;color:#000}#tables a:hover{background:#e4e5e6;color:#000;text-decoration:none}#tables a.select{position:relative;float:right;padding:5px;width:auto;border-radius:2px;background:#fff;color:#1E88E5;text-align:center;text-transform:uppercase;font-weight:bold;font-size:13px;line-height:18px}#content{display:flex;flex-direction:column;overflow-x:auto;margin:83px 0 0 19em;padding:17px 27px 100px;min-width:600px;width:100%}#content h2{position:fixed;top:0;z-index:1;margin-left:-28px;padding-top:0;padding-left:30px;width:100%;height:65px;background:#263238;color:#AFB3B5;line-height:104px}#breadcrumb{position:fixed;z-index:2;padding-top:10px;padding-left:20px;background:#263238;color:#263238}#breadcrumb a{color:#1E88E5;font-size:13px;line-height:18px;transition:all .2s}#breadcrumb a:hover{color:#10538d;text-decoration:none}#logout{position:fixed;top:21px;right:50px;z-index:2;margin:4px 2px;padding:5px;min-width:88px;outline:none;border:none;border-radius:2px;background:#1E88E5;box-shadow:0 1px 4px rgba(48,48,48,0.41),0 2px 3px rgba(0,0,0,0.26);color:#fff;text-align:center;text-transform:uppercase;font-weight:bold;font-size:13px;line-height:24px;transition:all .2s}#logout:hover{background:#10538d}select{margin:0;padding:3px;border:none;border:1px solid rgba(0,0,0,0.12);border-radius:2px;color:#666;background:#fff;cursor:pointer}a,a:link{color:#1E88E5;transition:all .2s}a:hover,a:link:hover{color:#10538d;text-decoration:none}input:not([type]),input[type=number],input[type=password],input[type=search],input[type=text]{padding:8px;border:1px solid rgba(0,0,0,0.12);border-radius:2px;font-size:15px}input[type=search]:first-child{box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12)}input[type=submit]{padding:0 16px;min-width:64px;height:36px;border:none;border-radius:2px;background:#1E88E5;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12);color:#fff;text-transform:uppercase;font-size:14px;cursor:pointer;transition:all .2s}input[type=submit]:hover{background:#10538d}input[type=button][disabled],input[type=submit][disabled]{background:#AFB3B5 !important;color:#504c4a;cursor:no-drop}div input[name=delete],div input[name=drop],div input[name=truncate],input[value=Kill]{background:repeating-linear-gradient(-55deg, #1E88E5, #1E88E5 5px, #4ca0ea 5px, #4ca0ea 10px);transition:all .2s}div input[name=delete]:hover,div input[name=drop]:hover,div input[name=truncate]:hover,input[value=Kill]:hover{background:repeating-linear-gradient(-55deg, #10538d, #10538d 5px, #1E88E5 5px, #1E88E5 10px)}input[type=checkbox]{display:inline-block;padding-left:25px;height:20px;outline:0;background-image:url("data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9Im5vIj8+CjxzdmcKICAgeG1sbnM6ZGM9Imh0dHA6Ly9wdXJsLm9yZy9kYy9lbGVtZW50cy8xLjEvIgogICB4bWxuczpjYz0iaHR0cDovL2NyZWF0aXZlY29tbW9ucy5vcmcvbnMjIgogICB4bWxuczpyZGY9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkvMDIvMjItcmRmLXN5bnRheC1ucyMiCiAgIHhtbG5zOnN2Zz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciCiAgIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIKICAgeG1sbnM6c29kaXBvZGk9Imh0dHA6Ly9zb2RpcG9kaS5zb3VyY2Vmb3JnZS5uZXQvRFREL3NvZGlwb2RpLTAuZHRkIgogICB4bWxuczppbmtzY2FwZT0iaHR0cDovL3d3dy5pbmtzY2FwZS5vcmcvbmFtZXNwYWNlcy9pbmtzY2FwZSIKICAgd2lkdGg9IjIwcHQiCiAgIGhlaWdodD0iNDBwdCIKICAgdmlld0JveD0iMCAwIDIwIDQwIgogICB2ZXJzaW9uPSIxLjEiCiAgIGlkPSJzdmcyIgogICBpbmtzY2FwZTp2ZXJzaW9uPSIwLjQ4LjUgcjEwMDQwIgogICBzb2RpcG9kaTpkb2NuYW1lPSJjaGVjay5zdmciPgogIDxtZXRhZGF0YQogICAgIGlkPSJtZXRhZGF0YTE5Ij4KICAgIDxyZGY6UkRGPgogICAgICA8Y2M6V29yawogICAgICAgICByZGY6YWJvdXQ9IiI+CiAgICAgICAgPGRjOmZvcm1hdD5pbWFnZS9zdmcreG1sPC9kYzpmb3JtYXQ+CiAgICAgICAgPGRjOnR5cGUKICAgICAgICAgICByZGY6cmVzb3VyY2U9Imh0dHA6Ly9wdXJsLm9yZy9kYy9kY21pdHlwZS9TdGlsbEltYWdlIiAvPgogICAgICA8L2NjOldvcms+CiAgICA8L3JkZjpSREY+CiAgPC9tZXRhZGF0YT4KICA8ZGVmcwogICAgIGlkPSJkZWZzMTciIC8+CiAgPHNvZGlwb2RpOm5hbWVkdmlldwogICAgIHBhZ2Vjb2xvcj0iI2ZmZmZmZiIKICAgICBib3JkZXJjb2xvcj0iIzY2NjY2NiIKICAgICBib3JkZXJvcGFjaXR5PSIxIgogICAgIG9iamVjdHRvbGVyYW5jZT0iMTAiCiAgICAgZ3JpZHRvbGVyYW5jZT0iMTAiCiAgICAgZ3VpZGV0b2xlcmFuY2U9IjEwIgogICAgIGlua3NjYXBlOnBhZ2VvcGFjaXR5PSIwIgogICAgIGlua3NjYXBlOnBhZ2VzaGFkb3c9IjIiCiAgICAgaW5rc2NhcGU6d2luZG93LXdpZHRoPSIxOTIwIgogICAgIGlua3NjYXBlOndpbmRvdy1oZWlnaHQ9IjEwMTciCiAgICAgaWQ9Im5hbWVkdmlldzE1IgogICAgIHNob3dncmlkPSJmYWxzZSIKICAgICBpbmtzY2FwZTp6b29tPSIxNiIKICAgICBpbmtzY2FwZTpjeD0iNDMuNzAyNjQ2IgogICAgIGlua3NjYXBlOmN5PSIzMS45NTE3ODMiCiAgICAgaW5rc2NhcGU6d2luZG93LXg9IjE5MTIiCiAgICAgaW5rc2NhcGU6d2luZG93LXk9Ii04IgogICAgIGlua3NjYXBlOndpbmRvdy1tYXhpbWl6ZWQ9IjEiCiAgICAgaW5rc2NhcGU6Y3VycmVudC1sYXllcj0ic3ZnMiIgLz4KICA8ZwogICAgIHN0eWxlPSJmaWxsOiMwMDAwMDAiCiAgICAgaWQ9ImczMDY4IgogICAgIHRyYW5zZm9ybT0ic2NhbGUoMC44LDAuOCkiPgogICAgPHBhdGgKICAgICAgIGlkPSJwYXRoMzA1OCIKICAgICAgIGQ9Ik0gMTksNSBWIDE5IEggNSBWIDUgSCAxOSBNIDE5LDMgSCA1IEMgMy45LDMgMywzLjkgMyw1IHYgMTQgYyAwLDEuMSAwLjksMiAyLDIgaCAxNCBjIDEuMSwwIDIsLTAuOSAyLC0yIFYgNSBDIDIxLDMuOSAyMC4xLDMgMTksMyB6IgogICAgICAgaW5rc2NhcGU6Y29ubmVjdG9yLWN1cnZhdHVyZT0iMCIgLz4KICAgIDxwYXRoCiAgICAgICBpZD0icGF0aDMwNjAiCiAgICAgICBkPSJNIDAsMCBIIDI0IFYgMjQgSCAwIHoiCiAgICAgICBpbmtzY2FwZTpjb25uZWN0b3ItY3VydmF0dXJlPSIwIgogICAgICAgc3R5bGU9ImZpbGw6bm9uZSIgLz4KICA8L2c+CiAgPGcKICAgICBzdHlsZT0iZmlsbDojMDAwMDAwIgogICAgIGlkPSJnMzA4NCIKICAgICB0cmFuc2Zvcm09Im1hdHJpeCgwLjgsMCwwLDAuOCwwLDIwKSI+CiAgICA8cGF0aAogICAgICAgaWQ9InBhdGgzMDc0IgogICAgICAgZD0iTSAwLDAgSCAyNCBWIDI0IEggMCB6IgogICAgICAgaW5rc2NhcGU6Y29ubmVjdG9yLWN1cnZhdHVyZT0iMCIKICAgICAgIHN0eWxlPSJmaWxsOm5vbmUiIC8+CiAgICA8cGF0aAogICAgICAgaWQ9InBhdGgzMDc2IgogICAgICAgZD0iTSAxOSwzIEggNSBDIDMuODksMyAzLDMuOSAzLDUgdiAxNCBjIDAsMS4xIDAuODksMiAyLDIgaCAxNCBjIDEuMTEsMCAyLC0wLjkgMiwtMiBWIDUgQyAyMSwzLjkgMjAuMTEsMyAxOSwzIHogTSAxMCwxNyA1LDEyIDYuNDEsMTAuNTkgMTAsMTQuMTcgMTcuNTksNi41OCAxOSw4IDEwLDE3IHoiCiAgICAgICBpbmtzY2FwZTpjb25uZWN0b3ItY3VydmF0dXJlPSIwIiAvPgogIDwvZz4KPC9zdmc+Cg==");background-position:0 0;background-size:20px;background-repeat:no-repeat;vertical-align:middle;font-size:20px;line-height:20px;cursor:pointer;-webkit-appearance:none;-webkit-user-select:none;user-select:none}input[type=checkbox]:checked{background-position:0 -20px}input[type=radio]{display:inline-block;padding-left:25px;height:20px;outline:0;background-image:url("data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9Im5vIj8+CjxzdmcKICAgeG1sbnM6ZGM9Imh0dHA6Ly9wdXJsLm9yZy9kYy9lbGVtZW50cy8xLjEvIgogICB4bWxuczpjYz0iaHR0cDovL2NyZWF0aXZlY29tbW9ucy5vcmcvbnMjIgogICB4bWxuczpyZGY9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkvMDIvMjItcmRmLXN5bnRheC1ucyMiCiAgIHhtbG5zOnN2Zz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciCiAgIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIKICAgeG1sbnM6c29kaXBvZGk9Imh0dHA6Ly9zb2RpcG9kaS5zb3VyY2Vmb3JnZS5uZXQvRFREL3NvZGlwb2RpLTAuZHRkIgogICB4bWxuczppbmtzY2FwZT0iaHR0cDovL3d3dy5pbmtzY2FwZS5vcmcvbmFtZXNwYWNlcy9pbmtzY2FwZSIKICAgd2lkdGg9IjIwcHQiCiAgIGhlaWdodD0iNDBwdCIKICAgdmlld0JveD0iMCAwIDIwIDQwIgogICB2ZXJzaW9uPSIxLjEiCiAgIGlkPSJzdmcyIgogICBpbmtzY2FwZTp2ZXJzaW9uPSIwLjQ4LjUgcjEwMDQwIgogICBzb2RpcG9kaTpkb2NuYW1lPSJjaGVjay5zdmciPgogIDxtZXRhZGF0YQogICAgIGlkPSJtZXRhZGF0YTE5Ij4KICAgIDxyZGY6UkRGPgogICAgICA8Y2M6V29yawogICAgICAgICByZGY6YWJvdXQ9IiI+CiAgICAgICAgPGRjOmZvcm1hdD5pbWFnZS9zdmcreG1sPC9kYzpmb3JtYXQ+CiAgICAgICAgPGRjOnR5cGUKICAgICAgICAgICByZGY6cmVzb3VyY2U9Imh0dHA6Ly9wdXJsLm9yZy9kYy9kY21pdHlwZS9TdGlsbEltYWdlIiAvPgogICAgICAgIDxkYzp0aXRsZT48L2RjOnRpdGxlPgogICAgICA8L2NjOldvcms+CiAgICA8L3JkZjpSREY+CiAgPC9tZXRhZGF0YT4KICA8ZGVmcwogICAgIGlkPSJkZWZzMTciIC8+CiAgPHNvZGlwb2RpOm5hbWVkdmlldwogICAgIHBhZ2Vjb2xvcj0iI2ZmZmZmZiIKICAgICBib3JkZXJjb2xvcj0iIzY2NjY2NiIKICAgICBib3JkZXJvcGFjaXR5PSIxIgogICAgIG9iamVjdHRvbGVyYW5jZT0iMTAiCiAgICAgZ3JpZHRvbGVyYW5jZT0iMTAiCiAgICAgZ3VpZGV0b2xlcmFuY2U9IjEwIgogICAgIGlua3NjYXBlOnBhZ2VvcGFjaXR5PSIwIgogICAgIGlua3NjYXBlOnBhZ2VzaGFkb3c9IjIiCiAgICAgaW5rc2NhcGU6d2luZG93LXdpZHRoPSIxOTIwIgogICAgIGlua3NjYXBlOndpbmRvdy1oZWlnaHQ9IjEwMTciCiAgICAgaWQ9Im5hbWVkdmlldzE1IgogICAgIHNob3dncmlkPSJmYWxzZSIKICAgICBpbmtzY2FwZTp6b29tPSIyMi42Mjc0MTciCiAgICAgaW5rc2NhcGU6Y3g9IjguNzkxODMzNyIKICAgICBpbmtzY2FwZTpjeT0iMTEuODUxMjkzIgogICAgIGlua3NjYXBlOndpbmRvdy14PSItOCIKICAgICBpbmtzY2FwZTp3aW5kb3cteT0iLTgiCiAgICAgaW5rc2NhcGU6d2luZG93LW1heGltaXplZD0iMSIKICAgICBpbmtzY2FwZTpjdXJyZW50LWxheWVyPSJzdmcyIiAvPgogIDxnCiAgICAgaWQ9ImczMDE1IgogICAgIHRyYW5zZm9ybT0ic2NhbGUoMC44LDAuOCkiPgogICAgPHBhdGgKICAgICAgIGlkPSJwYXRoMzAwNSIKICAgICAgIGQ9Ik0gMTIsMiBDIDYuNDgsMiAyLDYuNDggMiwxMiAyLDE3LjUyIDYuNDgsMjIgMTIsMjIgMTcuNTIsMjIgMjIsMTcuNTIgMjIsMTIgMjIsNi40OCAxNy41MiwyIDEyLDIgeiBtIDAsMTggQyA3LjU4LDIwIDQsMTYuNDIgNCwxMiA0LDcuNTggNy41OCw0IDEyLDQgYyA0LjQyLDAgOCwzLjU4IDgsOCAwLDQuNDIgLTMuNTgsOCAtOCw4IHoiCiAgICAgICBpbmtzY2FwZTpjb25uZWN0b3ItY3VydmF0dXJlPSIwIiAvPgogICAgPHBhdGgKICAgICAgIGlkPSJwYXRoMzAwNyIKICAgICAgIGQ9Ik0gMCwwIEggMjQgViAyNCBIIDAgeiIKICAgICAgIGlua3NjYXBlOmNvbm5lY3Rvci1jdXJ2YXR1cmU9IjAiCiAgICAgICBzdHlsZT0iZmlsbDpub25lIiAvPgogIDwvZz4KICA8ZwogICAgIGlkPSJnMzA0MiIKICAgICB0cmFuc2Zvcm09Im1hdHJpeCgwLjgsMCwwLDAuOCwwLDIwLjgpIj4KICAgIDxwYXRoCiAgICAgICBpZD0icGF0aDMwMzIiCiAgICAgICBkPSJtIDEyLDcgYyAtMi43NiwwIC01LDIuMjQgLTUsNSAwLDIuNzYgMi4yNCw1IDUsNSAyLjc2LDAgNSwtMi4yNCA1LC01IEMgMTcsOS4yNCAxNC43Niw3IDEyLDcgeiBNIDEyLDIgQyA2LjQ4LDIgMiw2LjQ4IDIsMTIgMiwxNy41MiA2LjQ4LDIyIDEyLDIyIDE3LjUyLDIyIDIyLDE3LjUyIDIyLDEyIDIyLDYuNDggMTcuNTIsMiAxMiwyIHogbSAwLDE4IEMgNy41OCwyMCA0LDE2LjQyIDQsMTIgNCw3LjU4IDcuNTgsNCAxMiw0IGMgNC40MiwwIDgsMy41OCA4LDggMCw0LjQyIC0zLjU4LDggLTgsOCB6IgogICAgICAgaW5rc2NhcGU6Y29ubmVjdG9yLWN1ydmF0dXJlPSIwIiAvPgogICAgPHBhdGgKICAgICAgIGlkPSJwYXRoMzAzNCIKICAgICAgIGQ9Ik0gMCwwIEggMjQgViAyNCBIIDAgeiIKICAgICAgIGlua3NjYXBlOmNvbm5lY3Rvci1jdXJ2YXR1cmU9IjAiCiAgICAgICBzdHlsZT0iZmlsbDpub25lIiAvPgogIDwvZz4KPC9zdmc+");background-position:0 0;background-size:20px;background-repeat:no-repeat;vertical-align:middle;font-size:20px;line-height:20px;cursor:pointer;-webkit-appearance:none;-webkit-user-select:none;user-select:none}input[type=radio]:checked{background-position:0 -21px}input[type=number]{padding:8px}#help{display:none}.sqlarea.jush-sql.jush{border:1px solid rgba(0,0,0,0.12) !important;background:#fff;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12)}.js .column{left:-50px;margin:-6px 0 0;padding:5px 0 7px 3px;border:1px solid rgba(0,0,0,0.12);border-radius:3px;background:#fff;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12)}.js .column a{padding:1px 8px 3px 5px;margin-right:3px;border-radius:2px;color:#1E88E5;transition:all .2s}.js .column a:hover{color:#fff;background:#1E88E5}table{margin-top:20px;min-width:800px;border-collapse:collapse;box-shadow:0 1px 4px rgba(88,88,88,0.01),0 2px 3px rgba(88,88,88,0.26);white-space:nowrap;font-size:13px;order:4}form table{width:100%}thead td,thead th{background:#ececec;position:sticky;top:0;z-index:2}thead td:before,thead th:before{content:'';position:absolute;background:#fafafa;top:-20px;left:-10px;width:120%;height:20px}thead td:after,thead th:after{content:'';position:absolute;left:0;bottom:0;width:100%;border-bottom:1px solid #cecece}thead th{padding:0 18px;text-align:left}th{box-sizing:border-box;padding:5px 18px !important;width:20%;border:1px solid #ececec;background:#fff;font-weight:normal;font-size:14px}td{box-sizing:border-box;padding:2px 10px 0;height:45px;border:1px solid #ececec;background:#fff;color:#000}.odd td,.odd th{background:#fafafa}td a,td a:visited,th a,th a:visited{color:#1E88E5;font-weight:700}.js .checkable .checked td,.js .checkable .checked th{background:#e0e0e0}#noindex,sup{display:none}.pages{position:absolute;padding:10px 20px 0;height:35px;border:1px solid rgba(0,0,0,0.12);background-color:#fff;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12);font-size:15px}.pages a:not(:first-child){margin-top:5px;padding:5px;border:1px solid #1E88E5;border-radius:2px;color:#263238;text-align:center}.pages a:not(:first-child):hover{background:#1E88E5;color:#fff;text-decoration:none}.icon{width:24px;height:24px;border-radius:2px;background:#000;opacity:.8;-webkit-filter:contrast(125%) invert(1);filter:contrast(125%) invert(1);transition:all .2s}.icon:hover{background:#e1771a}.footer{background:none;border:none;border-color:transparent;position:relative}.footer>div{background:transparent}#content form{display:table;order:1}#content table:nth-of-type(1){order:1;margin:38px 0}#content .links,#content h3,#content h3+.error{margin:15px 0 0;order:4}#content .links:nth-of-type(2){margin-top:30px;order:1}#content .links a{display:inline-block;margin:4px;padding:6px 12px;min-width:88px;border-radius:2px;background:#fff;box-shadow:0 1px 4px rgba(88,88,88,0.41),0 2px 3px rgba(88,88,88,0.26);color:#1E88E5;text-align:center;text-transform:uppercase;font-weight:bold;font-size:13px;line-height:24px;transition:all .2s}#content .links a:hover{background:#1E88E5;color:#fff;text-decoration:none}#content .links .active{background:#1E88E5;color:#fff;cursor:default}#content form>fieldset:first-child{background-color:transparent;border:none;box-shadow:none;float:right;margin:0;padding:0;margin-bottom:4px;margin-top:-40px}#content form>fieldset:first-child legend{display:none}#content #form fieldset:nth-of-type(1){margin-bottom:10px;margin-top:0;padding-bottom:11px;min-height:57px;border:1px solid rgba(0,0,0,0.12);background-color:#fff;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12);padding:.5em .8em;margin:.8em .5em 0 0;float:initial}#content #form fieldset:nth-of-type(1) legend{display:block}#content fieldset:nth-of-type(2).jsonly{float:right;margin-top:-30px;margin-right:8px;border:none}#content fieldset:nth-of-type(2).jsonly legend{display:none}#content fieldset:first-child #fieldset-import,#content fieldset:nth-of-type(1),#content fieldset:nth-of-type(2):not(.jsonly),#content fieldset:nth-of-type(3),#content fieldset:nth-of-type(4),#content fieldset:nth-of-type(5){margin-bottom:10px;padding-bottom:11px;min-height:57px;border:1px solid rgba(0,0,0,0.12);background-color:#fff;box-shadow:0 2px 2px 0 rgba(0,0,0,0.14),0 3px 1px -2px rgba(0,0,0,0.2),0 1px 5px 0 rgba(0,0,0,0.12)}#content fieldset:nth-of-type(6){border:none}#content fieldset:nth-of-type(6) legend{visibility:hidden}#content legend a{padding:5px;color:#1E88E5;font-weight:bold;font-size:13px;line-height:18px;transition:all .2s}#content legend a:hover{color:#10538d;text-decoration:none}#content fieldset:first-child #fieldset-import{margin-top:36px;padding:13px 10px 0 9px;margin-left:-12px}#content fieldset:first-child #fieldset-import:before{content:'Import';position:absolute;top:8px;left:20px;background:#fff;padding:0 7px}#content input[name=copy],#content input[name=move]{float:right;margin-right:-20px;margin-left:25px}#content input[name=copy],#content input[name=move]{float:right;margin-right:-20px;margin-left:25px}#content select{margin-bottom:2px;padding:8px}
-EOM
+    echo "🎨 Downloading Adminer Material theme..."
+    curl -sL "https://raw.githubusercontent.com/arcs-/Adminer-Material-Theme/master/adminer.css" -o "$ADMINER_DIR/adminer.css"
 
-    # Download and install Whoops into a clean directory
     echo "✨ Downloading Whoops error handler..."
     rm -rf "$APP_DIR/whoops" # Remove any old versions first
     mkdir -p "$APP_DIR/whoops"
-    curl -sL "https://github.com/filp/whoops/archive/refs/tags/2.18.3.tar.gz" | tar -xz -C "$APP_DIR/whoops" --strip-components=1
+    curl -sL "https://github.com/filp/whoops/archive/refs/tags/2.15.3.tar.gz" | tar -xz -C "$APP_DIR/whoops" --strip-components=1
 
     echo "⚙️ Starting services..."
-    # Ensure the MariaDB service can be started before proceeding.
-    if ! brew services restart mariadb; then
-        gum style --foreground red "❌ Failed to start MariaDB via Homebrew." \
-                  "Please run 'brew services start mariadb' manually and check for errors." \
-                  "If the issue persists, try 'brew reinstall mariadb'."
-        exit 1
+    if [ "$OS" == "macos" ]; then
+        if ! brew services restart mariadb; then
+            gum style --foreground red "❌ Failed to start MariaDB via Homebrew."
+            exit 1
+        fi
+    else # Linux
+        if ! $SUDO_CMD systemctl restart mariadb; then
+            gum style --foreground red "❌ Failed to start MariaDB via systemctl."
+            exit 1
+        fi
     fi
-    brew services restart mailpit
 
     # --- Database Configuration ---
     if [ -f "$CONFIG_FILE" ] && gum confirm "Existing Cove database config found. Use it and skip database setup?"; then
         echo "✅ Using existing database configuration."
     else
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Configuring MariaDB"
-
-        # Wait for MariaDB to be ready
         echo "   - Waiting for MariaDB service..."
         i=0
         while ! mysqladmin ping --silent; do
@@ -218,23 +394,18 @@ EOM
             fi
         done
         echo "   - ✅ MariaDB is ready."
-
         local db_user="cove_user"
         local db_pass
         db_pass=$(openssl rand -base64 16)
         local sql_command="DROP USER IF EXISTS '$db_user'@'localhost'; CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass'; GRANT ALL PRIVILEGES ON *.* TO '$db_user'@'localhost' WITH GRANT OPTION; FLUSH PRIVILEGES;"
         local user_created_successfully=false
 
-        # First, attempt the automated, non-interactive setup
         echo "   - Attempting automatic setup..."
-        if echo "$sql_command" | sudo mysql &> /dev/null; then
+        if echo "$sql_command" | $SUDO_CMD mysql &> /dev/null; then
             echo "   - ✅ Automatic database user creation successful."
             user_created_successfully=true
         else
-            # If the automated method fails, fall back to the interactive prompt
-            echo "   - ⚠️ Automatic setup failed. This can happen on custom MariaDB installs."
-            echo "   - Falling back to manual credential entry..."
-            
+            echo "   - ⚠️ Automatic setup failed. Falling back to manual credential entry..."
             local root_user
             root_user=$(gum input --value "root" --prompt "MariaDB Root Username: ")
             local root_pass
@@ -246,7 +417,6 @@ EOM
             fi
         fi
 
-        # Final check: only proceed if one of the methods worked
         if $user_created_successfully; then
             echo "   - 📝 Saving new configuration..."
             echo "DB_USER='$db_user'" > "$CONFIG_FILE"
@@ -264,4 +434,35 @@ EOM
 
     echo "✅ Initial configuration complete. Starting services..."
     cove_enable
+    
+    # Show post-install guidance
+    echo ""
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
+        "📋 First-Time Setup Notes"
+    echo ""
+    echo "  Your browser will show a certificate warning when accessing Cove sites."
+    echo "  This is normal for local development with self-signed certificates."
+    echo ""
+    echo "  Options to resolve:"
+    echo "    1. Click 'Advanced' and 'Proceed' to accept the certificate"
+    echo "    2. Or trust Caddy's root CA certificate system-wide (recommended)"
+    echo ""
+    if [ "$OS" == "macos" ]; then
+        echo "  On macOS, Caddy typically auto-trusts its CA. If not, the CA cert is at:"
+        echo "    ~/Library/Application Support/Caddy/pki/authorities/local/root.crt"
+    else
+        echo "  On Linux, the CA certificate is located at:"
+        echo "    ~/.local/share/caddy/pki/authorities/local/root.crt"
+        echo ""
+        echo "  To trust it system-wide (Ubuntu/Debian):"
+        echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"
+        echo "    sudo update-ca-certificates"
+        echo ""
+        echo "  For browser-only trust, import the certificate in your browser settings."
+    fi
+    
+    if [ "$IS_WSL" = true ]; then
+        echo ""
+        gum style --foreground yellow "  WSL: Run 'cove wsl-hosts' for Windows hosts file setup instructions."
+    fi
 }
