@@ -4,8 +4,7 @@ cove_list() {
         show_totals=true
     fi
 
-    # This heredoc contains a PHP script to find, sort, and format the site list.
-    # The output is a single, pre-formatted text block.
+    # PHP script to find, sort, and format the site list with box-drawing characters
     local php_output
     php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" php -r '
         function getDirectorySize(string $path): int {
@@ -47,7 +46,6 @@ cove_list() {
                     "name" => str_replace(".localhost", "", $item),
                     "domain" => "https://" . $item,
                     "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
-                    "path" => "~/Cove/Sites/" . $item . "/public",
                     "size" => $size,
                 ];
             }
@@ -64,52 +62,72 @@ cove_list() {
             $sites
         );
 
-        $output = [];
-        // Define column widths
-        $name_width = 22;
-        $domain_width = 40;
-        $type_width = 11;
-        $path_width = 52;
-        $size_width = 15;
+        // Column padding/gap
+        $gap = 3;
+        
+        // Calculate column widths
+        $name_width = max(array_map(fn($s) => strlen($s["name"]), $sites));
+        $name_width = max($name_width, 4) + $gap;
+        
+        $domain_width = max(array_map(fn($s) => strlen($s["domain"]), $sites));
+        $domain_width = max($domain_width, 6) + $gap;
+        
+        $type_width = $show_totals ? 9 + $gap : 10; // "WordPress" + gap or padding
+        
+        $size_width = $show_totals ? 11 : 0;
 
-        // Manually build and pad the header
-        $header = str_pad("Name", $name_width) . " " . str_pad("Domain", $domain_width) . " " . str_pad("Type", $type_width) . " " . str_pad("Path", $path_width);
-        
-        // Manually build the separator line
-        $separator = str_repeat("-", $name_width) . " " . str_repeat("-", $domain_width) . " " . str_repeat("-", $type_width) . " " . str_repeat("-", $path_width);
-        
+        // ANSI colors
+        $pink = "\033[38;5;212m";
+        $dim = "\033[2m";
+        $reset = "\033[0m";
+
+        // Box drawing characters
+        $tl = "╭"; $tr = "╮"; $bl = "╰"; $br = "╯";
+        $h = "─"; $v = "│";
+
+        // Calculate total width
+        $inner_width = $name_width + $domain_width + $type_width;
         if ($show_totals) {
-            $header    .= " " . str_pad("Size", $size_width);
-            $separator .= " " . str_repeat("-", $size_width);
+            $inner_width += $size_width;
         }
-        
-        $output[] = $header;
-        $output[] = $separator;
 
-        // Build each data row with manual padding
+        // Build horizontal lines
+        $top_line = $pink . $tl . str_repeat($h, $inner_width) . $tr . $reset;
+        $mid_line = $pink . $v . $reset . $dim . " " . str_repeat("-", $inner_width - 2) . " " . $reset . $pink . $v . $reset;
+        $bot_line = $pink . $bl . str_repeat($h, $inner_width) . $br . $reset;
+
+        // Header row (white text)
+        $header = $pink . $v . $reset . " " . str_pad("Name", $name_width - 1) . str_pad("Domain", $domain_width) . str_pad("Type", $type_width);
+        if ($show_totals) {
+            $header .= str_pad("Size", $size_width);
+        }
+        $header .= $pink . $v . $reset;
+
+        // Output
+        echo $top_line . "\n";
+        echo $header . "\n";
+        echo $mid_line . "\n";
+
         foreach ($sites as $site) {
-            $name_col = str_pad($site["name"], $name_width);
-            // Pad the URL first, then prepend the emoji to preserve alignment
-            $domain_col = "🌐 " . str_pad($site["domain"], $domain_width - 3); // Subtract 3 for "🌐 "
-            $type_col = str_pad($site["type"], $type_width);
-            $path_col = str_pad($site["path"], $path_width - 3);
-            $row = $name_col . " " . $domain_col . " " . $type_col . " " . $path_col;
-            
+            $row = $pink . $v . $reset . " " . str_pad($site["name"], $name_width - 1);
+            $row .= str_pad($site["domain"], $domain_width);
+            $row .= str_pad($site["type"], $type_width);
             if ($show_totals) {
-                $row .= " " . str_pad($site["size"] ?? "N/A", $size_width);
+                $row .= str_pad($site["size"] ?? "N/A", $size_width);
             }
-            $output[] = $row;
+            $row .= $pink . $v . $reset;
+            echo $row . "\n";
         }
 
-        // Print the entire formatted block
-        echo implode("\n", $output);
+        echo $bot_line . "\n";
     ')
 
     if [ -z "$php_output" ]; then
-        # Display a message if no sites are found.
-        gum style --padding "1 2" "ℹ️ No sites found. Add one with 'cove add <name>'."
+        gum style --padding "1 2" "No sites found. Add one with 'cove add <name>'."
     else
-        # Pipe the pre-formatted text block into gum style to wrap it in a nice box.
-        echo "$php_output" | gum style --border normal --margin "1" --padding "1 2" --border-foreground 212
+        echo ""
+        gum style --faint "Sites are located in ~/Cove/Sites/"
+        echo ""
+        echo "$php_output"
     fi
 }
