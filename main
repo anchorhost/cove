@@ -976,6 +976,9 @@ show_general_help() {
     echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  log              View logs for a site or the global error log."
     echo "  share            Create a temporary public tunnel to share a site."
+    if [ "$IS_WSL" = true ]; then
+        echo "  wsl-hosts        Show Windows hosts file update commands."
+    fi
     echo "  reload           Regenerates the Caddyfile and reloads the Caddy server."
     echo "  url              Prints the HTTPS URL for a given site."
     echo "  upgrade          Upgrades Cove to the latest available version."
@@ -1167,6 +1170,17 @@ display_command_help() {
             echo ""
             echo "You'll receive a random URL like https://abc123.localhost.run"
             echo "The URL is temporary and stops working when you press Ctrl+C."
+            ;;
+        wsl-hosts)
+            echo "Usage: cove wsl-hosts"
+            echo ""
+            echo "Display instructions for updating the Windows hosts file from WSL."
+            echo ""
+            echo "This command shows your current WSL IP address and provides PowerShell"
+            echo "commands to update the Windows hosts file so you can access Cove sites"
+            echo "from your Windows browser."
+            echo ""
+            echo "Note: Only available when running in WSL."
             ;;
         path)
             echo "Usage: cove path <name>"
@@ -1373,6 +1387,9 @@ main() {
         share)
             check_dependencies
             cove_share "$@"
+            ;;
+        wsl-hosts)
+            cove_wsl_hosts
             ;;
         url)
             cove_url "$@"

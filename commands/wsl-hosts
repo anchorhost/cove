@@ -1,0 +1,96 @@
+cove_wsl_hosts() {
+    if [ "$IS_WSL" != true ]; then
+        echo "This command is only available in WSL environments."
+        exit 1
+    fi
+    
+    local wsl_ip
+    wsl_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    
+    if [ -z "$wsl_ip" ]; then
+        gum style --foreground red "❌ Could not determine WSL IP address."
+        exit 1
+    fi
+    
+    # Build list of all hostnames
+    local hostnames="cove.localhost db.cove.localhost mail.cove.localhost"
+    
+    # Add all site hostnames
+    if [ -d "$SITES_DIR" ]; then
+        for site_path in "$SITES_DIR"/*; do
+            if [ -d "$site_path" ]; then
+                local site_hostname
+                site_hostname=$(basename "$site_path")
+                hostnames="$hostnames $site_hostname"
+                
+                # Also add any custom mappings
+                if [ -f "$site_path/mappings" ]; then
+                    while IFS= read -r mapping || [ -n "$mapping" ]; do
+                        if [ -n "$mapping" ]; then
+                            hostnames="$hostnames $mapping"
+                        fi
+                    done < "$site_path/mappings"
+                fi
+            fi
+        done
+    fi
+    
+    # Find Caddy's CA certificate path
+    local ca_cert="$HOME/.local/share/caddy/pki/authorities/local/root.crt"
+    local windows_cert_path=""
+    
+    # Convert WSL path to Windows path for the certificate
+    if [ -f "$ca_cert" ]; then
+        windows_cert_path=$(wslpath -w "$ca_cert" 2>/dev/null || echo "")
+    fi
+    
+    echo ""
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "WSL Setup Helper" \
+        "" \
+        "WSL IP Address: $wsl_ip"
+    
+    # --- STEP 1: Hosts File ---
+    echo ""
+    gum style --foreground 212 "━━━ Step 1: Update Windows Hosts File ━━━"
+    echo ""
+    echo "Run this command in PowerShell (as Administrator):"
+    echo ""
+    gum style --foreground cyan "Add-Content -Path C:\\Windows\\System32\\drivers\\etc\\hosts -Value \"\`n$wsl_ip $hostnames\""
+    echo ""
+    echo "Or manually add this line to C:\\Windows\\System32\\drivers\\etc\\hosts:"
+    echo ""
+    gum style --foreground cyan "$wsl_ip $hostnames"
+    
+    # --- STEP 2: Certificate Trust ---
+    echo ""
+    gum style --foreground 212 "━━━ Step 2: Trust Caddy's CA Certificate ━━━"
+    echo ""
+    echo "To remove browser certificate warnings, install Caddy's root CA in Windows."
+    echo ""
+    
+    if [ -n "$windows_cert_path" ]; then
+        echo "The certificate is located at:"
+        gum style --foreground cyan "$windows_cert_path"
+        echo ""
+        echo "Option A: Double-click the certificate in Windows Explorer and install it:"
+        echo "  1. Open the path above in Windows Explorer"
+        echo "  2. Double-click root.crt"
+        echo "  3. Click 'Install Certificate...'"
+        echo "  4. Select 'Local Machine' and click Next"
+        echo "  5. Select 'Place all certificates in the following store'"
+        echo "  6. Click Browse and select 'Trusted Root Certification Authorities'"
+        echo "  7. Click Next, then Finish"
+        echo ""
+        echo "Option B: Run this in PowerShell (as Administrator):"
+        echo ""
+        gum style --foreground cyan "Import-Certificate -FilePath \"$windows_cert_path\" -CertStoreLocation Cert:\\LocalMachine\\Root"
+    else
+        echo "Certificate not found at: $ca_cert"
+        echo "Make sure Caddy has been started at least once with 'cove enable'."
+    fi
+    
+    echo ""
+    gum style --foreground yellow "Note: WSL IP may change on restart. Run 'cove wsl-hosts' again to get updated info."
+    echo ""
+}
