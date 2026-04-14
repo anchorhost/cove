@@ -84,7 +84,7 @@ Cove provides a simple set of commands to manage your local environment.
 
 | Command | Description |
 | --- | --- |
-| `cove share [site]` | Creates a temporary public tunnel via localhost.run (no signup required). |
+| `cove share [site]` | Creates a temporary public tunnel via Cloudflare (installs cloudflared on-demand). |
 | `cove lan <enable\|disable\|status\|trust> [site]` | Manages LAN access to sites for mobile app sync (Bonjour/mDNS). |
 | `cove tailscale <enable\|disable\|status>` | Exposes sites to your Tailscale network via port-based routing. |
 | `cove wsl-hosts` | (WSL only) Shows Windows hosts file setup instructions. |
