@@ -1,6 +1,6 @@
 # --- Share Command ---
-# Creates a temporary public tunnel to share a local site via localhost.run
-# No downloads, no signups - just SSH
+# Creates a temporary public tunnel to share a local site via Cloudflare Quick Tunnels
+# Requires cloudflared (installed on-demand if missing)
 
 SHARE_PROXY_PORT=19876
 
@@ -43,10 +43,46 @@ cove_share() {
     
     local local_hostname="${site_name}.localhost"
     
-    # --- 2. Check for SSH ---
-    if ! command -v ssh &> /dev/null; then
-        gum style --foreground red "Error: SSH client not found. Please install OpenSSH."
-        exit 1
+    # --- 2. Check for cloudflared (install on-demand if missing) ---
+    if ! command -v cloudflared &> /dev/null; then
+        echo "cloudflared is required for cove share but is not installed."
+        echo ""
+        
+        local install_cmd=""
+        local install_name=""
+        
+        if command -v brew &> /dev/null; then
+            install_cmd="brew install cloudflared"
+            install_name="Homebrew"
+        elif command -v apt-get &> /dev/null; then
+            # Debian/Ubuntu - need to add Cloudflare's repo first
+            install_cmd="curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null && echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list && sudo apt-get update && sudo apt-get install -y cloudflared"
+            install_name="apt"
+        elif command -v dnf &> /dev/null; then
+            # Fedora/RHEL
+            install_cmd="curl -fsSL https://pkg.cloudflare.com/cloudflared-ascii.repo | sudo tee /etc/yum.repos.d/cloudflared.repo && sudo dnf install -y cloudflared"
+            install_name="dnf"
+        fi
+        
+        if [ -n "$install_cmd" ]; then
+            if gum confirm "Install cloudflared via ${install_name}?"; then
+                echo "Installing cloudflared..."
+                eval "$install_cmd"
+                if ! command -v cloudflared &> /dev/null; then
+                    gum style --foreground red "Error: Failed to install cloudflared."
+                    exit 1
+                fi
+                echo "cloudflared installed successfully."
+                echo ""
+            else
+                gum style --foreground red "Error: cloudflared is required."
+                exit 1
+            fi
+        else
+            gum style --foreground red "Error: cloudflared not found."
+            echo "Install it from: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+            exit 1
+        fi
     fi
     
     # --- 3. Check for Python (needed for the HTTP proxy) ---
@@ -61,10 +97,8 @@ cove_share() {
     fi
     
     # --- 4. Create temp files ---
-    local ssh_output
-    ssh_output=$(mktemp)
-    local public_url_file
-    public_url_file=$(mktemp)
+    local tunnel_output
+    tunnel_output=$(mktemp)
     
     # --- 5. Cleanup function ---
     local cleanup_triggered=""
@@ -77,11 +111,11 @@ cove_share() {
             kill $proxy_pid 2>/dev/null
             wait $proxy_pid 2>/dev/null
         fi
-        if [ -n "$ssh_pid" ]; then
-            kill $ssh_pid 2>/dev/null
-            wait $ssh_pid 2>/dev/null
+        if [ -n "$tunnel_pid" ]; then
+            kill $tunnel_pid 2>/dev/null
+            wait $tunnel_pid 2>/dev/null
         fi
-        rm -f "$ssh_output" "$public_url_file"
+        rm -f "$tunnel_output"
         echo "Done."
     }
     trap cleanup EXIT
@@ -96,15 +130,13 @@ cove_share() {
         "Press Ctrl+C to stop sharing."
     echo ""
     
-    echo "Connecting to localhost.run..."
+    echo "Starting Cloudflare tunnel..."
     
-    # --- 7. Start SSH to get the public URL first ---
-    ssh -o StrictHostKeyChecking=accept-new \
-        -o ServerAliveInterval=30 \
-        -o ServerAliveCountMax=3 \
-        -R 80:localhost:${SHARE_PROXY_PORT} \
-        nokey@localhost.run > "$ssh_output" 2>&1 &
-    ssh_pid=$!
+    # --- 7. Start cloudflared to get the public URL first ---
+    # Use --protocol http2 for better compatibility (QUIC can be blocked by firewalls)
+    cloudflared tunnel --url http://localhost:${SHARE_PROXY_PORT} \
+        --protocol http2 --no-autoupdate > "$tunnel_output" 2>&1 &
+    tunnel_pid=$!
     
     # Wait for the URL to appear in the output
     local public_url=""
@@ -115,17 +147,18 @@ cove_share() {
         sleep 1
         ((attempts++))
         
-        if ! kill -0 $ssh_pid 2>/dev/null; then
-            gum style --foreground red "Error: SSH connection failed."
-            cat "$ssh_output"
+        if ! kill -0 $tunnel_pid 2>/dev/null; then
+            gum style --foreground red "Error: Cloudflare tunnel failed to start."
+            cat "$tunnel_output"
             exit 1
         fi
         
-        public_url=$(grep -oE 'https://[a-z0-9]+\.lhr\.life' "$ssh_output" 2>/dev/null | head -1)
+        public_url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$tunnel_output" 2>/dev/null | head -1)
     done
     
     if [ -z "$public_url" ]; then
-        gum style --foreground red "Error: Could not get public URL from localhost.run"
+        gum style --foreground red "Error: Could not get public URL from Cloudflare"
+        cat "$tunnel_output"
         exit 1
     fi
     
@@ -149,7 +182,7 @@ from urllib.request import Request, urlopen
 
 TARGET_HOST = sys.argv[1]  # e.g., anchordev.localhost
 LISTEN_PORT = int(sys.argv[2])
-PUBLIC_HOST = sys.argv[3]  # e.g., abc123.lhr.life
+PUBLIC_HOST = sys.argv[3]  # e.g., random-words.trycloudflare.com
 
 # Create SSL context that doesn't verify certificates (for self-signed)
 ssl_ctx = ssl.create_default_context()
@@ -166,8 +199,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Log requests in a nice format
         import datetime
         timestamp = datetime.datetime.now().strftime('%H:%M:%S')
-        # Get client IP from X-Forwarded-For header (set by localhost.run)
-        client_ip = self.headers.get('X-Forwarded-For', self.client_address[0])
+        # Get client IP from CF-Connecting-IP (Cloudflare) or X-Forwarded-For
+        client_ip = self.headers.get('CF-Connecting-IP',
+                    self.headers.get('X-Forwarded-For', self.client_address[0]))
         # If multiple IPs in X-Forwarded-For, take the first (original client)
         if ',' in client_ip:
             client_ip = client_ip.split(',')[0].strip()
@@ -253,7 +287,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self): self.do_request()
     def do_PATCH(self): self.do_request()
 
-server = HTTPServer(('127.0.0.1', LISTEN_PORT), ProxyHandler)
+class QuietHTTPServer(HTTPServer):
+    """HTTPServer that silently ignores connection reset errors."""
+    def handle_error(self, request, client_address):
+        # Silently ignore connection reset errors (browser closed connection)
+        import sys
+        exc_type = sys.exc_info()[0]
+        if exc_type in (ConnectionResetError, BrokenPipeError):
+            return
+        # For other errors, use default handling
+        super().handle_error(request, client_address)
+
+server = QuietHTTPServer(('127.0.0.1', LISTEN_PORT), ProxyHandler)
 server.serve_forever()
 PYTHON_PROXY
     proxy_pid=$!
@@ -268,15 +313,14 @@ PYTHON_PROXY
     echo "Tunnel is active. Press Ctrl+C to stop."
     echo ""
     
-    # Monitor SSH connection - check every 5 seconds
-    while kill -0 $ssh_pid 2>/dev/null; do
+    # Monitor tunnel connection - check every 5 seconds
+    while kill -0 $tunnel_pid 2>/dev/null; do
         sleep 5
     done
     
-    # SSH process ended - check if it was unexpected
+    # Tunnel process ended - check if it was unexpected
     if [ -z "$cleanup_triggered" ]; then
         echo ""
-        gum style --foreground yellow "Connection to localhost.run lost. Reconnecting..."
-        # Could add reconnection logic here in the future
+        gum style --foreground yellow "Cloudflare tunnel disconnected."
     fi
 }

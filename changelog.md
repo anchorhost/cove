@@ -13,8 +13,8 @@
     * Includes `cove lan trust` instructions for installing Caddy's CA certificate on mobile devices.
 * **Log Viewer:** A new `cove log` command provides quick access to site logs or the global error log.
     * Supports `--follow` (`-f`) flag for real-time log tailing.
-* **Public Site Sharing:** A new `cove share` command creates temporary public tunnels using localhost.run.
-    * No downloads or signups required—just SSH.
+* **Public Site Sharing:** A new `cove share` command creates temporary public tunnels using Cloudflare Quick Tunnels.
+    * Uses `cloudflared` (installed on-demand via Homebrew if missing).
     * Generates a random public URL that works until you press Ctrl+C.
 * **Tailscale Integration:** A new `cove tailscale` command exposes all Cove sites to your Tailscale network.
     * Auto-detects your Tailscale hostname or accepts a manual override.
