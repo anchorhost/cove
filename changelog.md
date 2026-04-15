@@ -1,5 +1,47 @@
 # Changelog
 
+## [1.8] - 2026-04-15
+
+### ✨ New Features
+
+* **Alternative HTTP/HTTPS Ports:** Cove can now run alongside other local WordPress tools (Local, WordPress Studio, DevKinsta, MAMP) that already bind 80/443. The installer detects conflicts and offers a menu of alternatives.
+    * IPv4 **and** IPv6 port probing via bash `/dev/tcp`, so the check works even against root-owned listeners (which `lsof` can't see from a regular user on macOS).
+    * Recommended fallback ports `8090`/`8453` — picked specifically to avoid the well-trodden 8080/8443/8888/8881 range used by Docker, Lando, wp-env, MAMP, and WordPress Studio.
+    * Chosen ports persist to `~/Cove/config` and are emitted into the Caddy global block as `http_port`/`https_port`. Site blocks continue to use their plain `site.localhost {}` form — Caddy handles the rewrite automatically.
+    * Re-running `cove install` on a machine with non-default ports saved presents a "Keep current / Switch to default / Pick custom" menu so you can migrate in either direction.
+* **`cove ports` Command:** A new top-level command to reconfigure ports at any time, not just during install.
+    * Interactive menu by default; accepts `--http PORT --https PORT` for scripted use.
+    * After a port change, walks every WordPress site under `~/Cove/Sites/` and runs `wp search-replace --all-tables --skip-plugins --skip-themes` to rewrite stored URLs (siteurl, home, serialized content, custom mappings) so existing sites keep working on the new port.
+    * Iterates each hostname a site answers on — base domain *plus* any entries in `site/mappings` — so extra domains don't get left stale.
+    * `--dry-run` previews the port change and per-site replacement counts without committing anything.
+    * `--skip-urls` changes ports without touching databases, for power users who want to migrate manually.
+    * Shows a confirmation list before running (ask-once, not per-site).
+    * `cove install` now also runs this DB migration step when a re-install changes ports with pre-existing WordPress sites on disk.
+* **FrankenPHP-Backed `wp-cli`:** Cove now uses FrankenPHP's bundled PHP for *both* the web server and `wp-cli` invocations, removing the standalone `brew install php` dependency entirely.
+    * `get_wp_cmd` routes all wp-cli calls through `frankenphp php-cli` — one PHP runtime for everything Cove touches.
+    * A dedicated `~/Cove/php.ini` is written at install time and exported via `PHPRC`, giving Cove full control of `memory_limit`, `display_errors`, and `error_reporting` without fighting any system-wide `/opt/homebrew/etc/php/*/php.ini`.
+    * `cove list`, `cove db`, and `cove upgrade` also use `frankenphp php-cli -r` for their inline PHP helpers, so Cove works on a fresh Apple Silicon Mac with zero standalone PHP installed.
+
+### 🛠️ Improvements & Changes
+
+* **Tailscale Access Serves Sites Directly:** `cove tailscale enable` now serves site files directly from the Tailscale-scoped server block instead of reverse-proxying through the local `site.localhost` block. This fixes CSS/JS/image loading when a site is accessed from a remote device.
+* **Dynamic siteurl/home Override:** The bundled `captaincore-helper.php` MU-plugin now filters `option_home` and `option_siteurl` at request time when a site is accessed via a non-`.localhost` host (Tailscale, LAN, or `cove share`). Assets resolve against the *current* host so the page renders correctly, and `wp-cli` is unaffected.
+* **Smarter FrankenPHP Upgrade:** `cove upgrade` now detects how FrankenPHP was installed and uses the right upgrade path — `apt` or `dnf` for distro-packaged installs, direct download for static binaries.
+* **macOS Services via `launchd`:** Caddy, Mailpit, and the Cove-managed services now run via custom `launchd` plists on macOS instead of `brew services`, giving Cove precise control over process arguments and log routing, plus proper auto-restart on crashes.
+* **Shared Port Helpers:** `port_is_free`, `port_is_own`, `port_has_conflict`, `prompt_custom_ports`, `port_url_for`, and `update_wp_site_urls_for_port_change` are now top-level helpers in `main`, shared between `cove install` and `cove ports`.
+* **Cleaner `cove add` Output:** `cove add` now writes `WP_DEBUG_DISPLAY = false` into `wp-config.php` so WordPress doesn't force `display_errors` back on mid-install, keeping the command output clean. An additional stderr filter strips any remaining `Deprecated:` lines that leak out of wp-cli's colorizer on PHP 8.5.
+* **Readme Overhaul:** Major readme refresh, including a new Quick Start section, a "Running Alongside Local, Studio, or DevKinsta" walkthrough, a Troubleshooting section (cert warnings, WSL systemd, port conflicts, DB recovery), and a rewritten Features list that now covers LAN/mobile, Tailscale, Cloudflare share, WordPress migration, and `/etc/hosts` automation.
+
+### 🐛 Bug Fixes
+
+* **"Installation Cancelled" No Longer Reads as "Successful":** The outer `install-cove.sh` installer used to print `SUCCESS: Cove has been installed successfully!` even when the user explicitly cancelled from Cove's interactive prompts. The installer now lets `set -e` handle the non-zero exit from `cove install` cleanly, so a real cancel no longer ends with a contradictory success message.
+* **Mailpit Install on Fresh Apple Silicon Macs:** The upstream Mailpit installer hardcodes `/usr/local/bin` as its install directory, which doesn't exist on a fresh Apple Silicon Mac (Homebrew lives at `/opt/homebrew`). Cove now uses `brew install mailpit` on macOS instead, sidestepping the issue entirely. The upstream installer is still used on Linux, where `/usr/local/bin` is always present.
+* **FrankenPHP Install on Fresh Apple Silicon Macs:** The official FrankenPHP installer had the same `/usr/local/bin` problem — it would silently drop the binary in the *current working directory* instead of on `PATH`. Cove now runs the installer from a tempdir and, if the binary ends up there, moves it into `$BIN_DIR` (e.g., `/opt/homebrew/bin`) before continuing.
+* **PHP 8.5 Deprecation Noise:** wp-cli 2.12.0's bundled vendor code (`react/promise`, `php-cli-tools/Colors.php`) emits `Deprecated:` warnings on PHP 8.5 that previously flooded every `cove add` run — ~50 lines per install, polluting captured output like the one-time login URL. A combination of PHPRC `display_errors=0`, `WP_DEBUG_DISPLAY=false`, and a precision stderr filter on the install subshell now keeps output clean while preserving real errors.
+* **IPv6-Only Port Listeners Not Detected:** The initial version of `port_is_free` only probed `127.0.0.1`, which missed IPv6-only listeners like Python's `http.server` (which binds `::` by default). The helper now probes both IPv4 and IPv6 loopback so a service on either stack is seen.
+* **`wp --version` Validation Loop:** `install_dependency` used to run `wp --version` as a sanity check after install, which failed when no standalone `php` was on PATH (wp's shebang is `#!/usr/bin/env php`). The check now skips that validation step for `wp`, matching the existing special case for `mariadb`.
+* **Adminer Version Detection on macOS:** `cove upgrade` used Perl-regex `grep -oP ... \K` to read the installed Adminer version, which only works on GNU grep. macOS ships BSD grep, so detection silently fell back to "unknown" and the upgrade prompt always asked to re-download even when the current version was up to date. Switched to a portable `LC_ALL=C sed -nE` extraction that pulls the version cleanly from both `VERSION="x.y.z"` and the `@version` docblock.
+
 ## [1.7] - 2026-01-31
 
 ### ✨ New Features
