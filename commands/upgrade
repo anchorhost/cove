@@ -221,12 +221,11 @@ cove_upgrade() {
         return 0
     fi
     
-    # Get current Adminer version from the file
+    # Get current Adminer version from the file (portable — BSD grep has no -P/\K)
     local current_adminer_version
-    current_adminer_version=$(grep -oP "version\s*=\s*['\"]?\K[0-9]+\.[0-9]+\.[0-9]+" "$adminer_file" 2>/dev/null | head -1)
+    current_adminer_version=$(LC_ALL=C sed -nE 's/.*VERSION="([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$adminer_file" 2>/dev/null | head -1)
     if [ -z "$current_adminer_version" ]; then
-        # Try alternative pattern
-        current_adminer_version=$(grep -oP "Adminer\s+\K[0-9]+\.[0-9]+\.[0-9]+" "$adminer_file" 2>/dev/null | head -1)
+        current_adminer_version=$(LC_ALL=C sed -nE 's/.*@version[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' "$adminer_file" 2>/dev/null | head -1)
     fi
     
     if [ -z "$current_adminer_version" ]; then
