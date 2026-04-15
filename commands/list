@@ -6,7 +6,7 @@ cove_list() {
 
     # PHP script to find, sort, and format the site list with box-drawing characters
     local php_output
-    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" HTTPS_PORT_SUFFIX="$(https_port_suffix)" php -r '
+    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" HTTPS_PORT_SUFFIX="$(https_port_suffix)" frankenphp php-cli -r '
         function getDirectorySize(string $path): int {
             if (!is_dir($path)) return 0;
             $total_size = 0;
