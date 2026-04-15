@@ -13,8 +13,11 @@ install_dependency() {
 
     # 1. Validate the command. If it runs, we're done.
     if command -v "$cmd_name" &>/dev/null; then
-        # Special case: some commands don't support --version
-        if [[ "$cmd_name" == "mariadb" ]] || "$cmd_name" --version &>/dev/null 2>&1; then
+        # Special cases: mariadb doesn't support --version, and wp's shebang
+        # uses /usr/bin/env php which won't resolve since Cove no longer
+        # installs a standalone php (wp-cli is invoked through frankenphp
+        # php-cli at runtime — see get_wp_cmd in main).
+        if [[ "$cmd_name" == "mariadb" || "$cmd_name" == "wp" ]] || "$cmd_name" --version &>/dev/null 2>&1; then
             echo "✅ $cmd_name is already installed and valid."
             return 0
         fi
@@ -127,73 +130,6 @@ install_dependency() {
     fi
 }
 
-# Install PHP with required extensions for WordPress development
-install_php_with_extensions() {
-    echo "📦 Installing PHP with required extensions..."
-    
-    if [ "$OS" == "macos" ]; then
-        # macOS: PHP from Homebrew includes most extensions
-        if ! command -v php &>/dev/null; then
-            brew install php
-        fi
-        echo "✅ PHP installed via Homebrew."
-        return 0
-    fi
-    
-    # Linux: Need to install PHP and extensions separately
-    local php_packages=""
-    
-    if [ "$PKG_MANAGER" == "apt" ]; then
-        # Note: php-mysql is a metapackage, php-mysqli is the actual extension
-        php_packages="php php-cli php-fpm php-mysql php-mysqli php-xml php-mbstring php-curl php-gd php-zip php-intl php-bcmath php-soap"
-        echo "   - Updating package cache..."
-        $SUDO_CMD apt-get update -qq
-        echo "   - Installing PHP and extensions..."
-        # Show output so we can see what's happening
-        if $SUDO_CMD apt-get install -y $php_packages; then
-            echo "✅ PHP and extensions installed successfully."
-        else
-            echo "⚠️  Some PHP packages may have failed. Trying individual packages..."
-            # Try installing core packages individually
-            for pkg in php php-cli php-mysql php-mysqli php-xml php-mbstring php-curl; do
-                $SUDO_CMD apt-get install -y "$pkg" 2>/dev/null || true
-            done
-        fi
-    else
-        # Fedora/RHEL - package names differ slightly
-        php_packages="php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-gd php-zip php-intl php-bcmath php-soap"
-        echo "   - Installing PHP and extensions..."
-        if $SUDO_CMD dnf install -y $php_packages; then
-            echo "✅ PHP and extensions installed successfully."
-        else
-            echo "⚠️  Some PHP packages may have failed. Trying individual packages..."
-            for pkg in php php-cli php-mysqlnd php-xml php-mbstring php-curl; do
-                $SUDO_CMD dnf install -y "$pkg" 2>/dev/null || true
-            done
-        fi
-    fi
-    
-    # Verify mysqli extension is available
-    echo "   - Verifying PHP mysqli extension..."
-    if php -m 2>/dev/null | grep -qi mysqli; then
-        echo "✅ PHP mysqli extension is available."
-    else
-        echo ""
-        gum style --foreground red "⚠️  WARNING: PHP mysqli extension not found!"
-        echo "   WordPress and Adminer require mysqli to connect to MySQL/MariaDB."
-        echo ""
-        echo "   Try installing it manually:"
-        if [ "$PKG_MANAGER" == "apt" ]; then
-            echo "     sudo apt-get install php-mysqli"
-        else
-            echo "     sudo dnf install php-mysqlnd"
-        fi
-        echo ""
-    fi
-    
-    return 0
-}
-
 cove_install() {
     echo "🚀 Starting Cove installation..."
 
@@ -239,76 +175,27 @@ cove_install() {
     #   2. Conflict path — the target ports (post-reconfigure) are occupied
     #      by a non-Cove process; the user gets the conflict menu.
     # On a fresh install with free 80/443, both paths are skipped silently.
-    local target_http="$HTTP_PORT"
-    local target_https="$HTTPS_PORT"
+    # If the chosen ports differ from the starting values, a DB URL update
+    # step runs after install services come up (same code path as `cove ports`).
+    local original_http="$HTTP_PORT"
+    local original_https="$HTTPS_PORT"
     local port_choice_made=false
 
-    # Treat our own Caddy/FrankenPHP as a non-conflict so reinstalls are seamless.
-    _port_is_own() {
-        local app
-        app=$(port_listening_app "$1")
-        [ -n "$app" ] && { [[ "$app" == *"$CADDY_CMD"* ]] || [[ "$app" == *frankenph* ]]; }
-    }
-
-    # True if $1 is occupied by something that isn't one of our own services.
-    _port_has_conflict() {
-        port_is_free "$1" && return 1
-        _port_is_own "$1" && return 1
-        return 0
-    }
-
-    # Interactive custom-port picker. Validates input and checks availability.
-    # Sets target_http / target_https in the enclosing cove_install scope.
-    _prompt_custom_ports() {
-        local suggest_http="${1:-8090}" suggest_https="${2:-8453}"
-        local candidate
-        while true; do
-            candidate=$(gum input --value "$suggest_http" --prompt "HTTP port: ")
-            if [[ ! "$candidate" =~ ^[0-9]+$ ]] || [ "$candidate" -lt 1 ] || [ "$candidate" -gt 65535 ]; then
-                gum style --foreground red "   ❌ Invalid port number."
-                continue
-            fi
-            if ! port_is_free "$candidate"; then
-                gum style --foreground red "   ❌ Port $candidate is in use by: $(port_listening_app "$candidate")"
-                continue
-            fi
-            target_http="$candidate"
-            break
-        done
-        while true; do
-            candidate=$(gum input --value "$suggest_https" --prompt "HTTPS port: ")
-            if [[ ! "$candidate" =~ ^[0-9]+$ ]] || [ "$candidate" -lt 1 ] || [ "$candidate" -gt 65535 ]; then
-                gum style --foreground red "   ❌ Invalid port number."
-                continue
-            fi
-            if [ "$candidate" = "$target_http" ]; then
-                gum style --foreground red "   ❌ HTTPS port must differ from HTTP port."
-                continue
-            fi
-            if ! port_is_free "$candidate"; then
-                gum style --foreground red "   ❌ Port $candidate is in use by: $(port_listening_app "$candidate")"
-                continue
-            fi
-            target_https="$candidate"
-            break
-        done
-    }
-
     # --- Reconfigure path ---
-    if [ "$target_http" != "80" ] || [ "$target_https" != "443" ]; then
+    if [ "$HTTP_PORT" != "80" ] || [ "$HTTPS_PORT" != "443" ]; then
         echo ""
         gum style --foreground "212" \
-            "Cove is currently configured for custom ports: ${target_http} / ${target_https}"
+            "Cove is currently configured for custom ports: ${HTTP_PORT} / ${HTTPS_PORT}"
         echo ""
 
         local default_label="Switch to default ports (80 / 443)"
-        if _port_has_conflict 80 || _port_has_conflict 443; then
+        if port_has_conflict 80 || port_has_conflict 443; then
             default_label="Switch to default ports (80 / 443) — currently in use"
         fi
 
         local choice
         choice=$(gum choose \
-            "Keep current ports (${target_http} / ${target_https})" \
+            "Keep current ports (${HTTP_PORT} / ${HTTPS_PORT})" \
             "$default_label" \
             "Pick different custom ports")
 
@@ -317,11 +204,11 @@ cove_install() {
                 : # no change
                 ;;
             "Switch to default"*)
-                target_http=80
-                target_https=443
+                HTTP_PORT=80
+                HTTPS_PORT=443
                 ;;
             "Pick different"*)
-                _prompt_custom_ports 8090 8453
+                prompt_custom_ports 8090 8453
                 ;;
         esac
         port_choice_made=true
@@ -330,8 +217,8 @@ cove_install() {
     # --- Conflict path (for target ports post-reconfigure) ---
     local http_busy=false
     local https_busy=false
-    _port_has_conflict "$target_http"  && http_busy=true
-    _port_has_conflict "$target_https" && https_busy=true
+    port_has_conflict "$HTTP_PORT"  && http_busy=true
+    port_has_conflict "$HTTPS_PORT" && https_busy=true
 
     if $http_busy || $https_busy; then
         echo ""
@@ -339,13 +226,13 @@ cove_install() {
         echo ""
         if $http_busy; then
             local app
-            app=$(port_listening_app "$target_http")
-            echo "   Port ${target_http} is in use by: ${app:-another process}"
+            app=$(port_listening_app "$HTTP_PORT")
+            echo "   Port ${HTTP_PORT} is in use by: ${app:-another process}"
         fi
         if $https_busy; then
             local app
-            app=$(port_listening_app "$target_https")
-            echo "   Port ${target_https} is in use by: ${app:-another process}"
+            app=$(port_listening_app "$HTTPS_PORT")
+            echo "   Port ${HTTPS_PORT} is in use by: ${app:-another process}"
         fi
         echo ""
         echo "Cove needs an HTTP and HTTPS port. How would you like to proceed?"
@@ -355,25 +242,25 @@ cove_install() {
         choice=$(gum choose \
             "Use alternative ports (8090 / 8453) — run alongside other tools" \
             "Pick custom ports" \
-            "Proceed with ${target_http}/${target_https} anyway" \
+            "Proceed with ${HTTP_PORT}/${HTTPS_PORT} anyway" \
             "Cancel installation")
 
         case "$choice" in
             "Use alternative ports"*)
-                target_http=8090
-                target_https=8453
-                if ! port_is_free "$target_http" || ! port_is_free "$target_https"; then
+                HTTP_PORT=8090
+                HTTPS_PORT=8453
+                if ! port_is_free "$HTTP_PORT" || ! port_is_free "$HTTPS_PORT"; then
                     gum style --foreground yellow \
                         "⚠️  8090 or 8453 is also in use — please pick custom ports."
-                    _prompt_custom_ports 8090 8453
+                    prompt_custom_ports 8090 8453
                 fi
                 ;;
             "Pick custom ports")
-                _prompt_custom_ports 8090 8453
+                prompt_custom_ports 8090 8453
                 ;;
             "Proceed with"*)
                 gum style --foreground yellow \
-                    "⚠️  Services may fail to bind on ${target_http}/${target_https}."
+                    "⚠️  Services may fail to bind on ${HTTP_PORT}/${HTTPS_PORT}."
                 ;;
             "Cancel installation")
                 echo "🚫 Installation cancelled."
@@ -385,12 +272,11 @@ cove_install() {
 
     if $port_choice_made; then
         gum style --foreground green \
-            "✅ Using ports ${target_http} (HTTP) / ${target_https} (HTTPS)"
+            "✅ Using ports ${HTTP_PORT} (HTTP) / ${HTTPS_PORT} (HTTPS)"
     fi
 
-    # Persist and expose the final choice to regenerate_caddyfile.
-    HTTP_PORT="$target_http"
-    HTTPS_PORT="$target_https"
+    # Persist the final choice — regenerate_caddyfile and get_wp_cmd both
+    # pick up the globals directly.
     config_set HTTP_PORT "$HTTP_PORT"
     config_set HTTPS_PORT "$HTTPS_PORT"
 
@@ -402,13 +288,33 @@ cove_install() {
         fi
     fi
     
-    # FrankenPHP uses its own universal installer
+    # FrankenPHP uses its own universal installer.
+    # The upstream installer tries to write to /usr/local/bin and silently
+    # falls back to CWD when that fails — which happens on a fresh Apple
+    # Silicon Mac (Homebrew lives at /opt/homebrew/bin). To handle both,
+    # we run the installer from a tempdir and, if the binary ends up there
+    # instead of on PATH, move it into $BIN_DIR ourselves.
     if ! command -v frankenphp &> /dev/null; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: frankenphp"
         echo "   - Using the official FrankenPHP installer..."
-        if curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash; then
-             echo "✅ FrankenPHP installed successfully."
+        local fp_tmpdir
+        fp_tmpdir=$(mktemp -d)
+        if (cd "$fp_tmpdir" && curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash); then
+            hash -r
+            if ! command -v frankenphp &> /dev/null && [ -x "$fp_tmpdir/frankenphp" ]; then
+                $SUDO_CMD mv "$fp_tmpdir/frankenphp" "$BIN_DIR/frankenphp"
+                $SUDO_CMD chmod +x "$BIN_DIR/frankenphp"
+                hash -r
+            fi
+            rm -rf "$fp_tmpdir"
+            if command -v frankenphp &> /dev/null; then
+                echo "✅ FrankenPHP installed successfully."
+            else
+                gum style --foreground red "❌ FrankenPHP installer ran but the binary is not on PATH."
+                exit 1
+            fi
         else
+            rm -rf "$fp_tmpdir"
             gum style --foreground red "❌ The FrankenPHP download script failed."
             exit 1
         fi
@@ -441,16 +347,20 @@ cove_install() {
 
     # MariaDB - Database server
     install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" ""
-    
-    # PHP with extensions (uses dedicated function for Linux)
-    if [ "$OS" == "macos" ]; then
-        install_dependency "php" "php" "" "" ""
-    else
-        install_php_with_extensions
-    fi
 
-    # Mailpit - Email testing tool (uses its own universal installer)
-    if ! command -v mailpit &> /dev/null; then
+    # No standalone PHP install — wp-cli is invoked through `frankenphp php-cli`
+    # (see get_wp_cmd in main), so FrankenPHP's bundled PHP is the single PHP
+    # runtime for both web and CLI. On Linux the php-zts-* extensions installed
+    # above provide WordPress's required extensions to FrankenPHP.
+
+    # Mailpit - Email testing tool.
+    # On macOS we use the Homebrew formula. On Linux we use the upstream
+    # installer because mailpit isn't packaged in apt/dnf.
+    # Why: the upstream installer hardcodes /usr/local/bin, which doesn't
+    # exist on a fresh Apple Silicon Mac (Homebrew lives at /opt/homebrew).
+    if [ "$OS" == "macos" ]; then
+        install_dependency "mailpit" "mailpit" "" "" ""
+    elif ! command -v mailpit &> /dev/null; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: mailpit"
         echo "   - Using the official Mailpit installer..."
         if curl -sL https://raw.githubusercontent.com/axllent/mailpit/develop/install.sh | $SUDO_CMD bash; then
@@ -470,6 +380,18 @@ cove_install() {
     # --- Directory and Service Setup (Copied from original file) ---
     echo "📁 Creating Cove directory structure..."
     mkdir -p "$SITES_DIR" "$LOGS_DIR" "$GUI_DIR" "$ADMINER_DIR" "$CUSTOM_CADDY_DIR"
+
+    # Write the PHP ini that wp-cli (via `frankenphp php-cli`) will load.
+    # See the comment on $PHPRC export in main for the rationale.
+    # error_reporting=6143 is E_ALL minus E_DEPRECATED/E_USER_DEPRECATED/E_STRICT
+    # so wp-cli's bundled vendor code (react/promise, php-cli-tools/Colors.php)
+    # doesn't flood every command on PHP 8.5+.
+    echo "⚙️ Writing Cove PHP ini..."
+    cat > "$PHP_INI_FILE" <<'INI'
+memory_limit = 512M
+display_errors = 0
+error_reporting = 6143
+INI
     echo "🗃️ Downloading Adminer 5.4.1..."
     curl -sL "https://github.com/vrana/adminer/releases/download/v5.4.1/adminer-5.4.1.php" -o "$ADMINER_DIR/adminer-core.php"
     echo "⚙️ Creating Adminer autologin..."
@@ -578,6 +500,17 @@ EOM
 
     echo "✅ Initial configuration complete. Starting services..."
     cove_enable
+
+    # If the user changed HTTPS ports during install AND there are pre-existing
+    # WordPress sites in $SITES_DIR, migrate their stored URLs to the new port.
+    # On a fresh install with no sites, this is a silent no-op.
+    if [ "$original_https" != "$HTTPS_PORT" ]; then
+        if [ -d "$SITES_DIR" ] && [ -n "$(find "$SITES_DIR" -maxdepth 2 -name wp-config.php -print -quit 2>/dev/null)" ]; then
+            echo ""
+            echo "🔄 Updating WordPress site URLs to new HTTPS port..."
+            update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT"
+        fi
+    fi
 
     # Show post-install guidance
     echo ""
