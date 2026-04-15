@@ -1,0 +1,218 @@
+cove_ports() {
+    # -----------------------------------------------------------------
+    #  cove ports
+    #  Reconfigure the HTTP / HTTPS ports Cove listens on and (by
+    #  default) migrate every WordPress site's stored URLs via
+    #  `wp search-replace` so they match the new port.
+    #
+    #  Flags:
+    #    --http PORT     Non-interactive: set HTTP port
+    #    --https PORT    Non-interactive: set HTTPS port
+    #    --skip-urls     Change ports without touching WordPress databases
+    #    --dry-run       Preview changes (including search-replace counts)
+    #                    without committing anything
+    # -----------------------------------------------------------------
+
+    local explicit_http=""
+    local explicit_https=""
+    local skip_urls=false
+    local dry_run=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --http)
+                explicit_http="$2"
+                shift 2
+                ;;
+            --https)
+                explicit_https="$2"
+                shift 2
+                ;;
+            --skip-urls)
+                skip_urls=true
+                shift
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            -h|--help)
+                display_command_help ports
+                exit 0
+                ;;
+            *)
+                gum style --foreground red "❌ Unknown option: $1"
+                echo "Usage: cove ports [--http PORT] [--https PORT] [--skip-urls] [--dry-run]"
+                exit 1
+                ;;
+        esac
+    done
+
+    local original_http="$HTTP_PORT"
+    local original_https="$HTTPS_PORT"
+
+    # --- Determine target ports ---
+    if [ -n "$explicit_http" ] || [ -n "$explicit_https" ]; then
+        # Non-interactive path — validate and apply.
+        local target_http="${explicit_http:-$HTTP_PORT}"
+        local target_https="${explicit_https:-$HTTPS_PORT}"
+
+        if [[ ! "$target_http" =~ ^[0-9]+$ ]] || [ "$target_http" -lt 1 ] || [ "$target_http" -gt 65535 ]; then
+            gum style --foreground red "❌ Invalid HTTP port: $target_http"
+            exit 1
+        fi
+        if [[ ! "$target_https" =~ ^[0-9]+$ ]] || [ "$target_https" -lt 1 ] || [ "$target_https" -gt 65535 ]; then
+            gum style --foreground red "❌ Invalid HTTPS port: $target_https"
+            exit 1
+        fi
+        if [ "$target_http" = "$target_https" ]; then
+            gum style --foreground red "❌ HTTP and HTTPS ports must differ."
+            exit 1
+        fi
+
+        HTTP_PORT="$target_http"
+        HTTPS_PORT="$target_https"
+    else
+        # Interactive menu
+        echo ""
+        gum style --foreground "212" \
+            "Cove is currently on ports: HTTP ${HTTP_PORT} / HTTPS ${HTTPS_PORT}"
+        echo ""
+
+        local default_label="Switch to default ports (80 / 443)"
+        if [ "$HTTP_PORT" != "80" ] || [ "$HTTPS_PORT" != "443" ]; then
+            if port_has_conflict 80 || port_has_conflict 443; then
+                default_label="Switch to default ports (80 / 443) — currently in use"
+            fi
+        fi
+
+        local alt_label="Use alternative ports (8090 / 8453)"
+        if [ "$HTTP_PORT" = "8090" ] && [ "$HTTPS_PORT" = "8453" ]; then
+            alt_label=""
+        elif port_has_conflict 8090 || port_has_conflict 8453; then
+            alt_label="Use alternative ports (8090 / 8453) — currently in use"
+        fi
+
+        local -a menu_opts
+        menu_opts=("Keep current ports (${HTTP_PORT} / ${HTTPS_PORT})")
+        if [ "$HTTP_PORT" != "80" ] || [ "$HTTPS_PORT" != "443" ]; then
+            menu_opts+=("$default_label")
+        fi
+        if [ -n "$alt_label" ]; then
+            menu_opts+=("$alt_label")
+        fi
+        menu_opts+=("Pick custom ports" "Cancel")
+
+        local choice
+        choice=$(gum choose "${menu_opts[@]}")
+
+        case "$choice" in
+            "Keep current"*)
+                echo "ℹ️  No changes."
+                exit 0
+                ;;
+            "Switch to default"*)
+                HTTP_PORT=80
+                HTTPS_PORT=443
+                ;;
+            "Use alternative"*)
+                HTTP_PORT=8090
+                HTTPS_PORT=8453
+                ;;
+            "Pick custom ports")
+                prompt_custom_ports 8090 8453
+                ;;
+            "Cancel"|*)
+                echo "🚫 Cancelled."
+                exit 0
+                ;;
+        esac
+    fi
+
+    # --- Check if anything actually changed ---
+    if [ "$original_http" = "$HTTP_PORT" ] && [ "$original_https" = "$HTTPS_PORT" ]; then
+        echo "ℹ️  Ports unchanged."
+        exit 0
+    fi
+
+    # --- Preview ---
+    echo ""
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "Port change:" \
+        "  HTTP:  ${original_http} → ${HTTP_PORT}" \
+        "  HTTPS: ${original_https} → ${HTTPS_PORT}"
+
+    if ! $skip_urls && [ "$original_https" != "$HTTPS_PORT" ]; then
+        echo ""
+        local any_wp=false
+        if [ -d "$SITES_DIR" ]; then
+            local site_path site_name
+            for site_path in "$SITES_DIR"/*; do
+                [ -d "$site_path" ] || continue
+                [ -f "$site_path/public/wp-config.php" ] || continue
+                if ! $any_wp; then
+                    echo "The following WordPress sites will have stored URLs updated:"
+                    any_wp=true
+                fi
+                site_name=$(basename "$site_path")
+                echo "   • ${site_name}: $(port_url_for "$site_name" "$original_https") → $(port_url_for "$site_name" "$HTTPS_PORT")"
+            done
+        fi
+        if ! $any_wp; then
+            echo "(No WordPress sites to update.)"
+        fi
+    elif $skip_urls; then
+        echo ""
+        gum style --faint "(--skip-urls: WordPress databases will NOT be updated)"
+    fi
+
+    # --- Dry run exits here ---
+    if $dry_run; then
+        echo ""
+        echo "🔍 Dry run: running wp search-replace --dry-run..."
+        echo ""
+        if ! $skip_urls; then
+            update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT" --dry-run
+        fi
+        # Revert globals so nothing leaks to the caller
+        HTTP_PORT="$original_http"
+        HTTPS_PORT="$original_https"
+        echo ""
+        gum style --faint "Dry run complete. No changes committed."
+        exit 0
+    fi
+
+    # --- Confirm ---
+    echo ""
+    if ! gum confirm "Proceed with the port change?"; then
+        # Revert globals so nothing leaks to the caller
+        HTTP_PORT="$original_http"
+        HTTPS_PORT="$original_https"
+        echo "🚫 Cancelled."
+        exit 0
+    fi
+
+    # --- Commit ---
+    echo ""
+    echo "💾 Saving port configuration..."
+    config_set HTTP_PORT "$HTTP_PORT"
+    config_set HTTPS_PORT "$HTTPS_PORT"
+
+    if ! $skip_urls && [ "$original_https" != "$HTTPS_PORT" ]; then
+        echo ""
+        echo "🔄 Updating WordPress site URLs..."
+        update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT"
+    fi
+
+    echo ""
+    regenerate_caddyfile
+
+    echo ""
+    cove_enable
+
+    echo ""
+    gum style --foreground green "✅ Cove is now on ports ${HTTP_PORT} / ${HTTPS_PORT}"
+    if [ "$HTTPS_PORT" != "443" ]; then
+        gum style --faint "   Dashboard: $(url_for cove.localhost)"
+    fi
+}
