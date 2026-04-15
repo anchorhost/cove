@@ -2,10 +2,11 @@ cove_disable() {
     echo "🛑 Disabling Cove services..."
     
     echo "   - Stopping Caddy/FrankenPHP..."
-    $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null
-    
+
     # Stop services on MacOS
     if [ "$OS" == "macos" ]; then
+        launchctl unload "$COVE_DIR/com.cove.caddy.plist" &>/dev/null
+        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
         echo "   - Stopping MariaDB..."
         brew services stop mariadb &>/dev/null
         echo "   - Stopping Mailpit..."

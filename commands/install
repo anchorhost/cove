@@ -415,6 +415,29 @@ cove_install() {
     else
         echo "✅ FrankenPHP is already installed."
     fi
+    
+    # On Linux with apt/dnf, FrankenPHP needs additional PHP extensions installed
+    # The DEB/RPM packages don't include all extensions by default
+    if [ "$OS" = "linux" ]; then
+        echo "📦 Installing FrankenPHP PHP extensions for WordPress..."
+        if [ "$PKG_MANAGER" = "apt" ]; then
+            # Install required PHP extensions for WordPress via apt
+            $SUDO_CMD apt install -y php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath 2>/dev/null || true
+            echo "✅ FrankenPHP PHP extensions installed."
+        elif [ "$PKG_MANAGER" = "dnf" ]; then
+            # Install required PHP extensions for WordPress via dnf
+            $SUDO_CMD dnf install -y php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath 2>/dev/null || true
+            echo "✅ FrankenPHP PHP extensions installed."
+        fi
+        
+        # Verify mysqli is available
+        if ! frankenphp php-cli -r "echo implode(',', get_loaded_extensions());" 2>/dev/null | grep -qi mysqli; then
+            gum style --foreground yellow "⚠️ Warning: mysqli extension not found in FrankenPHP."
+            gum style --foreground yellow "   WordPress may not work correctly."
+            gum style --foreground yellow "   Try: sudo apt install php-zts-mysqli (for apt)"
+            gum style --foreground yellow "   Or:  sudo dnf install php-zts-mysqli (for dnf)"
+        fi
+    fi
 
     # MariaDB - Database server
     install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" ""

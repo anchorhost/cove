@@ -1,40 +1,98 @@
-upgrade_frankenphp_binary() {
-    local target_bin_dir
+upgrade_frankenphp() {
     local frankenphp_path
-
-    # First, try to find the path of the existing frankenphp command.
     frankenphp_path=$(command -v frankenphp)
-
-    if [ -n "$frankenphp_path" ]; then
-        # If found, use its directory as the installation target.
-        target_bin_dir=$(dirname "$frankenphp_path")
-        echo "   - Detected existing FrankenPHP in '$target_bin_dir'. Using this as the installation target."
-    else
-        # If not found, use the global BIN_DIR (set in setup_environment)
-        echo "   - FrankenPHP not found in PATH. Using default bin directory: $BIN_DIR"
-        target_bin_dir="$BIN_DIR"
-    fi
-
-    echo "   - Downloading the latest FrankenPHP binary..."
-    if curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash; then
-        if [ -f "./frankenphp" ]; then
-            echo "   - Moving 'frankenphp' to $target_bin_dir/..."
-            if $SUDO_CMD mv ./frankenphp "$target_bin_dir/frankenphp"; then
-                echo "   - ✅ FrankenPHP reinstalled successfully."
+    
+    # Check if installed via package manager (typically at /usr/bin/frankenphp)
+    if [ "$frankenphp_path" = "/usr/bin/frankenphp" ]; then
+        # Package manager installation - use apt/dnf to upgrade
+        if [ "$PKG_MANAGER" = "apt" ]; then
+            echo "   - FrankenPHP installed via apt. Upgrading with apt..."
+            if $SUDO_CMD apt update && $SUDO_CMD apt install --only-upgrade -y frankenphp; then
+                echo "   - ✅ FrankenPHP upgraded successfully via apt."
             else
-                gum style --foreground red "❌ Failed to move frankenphp." \
-                    "Please run this command manually from the directory you ran the installer:" \
-                    "sudo mv ./frankenphp \"$target_bin_dir/frankenphp\""
+                gum style --foreground red "❌ Failed to upgrade FrankenPHP via apt."
+                return 1
+            fi
+        elif [ "$PKG_MANAGER" = "dnf" ]; then
+            echo "   - FrankenPHP installed via dnf. Upgrading with dnf..."
+            if $SUDO_CMD dnf upgrade -y frankenphp; then
+                echo "   - ✅ FrankenPHP upgraded successfully via dnf."
+            else
+                gum style --foreground red "❌ Failed to upgrade FrankenPHP via dnf."
                 return 1
             fi
         else
-            gum style --foreground red "❌ FrankenPHP download script failed to create the 'frankenphp' file."
+            echo "   - ⚠️ Unknown package manager for FrankenPHP at /usr/bin. Skipping upgrade."
             return 1
         fi
     else
-        gum style --foreground red "❌ The FrankenPHP download script failed."
+        # Static binary installation - download directly
+        local target_bin_dir
+        if [ -n "$frankenphp_path" ]; then
+            target_bin_dir=$(dirname "$frankenphp_path")
+            echo "   - Detected static FrankenPHP binary in '$target_bin_dir'."
+        else
+            target_bin_dir="$BIN_DIR"
+            echo "   - FrankenPHP not found. Using default: $target_bin_dir"
+        fi
+        
+        echo "   - Downloading latest FrankenPHP static binary..."
+        
+        # Determine the correct binary for this platform
+        local arch=$(uname -m)
+        local os=$(uname -s)
+        local binary_name=""
+        
+        if [ "$os" = "Linux" ]; then
+            case $arch in
+                x86_64) binary_name="frankenphp-linux-x86_64" ;;
+                aarch64) binary_name="frankenphp-linux-aarch64" ;;
+            esac
+            # Check for glibc
+            if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+                binary_name="${binary_name}-gnu"
+            fi
+        elif [ "$os" = "Darwin" ]; then
+            case $arch in
+                arm64) binary_name="frankenphp-mac-arm64" ;;
+                x86_64) binary_name="frankenphp-mac-x86_64" ;;
+            esac
+        fi
+        
+        if [ -z "$binary_name" ]; then
+            gum style --foreground red "❌ No precompiled FrankenPHP binary available for $os/$arch"
+            return 1
+        fi
+        
+        local temp_binary="/tmp/frankenphp_new"
+        if curl -L --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${binary_name}" -o "$temp_binary"; then
+            chmod +x "$temp_binary"
+            if sudo mv "$temp_binary" "$target_bin_dir/frankenphp"; then
+                # Set capability to bind to low ports without root
+                if command -v setcap &>/dev/null; then
+                    $SUDO_CMD setcap 'cap_net_bind_service=+ep' "$target_bin_dir/frankenphp" 2>/dev/null || true
+                fi
+                echo "   - ✅ FrankenPHP upgraded successfully."
+            else
+                gum style --foreground red "❌ Failed to move FrankenPHP to $target_bin_dir"
+                rm -f "$temp_binary"
+                return 1
+            fi
+        else
+            gum style --foreground red "❌ Failed to download FrankenPHP binary."
+            return 1
+        fi
+    fi
+    
+    # Verify mysqli is available after upgrade
+    echo "   - Verifying PHP mysqli extension..."
+    if ! frankenphp php-cli -r "echo implode(',', get_loaded_extensions());" 2>/dev/null | grep -qi mysqli; then
+        gum style --foreground yellow "⚠️ Warning: mysqli extension not found in FrankenPHP."
+        gum style --foreground yellow "   WordPress sites may not work correctly."
         return 1
     fi
+    echo "   - ✅ mysqli extension verified."
+    
     return 0
 }
 
@@ -116,15 +174,15 @@ cove_upgrade() {
         return 0
     fi
 
-    # Get local version
+    # Get local version (strip 'v' prefix if present)
     local local_frankenphp_version
-    local_frankenphp_version=$(frankenphp version | awk '{print $2}')
+    local_frankenphp_version=$(frankenphp version | awk '{print $2}' | sed 's/^v//')
     if [ -z "$local_frankenphp_version" ]; then
         echo "   - ❌ Could not determine local FrankenPHP version. Skipping update check."
         return 1
     fi
 
-    # Get latest version from GitHub redirect
+    # Get latest version from GitHub redirect (strip 'v' prefix)
     local latest_frankenphp_version
     latest_frankenphp_version=$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/php/frankenphp/releases/latest | sed 's/.*\/v//')
 
@@ -136,19 +194,19 @@ cove_upgrade() {
     echo "   - Current FrankenPHP version:  $local_frankenphp_version"
     echo "   - Latest available version:    $latest_frankenphp_version"
 
-    # Use PHP for robust version comparison
-    local needs_upgrade
-    needs_upgrade=$(LOCAL_V="$local_frankenphp_version" REMOTE_V="$latest_frankenphp_version" php -r '
-        if (version_compare(getenv("LOCAL_V"), getenv("REMOTE_V"), "<")) {
-            echo "true";
-        } else {
-            echo "false";
-        }
-    ')
+    # Compare versions using sort -V (works without PHP)
+    local needs_upgrade="false"
+    if [ "$local_frankenphp_version" != "$latest_frankenphp_version" ]; then
+        local older_version
+        older_version=$(printf '%s\n' "$local_frankenphp_version" "$latest_frankenphp_version" | sort -V | head -n1)
+        if [ "$older_version" = "$local_frankenphp_version" ]; then
+            needs_upgrade="true"
+        fi
+    fi
 
     if [ "$needs_upgrade" == "true" ]; then
         echo "🚀 Upgrading FrankenPHP to version $latest_frankenphp_version..."
-        upgrade_frankenphp_binary
+        upgrade_frankenphp
     else
         echo "✅ FrankenPHP is already up to date."
     fi
