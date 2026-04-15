@@ -65,32 +65,41 @@ cove_add() {
         echo "Installing WordPress..."
         admin_pass=$(openssl rand -base64 12)
         
-        # Use a variable for the WP-CLI command with increased memory limit
-        # get_wp_cmd adds --allow-root if running as root (common in WSL/Docker)
-        local wp_cmd="php -d memory_limit=512M $(get_wp_cmd)"
+        # get_wp_cmd routes wp-cli through `frankenphp php-cli` and PHPRC
+        # (exported in main) sets display_errors=0 + error_reporting=6143.
+        # That handles parse-time and pre-bootstrap warnings, but wp-cli's
+        # own bootstrap calls `ini_set('display_errors', 'stderr')` to keep
+        # its status messages on stdout, which re-routes PHP deprecation
+        # warnings to stderr from wp-cli's bundled vendor code (Colors.php
+        # on PHP 8.5+). The stderr filter on the subshell strips those
+        # leaked Deprecated lines while still passing through real wp-cli
+        # error output (which doesn't carry the "Deprecated:" prefix).
+        local wp_cmd
+        wp_cmd=$(get_wp_cmd)
 
         (
             cd "$site_dir/public" || exit 1
-            
+
             # 1. Download WordPress with a higher memory limit
             if ! $wp_cmd core download --quiet; then
                 echo "❌ Error: Failed to download WordPress core. This might be a network issue or a permissions problem."
                 exit 1 # Exit the subshell with an error
             fi
-            
+
             # 2. Create the config file
             $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
 define( 'WP_DEBUG', true );
 define( 'WP_DEBUG_LOG', true );
+define( 'WP_DEBUG_DISPLAY', false );
 PHP
-            
+
             # 3. Install WordPress
             $wp_cmd core install --url="$(url_for "$full_hostname")" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
 
             # 4. Delete default plugins
             echo "   - Deleting default plugins (Hello Dolly, Akismet)..."
             $wp_cmd plugin delete hello akismet --quiet
-        )
+        ) 2> >(grep -v -E '^(PHP )?Deprecated:' >&2)
 
         # Check the exit code of the subshell. If it's not 0, something failed.
         if [ $? -ne 0 ]; then
