@@ -125,7 +125,7 @@ cove_share() {
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
         "Starting public tunnel for ${site_name}" \
         "" \
-        "Local: https://${local_hostname}" \
+        "Local: $(url_for "${local_hostname}")" \
         "" \
         "Press Ctrl+C to stop sharing."
     echo ""
@@ -173,7 +173,7 @@ cove_share() {
     # --- 8. Start Python HTTP proxy that rewrites URLs ---
     echo "Starting local proxy with URL rewriting..."
     
-    $python_cmd - "$local_hostname" "$SHARE_PROXY_PORT" "$public_host" << 'PYTHON_PROXY' &
+    $python_cmd - "$local_hostname" "$SHARE_PROXY_PORT" "$public_host" "$HTTPS_PORT" << 'PYTHON_PROXY' &
 import sys
 import ssl
 import re
@@ -183,6 +183,8 @@ from urllib.request import Request, urlopen
 TARGET_HOST = sys.argv[1]  # e.g., anchordev.localhost
 LISTEN_PORT = int(sys.argv[2])
 PUBLIC_HOST = sys.argv[3]  # e.g., random-words.trycloudflare.com
+HTTPS_PORT = int(sys.argv[4]) if len(sys.argv) > 4 else 443
+TARGET_AUTHORITY = TARGET_HOST if HTTPS_PORT == 443 else f"{TARGET_HOST}:{HTTPS_PORT}"
 
 # Create SSL context that doesn't verify certificates (for self-signed)
 ssl_ctx = ssl.create_default_context()
@@ -233,33 +235,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
         print(format % args, flush=True)
     
     def do_request(self):
-        target_url = f"https://{TARGET_HOST}{self.path}"
-        
+        target_url = f"https://{TARGET_AUTHORITY}{self.path}"
+
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
-        
+
         req = Request(target_url, data=body, method=self.command)
-        
+
         for key, value in self.headers.items():
             if key.lower() not in ('host', 'connection', 'accept-encoding'):
                 req.add_header(key, value)
-        req.add_header('Host', TARGET_HOST)
-        
+        req.add_header('Host', TARGET_AUTHORITY)
+
         try:
             with urlopen(req, context=ssl_ctx, timeout=60) as response:
                 response_body = response.read()
                 content_type = response.headers.get('Content-Type', '')
-                
+
                 # Rewrite URLs in text responses
                 if any(ct in content_type for ct in REWRITABLE_TYPES):
                     try:
                         text = response_body.decode('utf-8')
-                        # Replace https://site.localhost with https://public-url
-                        text = text.replace(f'https://{TARGET_HOST}', f'https://{PUBLIC_HOST}')
-                        # Also replace http:// version just in case
-                        text = text.replace(f'http://{TARGET_HOST}', f'https://{PUBLIC_HOST}')
-                        # Replace escaped versions (for JSON)
-                        text = text.replace(f'https:\\/\\/{TARGET_HOST}', f'https:\\/\\/{PUBLIC_HOST}')
+                        # Replace https://site.localhost[:port] with https://public-url
+                        text = text.replace(f'https://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
+                        text = text.replace(f'http://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
+                        # Escaped versions (for JSON)
+                        text = text.replace(f'https:\\/\\/{TARGET_AUTHORITY}', f'https:\\/\\/{PUBLIC_HOST}')
                         response_body = text.encode('utf-8')
                     except:
                         pass  # If decode fails, send original

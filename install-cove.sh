@@ -241,9 +241,11 @@ fi
 echo_info "Handing off to Cove to complete the installation..."
 echo "--------------------------------------------------"
 
-if ! "$DESTINATION_PATH" install; then
-    echo_error "The 'cove install' command failed. Please see the output above for details."
-fi
+# 'set -e' is active, so a non-zero exit from `cove install` will abort the
+# script before we reach the success messages below. This is important when
+# the user cancels from Cove's interactive prompts — we must not claim success
+# after the user has explicitly cancelled.
+"$DESTINATION_PATH" install
 
 echo "--------------------------------------------------"
 echo_success "Cove has been installed successfully!"

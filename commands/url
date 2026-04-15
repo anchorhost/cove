@@ -26,5 +26,5 @@ cove_url() {
     # -------------------------------------------------------------
     #  Print the URL – we keep the output plain so it can be piped.
     # -------------------------------------------------------------
-    echo "https://${site_name}.localhost"
+    url_for "${site_name}.localhost"
 }

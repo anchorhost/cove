@@ -90,7 +90,7 @@ cove_pull() {
     fi
 
     dest_path="$SITES_DIR/$site_name.localhost/public"
-    local_url="https://$site_name.localhost"
+    local_url="$(url_for "$site_name.localhost")"
 
     # --- 4. Perform Migration ---
     log_step "Generating backup for ${remote_url}..."

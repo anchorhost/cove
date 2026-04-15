@@ -93,6 +93,67 @@ CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
 
+# --- Port Configuration ---
+# Defaults; overridden by HTTP_PORT/HTTPS_PORT entries in $CONFIG_FILE if present.
+HTTP_PORT=80
+HTTPS_PORT=443
+if [ -f "$CONFIG_FILE" ]; then
+    _cove_saved_http=$(grep '^HTTP_PORT=' "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "'\"")
+    _cove_saved_https=$(grep '^HTTPS_PORT=' "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "'\"")
+    [ -n "$_cove_saved_http" ] && HTTP_PORT="$_cove_saved_http"
+    [ -n "$_cove_saved_https" ] && HTTPS_PORT="$_cove_saved_https"
+    unset _cove_saved_http _cove_saved_https
+fi
+
+# Returns ":8453" when HTTPS_PORT is non-default, otherwise empty.
+https_port_suffix() {
+    if [ "$HTTPS_PORT" = "443" ]; then
+        echo ""
+    else
+        echo ":$HTTPS_PORT"
+    fi
+}
+
+# Builds https URL with port suffix when non-default (e.g. "https://foo.localhost:8453").
+url_for() {
+    echo "https://${1}$(https_port_suffix)"
+}
+
+# Idempotent config writer: replaces any existing KEY= line before appending.
+config_set() {
+    local key="$1" val="$2"
+    local tmp
+    tmp=$(mktemp)
+    if [ -f "$CONFIG_FILE" ]; then
+        grep -v "^${key}=" "$CONFIG_FILE" > "$tmp" 2>/dev/null || true
+    fi
+    echo "${key}='${val}'" >> "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+# Returns the process name(s) listening on $1 for display purposes, or empty
+# if the process isn't visible (e.g. owned by another uid on macOS). Do NOT
+# use this for availability checks — use port_is_free for that.
+port_listening_app() {
+    local port="$1"
+    if command -v lsof &>/dev/null; then
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null \
+            | awk 'NR>1 {print $1}' | sort -u | paste -sd, -
+    elif command -v ss &>/dev/null; then
+        ss -tlnH "sport = :$port" 2>/dev/null \
+            | grep -oE 'users:\(\("[^"]+"' | sed 's/.*"\(.*\)"$/\1/' \
+            | sort -u | paste -sd, -
+    fi
+}
+
+# True when nothing is accepting connections on $1. Uses bash /dev/tcp so it
+# works regardless of who owns the listener (lsof is uid-scoped on macOS and
+# cannot see root-owned sockets from a regular user).
+port_is_free() {
+    local port="$1"
+    ! (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null
+}
+
 # --- Whoops Bootstrap Generation ---
 create_whoops_bootstrap() {
     echo "📜 Creating Whoops bootstrap file..."
@@ -423,10 +484,19 @@ regenerate_caddyfile() {
     local mailpit_path
     mailpit_path=$(command -v mailpit)
 
+    # Build optional http_port / https_port directives when non-default.
+    local port_directives=""
+    if [ "$HTTP_PORT" != "80" ]; then
+        port_directives+="    http_port $HTTP_PORT"$'\n'
+    fi
+    if [ "$HTTPS_PORT" != "443" ]; then
+        port_directives+="    https_port $HTTPS_PORT"$'\n'
+    fi
+
     # Write the static header of the Caddyfile
     cat > "$CADDYFILE_PATH" <<- EOM
 {
-    frankenphp {
+${port_directives}    frankenphp {
         php_ini sendmail_path "$mailpit_path sendmail -t"
         php_ini log_errors On
         php_ini display_errors Off
@@ -437,6 +507,9 @@ regenerate_caddyfile() {
         php_ini post_max_size 512M
     }
     order php_server before file_server
+    servers {
+        protocols h1
+    }
 }
 
 # --- Global Services ---
@@ -489,7 +562,6 @@ EOM
                 echo "$site_domains {" >> "$CADDYFILE_PATH"
                 
                 echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
-                echo "    encode gzip" >> "$CADDYFILE_PATH"
                 echo "    tls internal" >> "$CADDYFILE_PATH"
                 
                 echo "    log {" >> "$CADDYFILE_PATH"
@@ -525,7 +597,6 @@ EOM
                         echo "https://${lan_ip}:${lan_port} {" >> "$CADDYFILE_PATH"
                         echo "    bind 0.0.0.0" >> "$CADDYFILE_PATH"
                         echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
-                        echo "    encode gzip" >> "$CADDYFILE_PATH"
                         echo "    tls internal" >> "$CADDYFILE_PATH"
                         
                         echo "    log {" >> "$CADDYFILE_PATH"
@@ -700,6 +771,17 @@ $sitedir = 'SITES_DIR_PLACEHOLDER';
 $cove_path = 'COVE_EXECUTABLE_PATH_PLACEHOLDER';
 $user_home = 'USER_HOME_PLACEHOLDER';
 
+// Read the configured HTTPS port so site links include ":8453" when non-default.
+$__cove_https_port = 443;
+$__cove_cfg_path = $user_home . '/Cove/config';
+if (file_exists($__cove_cfg_path)) {
+    $__cove_cfg = parse_ini_file($__cove_cfg_path);
+    if (!empty($__cove_cfg['HTTPS_PORT'])) {
+        $__cove_https_port = (int) $__cove_cfg['HTTPS_PORT'];
+    }
+}
+$__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_port;
+
 // Handle GET requests for listing sites
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $action = $_GET['action'] ?? '';
@@ -713,7 +795,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                 if (is_dir($site_path)) {
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
-                        'domain' => 'https://' . $item,
+                        'domain' => 'https://' . $item . $__cove_port_suffix,
                         'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
                         'display_path' => '~/Cove/Sites/' . $item,
                         'full_path' => $site_path
@@ -819,6 +901,8 @@ EOM
 <?php
 $config_file = getenv('HOME') . '/Cove/config';
 $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
+$__cove_https_port = isset($config_data['HTTPS_PORT']) ? (int) $config_data['HTTPS_PORT'] : 443;
+$__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_port;
 ?>
 <!DOCTYPE html>
 <html lang="en" x-data="{ theme: localStorage.getItem('theme') || 'dark' }" x-init="$watch('theme', val => localStorage.setItem('theme', val))" :data-theme="theme">
@@ -858,8 +942,8 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
         <section>
             <h2>🚀 Quick Links</h2>
             <div class="grid">
-                <a href="https://db.cove.localhost" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">🗃️ Manage Databases (Adminer)</a>
-                <a href="https://mail.cove.localhost" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">✉️ Inspect Emails (Mailpit)</a>
+                <a href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">🗃️ Manage Databases (Adminer)</a>
+                <a href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">✉️ Inspect Emails (Mailpit)</a>
             </div>
         </section>
 
@@ -1256,7 +1340,7 @@ display_command_help() {
             echo "Usage: cove share [site]"
             echo ""
             echo "Creates a temporary public tunnel to share a local site with anyone on the internet."
-            echo "Powered by localhost.run - no downloads or signups required, just SSH."
+            echo "Powered by Cloudflare Quick Tunnels (cloudflared installed on-demand)."
             echo ""
             echo "Arguments:"
             echo "  [site]    The site name (optional). If omitted, prompts for selection."
@@ -1265,7 +1349,7 @@ display_command_help() {
             echo "  cove share           Interactive site selection"
             echo "  cove share mysite    Share mysite.localhost publicly"
             echo ""
-            echo "You'll receive a random URL like https://abc123.localhost.run"
+            echo "You'll receive a random URL like https://random-words.trycloudflare.com"
             echo "The URL is temporary and stops working when you press Ctrl+C."
             ;;
         wsl-hosts)

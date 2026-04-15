@@ -6,7 +6,7 @@ cove_list() {
 
     # PHP script to find, sort, and format the site list with box-drawing characters
     local php_output
-    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" php -r '
+    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" HTTPS_PORT_SUFFIX="$(https_port_suffix)" php -r '
         function getDirectorySize(string $path): int {
             if (!is_dir($path)) return 0;
             $total_size = 0;
@@ -28,6 +28,7 @@ cove_list() {
 
         $sites_dir = getenv("SITES_DIR");
         $show_totals = getenv("SHOW_TOTALS") === "true";
+        $port_suffix = getenv("HTTPS_PORT_SUFFIX") ?: "";
 
         if (!is_dir($sites_dir)) {
             exit;
@@ -44,7 +45,7 @@ cove_list() {
                 $size = $show_totals && is_dir($public_path) ? formatSize(getDirectorySize($public_path)) : null;
                 $sites[] = [
                     "name" => str_replace(".localhost", "", $item),
-                    "domain" => "https://" . $item,
+                    "domain" => "https://" . $item . $port_suffix,
                     "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
                     "size" => $size,
                 ];

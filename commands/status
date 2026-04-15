@@ -46,9 +46,9 @@ cove_status() {
     if [[ "$caddy_status" == "✅ Running" && "$mariadb_status" == "✅ Running" && "$mailpit_status" == "✅ Running" ]]; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
             "✅ All services are running" \
-            "Dashboard: https://cove.localhost" \
-            "Adminer:   https://db.cove.localhost" \
-            "Mailpit:   https://mail.cove.localhost"
+            "Dashboard: $(url_for cove.localhost)" \
+            "Adminer:   $(url_for db.cove.localhost)" \
+            "Mailpit:   $(url_for mail.cove.localhost)"
         
         # Show WSL-specific info
         if [ "$IS_WSL" = true ]; then

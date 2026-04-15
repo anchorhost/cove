@@ -78,7 +78,7 @@ cove_rename() {
         (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet)
 
         echo "   - Running search-replace for site URL..."
-        (cd "$new_site_dir/public" && $wp_cmd search-replace "https://$old_name.localhost" "https://$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet)
+        (cd "$new_site_dir/public" && $wp_cmd search-replace "$(url_for "$old_name.localhost")" "$(url_for "$new_name.localhost")" --all-tables --skip-plugins --skip-themes --quiet)
 
         echo "   - Dropping old database '$old_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
@@ -95,5 +95,5 @@ cove_rename() {
     # --- Reload Server Configuration ---
     regenerate_caddyfile
 
-    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: https://$new_name.localhost"
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: $(url_for "$new_name.localhost")"
 }

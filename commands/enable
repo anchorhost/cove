@@ -96,9 +96,9 @@ EOM
         echo ""
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
             "✅ Services are running" \
-            "Dashboard: https://cove.localhost" \
-            "Adminer:   https://db.cove.localhost" \
-            "Mailpit:   https://mail.cove.localhost"
+            "Dashboard: $(url_for cove.localhost)" \
+            "Adminer:   $(url_for db.cove.localhost)" \
+            "Mailpit:   $(url_for mail.cove.localhost)"
         
         # Show WSL-specific info
         if [ "$IS_WSL" = true ]; then

@@ -223,48 +223,7 @@ cove_install() {
         fi
     fi
 
-    # Check for services using standard web ports
-    # Use ss as fallback if lsof is not available (common on minimal Linux installs)
-    local port_check_cmd=""
-    if command -v lsof &>/dev/null; then
-        port_check_cmd="lsof"
-    elif command -v ss &>/dev/null; then
-        port_check_cmd="ss"
-    fi
-    
-    if [ -n "$port_check_cmd" ]; then
-        local ports_in_use=false
-        local listening_app=""
-        
-        if [ "$port_check_cmd" == "lsof" ]; then
-            if lsof -i :80 -i :443 2>/dev/null | grep -q 'LISTEN'; then
-                ports_in_use=true
-                listening_app=$(lsof -i :80 -i :443 2>/dev/null | grep 'LISTEN' | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')
-            fi
-        else
-            # Use ss for port checking
-            if ss -tlnp 2>/dev/null | grep -qE ':80\s|:443\s'; then
-                ports_in_use=true
-                listening_app=$(ss -tlnp 2>/dev/null | grep -E ':80\s|:443\s' | sed 's/.*users:(("\([^"]*\)".*/\1/' | sort -u | tr '\n' ' ')
-            fi
-        fi
-        
-        if [ "$ports_in_use" = true ]; then
-            if [[ "$listening_app" != *"$CADDY_CMD"* && "$listening_app" != *"frankenph"* ]]; then
-                echo "⚠️  Warning: A conflicting web server ('${listening_app}') may be running!"
-                echo "Cove needs ports 80/443 to function."
-                read -p "Do you want to proceed with the installation anyway? (y/N) " -n 1 -r
-                echo
-                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                    echo "🚫 Installation cancelled."
-                    exit 0
-                fi
-            fi
-        fi
-    fi
-    
-    # --- Dependency Installation ---
-    # Gum - Terminal UI library (needed first for nice prompts)
+    # --- Gum (required for the port-selection UI that follows) ---
     # Note: gum releases use format: gum_VERSION_Linux_x86_64.tar.gz
     local gum_arch="x86_64"
     if [ "$(uname -m)" == "aarch64" ] || [ "$(uname -m)" == "arm64" ]; then
@@ -272,6 +231,168 @@ cove_install() {
     fi
     local gum_url="https://github.com/charmbracelet/gum/releases/download/v0.14.1/gum_0.14.1_Linux_${gum_arch}.tar.gz"
     install_dependency "gum" "gum" "gum" "gum" "$gum_url"
+
+    # --- Port Selection ---
+    # Two paths can run here:
+    #   1. Reconfigure path — saved config already has non-default ports; the
+    #      user gets a menu to keep, switch to defaults, or pick new values.
+    #   2. Conflict path — the target ports (post-reconfigure) are occupied
+    #      by a non-Cove process; the user gets the conflict menu.
+    # On a fresh install with free 80/443, both paths are skipped silently.
+    local target_http="$HTTP_PORT"
+    local target_https="$HTTPS_PORT"
+    local port_choice_made=false
+
+    # Treat our own Caddy/FrankenPHP as a non-conflict so reinstalls are seamless.
+    _port_is_own() {
+        local app
+        app=$(port_listening_app "$1")
+        [ -n "$app" ] && { [[ "$app" == *"$CADDY_CMD"* ]] || [[ "$app" == *frankenph* ]]; }
+    }
+
+    # True if $1 is occupied by something that isn't one of our own services.
+    _port_has_conflict() {
+        port_is_free "$1" && return 1
+        _port_is_own "$1" && return 1
+        return 0
+    }
+
+    # Interactive custom-port picker. Validates input and checks availability.
+    # Sets target_http / target_https in the enclosing cove_install scope.
+    _prompt_custom_ports() {
+        local suggest_http="${1:-8090}" suggest_https="${2:-8453}"
+        local candidate
+        while true; do
+            candidate=$(gum input --value "$suggest_http" --prompt "HTTP port: ")
+            if [[ ! "$candidate" =~ ^[0-9]+$ ]] || [ "$candidate" -lt 1 ] || [ "$candidate" -gt 65535 ]; then
+                gum style --foreground red "   ❌ Invalid port number."
+                continue
+            fi
+            if ! port_is_free "$candidate"; then
+                gum style --foreground red "   ❌ Port $candidate is in use by: $(port_listening_app "$candidate")"
+                continue
+            fi
+            target_http="$candidate"
+            break
+        done
+        while true; do
+            candidate=$(gum input --value "$suggest_https" --prompt "HTTPS port: ")
+            if [[ ! "$candidate" =~ ^[0-9]+$ ]] || [ "$candidate" -lt 1 ] || [ "$candidate" -gt 65535 ]; then
+                gum style --foreground red "   ❌ Invalid port number."
+                continue
+            fi
+            if [ "$candidate" = "$target_http" ]; then
+                gum style --foreground red "   ❌ HTTPS port must differ from HTTP port."
+                continue
+            fi
+            if ! port_is_free "$candidate"; then
+                gum style --foreground red "   ❌ Port $candidate is in use by: $(port_listening_app "$candidate")"
+                continue
+            fi
+            target_https="$candidate"
+            break
+        done
+    }
+
+    # --- Reconfigure path ---
+    if [ "$target_http" != "80" ] || [ "$target_https" != "443" ]; then
+        echo ""
+        gum style --foreground "212" \
+            "Cove is currently configured for custom ports: ${target_http} / ${target_https}"
+        echo ""
+
+        local default_label="Switch to default ports (80 / 443)"
+        if _port_has_conflict 80 || _port_has_conflict 443; then
+            default_label="Switch to default ports (80 / 443) — currently in use"
+        fi
+
+        local choice
+        choice=$(gum choose \
+            "Keep current ports (${target_http} / ${target_https})" \
+            "$default_label" \
+            "Pick different custom ports")
+
+        case "$choice" in
+            "Keep current"*)
+                : # no change
+                ;;
+            "Switch to default"*)
+                target_http=80
+                target_https=443
+                ;;
+            "Pick different"*)
+                _prompt_custom_ports 8090 8453
+                ;;
+        esac
+        port_choice_made=true
+    fi
+
+    # --- Conflict path (for target ports post-reconfigure) ---
+    local http_busy=false
+    local https_busy=false
+    _port_has_conflict "$target_http"  && http_busy=true
+    _port_has_conflict "$target_https" && https_busy=true
+
+    if $http_busy || $https_busy; then
+        echo ""
+        echo "⚠️  Port Conflict Detected"
+        echo ""
+        if $http_busy; then
+            local app
+            app=$(port_listening_app "$target_http")
+            echo "   Port ${target_http} is in use by: ${app:-another process}"
+        fi
+        if $https_busy; then
+            local app
+            app=$(port_listening_app "$target_https")
+            echo "   Port ${target_https} is in use by: ${app:-another process}"
+        fi
+        echo ""
+        echo "Cove needs an HTTP and HTTPS port. How would you like to proceed?"
+        echo ""
+
+        local choice
+        choice=$(gum choose \
+            "Use alternative ports (8090 / 8453) — run alongside other tools" \
+            "Pick custom ports" \
+            "Proceed with ${target_http}/${target_https} anyway" \
+            "Cancel installation")
+
+        case "$choice" in
+            "Use alternative ports"*)
+                target_http=8090
+                target_https=8453
+                if ! port_is_free "$target_http" || ! port_is_free "$target_https"; then
+                    gum style --foreground yellow \
+                        "⚠️  8090 or 8453 is also in use — please pick custom ports."
+                    _prompt_custom_ports 8090 8453
+                fi
+                ;;
+            "Pick custom ports")
+                _prompt_custom_ports 8090 8453
+                ;;
+            "Proceed with"*)
+                gum style --foreground yellow \
+                    "⚠️  Services may fail to bind on ${target_http}/${target_https}."
+                ;;
+            "Cancel installation")
+                echo "🚫 Installation cancelled."
+                exit 1
+                ;;
+        esac
+        port_choice_made=true
+    fi
+
+    if $port_choice_made; then
+        gum style --foreground green \
+            "✅ Using ports ${target_http} (HTTP) / ${target_https} (HTTPS)"
+    fi
+
+    # Persist and expose the final choice to regenerate_caddyfile.
+    HTTP_PORT="$target_http"
+    HTTPS_PORT="$target_https"
+    config_set HTTP_PORT "$HTTP_PORT"
+    config_set HTTPS_PORT "$HTTPS_PORT"
 
     # --- Pre-install Checks ---
     if [ -d "$COVE_DIR" ]; then
@@ -419,8 +540,8 @@ EOM
 
         if $user_created_successfully; then
             echo "   - 📝 Saving new configuration..."
-            echo "DB_USER='$db_user'" > "$CONFIG_FILE"
-            echo "DB_PASSWORD='$db_pass'" >> "$CONFIG_FILE"
+            config_set DB_USER "$db_user"
+            config_set DB_PASSWORD "$db_pass"
         else
             gum style --foreground red "❌ Database user creation failed. Please check credentials and MariaDB logs."
             exit 1
@@ -434,11 +555,18 @@ EOM
 
     echo "✅ Initial configuration complete. Starting services..."
     cove_enable
-    
+
     # Show post-install guidance
     echo ""
-    gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
-        "📋 First-Time Setup Notes"
+    if [ "$HTTPS_PORT" != "443" ]; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
+            "📋 First-Time Setup Notes" \
+            "Cove is running on custom ports: HTTP ${HTTP_PORT} / HTTPS ${HTTPS_PORT}" \
+            "Access the dashboard at: $(url_for cove.localhost)"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
+            "📋 First-Time Setup Notes"
+    fi
     echo ""
     echo "  Your browser will show a certificate warning when accessing Cove sites."
     echo "  This is normal for local development with self-signed certificates."

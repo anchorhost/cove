@@ -157,7 +157,7 @@ cove_lan_enable() {
         "LAN Access Enabled for ${site_name}" \
         "" \
         "Port: ${port}" \
-        "Local URL: https://${site_name}.localhost" \
+        "Local URL: $(url_for "${site_name}.localhost")" \
         "LAN URL: https://${lan_ip}:${port}" \
         "" \
         "Bonjour: _beckon._tcp (discoverable by iOS apps)" \
