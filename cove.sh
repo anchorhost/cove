@@ -77,6 +77,7 @@ setup_environment
 COVE_DIR="$HOME/Cove"
 CONFIG_FILE="$COVE_DIR/config"
 CADDYFILE_PATH="$COVE_DIR/Caddyfile"
+PHP_INI_FILE="$COVE_DIR/php.ini"
 
 APP_DIR="$COVE_DIR/App"
 SITES_DIR="$COVE_DIR/Sites"
@@ -88,10 +89,228 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.7"
+COVE_VERSION="1.8"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
+
+# Export PHPRC so every PHP invocation (frankenphp php-cli, frankenphp -r, and
+# any nested wp-cli call) picks up our memory_limit / display_errors / error
+# reporting overrides from $PHP_INI_FILE. The file is written by `cove install`;
+# until then PHPRC points at a non-existent path, which PHP silently ignores.
+export PHPRC="$PHP_INI_FILE"
+
+# --- Port Configuration ---
+# Defaults; overridden by HTTP_PORT/HTTPS_PORT entries in $CONFIG_FILE if present.
+HTTP_PORT=80
+HTTPS_PORT=443
+if [ -f "$CONFIG_FILE" ]; then
+    _cove_saved_http=$(grep '^HTTP_PORT=' "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "'\"")
+    _cove_saved_https=$(grep '^HTTPS_PORT=' "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "'\"")
+    [ -n "$_cove_saved_http" ] && HTTP_PORT="$_cove_saved_http"
+    [ -n "$_cove_saved_https" ] && HTTPS_PORT="$_cove_saved_https"
+    unset _cove_saved_http _cove_saved_https
+fi
+
+# Returns ":8453" when HTTPS_PORT is non-default, otherwise empty.
+https_port_suffix() {
+    if [ "$HTTPS_PORT" = "443" ]; then
+        echo ""
+    else
+        echo ":$HTTPS_PORT"
+    fi
+}
+
+# Builds https URL with port suffix when non-default (e.g. "https://foo.localhost:8453").
+url_for() {
+    echo "https://${1}$(https_port_suffix)"
+}
+
+# Idempotent config writer: replaces any existing KEY= line before appending.
+config_set() {
+    local key="$1" val="$2"
+    local tmp
+    tmp=$(mktemp)
+    if [ -f "$CONFIG_FILE" ]; then
+        grep -v "^${key}=" "$CONFIG_FILE" > "$tmp" 2>/dev/null || true
+    fi
+    echo "${key}='${val}'" >> "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+# Returns the process name(s) listening on $1 for display purposes, or empty
+# if the process isn't visible (e.g. owned by another uid on macOS). Do NOT
+# use this for availability checks — use port_is_free for that.
+port_listening_app() {
+    local port="$1"
+    if command -v lsof &>/dev/null; then
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null \
+            | awk 'NR>1 {print $1}' | sort -u | paste -sd, -
+    elif command -v ss &>/dev/null; then
+        ss -tlnH "sport = :$port" 2>/dev/null \
+            | grep -oE 'users:\(\("[^"]+"' | sed 's/.*"\(.*\)"$/\1/' \
+            | sort -u | paste -sd, -
+    fi
+}
+
+# True when nothing is accepting connections on $1. Uses bash /dev/tcp so it
+# works regardless of who owns the listener (lsof is uid-scoped on macOS and
+# cannot see root-owned sockets from a regular user). Probes both IPv4 and
+# IPv6 loopback because some servers (e.g. Python's http.server) bind v6-only
+# by default and the v4 probe alone would miss them.
+port_is_free() {
+    local port="$1"
+    if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
+        return 1
+    fi
+    if (exec 3<>/dev/tcp/::1/"$port") 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# True if the process listening on $1 is one of our own services (Caddy /
+# FrankenPHP). Used so reinstalls don't flag their own services as conflicts.
+port_is_own() {
+    local app
+    app=$(port_listening_app "$1")
+    [ -n "$app" ] && { [[ "$app" == *"$CADDY_CMD"* ]] || [[ "$app" == *frankenph* ]]; }
+}
+
+# True if $1 is occupied by something that isn't one of our own services.
+port_has_conflict() {
+    port_is_free "$1" && return 1
+    port_is_own "$1" && return 1
+    return 0
+}
+
+# Interactive prompt that asks for HTTP and HTTPS ports, validates each, and
+# re-prompts until both are free. Sets HTTP_PORT / HTTPS_PORT globals on
+# success. Called by the install and `cove ports` flows.
+prompt_custom_ports() {
+    local suggest_http="${1:-8090}" suggest_https="${2:-8453}"
+    local candidate
+    while true; do
+        candidate=$(gum input --value "$suggest_http" --prompt "HTTP port: ")
+        if [[ ! "$candidate" =~ ^[0-9]+$ ]] || [ "$candidate" -lt 1 ] || [ "$candidate" -gt 65535 ]; then
+            gum style --foreground red "   ❌ Invalid port number."
+            continue
+        fi
+        if ! port_is_free "$candidate"; then
+            gum style --foreground red "   ❌ Port $candidate is in use by: $(port_listening_app "$candidate")"
+            continue
+        fi
+        HTTP_PORT="$candidate"
+        break
+    done
+    while true; do
+        candidate=$(gum input --value "$suggest_https" --prompt "HTTPS port: ")
+        if [[ ! "$candidate" =~ ^[0-9]+$ ]] || [ "$candidate" -lt 1 ] || [ "$candidate" -gt 65535 ]; then
+            gum style --foreground red "   ❌ Invalid port number."
+            continue
+        fi
+        if [ "$candidate" = "$HTTP_PORT" ]; then
+            gum style --foreground red "   ❌ HTTPS port must differ from HTTP port."
+            continue
+        fi
+        if ! port_is_free "$candidate"; then
+            gum style --foreground red "   ❌ Port $candidate is in use by: $(port_listening_app "$candidate")"
+            continue
+        fi
+        HTTPS_PORT="$candidate"
+        break
+    done
+}
+
+# Build the https:// URL for a hostname given an HTTPS port. Omits the port
+# suffix when $2 equals 443 so stored URLs match the "no suffix" form.
+port_url_for() {
+    local host="$1" port="$2"
+    if [ "$port" = "443" ]; then
+        echo "https://$host"
+    else
+        echo "https://$host:$port"
+    fi
+}
+
+# Walk every WordPress site under $SITES_DIR and run `wp search-replace` to
+# migrate stored URLs from OLD_HTTPS port to NEW_HTTPS port. Updates each
+# hostname the site answers on (base + entries in site/mappings) so custom
+# mappings don't get left stale. Pass "--dry-run" as the third argument to
+# preview replacement counts without committing.
+#
+# No-op if OLD_HTTPS == NEW_HTTPS or if $SITES_DIR has no WordPress sites.
+# Returns 0 even if individual sites fail — per-site errors are reported
+# in the output and summarised at the end.
+update_wp_site_urls_for_port_change() {
+    local old_https="$1" new_https="$2" dry_run_flag="${3:-}"
+    local dry_run=false
+    [ "$dry_run_flag" = "--dry-run" ] && dry_run=true
+
+    [ "$old_https" = "$new_https" ] && return 0
+    [ -d "$SITES_DIR" ] || return 0
+
+    local wp_cmd
+    wp_cmd=$(get_wp_cmd)
+
+    local total_sites=0 updated_sites=0 failed_hosts=0
+    local site_path site_name hostname mapping old_url new_url
+    local -a hostnames
+
+    for site_path in "$SITES_DIR"/*; do
+        [ -d "$site_path" ] || continue
+        [ -f "$site_path/public/wp-config.php" ] || continue
+        total_sites=$((total_sites + 1))
+        site_name=$(basename "$site_path")
+
+        hostnames=("$site_name")
+        if [ -f "$site_path/mappings" ]; then
+            while IFS= read -r mapping || [ -n "$mapping" ]; do
+                [ -n "$mapping" ] && hostnames+=("$mapping")
+            done < "$site_path/mappings"
+        fi
+
+        local any_updated=false
+        for hostname in "${hostnames[@]}"; do
+            old_url=$(port_url_for "$hostname" "$old_https")
+            new_url=$(port_url_for "$hostname" "$new_https")
+            [ "$old_url" = "$new_url" ] && continue
+
+            local -a sr_args
+            sr_args=(--all-tables --skip-plugins --skip-themes --format=count)
+            $dry_run && sr_args+=(--dry-run)
+
+            local output rc count
+            output=$( (cd "$site_path/public" && $wp_cmd search-replace "$old_url" "$new_url" "${sr_args[@]}") 2>&1 )
+            rc=$?
+            if [ $rc -eq 0 ]; then
+                count=$(echo "$output" | tr -d '[:space:]')
+                [[ "$count" =~ ^[0-9]+$ ]] || count=0
+                if $dry_run; then
+                    echo "   • ${hostname}: would replace ${count} occurrence(s)"
+                else
+                    echo "   • ${hostname}: replaced ${count} occurrence(s)"
+                fi
+                any_updated=true
+            else
+                gum style --foreground red "   ❌ ${hostname}: search-replace failed"
+                failed_hosts=$((failed_hosts + 1))
+            fi
+        done
+        $any_updated && updated_sites=$((updated_sites + 1))
+    done
+
+    echo ""
+    if $dry_run; then
+        echo "🔍 Dry run: $updated_sites of $total_sites WordPress site(s) would be updated."
+    else
+        echo "📊 $updated_sites of $total_sites WordPress site(s) updated."
+    fi
+    if [ $failed_hosts -gt 0 ]; then
+        gum style --foreground yellow "⚠️  $failed_hosts hostname replacement(s) failed."
+    fi
+    return 0
+}
 
 # --- Whoops Bootstrap Generation ---
 create_whoops_bootstrap() {
@@ -150,7 +369,7 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.2.8
+ * Version: 0.3.0
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
@@ -292,6 +511,31 @@ add_filter( 'auto_plugin_update_send_email', '__return_false' );
  * Disable auto-update email notifications for themes.
  */
 add_filter( 'auto_theme_update_send_email', '__return_false' );
+
+/**
+ * Dynamic URL override for Tailscale/LAN/Share access.
+ * When accessed via a non-localhost domain, override home and siteurl
+ * to use the current host so CSS/JS/images load correctly.
+ */
+function cove_maybe_override_site_url( $value ) {
+    // Only run in front-end context with a valid HTTP_HOST
+    if ( defined( 'WP_CLI' ) && WP_CLI ) {
+        return $value;
+    }
+    
+    $host = isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : '';
+    
+    // Skip if no host or if it ends with .localhost (normal local access)
+    if ( empty( $host ) || preg_match( '/\.localhost(:\d+)?$/', $host ) ) {
+        return $value;
+    }
+    
+    // Override to current host for Tailscale, LAN, or public share access
+    $scheme = ( ! empty( $_SERVER['HTTPS'] ) && $_SERVER['HTTPS'] !== 'off' ) ? 'https' : 'http';
+    return $scheme . '://' . $host;
+}
+add_filter( 'option_home', 'cove_maybe_override_site_url' );
+add_filter( 'option_siteurl', 'cove_maybe_override_site_url' );
 heredoc
 
     local mu_plugins_dir="$public_dir/wp-content/mu-plugins"
@@ -332,15 +576,26 @@ check_dependencies() {
 
 # --- Helper Functions ---
 
-# Helper function to get WP-CLI command with --allow-root if running as root
-# This is needed for WSL/Docker environments where root is common
+# Helper function to get WP-CLI command. Routes wp-cli through FrankenPHP's
+# bundled PHP via `frankenphp php-cli` so that we use one PHP runtime for both
+# web (Caddy) and CLI — no separate brew `php` install needed. PHP settings
+# (memory_limit, display_errors, error_reporting) come from $PHP_INI_FILE,
+# which `cove install` writes alongside ~/Cove/config. PHPRC is exported once
+# at script init below so every PHP invocation in any subshell picks it up.
+#
+# `frankenphp php-cli` does NOT support PHP CLI flags like -d or -c. PHPRC
+# is the only mechanism for setting ini values, hence the dedicated ini file.
+#
+# --allow-root is needed in WSL/Docker where the script runs as root.
 get_wp_cmd() {
     local wp_path
     wp_path=$(command -v wp)
+    local frank
+    frank=$(command -v frankenphp)
     if [ "$(id -u)" -eq 0 ]; then
-        echo "$wp_path --allow-root"
+        echo "$frank php-cli $wp_path --allow-root"
     else
-        echo "$wp_path"
+        echo "$frank php-cli $wp_path"
     fi
 }
 
@@ -423,10 +678,19 @@ regenerate_caddyfile() {
     local mailpit_path
     mailpit_path=$(command -v mailpit)
 
+    # Build optional http_port / https_port directives when non-default.
+    local port_directives=""
+    if [ "$HTTP_PORT" != "80" ]; then
+        port_directives+="    http_port $HTTP_PORT"$'\n'
+    fi
+    if [ "$HTTPS_PORT" != "443" ]; then
+        port_directives+="    https_port $HTTPS_PORT"$'\n'
+    fi
+
     # Write the static header of the Caddyfile
     cat > "$CADDYFILE_PATH" <<- EOM
 {
-    frankenphp {
+${port_directives}    frankenphp {
         php_ini sendmail_path "$mailpit_path sendmail -t"
         php_ini log_errors On
         php_ini display_errors Off
@@ -437,6 +701,9 @@ regenerate_caddyfile() {
         php_ini post_max_size 512M
     }
     order php_server before file_server
+    servers {
+        protocols h1
+    }
 }
 
 # --- Global Services ---
@@ -489,7 +756,6 @@ EOM
                 echo "$site_domains {" >> "$CADDYFILE_PATH"
                 
                 echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
-                echo "    encode gzip" >> "$CADDYFILE_PATH"
                 echo "    tls internal" >> "$CADDYFILE_PATH"
                 
                 echo "    log {" >> "$CADDYFILE_PATH"
@@ -525,7 +791,6 @@ EOM
                         echo "https://${lan_ip}:${lan_port} {" >> "$CADDYFILE_PATH"
                         echo "    bind 0.0.0.0" >> "$CADDYFILE_PATH"
                         echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
-                        echo "    encode gzip" >> "$CADDYFILE_PATH"
                         echo "    tls internal" >> "$CADDYFILE_PATH"
                         
                         echo "    log {" >> "$CADDYFILE_PATH"
@@ -617,17 +882,30 @@ EOM
                     echo "# Tailscale: ${site_base_name} -> port ${ts_port}" >> "$CADDYFILE_PATH"
                     echo "https://${tailscale_hostname}:${ts_port} {" >> "$CADDYFILE_PATH"
                     echo "    tls internal" >> "$CADDYFILE_PATH"
+                    
                     if [ -n "$direct_proxy_target" ]; then
                         # Proxy directly to the backend target
                         echo "    reverse_proxy ${direct_proxy_target}" >> "$CADDYFILE_PATH"
                     else
-                        # Proxy through the local site
-                        echo "    reverse_proxy https://${site_name} {" >> "$CADDYFILE_PATH"
-                        echo "        header_up Host ${site_name}" >> "$CADDYFILE_PATH"
-                        echo "        transport http {" >> "$CADDYFILE_PATH"
-                        echo "            tls_insecure_skip_verify" >> "$CADDYFILE_PATH"
-                        echo "        }" >> "$CADDYFILE_PATH"
+                        # Serve site directly (not via proxy) for better compatibility
+                        echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
+
+                        echo "    log {" >> "$CADDYFILE_PATH"
+                        echo "        output file \"$site_path/logs/caddy-tailscale.log\"" >> "$CADDYFILE_PATH"
                         echo "    }" >> "$CADDYFILE_PATH"
+                        
+                        # Include custom directives if present
+                        if [ -f "$directive_file" ]; then
+                            echo "" >> "$CADDYFILE_PATH"
+                            sed 's/^/    /' "$directive_file" >> "$CADDYFILE_PATH"
+                            echo "" >> "$CADDYFILE_PATH"
+                        fi
+                        
+                        echo "    php_server" >> "$CADDYFILE_PATH"
+                        
+                        if [ ! -f "$site_path/public/wp-config.php" ]; then
+                            echo "    file_server" >> "$CADDYFILE_PATH"
+                        fi
                     fi
                     echo "}" >> "$CADDYFILE_PATH"
                     echo "" >> "$CADDYFILE_PATH"
@@ -649,29 +927,21 @@ EOM
         echo "}" >> "$CADDYFILE_PATH"
         echo "" >> "$CADDYFILE_PATH"
         
-        # DB on port 9902
+        # DB on port 9902 - serve directly
         echo "# Tailscale: db -> port 9902" >> "$CADDYFILE_PATH"
         echo "https://${tailscale_hostname}:9902 {" >> "$CADDYFILE_PATH"
         echo "    tls internal" >> "$CADDYFILE_PATH"
-        echo "    reverse_proxy https://db.cove.localhost {" >> "$CADDYFILE_PATH"
-        echo "        header_up Host db.cove.localhost" >> "$CADDYFILE_PATH"
-        echo "        transport http {" >> "$CADDYFILE_PATH"
-        echo "            tls_insecure_skip_verify" >> "$CADDYFILE_PATH"
-        echo "        }" >> "$CADDYFILE_PATH"
-        echo "    }" >> "$CADDYFILE_PATH"
+        echo "    root * \"$ADMINER_DIR\"" >> "$CADDYFILE_PATH"
+        echo "    php_server" >> "$CADDYFILE_PATH"
         echo "}" >> "$CADDYFILE_PATH"
         echo "" >> "$CADDYFILE_PATH"
         
-        # Dashboard on port 9900
+        # Dashboard on port 9900 - serve directly
         echo "# Tailscale: cove dashboard -> port 9900" >> "$CADDYFILE_PATH"
         echo "https://${tailscale_hostname}:9900 {" >> "$CADDYFILE_PATH"
         echo "    tls internal" >> "$CADDYFILE_PATH"
-        echo "    reverse_proxy https://cove.localhost {" >> "$CADDYFILE_PATH"
-        echo "        header_up Host cove.localhost" >> "$CADDYFILE_PATH"
-        echo "        transport http {" >> "$CADDYFILE_PATH"
-        echo "            tls_insecure_skip_verify" >> "$CADDYFILE_PATH"
-        echo "        }" >> "$CADDYFILE_PATH"
-        echo "    }" >> "$CADDYFILE_PATH"
+        echo "    root * \"$GUI_DIR\"" >> "$CADDYFILE_PATH"
+        echo "    php_server" >> "$CADDYFILE_PATH"
         echo "}" >> "$CADDYFILE_PATH"
         echo "" >> "$CADDYFILE_PATH"
     fi
@@ -700,6 +970,17 @@ $sitedir = 'SITES_DIR_PLACEHOLDER';
 $cove_path = 'COVE_EXECUTABLE_PATH_PLACEHOLDER';
 $user_home = 'USER_HOME_PLACEHOLDER';
 
+// Read the configured HTTPS port so site links include ":8453" when non-default.
+$__cove_https_port = 443;
+$__cove_cfg_path = $user_home . '/Cove/config';
+if (file_exists($__cove_cfg_path)) {
+    $__cove_cfg = parse_ini_file($__cove_cfg_path);
+    if (!empty($__cove_cfg['HTTPS_PORT'])) {
+        $__cove_https_port = (int) $__cove_cfg['HTTPS_PORT'];
+    }
+}
+$__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_port;
+
 // Handle GET requests for listing sites
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $action = $_GET['action'] ?? '';
@@ -713,7 +994,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                 if (is_dir($site_path)) {
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
-                        'domain' => 'https://' . $item,
+                        'domain' => 'https://' . $item . $__cove_port_suffix,
                         'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
                         'display_path' => '~/Cove/Sites/' . $item,
                         'full_path' => $site_path
@@ -819,6 +1100,8 @@ EOM
 <?php
 $config_file = getenv('HOME') . '/Cove/config';
 $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
+$__cove_https_port = isset($config_data['HTTPS_PORT']) ? (int) $config_data['HTTPS_PORT'] : 443;
+$__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_port;
 ?>
 <!DOCTYPE html>
 <html lang="en" x-data="{ theme: localStorage.getItem('theme') || 'dark' }" x-init="$watch('theme', val => localStorage.setItem('theme', val))" :data-theme="theme">
@@ -858,8 +1141,8 @@ $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
         <section>
             <h2>🚀 Quick Links</h2>
             <div class="grid">
-                <a href="https://db.cove.localhost" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">🗃️ Manage Databases (Adminer)</a>
-                <a href="https://mail.cove.localhost" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">✉️ Inspect Emails (Mailpit)</a>
+                <a href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">🗃️ Manage Databases (Adminer)</a>
+                <a href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">✉️ Inspect Emails (Mailpit)</a>
             </div>
         </section>
 
@@ -1071,6 +1354,7 @@ show_general_help() {
     echo "  tailscale        Expose all sites to your Tailscale network."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  lan              Enable LAN access to sites for mobile app sync."
+    echo "  ports            Reconfigure HTTP/HTTPS ports + update site URLs."
     echo "  log              View logs for a site or the global error log."
     echo "  share            Create a temporary public tunnel to share a site."
     if [ "$IS_WSL" = true ]; then
@@ -1236,6 +1520,33 @@ display_command_help() {
             echo "  status           Show which sites have LAN access enabled"
             echo "  trust            Instructions for trusting Caddy's CA on mobile devices"
             ;;
+        ports)
+            echo "Usage: cove ports [options]"
+            echo ""
+            echo "Reconfigure the HTTP/HTTPS ports Cove listens on."
+            echo ""
+            echo "By default, asks once to migrate every WordPress site's stored URLs"
+            echo "(siteurl, home, and serialized content) via 'wp search-replace' so"
+            echo "existing sites keep working on the new port. Handles custom mappings"
+            echo "and skips non-WordPress sites automatically."
+            echo ""
+            echo "Run with no arguments for an interactive menu, or pass --http / --https"
+            echo "for scripted use."
+            echo ""
+            echo "Options:"
+            echo "  --http PORT     Non-interactive: set HTTP port"
+            echo "  --https PORT    Non-interactive: set HTTPS port"
+            echo "  --skip-urls     Change ports without touching WordPress databases"
+            echo "  --dry-run       Preview changes (including replacement counts)"
+            echo "                  without committing anything"
+            echo ""
+            echo "Examples:"
+            echo "  cove ports                          Interactive menu"
+            echo "  cove ports --http 8090 --https 8453 Set ports non-interactively"
+            echo "  cove ports --dry-run                Preview the effect of a port change"
+            echo ""
+            echo "Tip: run 'cove db backup' first if you want a safety net before the DB update."
+            ;;
         log)
             echo "Usage: cove log [site] [--follow]"
             echo ""
@@ -1256,7 +1567,7 @@ display_command_help() {
             echo "Usage: cove share [site]"
             echo ""
             echo "Creates a temporary public tunnel to share a local site with anyone on the internet."
-            echo "Powered by localhost.run - no downloads or signups required, just SSH."
+            echo "Powered by Cloudflare Quick Tunnels (cloudflared installed on-demand)."
             echo ""
             echo "Arguments:"
             echo "  [site]    The site name (optional). If omitted, prompts for selection."
@@ -1265,7 +1576,7 @@ display_command_help() {
             echo "  cove share           Interactive site selection"
             echo "  cove share mysite    Share mysite.localhost publicly"
             echo ""
-            echo "You'll receive a random URL like https://abc123.localhost.run"
+            echo "You'll receive a random URL like https://random-words.trycloudflare.com"
             echo "The URL is temporary and stops working when you press Ctrl+C."
             ;;
         wsl-hosts)
@@ -1478,6 +1789,10 @@ main() {
             check_dependencies
             cove_lan "$@"
             ;;
+        ports)
+            check_dependencies
+            cove_ports "$@"
+            ;;
         log)
             cove_log "$@"
             ;;
@@ -1576,32 +1891,41 @@ cove_add() {
         echo "Installing WordPress..."
         admin_pass=$(openssl rand -base64 12)
         
-        # Use a variable for the WP-CLI command with increased memory limit
-        # get_wp_cmd adds --allow-root if running as root (common in WSL/Docker)
-        local wp_cmd="php -d memory_limit=512M $(get_wp_cmd)"
+        # get_wp_cmd routes wp-cli through `frankenphp php-cli` and PHPRC
+        # (exported in main) sets display_errors=0 + error_reporting=6143.
+        # That handles parse-time and pre-bootstrap warnings, but wp-cli's
+        # own bootstrap calls `ini_set('display_errors', 'stderr')` to keep
+        # its status messages on stdout, which re-routes PHP deprecation
+        # warnings to stderr from wp-cli's bundled vendor code (Colors.php
+        # on PHP 8.5+). The stderr filter on the subshell strips those
+        # leaked Deprecated lines while still passing through real wp-cli
+        # error output (which doesn't carry the "Deprecated:" prefix).
+        local wp_cmd
+        wp_cmd=$(get_wp_cmd)
 
         (
             cd "$site_dir/public" || exit 1
-            
+
             # 1. Download WordPress with a higher memory limit
             if ! $wp_cmd core download --quiet; then
                 echo "❌ Error: Failed to download WordPress core. This might be a network issue or a permissions problem."
                 exit 1 # Exit the subshell with an error
             fi
-            
+
             # 2. Create the config file
             $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
 define( 'WP_DEBUG', true );
 define( 'WP_DEBUG_LOG', true );
+define( 'WP_DEBUG_DISPLAY', false );
 PHP
-            
+
             # 3. Install WordPress
-            $wp_cmd core install --url="https://$full_hostname" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
+            $wp_cmd core install --url="$(url_for "$full_hostname")" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
 
             # 4. Delete default plugins
             echo "   - Deleting default plugins (Hello Dolly, Akismet)..."
             $wp_cmd plugin delete hello akismet --quiet
-        )
+        ) 2> >(grep -v -E '^(PHP )?Deprecated:' >&2)
 
         # Check the exit code of the subshell. If it's not 0, something failed.
         if [ $? -ne 0 ]; then
@@ -1627,7 +1951,7 @@ PHP
     echo "✅ Site '$full_hostname' created successfully!"
     
     if [ "$site_type" == "wordpress" ]; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: https://$full_hostname/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: $(url_for "$full_hostname")/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
     fi
 }
 cove_db_backup() {
@@ -1735,8 +2059,13 @@ cove_db_list() {
     fi
 
     # This heredoc contains a PHP script to find, connect, and format the database list.
+    # We invoke it via `frankenphp php-cli -r` so we don't depend on a standalone php binary.
+    local wp_path
+    wp_path=$(command -v wp)
+    local frank
+    frank=$(command -v frankenphp)
     local php_output
-    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" WP_ROOT_FLAG="$wp_root_flag" php -r '
+    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" WP_ROOT_FLAG="$wp_root_flag" WP_PATH="$wp_path" FRANK_BIN="$frank" frankenphp php-cli -r '
         function formatSize(int $bytes): string {
             if ($bytes === 0) return "0 B";
             $units = ["B", "KB", "MB", "GB", "TB"];
@@ -1748,6 +2077,9 @@ cove_db_list() {
         $db_user = getenv("DB_USER");
         $db_pass = getenv("DB_PASSWORD");
         $wp_root_flag = getenv("WP_ROOT_FLAG");
+        $wp_path = getenv("WP_PATH");
+        $frank_bin = getenv("FRANK_BIN");
+        $wp_invoker = escapeshellarg($frank_bin) . " php-cli " . escapeshellarg($wp_path);
 
         if (!is_dir($sites_dir)) { exit; }
 
@@ -1764,7 +2096,7 @@ cove_db_list() {
                 $public_dir_esc = escapeshellarg($public_dir);
                 $cmd_suffix = " " . $wp_root_flag . " --skip-plugins --skip-themes --quiet 2>/dev/null";
                 
-                $name_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_NAME" . $cmd_suffix);
+                $name_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_NAME" . $cmd_suffix);
                 if (is_null($name_raw)) { continue; }
                 $site_db_name = trim($name_raw);
                 if (empty($site_db_name)) { continue; }
@@ -1774,10 +2106,10 @@ cove_db_list() {
                 $size_str = "N/A";
 
                 if (!str_contains(strtolower($site_db_name), "sqlite")) {
-                    $user_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_USER" . $cmd_suffix);
+                    $user_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_USER" . $cmd_suffix);
                     if (!is_null($user_raw)) { $site_db_user = trim($user_raw); }
 
-                    $pass_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_PASSWORD" . $cmd_suffix);
+                    $pass_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_PASSWORD" . $cmd_suffix);
                     if (!is_null($pass_raw)) { $site_db_pass = trim($pass_raw); }
                     
                     $stmt = $pdo->prepare("SELECT SUM(data_length + index_length) as size FROM information_schema.TABLES WHERE table_schema = ?");
@@ -1970,10 +2302,11 @@ cove_disable() {
     echo "🛑 Disabling Cove services..."
     
     echo "   - Stopping Caddy/FrankenPHP..."
-    $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null
-    
+
     # Stop services on MacOS
     if [ "$OS" == "macos" ]; then
+        launchctl unload "$COVE_DIR/com.cove.caddy.plist" &>/dev/null
+        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
         echo "   - Stopping MariaDB..."
         brew services stop mariadb &>/dev/null
         echo "   - Stopping Mailpit..."
@@ -2085,16 +2418,59 @@ EOM
     fi
     
     echo "   - Starting Caddy/FrankenPHP..."
-    $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
-    $SUDO_CMD "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
+
+    if [ "$OS" == "macos" ]; then
+        local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
+        local frankenphp_bin
+        frankenphp_bin=$(command -v "$CADDY_CMD")
+
+        # Stop any existing instance
+        launchctl unload "$caddy_plist_path" &>/dev/null
+        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
+
+        cat > "$caddy_plist_path" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>KeepAlive</key>
+        <true/>
+        <key>Label</key>
+        <string>com.cove.caddy</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>$frankenphp_bin</string>
+                <string>run</string>
+                <string>--config</string>
+                <string>$CADDYFILE_PATH</string>
+                <string>--pidfile</string>
+                <string>$COVE_DIR/caddy.pid</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>$LOGS_DIR/caddy-process.log</string>
+        <key>StandardOutPath</key>
+        <string>$LOGS_DIR/caddy-process.log</string>
+</dict>
+</plist>
+EOM
+        launchctl load "$caddy_plist_path"
+        launchctl start com.cove.caddy
+    fi
+
+    if [ "$OS" == "linux" ]; then
+        $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
+        $SUDO_CMD "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
+    fi
 
     if [ $? -eq 0 ]; then
         echo ""
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
             "✅ Services are running" \
-            "Dashboard: https://cove.localhost" \
-            "Adminer:   https://db.cove.localhost" \
-            "Mailpit:   https://mail.cove.localhost"
+            "Dashboard: $(url_for cove.localhost)" \
+            "Adminer:   $(url_for db.cove.localhost)" \
+            "Mailpit:   $(url_for mail.cove.localhost)"
         
         # Show WSL-specific info
         if [ "$IS_WSL" = true ]; then
@@ -2131,8 +2507,11 @@ install_dependency() {
 
     # 1. Validate the command. If it runs, we're done.
     if command -v "$cmd_name" &>/dev/null; then
-        # Special case: some commands don't support --version
-        if [[ "$cmd_name" == "mariadb" ]] || "$cmd_name" --version &>/dev/null 2>&1; then
+        # Special cases: mariadb doesn't support --version, and wp's shebang
+        # uses /usr/bin/env php which won't resolve since Cove no longer
+        # installs a standalone php (wp-cli is invoked through frankenphp
+        # php-cli at runtime — see get_wp_cmd in main).
+        if [[ "$cmd_name" == "mariadb" || "$cmd_name" == "wp" ]] || "$cmd_name" --version &>/dev/null 2>&1; then
             echo "✅ $cmd_name is already installed and valid."
             return 0
         fi
@@ -2245,73 +2624,6 @@ install_dependency() {
     fi
 }
 
-# Install PHP with required extensions for WordPress development
-install_php_with_extensions() {
-    echo "📦 Installing PHP with required extensions..."
-    
-    if [ "$OS" == "macos" ]; then
-        # macOS: PHP from Homebrew includes most extensions
-        if ! command -v php &>/dev/null; then
-            brew install php
-        fi
-        echo "✅ PHP installed via Homebrew."
-        return 0
-    fi
-    
-    # Linux: Need to install PHP and extensions separately
-    local php_packages=""
-    
-    if [ "$PKG_MANAGER" == "apt" ]; then
-        # Note: php-mysql is a metapackage, php-mysqli is the actual extension
-        php_packages="php php-cli php-fpm php-mysql php-mysqli php-xml php-mbstring php-curl php-gd php-zip php-intl php-bcmath php-soap"
-        echo "   - Updating package cache..."
-        $SUDO_CMD apt-get update -qq
-        echo "   - Installing PHP and extensions..."
-        # Show output so we can see what's happening
-        if $SUDO_CMD apt-get install -y $php_packages; then
-            echo "✅ PHP and extensions installed successfully."
-        else
-            echo "⚠️  Some PHP packages may have failed. Trying individual packages..."
-            # Try installing core packages individually
-            for pkg in php php-cli php-mysql php-mysqli php-xml php-mbstring php-curl; do
-                $SUDO_CMD apt-get install -y "$pkg" 2>/dev/null || true
-            done
-        fi
-    else
-        # Fedora/RHEL - package names differ slightly
-        php_packages="php php-cli php-fpm php-mysqlnd php-xml php-mbstring php-curl php-gd php-zip php-intl php-bcmath php-soap"
-        echo "   - Installing PHP and extensions..."
-        if $SUDO_CMD dnf install -y $php_packages; then
-            echo "✅ PHP and extensions installed successfully."
-        else
-            echo "⚠️  Some PHP packages may have failed. Trying individual packages..."
-            for pkg in php php-cli php-mysqlnd php-xml php-mbstring php-curl; do
-                $SUDO_CMD dnf install -y "$pkg" 2>/dev/null || true
-            done
-        fi
-    fi
-    
-    # Verify mysqli extension is available
-    echo "   - Verifying PHP mysqli extension..."
-    if php -m 2>/dev/null | grep -qi mysqli; then
-        echo "✅ PHP mysqli extension is available."
-    else
-        echo ""
-        gum style --foreground red "⚠️  WARNING: PHP mysqli extension not found!"
-        echo "   WordPress and Adminer require mysqli to connect to MySQL/MariaDB."
-        echo ""
-        echo "   Try installing it manually:"
-        if [ "$PKG_MANAGER" == "apt" ]; then
-            echo "     sudo apt-get install php-mysqli"
-        else
-            echo "     sudo dnf install php-mysqlnd"
-        fi
-        echo ""
-    fi
-    
-    return 0
-}
-
 cove_install() {
     echo "🚀 Starting Cove installation..."
 
@@ -2341,48 +2653,7 @@ cove_install() {
         fi
     fi
 
-    # Check for services using standard web ports
-    # Use ss as fallback if lsof is not available (common on minimal Linux installs)
-    local port_check_cmd=""
-    if command -v lsof &>/dev/null; then
-        port_check_cmd="lsof"
-    elif command -v ss &>/dev/null; then
-        port_check_cmd="ss"
-    fi
-    
-    if [ -n "$port_check_cmd" ]; then
-        local ports_in_use=false
-        local listening_app=""
-        
-        if [ "$port_check_cmd" == "lsof" ]; then
-            if lsof -i :80 -i :443 2>/dev/null | grep -q 'LISTEN'; then
-                ports_in_use=true
-                listening_app=$(lsof -i :80 -i :443 2>/dev/null | grep 'LISTEN' | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')
-            fi
-        else
-            # Use ss for port checking
-            if ss -tlnp 2>/dev/null | grep -qE ':80\s|:443\s'; then
-                ports_in_use=true
-                listening_app=$(ss -tlnp 2>/dev/null | grep -E ':80\s|:443\s' | sed 's/.*users:(("\([^"]*\)".*/\1/' | sort -u | tr '\n' ' ')
-            fi
-        fi
-        
-        if [ "$ports_in_use" = true ]; then
-            if [[ "$listening_app" != *"$CADDY_CMD"* && "$listening_app" != *"frankenph"* ]]; then
-                echo "⚠️  Warning: A conflicting web server ('${listening_app}') may be running!"
-                echo "Cove needs ports 80/443 to function."
-                read -p "Do you want to proceed with the installation anyway? (y/N) " -n 1 -r
-                echo
-                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                    echo "🚫 Installation cancelled."
-                    exit 0
-                fi
-            fi
-        fi
-    fi
-    
-    # --- Dependency Installation ---
-    # Gum - Terminal UI library (needed first for nice prompts)
+    # --- Gum (required for the port-selection UI that follows) ---
     # Note: gum releases use format: gum_VERSION_Linux_x86_64.tar.gz
     local gum_arch="x86_64"
     if [ "$(uname -m)" == "aarch64" ] || [ "$(uname -m)" == "arm64" ]; then
@@ -2390,6 +2661,118 @@ cove_install() {
     fi
     local gum_url="https://github.com/charmbracelet/gum/releases/download/v0.14.1/gum_0.14.1_Linux_${gum_arch}.tar.gz"
     install_dependency "gum" "gum" "gum" "gum" "$gum_url"
+
+    # --- Port Selection ---
+    # Two paths can run here:
+    #   1. Reconfigure path — saved config already has non-default ports; the
+    #      user gets a menu to keep, switch to defaults, or pick new values.
+    #   2. Conflict path — the target ports (post-reconfigure) are occupied
+    #      by a non-Cove process; the user gets the conflict menu.
+    # On a fresh install with free 80/443, both paths are skipped silently.
+    # If the chosen ports differ from the starting values, a DB URL update
+    # step runs after install services come up (same code path as `cove ports`).
+    local original_http="$HTTP_PORT"
+    local original_https="$HTTPS_PORT"
+    local port_choice_made=false
+
+    # --- Reconfigure path ---
+    if [ "$HTTP_PORT" != "80" ] || [ "$HTTPS_PORT" != "443" ]; then
+        echo ""
+        gum style --foreground "212" \
+            "Cove is currently configured for custom ports: ${HTTP_PORT} / ${HTTPS_PORT}"
+        echo ""
+
+        local default_label="Switch to default ports (80 / 443)"
+        if port_has_conflict 80 || port_has_conflict 443; then
+            default_label="Switch to default ports (80 / 443) — currently in use"
+        fi
+
+        local choice
+        choice=$(gum choose \
+            "Keep current ports (${HTTP_PORT} / ${HTTPS_PORT})" \
+            "$default_label" \
+            "Pick different custom ports")
+
+        case "$choice" in
+            "Keep current"*)
+                : # no change
+                ;;
+            "Switch to default"*)
+                HTTP_PORT=80
+                HTTPS_PORT=443
+                ;;
+            "Pick different"*)
+                prompt_custom_ports 8090 8453
+                ;;
+        esac
+        port_choice_made=true
+    fi
+
+    # --- Conflict path (for target ports post-reconfigure) ---
+    local http_busy=false
+    local https_busy=false
+    port_has_conflict "$HTTP_PORT"  && http_busy=true
+    port_has_conflict "$HTTPS_PORT" && https_busy=true
+
+    if $http_busy || $https_busy; then
+        echo ""
+        echo "⚠️  Port Conflict Detected"
+        echo ""
+        if $http_busy; then
+            local app
+            app=$(port_listening_app "$HTTP_PORT")
+            echo "   Port ${HTTP_PORT} is in use by: ${app:-another process}"
+        fi
+        if $https_busy; then
+            local app
+            app=$(port_listening_app "$HTTPS_PORT")
+            echo "   Port ${HTTPS_PORT} is in use by: ${app:-another process}"
+        fi
+        echo ""
+        echo "Cove needs an HTTP and HTTPS port. How would you like to proceed?"
+        echo ""
+
+        local choice
+        choice=$(gum choose \
+            "Use alternative ports (8090 / 8453) — run alongside other tools" \
+            "Pick custom ports" \
+            "Proceed with ${HTTP_PORT}/${HTTPS_PORT} anyway" \
+            "Cancel installation")
+
+        case "$choice" in
+            "Use alternative ports"*)
+                HTTP_PORT=8090
+                HTTPS_PORT=8453
+                if ! port_is_free "$HTTP_PORT" || ! port_is_free "$HTTPS_PORT"; then
+                    gum style --foreground yellow \
+                        "⚠️  8090 or 8453 is also in use — please pick custom ports."
+                    prompt_custom_ports 8090 8453
+                fi
+                ;;
+            "Pick custom ports")
+                prompt_custom_ports 8090 8453
+                ;;
+            "Proceed with"*)
+                gum style --foreground yellow \
+                    "⚠️  Services may fail to bind on ${HTTP_PORT}/${HTTPS_PORT}."
+                ;;
+            "Cancel installation")
+                echo "🚫 Installation cancelled."
+                exit 1
+                ;;
+        esac
+        port_choice_made=true
+    fi
+
+    if $port_choice_made; then
+        gum style --foreground green \
+            "✅ Using ports ${HTTP_PORT} (HTTP) / ${HTTPS_PORT} (HTTPS)"
+    fi
+
+    # Persist the final choice — regenerate_caddyfile and get_wp_cmd both
+    # pick up the globals directly.
+    config_set HTTP_PORT "$HTTP_PORT"
+    config_set HTTPS_PORT "$HTTPS_PORT"
 
     # --- Pre-install Checks ---
     if [ -d "$COVE_DIR" ]; then
@@ -2399,32 +2782,79 @@ cove_install() {
         fi
     fi
     
-    # FrankenPHP uses its own universal installer
+    # FrankenPHP uses its own universal installer.
+    # The upstream installer tries to write to /usr/local/bin and silently
+    # falls back to CWD when that fails — which happens on a fresh Apple
+    # Silicon Mac (Homebrew lives at /opt/homebrew/bin). To handle both,
+    # we run the installer from a tempdir and, if the binary ends up there
+    # instead of on PATH, move it into $BIN_DIR ourselves.
     if ! command -v frankenphp &> /dev/null; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: frankenphp"
         echo "   - Using the official FrankenPHP installer..."
-        if curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash; then
-             echo "✅ FrankenPHP installed successfully."
+        local fp_tmpdir
+        fp_tmpdir=$(mktemp -d)
+        if (cd "$fp_tmpdir" && curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash); then
+            hash -r
+            if ! command -v frankenphp &> /dev/null && [ -x "$fp_tmpdir/frankenphp" ]; then
+                $SUDO_CMD mv "$fp_tmpdir/frankenphp" "$BIN_DIR/frankenphp"
+                $SUDO_CMD chmod +x "$BIN_DIR/frankenphp"
+                hash -r
+            fi
+            rm -rf "$fp_tmpdir"
+            if command -v frankenphp &> /dev/null; then
+                echo "✅ FrankenPHP installed successfully."
+            else
+                gum style --foreground red "❌ FrankenPHP installer ran but the binary is not on PATH."
+                exit 1
+            fi
         else
+            rm -rf "$fp_tmpdir"
             gum style --foreground red "❌ The FrankenPHP download script failed."
             exit 1
         fi
     else
         echo "✅ FrankenPHP is already installed."
     fi
+    
+    # On Linux with apt/dnf, FrankenPHP needs additional PHP extensions installed
+    # The DEB/RPM packages don't include all extensions by default
+    if [ "$OS" = "linux" ]; then
+        echo "📦 Installing FrankenPHP PHP extensions for WordPress..."
+        if [ "$PKG_MANAGER" = "apt" ]; then
+            # Install required PHP extensions for WordPress via apt
+            $SUDO_CMD apt install -y php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath 2>/dev/null || true
+            echo "✅ FrankenPHP PHP extensions installed."
+        elif [ "$PKG_MANAGER" = "dnf" ]; then
+            # Install required PHP extensions for WordPress via dnf
+            $SUDO_CMD dnf install -y php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath 2>/dev/null || true
+            echo "✅ FrankenPHP PHP extensions installed."
+        fi
+        
+        # Verify mysqli is available
+        if ! frankenphp php-cli -r "echo implode(',', get_loaded_extensions());" 2>/dev/null | grep -qi mysqli; then
+            gum style --foreground yellow "⚠️ Warning: mysqli extension not found in FrankenPHP."
+            gum style --foreground yellow "   WordPress may not work correctly."
+            gum style --foreground yellow "   Try: sudo apt install php-zts-mysqli (for apt)"
+            gum style --foreground yellow "   Or:  sudo dnf install php-zts-mysqli (for dnf)"
+        fi
+    fi
 
     # MariaDB - Database server
     install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" ""
-    
-    # PHP with extensions (uses dedicated function for Linux)
-    if [ "$OS" == "macos" ]; then
-        install_dependency "php" "php" "" "" ""
-    else
-        install_php_with_extensions
-    fi
 
-    # Mailpit - Email testing tool (uses its own universal installer)
-    if ! command -v mailpit &> /dev/null; then
+    # No standalone PHP install — wp-cli is invoked through `frankenphp php-cli`
+    # (see get_wp_cmd in main), so FrankenPHP's bundled PHP is the single PHP
+    # runtime for both web and CLI. On Linux the php-zts-* extensions installed
+    # above provide WordPress's required extensions to FrankenPHP.
+
+    # Mailpit - Email testing tool.
+    # On macOS we use the Homebrew formula. On Linux we use the upstream
+    # installer because mailpit isn't packaged in apt/dnf.
+    # Why: the upstream installer hardcodes /usr/local/bin, which doesn't
+    # exist on a fresh Apple Silicon Mac (Homebrew lives at /opt/homebrew).
+    if [ "$OS" == "macos" ]; then
+        install_dependency "mailpit" "mailpit" "" "" ""
+    elif ! command -v mailpit &> /dev/null; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: mailpit"
         echo "   - Using the official Mailpit installer..."
         if curl -sL https://raw.githubusercontent.com/axllent/mailpit/develop/install.sh | $SUDO_CMD bash; then
@@ -2444,6 +2874,18 @@ cove_install() {
     # --- Directory and Service Setup (Copied from original file) ---
     echo "📁 Creating Cove directory structure..."
     mkdir -p "$SITES_DIR" "$LOGS_DIR" "$GUI_DIR" "$ADMINER_DIR" "$CUSTOM_CADDY_DIR"
+
+    # Write the PHP ini that wp-cli (via `frankenphp php-cli`) will load.
+    # See the comment on $PHPRC export in main for the rationale.
+    # error_reporting=6143 is E_ALL minus E_DEPRECATED/E_USER_DEPRECATED/E_STRICT
+    # so wp-cli's bundled vendor code (react/promise, php-cli-tools/Colors.php)
+    # doesn't flood every command on PHP 8.5+.
+    echo "⚙️ Writing Cove PHP ini..."
+    cat > "$PHP_INI_FILE" <<'INI'
+memory_limit = 512M
+display_errors = 0
+error_reporting = 6143
+INI
     echo "🗃️ Downloading Adminer 5.4.1..."
     curl -sL "https://github.com/vrana/adminer/releases/download/v5.4.1/adminer-5.4.1.php" -o "$ADMINER_DIR/adminer-core.php"
     echo "⚙️ Creating Adminer autologin..."
@@ -2537,8 +2979,8 @@ EOM
 
         if $user_created_successfully; then
             echo "   - 📝 Saving new configuration..."
-            echo "DB_USER='$db_user'" > "$CONFIG_FILE"
-            echo "DB_PASSWORD='$db_pass'" >> "$CONFIG_FILE"
+            config_set DB_USER "$db_user"
+            config_set DB_PASSWORD "$db_pass"
         else
             gum style --foreground red "❌ Database user creation failed. Please check credentials and MariaDB logs."
             exit 1
@@ -2552,11 +2994,29 @@ EOM
 
     echo "✅ Initial configuration complete. Starting services..."
     cove_enable
-    
+
+    # If the user changed HTTPS ports during install AND there are pre-existing
+    # WordPress sites in $SITES_DIR, migrate their stored URLs to the new port.
+    # On a fresh install with no sites, this is a silent no-op.
+    if [ "$original_https" != "$HTTPS_PORT" ]; then
+        if [ -d "$SITES_DIR" ] && [ -n "$(find "$SITES_DIR" -maxdepth 2 -name wp-config.php -print -quit 2>/dev/null)" ]; then
+            echo ""
+            echo "🔄 Updating WordPress site URLs to new HTTPS port..."
+            update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT"
+        fi
+    fi
+
     # Show post-install guidance
     echo ""
-    gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
-        "📋 First-Time Setup Notes"
+    if [ "$HTTPS_PORT" != "443" ]; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
+            "📋 First-Time Setup Notes" \
+            "Cove is running on custom ports: HTTP ${HTTP_PORT} / HTTPS ${HTTPS_PORT}" \
+            "Access the dashboard at: $(url_for cove.localhost)"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
+            "📋 First-Time Setup Notes"
+    fi
     echo ""
     echo "  Your browser will show a certificate warning when accessing Cove sites."
     echo "  This is normal for local development with self-signed certificates."
@@ -2743,7 +3203,7 @@ cove_lan_enable() {
         "LAN Access Enabled for ${site_name}" \
         "" \
         "Port: ${port}" \
-        "Local URL: https://${site_name}.localhost" \
+        "Local URL: $(url_for "${site_name}.localhost")" \
         "LAN URL: https://${lan_ip}:${port}" \
         "" \
         "Bonjour: _beckon._tcp (discoverable by iOS apps)" \
@@ -2927,7 +3387,7 @@ cove_list() {
 
     # PHP script to find, sort, and format the site list with box-drawing characters
     local php_output
-    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" php -r '
+    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" HTTPS_PORT_SUFFIX="$(https_port_suffix)" frankenphp php-cli -r '
         function getDirectorySize(string $path): int {
             if (!is_dir($path)) return 0;
             $total_size = 0;
@@ -2949,6 +3409,7 @@ cove_list() {
 
         $sites_dir = getenv("SITES_DIR");
         $show_totals = getenv("SHOW_TOTALS") === "true";
+        $port_suffix = getenv("HTTPS_PORT_SUFFIX") ?: "";
 
         if (!is_dir($sites_dir)) {
             exit;
@@ -2965,7 +3426,7 @@ cove_list() {
                 $size = $show_totals && is_dir($public_path) ? formatSize(getDirectorySize($public_path)) : null;
                 $sites[] = [
                     "name" => str_replace(".localhost", "", $item),
-                    "domain" => "https://" . $item,
+                    "domain" => "https://" . $item . $port_suffix,
                     "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
                     "size" => $size,
                 ];
@@ -3327,6 +3788,225 @@ cove_path() {
     echo "$site_dir"
 }
 
+cove_ports() {
+    # -----------------------------------------------------------------
+    #  cove ports
+    #  Reconfigure the HTTP / HTTPS ports Cove listens on and (by
+    #  default) migrate every WordPress site's stored URLs via
+    #  `wp search-replace` so they match the new port.
+    #
+    #  Flags:
+    #    --http PORT     Non-interactive: set HTTP port
+    #    --https PORT    Non-interactive: set HTTPS port
+    #    --skip-urls     Change ports without touching WordPress databases
+    #    --dry-run       Preview changes (including search-replace counts)
+    #                    without committing anything
+    # -----------------------------------------------------------------
+
+    local explicit_http=""
+    local explicit_https=""
+    local skip_urls=false
+    local dry_run=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --http)
+                explicit_http="$2"
+                shift 2
+                ;;
+            --https)
+                explicit_https="$2"
+                shift 2
+                ;;
+            --skip-urls)
+                skip_urls=true
+                shift
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            -h|--help)
+                display_command_help ports
+                exit 0
+                ;;
+            *)
+                gum style --foreground red "❌ Unknown option: $1"
+                echo "Usage: cove ports [--http PORT] [--https PORT] [--skip-urls] [--dry-run]"
+                exit 1
+                ;;
+        esac
+    done
+
+    local original_http="$HTTP_PORT"
+    local original_https="$HTTPS_PORT"
+
+    # --- Determine target ports ---
+    if [ -n "$explicit_http" ] || [ -n "$explicit_https" ]; then
+        # Non-interactive path — validate and apply.
+        local target_http="${explicit_http:-$HTTP_PORT}"
+        local target_https="${explicit_https:-$HTTPS_PORT}"
+
+        if [[ ! "$target_http" =~ ^[0-9]+$ ]] || [ "$target_http" -lt 1 ] || [ "$target_http" -gt 65535 ]; then
+            gum style --foreground red "❌ Invalid HTTP port: $target_http"
+            exit 1
+        fi
+        if [[ ! "$target_https" =~ ^[0-9]+$ ]] || [ "$target_https" -lt 1 ] || [ "$target_https" -gt 65535 ]; then
+            gum style --foreground red "❌ Invalid HTTPS port: $target_https"
+            exit 1
+        fi
+        if [ "$target_http" = "$target_https" ]; then
+            gum style --foreground red "❌ HTTP and HTTPS ports must differ."
+            exit 1
+        fi
+
+        HTTP_PORT="$target_http"
+        HTTPS_PORT="$target_https"
+    else
+        # Interactive menu
+        echo ""
+        gum style --foreground "212" \
+            "Cove is currently on ports: HTTP ${HTTP_PORT} / HTTPS ${HTTPS_PORT}"
+        echo ""
+
+        local default_label="Switch to default ports (80 / 443)"
+        if [ "$HTTP_PORT" != "80" ] || [ "$HTTPS_PORT" != "443" ]; then
+            if port_has_conflict 80 || port_has_conflict 443; then
+                default_label="Switch to default ports (80 / 443) — currently in use"
+            fi
+        fi
+
+        local alt_label="Use alternative ports (8090 / 8453)"
+        if [ "$HTTP_PORT" = "8090" ] && [ "$HTTPS_PORT" = "8453" ]; then
+            alt_label=""
+        elif port_has_conflict 8090 || port_has_conflict 8453; then
+            alt_label="Use alternative ports (8090 / 8453) — currently in use"
+        fi
+
+        local -a menu_opts
+        menu_opts=("Keep current ports (${HTTP_PORT} / ${HTTPS_PORT})")
+        if [ "$HTTP_PORT" != "80" ] || [ "$HTTPS_PORT" != "443" ]; then
+            menu_opts+=("$default_label")
+        fi
+        if [ -n "$alt_label" ]; then
+            menu_opts+=("$alt_label")
+        fi
+        menu_opts+=("Pick custom ports" "Cancel")
+
+        local choice
+        choice=$(gum choose "${menu_opts[@]}")
+
+        case "$choice" in
+            "Keep current"*)
+                echo "ℹ️  No changes."
+                exit 0
+                ;;
+            "Switch to default"*)
+                HTTP_PORT=80
+                HTTPS_PORT=443
+                ;;
+            "Use alternative"*)
+                HTTP_PORT=8090
+                HTTPS_PORT=8453
+                ;;
+            "Pick custom ports")
+                prompt_custom_ports 8090 8453
+                ;;
+            "Cancel"|*)
+                echo "🚫 Cancelled."
+                exit 0
+                ;;
+        esac
+    fi
+
+    # --- Check if anything actually changed ---
+    if [ "$original_http" = "$HTTP_PORT" ] && [ "$original_https" = "$HTTPS_PORT" ]; then
+        echo "ℹ️  Ports unchanged."
+        exit 0
+    fi
+
+    # --- Preview ---
+    echo ""
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "Port change:" \
+        "  HTTP:  ${original_http} → ${HTTP_PORT}" \
+        "  HTTPS: ${original_https} → ${HTTPS_PORT}"
+
+    if ! $skip_urls && [ "$original_https" != "$HTTPS_PORT" ]; then
+        echo ""
+        local any_wp=false
+        if [ -d "$SITES_DIR" ]; then
+            local site_path site_name
+            for site_path in "$SITES_DIR"/*; do
+                [ -d "$site_path" ] || continue
+                [ -f "$site_path/public/wp-config.php" ] || continue
+                if ! $any_wp; then
+                    echo "The following WordPress sites will have stored URLs updated:"
+                    any_wp=true
+                fi
+                site_name=$(basename "$site_path")
+                echo "   • ${site_name}: $(port_url_for "$site_name" "$original_https") → $(port_url_for "$site_name" "$HTTPS_PORT")"
+            done
+        fi
+        if ! $any_wp; then
+            echo "(No WordPress sites to update.)"
+        fi
+    elif $skip_urls; then
+        echo ""
+        gum style --faint "(--skip-urls: WordPress databases will NOT be updated)"
+    fi
+
+    # --- Dry run exits here ---
+    if $dry_run; then
+        echo ""
+        echo "🔍 Dry run: running wp search-replace --dry-run..."
+        echo ""
+        if ! $skip_urls; then
+            update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT" --dry-run
+        fi
+        # Revert globals so nothing leaks to the caller
+        HTTP_PORT="$original_http"
+        HTTPS_PORT="$original_https"
+        echo ""
+        gum style --faint "Dry run complete. No changes committed."
+        exit 0
+    fi
+
+    # --- Confirm ---
+    echo ""
+    if ! gum confirm "Proceed with the port change?"; then
+        # Revert globals so nothing leaks to the caller
+        HTTP_PORT="$original_http"
+        HTTPS_PORT="$original_https"
+        echo "🚫 Cancelled."
+        exit 0
+    fi
+
+    # --- Commit ---
+    echo ""
+    echo "💾 Saving port configuration..."
+    config_set HTTP_PORT "$HTTP_PORT"
+    config_set HTTPS_PORT "$HTTPS_PORT"
+
+    if ! $skip_urls && [ "$original_https" != "$HTTPS_PORT" ]; then
+        echo ""
+        echo "🔄 Updating WordPress site URLs..."
+        update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT"
+    fi
+
+    echo ""
+    regenerate_caddyfile
+
+    echo ""
+    cove_enable
+
+    echo ""
+    gum style --foreground green "✅ Cove is now on ports ${HTTP_PORT} / ${HTTPS_PORT}"
+    if [ "$HTTPS_PORT" != "443" ]; then
+        gum style --faint "   Dashboard: $(url_for cove.localhost)"
+    fi
+}
+
 # --- Proxy Storage Directory ---
 PROXY_DIR="$APP_DIR/proxies"
 
@@ -3634,7 +4314,7 @@ cove_pull() {
     fi
 
     dest_path="$SITES_DIR/$site_name.localhost/public"
-    local_url="https://$site_name.localhost"
+    local_url="$(url_for "$site_name.localhost")"
 
     # --- 4. Perform Migration ---
     log_step "Generating backup for ${remote_url}..."
@@ -3893,7 +4573,7 @@ cove_rename() {
         (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet)
 
         echo "   - Running search-replace for site URL..."
-        (cd "$new_site_dir/public" && $wp_cmd search-replace "https://$old_name.localhost" "https://$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet)
+        (cd "$new_site_dir/public" && $wp_cmd search-replace "$(url_for "$old_name.localhost")" "$(url_for "$new_name.localhost")" --all-tables --skip-plugins --skip-themes --quiet)
 
         echo "   - Dropping old database '$old_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
@@ -3910,11 +4590,11 @@ cove_rename() {
     # --- Reload Server Configuration ---
     regenerate_caddyfile
 
-    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: https://$new_name.localhost"
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: $(url_for "$new_name.localhost")"
 }
 # --- Share Command ---
-# Creates a temporary public tunnel to share a local site via localhost.run
-# No downloads, no signups - just SSH
+# Creates a temporary public tunnel to share a local site via Cloudflare Quick Tunnels
+# Requires cloudflared (installed on-demand if missing)
 
 SHARE_PROXY_PORT=19876
 
@@ -3957,10 +4637,46 @@ cove_share() {
     
     local local_hostname="${site_name}.localhost"
     
-    # --- 2. Check for SSH ---
-    if ! command -v ssh &> /dev/null; then
-        gum style --foreground red "Error: SSH client not found. Please install OpenSSH."
-        exit 1
+    # --- 2. Check for cloudflared (install on-demand if missing) ---
+    if ! command -v cloudflared &> /dev/null; then
+        echo "cloudflared is required for cove share but is not installed."
+        echo ""
+        
+        local install_cmd=""
+        local install_name=""
+        
+        if command -v brew &> /dev/null; then
+            install_cmd="brew install cloudflared"
+            install_name="Homebrew"
+        elif command -v apt-get &> /dev/null; then
+            # Debian/Ubuntu - need to add Cloudflare's repo first
+            install_cmd="curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null && echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list && sudo apt-get update && sudo apt-get install -y cloudflared"
+            install_name="apt"
+        elif command -v dnf &> /dev/null; then
+            # Fedora/RHEL
+            install_cmd="curl -fsSL https://pkg.cloudflare.com/cloudflared-ascii.repo | sudo tee /etc/yum.repos.d/cloudflared.repo && sudo dnf install -y cloudflared"
+            install_name="dnf"
+        fi
+        
+        if [ -n "$install_cmd" ]; then
+            if gum confirm "Install cloudflared via ${install_name}?"; then
+                echo "Installing cloudflared..."
+                eval "$install_cmd"
+                if ! command -v cloudflared &> /dev/null; then
+                    gum style --foreground red "Error: Failed to install cloudflared."
+                    exit 1
+                fi
+                echo "cloudflared installed successfully."
+                echo ""
+            else
+                gum style --foreground red "Error: cloudflared is required."
+                exit 1
+            fi
+        else
+            gum style --foreground red "Error: cloudflared not found."
+            echo "Install it from: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+            exit 1
+        fi
     fi
     
     # --- 3. Check for Python (needed for the HTTP proxy) ---
@@ -3975,10 +4691,8 @@ cove_share() {
     fi
     
     # --- 4. Create temp files ---
-    local ssh_output
-    ssh_output=$(mktemp)
-    local public_url_file
-    public_url_file=$(mktemp)
+    local tunnel_output
+    tunnel_output=$(mktemp)
     
     # --- 5. Cleanup function ---
     local cleanup_triggered=""
@@ -3991,11 +4705,11 @@ cove_share() {
             kill $proxy_pid 2>/dev/null
             wait $proxy_pid 2>/dev/null
         fi
-        if [ -n "$ssh_pid" ]; then
-            kill $ssh_pid 2>/dev/null
-            wait $ssh_pid 2>/dev/null
+        if [ -n "$tunnel_pid" ]; then
+            kill $tunnel_pid 2>/dev/null
+            wait $tunnel_pid 2>/dev/null
         fi
-        rm -f "$ssh_output" "$public_url_file"
+        rm -f "$tunnel_output"
         echo "Done."
     }
     trap cleanup EXIT
@@ -4005,20 +4719,18 @@ cove_share() {
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
         "Starting public tunnel for ${site_name}" \
         "" \
-        "Local: https://${local_hostname}" \
+        "Local: $(url_for "${local_hostname}")" \
         "" \
         "Press Ctrl+C to stop sharing."
     echo ""
     
-    echo "Connecting to localhost.run..."
+    echo "Starting Cloudflare tunnel..."
     
-    # --- 7. Start SSH to get the public URL first ---
-    ssh -o StrictHostKeyChecking=accept-new \
-        -o ServerAliveInterval=30 \
-        -o ServerAliveCountMax=3 \
-        -R 80:localhost:${SHARE_PROXY_PORT} \
-        nokey@localhost.run > "$ssh_output" 2>&1 &
-    ssh_pid=$!
+    # --- 7. Start cloudflared to get the public URL first ---
+    # Use --protocol http2 for better compatibility (QUIC can be blocked by firewalls)
+    cloudflared tunnel --url http://localhost:${SHARE_PROXY_PORT} \
+        --protocol http2 --no-autoupdate > "$tunnel_output" 2>&1 &
+    tunnel_pid=$!
     
     # Wait for the URL to appear in the output
     local public_url=""
@@ -4029,17 +4741,18 @@ cove_share() {
         sleep 1
         ((attempts++))
         
-        if ! kill -0 $ssh_pid 2>/dev/null; then
-            gum style --foreground red "Error: SSH connection failed."
-            cat "$ssh_output"
+        if ! kill -0 $tunnel_pid 2>/dev/null; then
+            gum style --foreground red "Error: Cloudflare tunnel failed to start."
+            cat "$tunnel_output"
             exit 1
         fi
         
-        public_url=$(grep -oE 'https://[a-z0-9]+\.lhr\.life' "$ssh_output" 2>/dev/null | head -1)
+        public_url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$tunnel_output" 2>/dev/null | head -1)
     done
     
     if [ -z "$public_url" ]; then
-        gum style --foreground red "Error: Could not get public URL from localhost.run"
+        gum style --foreground red "Error: Could not get public URL from Cloudflare"
+        cat "$tunnel_output"
         exit 1
     fi
     
@@ -4054,7 +4767,7 @@ cove_share() {
     # --- 8. Start Python HTTP proxy that rewrites URLs ---
     echo "Starting local proxy with URL rewriting..."
     
-    $python_cmd - "$local_hostname" "$SHARE_PROXY_PORT" "$public_host" << 'PYTHON_PROXY' &
+    $python_cmd - "$local_hostname" "$SHARE_PROXY_PORT" "$public_host" "$HTTPS_PORT" << 'PYTHON_PROXY' &
 import sys
 import ssl
 import re
@@ -4063,7 +4776,9 @@ from urllib.request import Request, urlopen
 
 TARGET_HOST = sys.argv[1]  # e.g., anchordev.localhost
 LISTEN_PORT = int(sys.argv[2])
-PUBLIC_HOST = sys.argv[3]  # e.g., abc123.lhr.life
+PUBLIC_HOST = sys.argv[3]  # e.g., random-words.trycloudflare.com
+HTTPS_PORT = int(sys.argv[4]) if len(sys.argv) > 4 else 443
+TARGET_AUTHORITY = TARGET_HOST if HTTPS_PORT == 443 else f"{TARGET_HOST}:{HTTPS_PORT}"
 
 # Create SSL context that doesn't verify certificates (for self-signed)
 ssl_ctx = ssl.create_default_context()
@@ -4080,8 +4795,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Log requests in a nice format
         import datetime
         timestamp = datetime.datetime.now().strftime('%H:%M:%S')
-        # Get client IP from X-Forwarded-For header (set by localhost.run)
-        client_ip = self.headers.get('X-Forwarded-For', self.client_address[0])
+        # Get client IP from CF-Connecting-IP (Cloudflare) or X-Forwarded-For
+        client_ip = self.headers.get('CF-Connecting-IP',
+                    self.headers.get('X-Forwarded-For', self.client_address[0]))
         # If multiple IPs in X-Forwarded-For, take the first (original client)
         if ',' in client_ip:
             client_ip = client_ip.split(',')[0].strip()
@@ -4113,33 +4829,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
         print(format % args, flush=True)
     
     def do_request(self):
-        target_url = f"https://{TARGET_HOST}{self.path}"
-        
+        target_url = f"https://{TARGET_AUTHORITY}{self.path}"
+
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
-        
+
         req = Request(target_url, data=body, method=self.command)
-        
+
         for key, value in self.headers.items():
             if key.lower() not in ('host', 'connection', 'accept-encoding'):
                 req.add_header(key, value)
-        req.add_header('Host', TARGET_HOST)
-        
+        req.add_header('Host', TARGET_AUTHORITY)
+
         try:
             with urlopen(req, context=ssl_ctx, timeout=60) as response:
                 response_body = response.read()
                 content_type = response.headers.get('Content-Type', '')
-                
+
                 # Rewrite URLs in text responses
                 if any(ct in content_type for ct in REWRITABLE_TYPES):
                     try:
                         text = response_body.decode('utf-8')
-                        # Replace https://site.localhost with https://public-url
-                        text = text.replace(f'https://{TARGET_HOST}', f'https://{PUBLIC_HOST}')
-                        # Also replace http:// version just in case
-                        text = text.replace(f'http://{TARGET_HOST}', f'https://{PUBLIC_HOST}')
-                        # Replace escaped versions (for JSON)
-                        text = text.replace(f'https:\\/\\/{TARGET_HOST}', f'https:\\/\\/{PUBLIC_HOST}')
+                        # Replace https://site.localhost[:port] with https://public-url
+                        text = text.replace(f'https://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
+                        text = text.replace(f'http://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
+                        # Escaped versions (for JSON)
+                        text = text.replace(f'https:\\/\\/{TARGET_AUTHORITY}', f'https:\\/\\/{PUBLIC_HOST}')
                         response_body = text.encode('utf-8')
                     except:
                         pass  # If decode fails, send original
@@ -4167,7 +4882,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self): self.do_request()
     def do_PATCH(self): self.do_request()
 
-server = HTTPServer(('127.0.0.1', LISTEN_PORT), ProxyHandler)
+class QuietHTTPServer(HTTPServer):
+    """HTTPServer that silently ignores connection reset errors."""
+    def handle_error(self, request, client_address):
+        # Silently ignore connection reset errors (browser closed connection)
+        import sys
+        exc_type = sys.exc_info()[0]
+        if exc_type in (ConnectionResetError, BrokenPipeError):
+            return
+        # For other errors, use default handling
+        super().handle_error(request, client_address)
+
+server = QuietHTTPServer(('127.0.0.1', LISTEN_PORT), ProxyHandler)
 server.serve_forever()
 PYTHON_PROXY
     proxy_pid=$!
@@ -4182,16 +4908,15 @@ PYTHON_PROXY
     echo "Tunnel is active. Press Ctrl+C to stop."
     echo ""
     
-    # Monitor SSH connection - check every 5 seconds
-    while kill -0 $ssh_pid 2>/dev/null; do
+    # Monitor tunnel connection - check every 5 seconds
+    while kill -0 $tunnel_pid 2>/dev/null; do
         sleep 5
     done
     
-    # SSH process ended - check if it was unexpected
+    # Tunnel process ended - check if it was unexpected
     if [ -z "$cleanup_triggered" ]; then
         echo ""
-        gum style --foreground yellow "Connection to localhost.run lost. Reconnecting..."
-        # Could add reconnection logic here in the future
+        gum style --foreground yellow "Cloudflare tunnel disconnected."
     fi
 }
 
@@ -4243,9 +4968,9 @@ cove_status() {
     if [[ "$caddy_status" == "✅ Running" && "$mariadb_status" == "✅ Running" && "$mailpit_status" == "✅ Running" ]]; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
             "✅ All services are running" \
-            "Dashboard: https://cove.localhost" \
-            "Adminer:   https://db.cove.localhost" \
-            "Mailpit:   https://mail.cove.localhost"
+            "Dashboard: $(url_for cove.localhost)" \
+            "Adminer:   $(url_for db.cove.localhost)" \
+            "Mailpit:   $(url_for mail.cove.localhost)"
         
         # Show WSL-specific info
         if [ "$IS_WSL" = true ]; then
@@ -4410,43 +5135,101 @@ cove_tailscale() {
     esac
 }
 
-upgrade_frankenphp_binary() {
-    local target_bin_dir
+upgrade_frankenphp() {
     local frankenphp_path
-
-    # First, try to find the path of the existing frankenphp command.
     frankenphp_path=$(command -v frankenphp)
-
-    if [ -n "$frankenphp_path" ]; then
-        # If found, use its directory as the installation target.
-        target_bin_dir=$(dirname "$frankenphp_path")
-        echo "   - Detected existing FrankenPHP in '$target_bin_dir'. Using this as the installation target."
-    else
-        # If not found, use the global BIN_DIR (set in setup_environment)
-        echo "   - FrankenPHP not found in PATH. Using default bin directory: $BIN_DIR"
-        target_bin_dir="$BIN_DIR"
-    fi
-
-    echo "   - Downloading the latest FrankenPHP binary..."
-    if curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash; then
-        if [ -f "./frankenphp" ]; then
-            echo "   - Moving 'frankenphp' to $target_bin_dir/..."
-            if $SUDO_CMD mv ./frankenphp "$target_bin_dir/frankenphp"; then
-                echo "   - ✅ FrankenPHP reinstalled successfully."
+    
+    # Check if installed via package manager (typically at /usr/bin/frankenphp)
+    if [ "$frankenphp_path" = "/usr/bin/frankenphp" ]; then
+        # Package manager installation - use apt/dnf to upgrade
+        if [ "$PKG_MANAGER" = "apt" ]; then
+            echo "   - FrankenPHP installed via apt. Upgrading with apt..."
+            if $SUDO_CMD apt update && $SUDO_CMD apt install --only-upgrade -y frankenphp; then
+                echo "   - ✅ FrankenPHP upgraded successfully via apt."
             else
-                gum style --foreground red "❌ Failed to move frankenphp." \
-                    "Please run this command manually from the directory you ran the installer:" \
-                    "sudo mv ./frankenphp \"$target_bin_dir/frankenphp\""
+                gum style --foreground red "❌ Failed to upgrade FrankenPHP via apt."
+                return 1
+            fi
+        elif [ "$PKG_MANAGER" = "dnf" ]; then
+            echo "   - FrankenPHP installed via dnf. Upgrading with dnf..."
+            if $SUDO_CMD dnf upgrade -y frankenphp; then
+                echo "   - ✅ FrankenPHP upgraded successfully via dnf."
+            else
+                gum style --foreground red "❌ Failed to upgrade FrankenPHP via dnf."
                 return 1
             fi
         else
-            gum style --foreground red "❌ FrankenPHP download script failed to create the 'frankenphp' file."
+            echo "   - ⚠️ Unknown package manager for FrankenPHP at /usr/bin. Skipping upgrade."
             return 1
         fi
     else
-        gum style --foreground red "❌ The FrankenPHP download script failed."
+        # Static binary installation - download directly
+        local target_bin_dir
+        if [ -n "$frankenphp_path" ]; then
+            target_bin_dir=$(dirname "$frankenphp_path")
+            echo "   - Detected static FrankenPHP binary in '$target_bin_dir'."
+        else
+            target_bin_dir="$BIN_DIR"
+            echo "   - FrankenPHP not found. Using default: $target_bin_dir"
+        fi
+        
+        echo "   - Downloading latest FrankenPHP static binary..."
+        
+        # Determine the correct binary for this platform
+        local arch=$(uname -m)
+        local os=$(uname -s)
+        local binary_name=""
+        
+        if [ "$os" = "Linux" ]; then
+            case $arch in
+                x86_64) binary_name="frankenphp-linux-x86_64" ;;
+                aarch64) binary_name="frankenphp-linux-aarch64" ;;
+            esac
+            # Check for glibc
+            if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+                binary_name="${binary_name}-gnu"
+            fi
+        elif [ "$os" = "Darwin" ]; then
+            case $arch in
+                arm64) binary_name="frankenphp-mac-arm64" ;;
+                x86_64) binary_name="frankenphp-mac-x86_64" ;;
+            esac
+        fi
+        
+        if [ -z "$binary_name" ]; then
+            gum style --foreground red "❌ No precompiled FrankenPHP binary available for $os/$arch"
+            return 1
+        fi
+        
+        local temp_binary="/tmp/frankenphp_new"
+        if curl -L --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${binary_name}" -o "$temp_binary"; then
+            chmod +x "$temp_binary"
+            if sudo mv "$temp_binary" "$target_bin_dir/frankenphp"; then
+                # Set capability to bind to low ports without root
+                if command -v setcap &>/dev/null; then
+                    $SUDO_CMD setcap 'cap_net_bind_service=+ep' "$target_bin_dir/frankenphp" 2>/dev/null || true
+                fi
+                echo "   - ✅ FrankenPHP upgraded successfully."
+            else
+                gum style --foreground red "❌ Failed to move FrankenPHP to $target_bin_dir"
+                rm -f "$temp_binary"
+                return 1
+            fi
+        else
+            gum style --foreground red "❌ Failed to download FrankenPHP binary."
+            return 1
+        fi
+    fi
+    
+    # Verify mysqli is available after upgrade
+    echo "   - Verifying PHP mysqli extension..."
+    if ! frankenphp php-cli -r "echo implode(',', get_loaded_extensions());" 2>/dev/null | grep -qi mysqli; then
+        gum style --foreground yellow "⚠️ Warning: mysqli extension not found in FrankenPHP."
+        gum style --foreground yellow "   WordPress sites may not work correctly."
         return 1
     fi
+    echo "   - ✅ mysqli extension verified."
+    
     return 0
 }
 
@@ -4528,15 +5311,15 @@ cove_upgrade() {
         return 0
     fi
 
-    # Get local version
+    # Get local version (strip 'v' prefix if present)
     local local_frankenphp_version
-    local_frankenphp_version=$(frankenphp version | awk '{print $2}')
+    local_frankenphp_version=$(frankenphp version | awk '{print $2}' | sed 's/^v//')
     if [ -z "$local_frankenphp_version" ]; then
         echo "   - ❌ Could not determine local FrankenPHP version. Skipping update check."
         return 1
     fi
 
-    # Get latest version from GitHub redirect
+    # Get latest version from GitHub redirect (strip 'v' prefix)
     local latest_frankenphp_version
     latest_frankenphp_version=$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/php/frankenphp/releases/latest | sed 's/.*\/v//')
 
@@ -4548,19 +5331,19 @@ cove_upgrade() {
     echo "   - Current FrankenPHP version:  $local_frankenphp_version"
     echo "   - Latest available version:    $latest_frankenphp_version"
 
-    # Use PHP for robust version comparison
-    local needs_upgrade
-    needs_upgrade=$(LOCAL_V="$local_frankenphp_version" REMOTE_V="$latest_frankenphp_version" php -r '
-        if (version_compare(getenv("LOCAL_V"), getenv("REMOTE_V"), "<")) {
-            echo "true";
-        } else {
-            echo "false";
-        }
-    ')
+    # Compare versions using sort -V (works without PHP)
+    local needs_upgrade="false"
+    if [ "$local_frankenphp_version" != "$latest_frankenphp_version" ]; then
+        local older_version
+        older_version=$(printf '%s\n' "$local_frankenphp_version" "$latest_frankenphp_version" | sort -V | head -n1)
+        if [ "$older_version" = "$local_frankenphp_version" ]; then
+            needs_upgrade="true"
+        fi
+    fi
 
     if [ "$needs_upgrade" == "true" ]; then
         echo "🚀 Upgrading FrankenPHP to version $latest_frankenphp_version..."
-        upgrade_frankenphp_binary
+        upgrade_frankenphp
     else
         echo "✅ FrankenPHP is already up to date."
     fi
@@ -4575,12 +5358,11 @@ cove_upgrade() {
         return 0
     fi
     
-    # Get current Adminer version from the file
+    # Get current Adminer version from the file (portable — BSD grep has no -P/\K)
     local current_adminer_version
-    current_adminer_version=$(grep -oP "version\s*=\s*['\"]?\K[0-9]+\.[0-9]+\.[0-9]+" "$adminer_file" 2>/dev/null | head -1)
+    current_adminer_version=$(LC_ALL=C sed -nE 's/.*VERSION="([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$adminer_file" 2>/dev/null | head -1)
     if [ -z "$current_adminer_version" ]; then
-        # Try alternative pattern
-        current_adminer_version=$(grep -oP "Adminer\s+\K[0-9]+\.[0-9]+\.[0-9]+" "$adminer_file" 2>/dev/null | head -1)
+        current_adminer_version=$(LC_ALL=C sed -nE 's/.*@version[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' "$adminer_file" 2>/dev/null | head -1)
     fi
     
     if [ -z "$current_adminer_version" ]; then
@@ -4603,7 +5385,7 @@ cove_upgrade() {
     # Compare versions (skip if current is unknown)
     if [ "$current_adminer_version" != "unknown" ]; then
         local adminer_needs_upgrade
-        adminer_needs_upgrade=$(LOCAL_V="$current_adminer_version" REMOTE_V="$latest_adminer_version" php -r '
+        adminer_needs_upgrade=$(LOCAL_V="$current_adminer_version" REMOTE_V="$latest_adminer_version" frankenphp php-cli -r '
             if (version_compare(getenv("LOCAL_V"), getenv("REMOTE_V"), "<")) {
                 echo "true";
             } else {
@@ -4661,7 +5443,7 @@ cove_url() {
     # -------------------------------------------------------------
     #  Print the URL – we keep the output plain so it can be piped.
     # -------------------------------------------------------------
-    echo "https://${site_name}.localhost"
+    url_for "${site_name}.localhost"
 }
 cove_version() {
     echo "Cove version $COVE_VERSION"
