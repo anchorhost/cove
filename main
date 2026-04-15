@@ -211,7 +211,7 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.2.8
+ * Version: 0.3.0
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
@@ -353,6 +353,31 @@ add_filter( 'auto_plugin_update_send_email', '__return_false' );
  * Disable auto-update email notifications for themes.
  */
 add_filter( 'auto_theme_update_send_email', '__return_false' );
+
+/**
+ * Dynamic URL override for Tailscale/LAN/Share access.
+ * When accessed via a non-localhost domain, override home and siteurl
+ * to use the current host so CSS/JS/images load correctly.
+ */
+function cove_maybe_override_site_url( $value ) {
+    // Only run in front-end context with a valid HTTP_HOST
+    if ( defined( 'WP_CLI' ) && WP_CLI ) {
+        return $value;
+    }
+    
+    $host = isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : '';
+    
+    // Skip if no host or if it ends with .localhost (normal local access)
+    if ( empty( $host ) || preg_match( '/\.localhost(:\d+)?$/', $host ) ) {
+        return $value;
+    }
+    
+    // Override to current host for Tailscale, LAN, or public share access
+    $scheme = ( ! empty( $_SERVER['HTTPS'] ) && $_SERVER['HTTPS'] !== 'off' ) ? 'https' : 'http';
+    return $scheme . '://' . $host;
+}
+add_filter( 'option_home', 'cove_maybe_override_site_url' );
+add_filter( 'option_siteurl', 'cove_maybe_override_site_url' );
 heredoc
 
     local mu_plugins_dir="$public_dir/wp-content/mu-plugins"
@@ -688,17 +713,30 @@ EOM
                     echo "# Tailscale: ${site_base_name} -> port ${ts_port}" >> "$CADDYFILE_PATH"
                     echo "https://${tailscale_hostname}:${ts_port} {" >> "$CADDYFILE_PATH"
                     echo "    tls internal" >> "$CADDYFILE_PATH"
+                    
                     if [ -n "$direct_proxy_target" ]; then
                         # Proxy directly to the backend target
                         echo "    reverse_proxy ${direct_proxy_target}" >> "$CADDYFILE_PATH"
                     else
-                        # Proxy through the local site
-                        echo "    reverse_proxy https://${site_name} {" >> "$CADDYFILE_PATH"
-                        echo "        header_up Host ${site_name}" >> "$CADDYFILE_PATH"
-                        echo "        transport http {" >> "$CADDYFILE_PATH"
-                        echo "            tls_insecure_skip_verify" >> "$CADDYFILE_PATH"
-                        echo "        }" >> "$CADDYFILE_PATH"
+                        # Serve site directly (not via proxy) for better compatibility
+                        echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
+
+                        echo "    log {" >> "$CADDYFILE_PATH"
+                        echo "        output file \"$site_path/logs/caddy-tailscale.log\"" >> "$CADDYFILE_PATH"
                         echo "    }" >> "$CADDYFILE_PATH"
+                        
+                        # Include custom directives if present
+                        if [ -f "$directive_file" ]; then
+                            echo "" >> "$CADDYFILE_PATH"
+                            sed 's/^/    /' "$directive_file" >> "$CADDYFILE_PATH"
+                            echo "" >> "$CADDYFILE_PATH"
+                        fi
+                        
+                        echo "    php_server" >> "$CADDYFILE_PATH"
+                        
+                        if [ ! -f "$site_path/public/wp-config.php" ]; then
+                            echo "    file_server" >> "$CADDYFILE_PATH"
+                        fi
                     fi
                     echo "}" >> "$CADDYFILE_PATH"
                     echo "" >> "$CADDYFILE_PATH"
@@ -720,29 +758,21 @@ EOM
         echo "}" >> "$CADDYFILE_PATH"
         echo "" >> "$CADDYFILE_PATH"
         
-        # DB on port 9902
+        # DB on port 9902 - serve directly
         echo "# Tailscale: db -> port 9902" >> "$CADDYFILE_PATH"
         echo "https://${tailscale_hostname}:9902 {" >> "$CADDYFILE_PATH"
         echo "    tls internal" >> "$CADDYFILE_PATH"
-        echo "    reverse_proxy https://db.cove.localhost {" >> "$CADDYFILE_PATH"
-        echo "        header_up Host db.cove.localhost" >> "$CADDYFILE_PATH"
-        echo "        transport http {" >> "$CADDYFILE_PATH"
-        echo "            tls_insecure_skip_verify" >> "$CADDYFILE_PATH"
-        echo "        }" >> "$CADDYFILE_PATH"
-        echo "    }" >> "$CADDYFILE_PATH"
+        echo "    root * \"$ADMINER_DIR\"" >> "$CADDYFILE_PATH"
+        echo "    php_server" >> "$CADDYFILE_PATH"
         echo "}" >> "$CADDYFILE_PATH"
         echo "" >> "$CADDYFILE_PATH"
         
-        # Dashboard on port 9900
+        # Dashboard on port 9900 - serve directly
         echo "# Tailscale: cove dashboard -> port 9900" >> "$CADDYFILE_PATH"
         echo "https://${tailscale_hostname}:9900 {" >> "$CADDYFILE_PATH"
         echo "    tls internal" >> "$CADDYFILE_PATH"
-        echo "    reverse_proxy https://cove.localhost {" >> "$CADDYFILE_PATH"
-        echo "        header_up Host cove.localhost" >> "$CADDYFILE_PATH"
-        echo "        transport http {" >> "$CADDYFILE_PATH"
-        echo "            tls_insecure_skip_verify" >> "$CADDYFILE_PATH"
-        echo "        }" >> "$CADDYFILE_PATH"
-        echo "    }" >> "$CADDYFILE_PATH"
+        echo "    root * \"$GUI_DIR\"" >> "$CADDYFILE_PATH"
+        echo "    php_server" >> "$CADDYFILE_PATH"
         echo "}" >> "$CADDYFILE_PATH"
         echo "" >> "$CADDYFILE_PATH"
     fi
