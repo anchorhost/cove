@@ -6,14 +6,20 @@ Cove is a command-line tool that simplifies the creation and management of local
 
 ## ✨ Features
 
-  * **Simple CLI**: Manage everything from your terminal with simple commands.
-  * **Web Dashboard**: A handy web interface to view and manage your sites.
-  * **Automatic HTTPS**: All sites are automatically served over HTTPS locally using internal certificates.
-  * **WordPress & Static Sites**: Quickly create a new WordPress installation or a plain static site.
-  * **Database Management**: Includes Adminer for database management and a command for easy backups.
-  * **Email Catching**: Built-in Mailpit service catches all outgoing emails for easy inspection.
-  * **Pretty Errors**: Uses Whoops for beautiful and informative PHP error pages.
-  * **Custom Rules**: Easily add site-specific Caddy directives.
+  * **Simple CLI**: Manage everything from your terminal with a handful of short commands.
+  * **Web Dashboard**: A PicoCSS-styled GUI at `https://cove.localhost` to view, add, and delete sites, plus one-click admin logins.
+  * **Automatic HTTPS**: Every site is served over HTTPS using Caddy's internal CA — no cert wrangling.
+  * **WordPress & Static Sites**: Spin up a fresh WordPress install or a plain static site with one command.
+  * **WordPress Migration**: Pull a remote site down via SSH (`cove pull`) or push a local site up (`cove push`).
+  * **Database Management**: Adminer with passwordless auto-login, `cove db backup` for every site, and `cove db list` to inspect credentials.
+  * **Email Catching**: Built-in Mailpit catches every outgoing email so you never risk sending a test to a real inbox.
+  * **Custom Ports**: Run Cove alongside Local, Studio, DevKinsta, or MAMP — pick alternative HTTP/HTTPS ports and Cove migrates stored WordPress URLs automatically.
+  * **LAN & Mobile Testing**: `cove lan` exposes sites to your phone via Bonjour/mDNS for iOS app sync.
+  * **Tailscale Integration**: `cove tailscale enable` makes every site reachable from any device on your tailnet.
+  * **Instant Public Sharing**: `cove share` spins up a Cloudflare Tunnel so you can share a WIP site with a client in seconds.
+  * **Hosts File Automation**: Cove manages `/etc/hosts` entries for you — no manual editing.
+  * **Pretty Errors**: Whoops renders beautiful PHP error pages with stack traces and editor integration.
+  * **Custom Caddy Rules**: Per-site directives for reverse proxies, auth, headers, or anything else Caddy supports.
 
 ## Core Technologies
 
@@ -29,8 +35,23 @@ Cove is a command-line tool that simplifies the creation and management of local
 Run the following in your terminal to install `cove`.
 
 ```bash
-bash <(curl -sL https://cove.run/cove-install.sh)
+bash <(curl -sL https://cove.run/install-cove.sh)
 ```
+
+On macOS, the installer will offer to install Homebrew first if it's not already present. On Linux, make sure `curl` is installed before running it.
+
+## 🚀 Quick Start
+
+Once installed, this is the shortest path from zero to a working WordPress site:
+
+```bash
+cove add myblog                # fresh WP install at https://myblog.localhost
+cove login myblog              # generates a one-time admin login URL
+cove list                      # shows every site Cove manages
+cove db backup                 # snapshots every site's database to .sql
+```
+
+Open `https://cove.localhost` in your browser to see the dashboard. Your browser may show a certificate warning on first visit — click through, or trust Caddy's root CA once (see [Troubleshooting](#-troubleshooting)).
 
 ## 💻 Usage
 
@@ -42,11 +63,11 @@ Cove provides a simple set of commands to manage your local environment.
 | --- | --- |
 | `cove add <name> [--plain]` | Creates a new WordPress site (`<name>.localhost`). Use `--plain` for a static site. |
 | `cove delete <name> [--force]` | Deletes a site's directory and its associated database. |
-| `cove rename <old-name> <new-name>` | Renames a site, its directory, database, and updates its URL in the database. |
+| `cove rename <old-name> <new-name>` | Renames a site, its directory, database, and runs `wp search-replace` so stored URLs (siteurl, home, serialized content) all update to the new domain. |
 | `cove list [--totals]` | Lists all sites managed by Cove. Use `--totals` to show disk usage. |
 | `cove login <site> [<user>]` | Generates a one-time login link for a WordPress site. |
 | `cove path <name>` | Outputs the full system path to a site's public directory. |
-| `cove url <name>` | Prints the full `https://<name>.localhost` URL for a site. |
+| `cove url <name>` | Prints the full HTTPS URL for a site (including the port suffix when on alternative ports). |
 | `cove log [<site>] [-f]` | Shows error logs. Use `-f` to follow logs in real-time. |
 
 ### Migration
@@ -76,6 +97,7 @@ Cove provides a simple set of commands to manage your local environment.
 
 | Command | Description |
 | --- | --- |
+| `cove ports [--http N --https N]` | Interactively reconfigure HTTP/HTTPS ports. Migrates every WordPress site's stored URLs via `wp search-replace` so existing sites keep working. Supports `--dry-run` and `--skip-urls`. |
 | `cove directive <add\|update\|delete\|list> [site]` | Manages custom Caddyfile rules for a specific site. |
 | `cove mappings <site> [add\|remove] [domain]` | Manages additional domain mappings for a site. |
 | `cove proxy <add\|list\|delete>` | Manages standalone reverse proxy entries in the Caddyfile. |
@@ -98,6 +120,34 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove version` | Displays the current version of Cove. |
 
 *You can get help for any command by running `cove <command> --help`.*
+
+## Running Alongside Local, Studio, or DevKinsta
+
+Cove can coexist with other local WordPress tools that already bind ports 80 and 443. When you run `cove install` and something else is listening on the default ports, Cove detects the conflict and offers a menu:
+
+```
+⚠️  Port Conflict Detected
+   Port 80 is in use by: Local
+   Port 443 is in use by: Local
+
+❯ Use alternative ports (8090 / 8453) — run alongside other tools
+  Pick custom ports
+  Proceed with 80/443 anyway
+  Cancel installation
+```
+
+Pick *Use alternative ports* and Cove will install on `8090` / `8453`. Visit `https://myblog.localhost:8453` — Caddy's auto-HTTPS handles the non-default port transparently.
+
+You can switch back and forth at any time without losing work:
+
+```bash
+cove ports                              # interactive menu (Keep / Default / Custom)
+cove ports --http 80 --https 443        # switch back to defaults
+cove ports --http 8090 --https 8453     # switch to alternatives
+cove ports --dry-run                    # preview the effect of a port change
+```
+
+When the HTTPS port changes, Cove walks every WordPress site under `~/Cove/Sites/` and runs `wp search-replace` to rewrite stored URLs (siteurl, home, serialized content, custom mappings) so existing sites keep working on the new port. Non-WordPress sites are skipped automatically.
 
 ## Proxying Local Services
 
@@ -143,13 +193,15 @@ cove tailscale disable
 
 ## 🖥️ The Dashboard
 
-The web dashboard, available at `https://cove.localhost`, provides a quick and easy way to:
+The web dashboard, available at `https://cove.localhost` (or `https://cove.localhost:8453` when you're on alternative ports), provides a quick and easy way to:
 
-  * View all your managed sites.
-  * Add new WordPress or Plain sites via a simple form.
-  * Delete existing sites with a click.
+  * View all your managed sites, with clickable domains that open each site in a new tab.
+  * Add new WordPress or plain sites via a simple form.
+  * Delete existing sites with one click (with a confirmation prompt).
+  * Generate a one-time admin login URL for any WordPress site — no password needed.
   * Access quick links to Adminer and Mailpit.
-  * See your database connection credentials.
+  * See your shared MariaDB connection credentials at a glance.
+  * Toggle between light and dark themes (your choice is remembered).
 
 ## 🛠️ Development
 
@@ -205,6 +257,48 @@ The `--dev` flag tells the installer to use the local `cove.sh` from the same di
 - **macOS**: Intel and Apple Silicon (via Homebrew)
 - **Linux**: Ubuntu/Debian (apt) and Fedora/RHEL/CentOS (dnf)
 - **WSL2**: Windows Subsystem for Linux (requires systemd enabled)
+
+## 🩺 Troubleshooting
+
+### "Your connection is not private" certificate warning
+
+Cove issues its own local certificates via Caddy's internal CA. Browsers don't trust it by default, so you'll see a warning on your first visit to any site. You have two options:
+
+1. **Click through once per site** — click *Advanced* → *Proceed to …* and the browser will cache the decision.
+2. **Trust Caddy's root CA system-wide** (recommended). The CA cert lives at:
+   - **macOS**: `~/Library/Application Support/Caddy/pki/authorities/local/root.crt` — usually auto-trusted by Caddy on install.
+   - **Linux (Ubuntu/Debian)**:
+     ```bash
+     sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt
+     sudo update-ca-certificates
+     ```
+
+### Ports 80 or 443 are already in use
+
+Cove's installer detects this and offers the reconfiguration menu described in [Running Alongside Local, Studio, or DevKinsta](#running-alongside-local-studio-or-devkinsta). If you skipped the prompt or want to change ports later, run `cove ports`.
+
+### WSL2: "systemd is not running"
+
+Cove needs systemd for service management (Caddy, MariaDB, Mailpit). Enable it by adding to `/etc/wsl.conf` inside your WSL distro:
+
+```ini
+[boot]
+systemd=true
+```
+
+Then from a Windows PowerShell: `wsl --shutdown`, and restart your WSL session.
+
+### WSL2: sites unreachable from Windows browser
+
+WSL2 has its own virtual network, so `myblog.localhost` doesn't resolve from Windows by default. Run `cove wsl-hosts` inside WSL and follow the PowerShell snippet it prints to update Windows' hosts file.
+
+### `cove add` fails with a database error
+
+Make sure MariaDB is running (`cove status`) and that `~/Cove/config` contains a valid `DB_USER` and `DB_PASSWORD`. If MariaDB won't start on macOS, try `brew services restart mariadb` and then re-run `cove enable`.
+
+### I changed ports but existing WordPress sites are broken
+
+If you used `--skip-urls` during `cove ports`, the WordPress `siteurl` / `home` options still point at the old port. Re-run `cove ports` without `--skip-urls` (even changing back and forth works) and Cove will run `wp search-replace` to realign everything. For one-off fixes, you can also run `wp option update siteurl https://yoursite.localhost:8453` from inside the site's `public/` directory.
 
 ## 📜 License
 
