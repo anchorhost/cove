@@ -103,8 +103,13 @@ cove_db_list() {
     fi
 
     # This heredoc contains a PHP script to find, connect, and format the database list.
+    # We invoke it via `frankenphp php-cli -r` so we don't depend on a standalone php binary.
+    local wp_path
+    wp_path=$(command -v wp)
+    local frank
+    frank=$(command -v frankenphp)
     local php_output
-    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" WP_ROOT_FLAG="$wp_root_flag" php -r '
+    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" WP_ROOT_FLAG="$wp_root_flag" WP_PATH="$wp_path" FRANK_BIN="$frank" frankenphp php-cli -r '
         function formatSize(int $bytes): string {
             if ($bytes === 0) return "0 B";
             $units = ["B", "KB", "MB", "GB", "TB"];
@@ -116,6 +121,9 @@ cove_db_list() {
         $db_user = getenv("DB_USER");
         $db_pass = getenv("DB_PASSWORD");
         $wp_root_flag = getenv("WP_ROOT_FLAG");
+        $wp_path = getenv("WP_PATH");
+        $frank_bin = getenv("FRANK_BIN");
+        $wp_invoker = escapeshellarg($frank_bin) . " php-cli " . escapeshellarg($wp_path);
 
         if (!is_dir($sites_dir)) { exit; }
 
@@ -132,7 +140,7 @@ cove_db_list() {
                 $public_dir_esc = escapeshellarg($public_dir);
                 $cmd_suffix = " " . $wp_root_flag . " --skip-plugins --skip-themes --quiet 2>/dev/null";
                 
-                $name_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_NAME" . $cmd_suffix);
+                $name_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_NAME" . $cmd_suffix);
                 if (is_null($name_raw)) { continue; }
                 $site_db_name = trim($name_raw);
                 if (empty($site_db_name)) { continue; }
@@ -142,10 +150,10 @@ cove_db_list() {
                 $size_str = "N/A";
 
                 if (!str_contains(strtolower($site_db_name), "sqlite")) {
-                    $user_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_USER" . $cmd_suffix);
+                    $user_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_USER" . $cmd_suffix);
                     if (!is_null($user_raw)) { $site_db_user = trim($user_raw); }
 
-                    $pass_raw = shell_exec("cd " . $public_dir_esc . " && wp config get DB_PASSWORD" . $cmd_suffix);
+                    $pass_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_PASSWORD" . $cmd_suffix);
                     if (!is_null($pass_raw)) { $site_db_pass = trim($pass_raw); }
                     
                     $stmt = $pdo->prepare("SELECT SUM(data_length + index_length) as size FROM information_schema.TABLES WHERE table_schema = ?");
