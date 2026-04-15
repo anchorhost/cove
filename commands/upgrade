@@ -249,7 +249,7 @@ cove_upgrade() {
     # Compare versions (skip if current is unknown)
     if [ "$current_adminer_version" != "unknown" ]; then
         local adminer_needs_upgrade
-        adminer_needs_upgrade=$(LOCAL_V="$current_adminer_version" REMOTE_V="$latest_adminer_version" php -r '
+        adminer_needs_upgrade=$(LOCAL_V="$current_adminer_version" REMOTE_V="$latest_adminer_version" frankenphp php-cli -r '
             if (version_compare(getenv("LOCAL_V"), getenv("REMOTE_V"), "<")) {
                 echo "true";
             } else {
