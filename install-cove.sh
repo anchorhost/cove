@@ -15,12 +15,16 @@ INSTALL_DIR=""
 SUDO_CMD="sudo"
 IS_WSL=false
 DEV_MODE=false
+MAIN_MODE=false
 
 # --- Parse Arguments ---
 for arg in "$@"; do
     case "$arg" in
         --dev)
             DEV_MODE=true
+            ;;
+        --main)
+            MAIN_MODE=true
             ;;
     esac
 done
@@ -163,7 +167,11 @@ pre_flight_checks() {
     fi
     
     if [ ! -w "$INSTALL_DIR" ]; then
-        echo_error "Installation directory '$INSTALL_DIR' is not writable. Please fix permissions or run with sudo."
+        if [ "$OS" = "linux" ] && command -v sudo &>/dev/null; then
+            echo_info "Installation directory '$INSTALL_DIR' requires sudo — you may be prompted for your password."
+        else
+            echo_error "Installation directory '$INSTALL_DIR' is not writable. Please fix permissions or run with sudo."
+        fi
     fi
 }
 
@@ -177,7 +185,11 @@ pre_flight_checks
 
 # 3. Define installation paths
 EXECUTABLE_NAME="cove"
-DOWNLOAD_URL="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
+if [ "$MAIN_MODE" = true ]; then
+    DOWNLOAD_URL="https://raw.githubusercontent.com/anchorhost/cove/main/cove.sh"
+else
+    DOWNLOAD_URL="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
+fi
 DESTINATION_PATH="$INSTALL_DIR/$EXECUTABLE_NAME"
 
 # Get the directory where this script is located (for --dev mode)
@@ -210,7 +222,11 @@ if [ "$DEV_MODE" = true ]; then
     fi
     echo_success "Local cove.sh installed to $DESTINATION_PATH"
 else
-    echo_info "Downloading the latest version of Cove..."
+    if [ "$MAIN_MODE" = true ]; then
+        echo_info "🧪 MAIN MODE: Downloading cove.sh from the main branch (unreleased)..."
+    else
+        echo_info "Downloading the latest version of Cove..."
+    fi
 
     # Download to temp first, then move with sudo if needed
     TEMP_DOWNLOAD="/tmp/cove.sh.download"

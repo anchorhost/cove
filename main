@@ -129,6 +129,7 @@ url_for() {
 # Idempotent config writer: replaces any existing KEY= line before appending.
 config_set() {
     local key="$1" val="$2"
+    mkdir -p "$(dirname "$CONFIG_FILE")"
     local tmp
     tmp=$(mktemp)
     if [ -f "$CONFIG_FILE" ]; then
