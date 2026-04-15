@@ -77,6 +77,7 @@ setup_environment
 COVE_DIR="$HOME/Cove"
 CONFIG_FILE="$COVE_DIR/config"
 CADDYFILE_PATH="$COVE_DIR/Caddyfile"
+PHP_INI_FILE="$COVE_DIR/php.ini"
 
 APP_DIR="$COVE_DIR/App"
 SITES_DIR="$COVE_DIR/Sites"
@@ -92,6 +93,12 @@ COVE_VERSION="1.7"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
+
+# Export PHPRC so every PHP invocation (frankenphp php-cli, frankenphp -r, and
+# any nested wp-cli call) picks up our memory_limit / display_errors / error
+# reporting overrides from $PHP_INI_FILE. The file is written by `cove install`;
+# until then PHPRC points at a non-existent path, which PHP silently ignores.
+export PHPRC="$PHP_INI_FILE"
 
 # --- Port Configuration ---
 # Defaults; overridden by HTTP_PORT/HTTPS_PORT entries in $CONFIG_FILE if present.
@@ -148,10 +155,161 @@ port_listening_app() {
 
 # True when nothing is accepting connections on $1. Uses bash /dev/tcp so it
 # works regardless of who owns the listener (lsof is uid-scoped on macOS and
-# cannot see root-owned sockets from a regular user).
+# cannot see root-owned sockets from a regular user). Probes both IPv4 and
+# IPv6 loopback because some servers (e.g. Python's http.server) bind v6-only
+# by default and the v4 probe alone would miss them.
 port_is_free() {
     local port="$1"
-    ! (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null
+    if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
+        return 1
+    fi
+    if (exec 3<>/dev/tcp/::1/"$port") 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# True if the process listening on $1 is one of our own services (Caddy /
+# FrankenPHP). Used so reinstalls don't flag their own services as conflicts.
+port_is_own() {
+    local app
+    app=$(port_listening_app "$1")
+    [ -n "$app" ] && { [[ "$app" == *"$CADDY_CMD"* ]] || [[ "$app" == *frankenph* ]]; }
+}
+
+# True if $1 is occupied by something that isn't one of our own services.
+port_has_conflict() {
+    port_is_free "$1" && return 1
+    port_is_own "$1" && return 1
+    return 0
+}
+
+# Interactive prompt that asks for HTTP and HTTPS ports, validates each, and
+# re-prompts until both are free. Sets HTTP_PORT / HTTPS_PORT globals on
+# success. Called by the install and `cove ports` flows.
+prompt_custom_ports() {
+    local suggest_http="${1:-8090}" suggest_https="${2:-8453}"
+    local candidate
+    while true; do
+        candidate=$(gum input --value "$suggest_http" --prompt "HTTP port: ")
+        if [[ ! "$candidate" =~ ^[0-9]+$ ]] || [ "$candidate" -lt 1 ] || [ "$candidate" -gt 65535 ]; then
+            gum style --foreground red "   ❌ Invalid port number."
+            continue
+        fi
+        if ! port_is_free "$candidate"; then
+            gum style --foreground red "   ❌ Port $candidate is in use by: $(port_listening_app "$candidate")"
+            continue
+        fi
+        HTTP_PORT="$candidate"
+        break
+    done
+    while true; do
+        candidate=$(gum input --value "$suggest_https" --prompt "HTTPS port: ")
+        if [[ ! "$candidate" =~ ^[0-9]+$ ]] || [ "$candidate" -lt 1 ] || [ "$candidate" -gt 65535 ]; then
+            gum style --foreground red "   ❌ Invalid port number."
+            continue
+        fi
+        if [ "$candidate" = "$HTTP_PORT" ]; then
+            gum style --foreground red "   ❌ HTTPS port must differ from HTTP port."
+            continue
+        fi
+        if ! port_is_free "$candidate"; then
+            gum style --foreground red "   ❌ Port $candidate is in use by: $(port_listening_app "$candidate")"
+            continue
+        fi
+        HTTPS_PORT="$candidate"
+        break
+    done
+}
+
+# Build the https:// URL for a hostname given an HTTPS port. Omits the port
+# suffix when $2 equals 443 so stored URLs match the "no suffix" form.
+port_url_for() {
+    local host="$1" port="$2"
+    if [ "$port" = "443" ]; then
+        echo "https://$host"
+    else
+        echo "https://$host:$port"
+    fi
+}
+
+# Walk every WordPress site under $SITES_DIR and run `wp search-replace` to
+# migrate stored URLs from OLD_HTTPS port to NEW_HTTPS port. Updates each
+# hostname the site answers on (base + entries in site/mappings) so custom
+# mappings don't get left stale. Pass "--dry-run" as the third argument to
+# preview replacement counts without committing.
+#
+# No-op if OLD_HTTPS == NEW_HTTPS or if $SITES_DIR has no WordPress sites.
+# Returns 0 even if individual sites fail — per-site errors are reported
+# in the output and summarised at the end.
+update_wp_site_urls_for_port_change() {
+    local old_https="$1" new_https="$2" dry_run_flag="${3:-}"
+    local dry_run=false
+    [ "$dry_run_flag" = "--dry-run" ] && dry_run=true
+
+    [ "$old_https" = "$new_https" ] && return 0
+    [ -d "$SITES_DIR" ] || return 0
+
+    local wp_cmd
+    wp_cmd=$(get_wp_cmd)
+
+    local total_sites=0 updated_sites=0 failed_hosts=0
+    local site_path site_name hostname mapping old_url new_url
+    local -a hostnames
+
+    for site_path in "$SITES_DIR"/*; do
+        [ -d "$site_path" ] || continue
+        [ -f "$site_path/public/wp-config.php" ] || continue
+        total_sites=$((total_sites + 1))
+        site_name=$(basename "$site_path")
+
+        hostnames=("$site_name")
+        if [ -f "$site_path/mappings" ]; then
+            while IFS= read -r mapping || [ -n "$mapping" ]; do
+                [ -n "$mapping" ] && hostnames+=("$mapping")
+            done < "$site_path/mappings"
+        fi
+
+        local any_updated=false
+        for hostname in "${hostnames[@]}"; do
+            old_url=$(port_url_for "$hostname" "$old_https")
+            new_url=$(port_url_for "$hostname" "$new_https")
+            [ "$old_url" = "$new_url" ] && continue
+
+            local -a sr_args
+            sr_args=(--all-tables --skip-plugins --skip-themes --format=count)
+            $dry_run && sr_args+=(--dry-run)
+
+            local output rc count
+            output=$( (cd "$site_path/public" && $wp_cmd search-replace "$old_url" "$new_url" "${sr_args[@]}") 2>&1 )
+            rc=$?
+            if [ $rc -eq 0 ]; then
+                count=$(echo "$output" | tr -d '[:space:]')
+                [[ "$count" =~ ^[0-9]+$ ]] || count=0
+                if $dry_run; then
+                    echo "   • ${hostname}: would replace ${count} occurrence(s)"
+                else
+                    echo "   • ${hostname}: replaced ${count} occurrence(s)"
+                fi
+                any_updated=true
+            else
+                gum style --foreground red "   ❌ ${hostname}: search-replace failed"
+                failed_hosts=$((failed_hosts + 1))
+            fi
+        done
+        $any_updated && updated_sites=$((updated_sites + 1))
+    done
+
+    echo ""
+    if $dry_run; then
+        echo "🔍 Dry run: $updated_sites of $total_sites WordPress site(s) would be updated."
+    else
+        echo "📊 $updated_sites of $total_sites WordPress site(s) updated."
+    fi
+    if [ $failed_hosts -gt 0 ]; then
+        gum style --foreground yellow "⚠️  $failed_hosts hostname replacement(s) failed."
+    fi
+    return 0
 }
 
 # --- Whoops Bootstrap Generation ---
@@ -418,15 +576,26 @@ check_dependencies() {
 
 # --- Helper Functions ---
 
-# Helper function to get WP-CLI command with --allow-root if running as root
-# This is needed for WSL/Docker environments where root is common
+# Helper function to get WP-CLI command. Routes wp-cli through FrankenPHP's
+# bundled PHP via `frankenphp php-cli` so that we use one PHP runtime for both
+# web (Caddy) and CLI — no separate brew `php` install needed. PHP settings
+# (memory_limit, display_errors, error_reporting) come from $PHP_INI_FILE,
+# which `cove install` writes alongside ~/Cove/config. PHPRC is exported once
+# at script init below so every PHP invocation in any subshell picks it up.
+#
+# `frankenphp php-cli` does NOT support PHP CLI flags like -d or -c. PHPRC
+# is the only mechanism for setting ini values, hence the dedicated ini file.
+#
+# --allow-root is needed in WSL/Docker where the script runs as root.
 get_wp_cmd() {
     local wp_path
     wp_path=$(command -v wp)
+    local frank
+    frank=$(command -v frankenphp)
     if [ "$(id -u)" -eq 0 ]; then
-        echo "$wp_path --allow-root"
+        echo "$frank php-cli $wp_path --allow-root"
     else
-        echo "$wp_path"
+        echo "$frank php-cli $wp_path"
     fi
 }
 
@@ -1185,6 +1354,7 @@ show_general_help() {
     echo "  tailscale        Expose all sites to your Tailscale network."
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  lan              Enable LAN access to sites for mobile app sync."
+    echo "  ports            Reconfigure HTTP/HTTPS ports + update site URLs."
     echo "  log              View logs for a site or the global error log."
     echo "  share            Create a temporary public tunnel to share a site."
     if [ "$IS_WSL" = true ]; then
@@ -1349,6 +1519,33 @@ display_command_help() {
             echo "  disable <site>   Disable LAN access for a site"
             echo "  status           Show which sites have LAN access enabled"
             echo "  trust            Instructions for trusting Caddy's CA on mobile devices"
+            ;;
+        ports)
+            echo "Usage: cove ports [options]"
+            echo ""
+            echo "Reconfigure the HTTP/HTTPS ports Cove listens on."
+            echo ""
+            echo "By default, asks once to migrate every WordPress site's stored URLs"
+            echo "(siteurl, home, and serialized content) via 'wp search-replace' so"
+            echo "existing sites keep working on the new port. Handles custom mappings"
+            echo "and skips non-WordPress sites automatically."
+            echo ""
+            echo "Run with no arguments for an interactive menu, or pass --http / --https"
+            echo "for scripted use."
+            echo ""
+            echo "Options:"
+            echo "  --http PORT     Non-interactive: set HTTP port"
+            echo "  --https PORT    Non-interactive: set HTTPS port"
+            echo "  --skip-urls     Change ports without touching WordPress databases"
+            echo "  --dry-run       Preview changes (including replacement counts)"
+            echo "                  without committing anything"
+            echo ""
+            echo "Examples:"
+            echo "  cove ports                          Interactive menu"
+            echo "  cove ports --http 8090 --https 8453 Set ports non-interactively"
+            echo "  cove ports --dry-run                Preview the effect of a port change"
+            echo ""
+            echo "Tip: run 'cove db backup' first if you want a safety net before the DB update."
             ;;
         log)
             echo "Usage: cove log [site] [--follow]"
@@ -1591,6 +1788,10 @@ main() {
         lan)
             check_dependencies
             cove_lan "$@"
+            ;;
+        ports)
+            check_dependencies
+            cove_ports "$@"
             ;;
         log)
             cove_log "$@"
