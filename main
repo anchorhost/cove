@@ -600,6 +600,13 @@ get_wp_cmd() {
     fi
 }
 
+# Safely single-quote a value for interpolation into a remote shell command.
+# Interior single quotes become the standard '\'' escape sequence, so the
+# result can be dropped into ssh "... $(shell_quote "$v") ..." without injection.
+shell_quote() {
+    printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
 # Helper function to get the correct MariaDB service name on Linux
 # Different distros may use 'mariadb', 'mysql', or 'mysqld' as the service name
 get_mariadb_service_name() {

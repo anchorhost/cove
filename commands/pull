@@ -37,11 +37,13 @@ cove_pull() {
     local remote_path
     remote_path=$(gum input --value "public/" --prompt "Path to WordPress Root: ")
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
-    
+    local remote_path_q
+    remote_path_q=$(shell_quote "$remote_path")
+
     # --- 2. Validate Remote Site ---
     log_step "Validating remote WordPress site..."
     local remote_url
-    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path && wp option get home 2>/dev/null")
+    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path_q && wp option get home 2>/dev/null")
     domain=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//')
     
     if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
@@ -101,7 +103,7 @@ cove_pull() {
     fi
 
     local backup_url
-    backup_url=$(ssh $ssh_opts $remote_ssh "curl -sL https://captaincore.io/do | bash -s -- backup $remote_path --quiet $backup_extra_args")
+    backup_url=$(ssh $ssh_opts $remote_ssh "curl -sL https://captaincore.io/do | bash -s -- backup $remote_path_q --quiet $backup_extra_args")
 
     if [[ -z "$backup_url" || ! "$backup_url" == *.zip ]]; then
         log_error "Failed to generate backup or received an invalid backup URL."
@@ -151,7 +153,9 @@ EOM
     # --- 7. Cleanup ---
     log_step "Cleaning up remote backup file..."
     local filename="${backup_url##*/}"
-    ssh $ssh_opts $remote_ssh "rm -f $remote_path/${filename}" 2>/dev/null
+    local remote_backup_q
+    remote_backup_q=$(shell_quote "$remote_path/$filename")
+    ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q" 2>/dev/null
     log_success "Cleanup complete."
  
     # --- 8. Finalize ---
