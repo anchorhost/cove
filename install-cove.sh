@@ -261,7 +261,15 @@ echo "--------------------------------------------------"
 # script before we reach the success messages below. This is important when
 # the user cancels from Cove's interactive prompts — we must not claim success
 # after the user has explicitly cancelled.
-"$DESTINATION_PATH" install
+#
+# Redirect stdin from /dev/tty so interactive prompts (gum confirm/choose,
+# read) work when this installer is run via `curl | bash`, which would
+# otherwise hand the child a closed stdin and silently fail every prompt.
+if [ -r /dev/tty ]; then
+    "$DESTINATION_PATH" install < /dev/tty
+else
+    "$DESTINATION_PATH" install
+fi
 
 echo "--------------------------------------------------"
 echo_success "Cove has been installed successfully!"
