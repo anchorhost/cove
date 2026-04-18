@@ -26,6 +26,16 @@ cove_delete() {
         fi
     fi
 
+    # Collect hostnames to strip from /etc/hosts BEFORE we rm -rf the site dir
+    local hosts_to_remove=("$site_name.localhost")
+    if [ -f "$site_dir/mappings" ]; then
+        while IFS= read -r mapping || [ -n "$mapping" ]; do
+            if [ -n "$mapping" ]; then
+                hosts_to_remove+=("$mapping")
+            fi
+        done < "$site_dir/mappings"
+    fi
+
     echo "🔥 Deleting site: $site_name.localhost"
     if [ -f "$site_dir/public/wp-config.php" ]; then
         local db_name
@@ -42,6 +52,30 @@ cove_delete() {
     if [ -f "$custom_conf_file" ]; then
         rm "$custom_conf_file"
         echo "⚙️ Custom directives deleted."
+    fi
+
+    # --- Clean /etc/hosts entries ---
+    local entries_exist=false
+    local host
+    for host in "${hosts_to_remove[@]}"; do
+        if grep -qE "^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$" /etc/hosts 2>/dev/null; then
+            entries_exist=true
+            break
+        fi
+    done
+
+    if $entries_exist; then
+        echo "🧹 Removing /etc/hosts entries (requires sudo)..."
+        local sed_args=()
+        for host in "${hosts_to_remove[@]}"; do
+            sed_args+=(-e "/^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$/d")
+        done
+        if sudo sed -i.bak -E "${sed_args[@]}" /etc/hosts; then
+            sudo rm -f /etc/hosts.bak
+            echo "   - ✅ /etc/hosts cleaned."
+        else
+            gum style --foreground yellow "   - ⚠️ Could not update /etc/hosts."
+        fi
     fi
 
     echo "✅ Site '$site_name.localhost' has been removed."
