@@ -119,9 +119,22 @@ PHP
     # Only run the reload if the --no-reload flag was NOT passed.
     if [ "$no_reload_flag" = false ]; then
         regenerate_caddyfile
+
+        # Caddy's reload admin API returns as soon as the new config is live,
+        # but its internal CA issues the TLS cert for the new hostname
+        # asynchronously after that. Racing a request in that window surfaces
+        # as "tlsv1 alert internal error". Poll HTTPS briefly so we only return
+        # once Caddy can actually complete a handshake for the new domain.
+        local warm_url
+        warm_url=$(url_for "$full_hostname")
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -ks --max-time 1 -o /dev/null "$warm_url/" 2>/dev/null; then
+                break
+            fi
+            sleep 0.2
+        done
     fi
 
-    sleep 0.25
     echo "✅ Site '$full_hostname' created successfully!"
     
     if [ "$site_type" == "wordpress" ]; then

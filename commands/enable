@@ -88,52 +88,7 @@ EOM
         $SUDO_CMD systemctl restart mailpit
     fi
     
-    echo "   - Starting Caddy/FrankenPHP..."
-
-    if [ "$OS" == "macos" ]; then
-        local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
-        local frankenphp_bin
-        frankenphp_bin=$(command -v "$CADDY_CMD")
-
-        # Stop any existing instance
-        launchctl unload "$caddy_plist_path" &>/dev/null
-        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
-
-        cat > "$caddy_plist_path" << EOM
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-        <key>KeepAlive</key>
-        <true/>
-        <key>Label</key>
-        <string>com.cove.caddy</string>
-        <key>ProgramArguments</key>
-        <array>
-                <string>$frankenphp_bin</string>
-                <string>run</string>
-                <string>--config</string>
-                <string>$CADDYFILE_PATH</string>
-                <string>--pidfile</string>
-                <string>$COVE_DIR/caddy.pid</string>
-        </array>
-        <key>RunAtLoad</key>
-        <true/>
-        <key>StandardErrorPath</key>
-        <string>$LOGS_DIR/caddy-process.log</string>
-        <key>StandardOutPath</key>
-        <string>$LOGS_DIR/caddy-process.log</string>
-</dict>
-</plist>
-EOM
-        launchctl load "$caddy_plist_path"
-        launchctl start com.cove.caddy
-    fi
-
-    if [ "$OS" == "linux" ]; then
-        $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
-        $SUDO_CMD "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
-    fi
+    start_caddy_service
 
     if [ $? -eq 0 ]; then
         echo ""
