@@ -49,11 +49,13 @@ cove_push() {
     local remote_path
     remote_path=$(gum input --value "public/" --prompt "Path to Remote WordPress Root: ")
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
-    
+    local remote_path_q
+    remote_path_q=$(shell_quote "$remote_path")
+
     # --- 3. Validate Remote Site ---
     log_step "Validating remote WordPress site..."
     local remote_url
-    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path && wp option get home 2>/dev/null")
+    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path_q && wp option get home 2>/dev/null")
     
     if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
         log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
@@ -78,9 +80,14 @@ cove_push() {
     size=$(ls -lh "$backup_filename" | awk '{print $5}')
     log_success "Local backup created: ${backup_filename} ($size)"
 
+    local backup_filename_q
+    backup_filename_q=$(shell_quote "$backup_filename")
+    local remote_backup_q
+    remote_backup_q=$(shell_quote "$remote_path/$backup_filename")
+
     # --- 6. Upload Backup ---
     log_step "Uploading backup to remote server..."
-    if ! cat "$backup_filename" | ssh $ssh_opts $remote_ssh "cat > '$remote_path/$backup_filename'"; then
+    if ! cat "$backup_filename" | ssh $ssh_opts $remote_ssh "cat > $remote_backup_q"; then
         # Clean up local backup on failure
         rm -f "$backup_filename"
         log_error "Failed to upload backup."
@@ -89,7 +96,7 @@ cove_push() {
 
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
-    if ! ssh $ssh_opts $remote_ssh "cd '$remote_path' && curl -sL https://captaincore.io/do | bash -s -- migrate --url='$backup_filename' --update-urls"; then
+    if ! ssh $ssh_opts $remote_ssh "cd $remote_path_q && curl -sL https://captaincore.io/do | bash -s -- migrate --url=$backup_filename_q --update-urls"; then
         log_error "The remote migration script failed to execute correctly."
     fi
     log_success "Remote restore complete."
@@ -97,7 +104,7 @@ cove_push() {
     # --- 8. Cleanup ---
     log_step "Cleaning up backup files..."
     rm -f "$backup_filename"
-    ssh $ssh_opts $remote_ssh "rm -f '$remote_path/$backup_filename'"
+    ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q"
     log_success "Cleanup complete."
 
     # --- 9. Finalize ---
