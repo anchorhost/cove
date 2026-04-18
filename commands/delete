@@ -70,11 +70,17 @@ cove_delete() {
         for host in "${hosts_to_remove[@]}"; do
             sed_args+=(-e "/^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$/d")
         done
-        if sudo sed -i.bak -E "${sed_args[@]}" /etc/hosts; then
-            sudo rm -f /etc/hosts.bak
+        # Use non-interactive sudo when we don't have a TTY (e.g., the dashboard's
+        # PHP shell_exec). In that context an interactive sudo prompt can hang
+        # the caller waiting for a password that will never arrive. From a real
+        # terminal the flag is empty, so sudo prompts as normal.
+        local sudo_flag=""
+        [ -t 0 ] || sudo_flag="-n"
+        if sudo $sudo_flag sed -i.bak -E "${sed_args[@]}" /etc/hosts 2>/dev/null; then
+            sudo $sudo_flag rm -f /etc/hosts.bak 2>/dev/null
             echo "   - ✅ /etc/hosts cleaned."
         else
-            gum style --foreground yellow "   - ⚠️ Could not update /etc/hosts."
+            gum style --foreground yellow "   - ⚠️ Skipped /etc/hosts cleanup (sudo unavailable from this context). Run 'cove reload' from a terminal to sync."
         fi
     fi
 
