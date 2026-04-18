@@ -53,7 +53,9 @@ cove_db_backup() {
                     return 1
                 fi
                 
-                local backup_file="../private/database-backup.sql"
+                local backup_timestamp
+                backup_timestamp=$(date +%Y%m%d-%H%M%S)
+                local backup_file="../private/database-backup-${backup_timestamp}.sql"
                 echo "   Saving backup to: $(basename "$site_path")/private/$(basename "$backup_file")"
 
                 # Execute the dump command
