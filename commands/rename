@@ -60,7 +60,13 @@ cove_rename() {
         old_db_name=$(echo "cove_$old_name" | tr -c '[:alnum:]_' '_')
         local new_db_name
         new_db_name=$(echo "cove_$new_name" | tr -c '[:alnum:]_' '_')
-        local temp_sql_dump="/tmp/${old_db_name}.sql"
+        local temp_sql_dump
+        temp_sql_dump=$(mktemp) || {
+            gum style --foreground red "❌ Error: Could not create a temporary file for the database dump."
+            mv "$new_site_dir" "$old_site_dir"
+            exit 1
+        }
+        trap 'rm -f "$temp_sql_dump"' EXIT
 
         echo "   - Backing up old database '$old_db_name'..."
         if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$old_db_name" > "$temp_sql_dump"; then
@@ -72,7 +78,6 @@ cove_rename() {
         echo "   - Creating and importing to new database '$new_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db_name" < "$temp_sql_dump"
-        rm "$temp_sql_dump"
 
         echo "   - Updating wp-config.php..."
         (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet)
