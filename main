@@ -1253,6 +1253,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cove — sites</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%238bb382'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1260,7 +1261,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <style>
         *, *::before, *::after { box-sizing: border-box; }
         html, body { margin: 0; padding: 0; }
-        html { background: #0e1114; }
+        html { background: #0f1210; }
         html[data-theme="light"] { background: #fbfaf7; }
 
         :root {
@@ -1275,31 +1276,37 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         }
 
         html[data-theme="dark"], html:not([data-theme]) {
-            --bg: #0e1114;
-            --panel: #1a1d21;
-            --panel-hover: #20232a;
-            --panel-border: #292d33;
-            --text: #e8e8e3;
-            --text-dim: #8b8f94;
-            --text-faint: #5a5e63;
-            --pill-bg: #22262c;
+            --bg: #0f1210;
+            --bg-sunk: #0b0e0c;
+            --panel: #181c19;
+            --panel-hover: #1e2320;
+            --panel-border: #252925;
+            --text: #edeee9;
+            --text-dim: #8a8e85;
+            --text-faint: #5d615a;
+            /* Dark-mode teal is brighter so it reads cleanly against the
+               warmer panel — matches the landing page palette. */
+            --accent: oklch(72% 0.12 190);
+            --pill-bg: #1e2320;
             --pill-wp-bg: color-mix(in oklch, var(--accent) 18%, transparent);
             --pill-wp-fg: color-mix(in oklch, var(--accent) 80%, white);
-            --pill-static-bg: #22262c;
-            --pill-static-fg: #9da1a6;
-            --input-bg: #0e1114;
+            --pill-static-bg: #1e2320;
+            --pill-static-fg: #9a9d94;
+            --input-bg: #0b0e0c;
             --danger: #d66a6a;
+            --shadow-lg: 0 28px 60px -24px rgba(0,0,0,0.7), 0 6px 16px -6px rgba(0,0,0,0.4);
             color-scheme: dark;
         }
 
         html[data-theme="light"] {
             --bg: #fbfaf7;
+            --bg-sunk: #f4f2ec;
             --panel: #ffffff;
             --panel-hover: #f6f4ee;
-            --panel-border: #e9e2d9;
+            --panel-border: #e8e4da;
             --text: #1a1c1b;
-            --text-dim: #6e7071;
-            --text-faint: #9fa1a3;
+            --text-dim: #6b6f6a;
+            --text-faint: #9a9d97;
             /* White on teal reads stronger than the dark accent-fg does on
                the lighter background — override just for light mode. */
             --accent-fg: #ffffff;
@@ -1310,6 +1317,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --pill-static-fg: #8a8781;
             --input-bg: #fbfaf7;
             --danger: #b44848;
+            --shadow-lg: 0 24px 50px -24px rgba(20,28,30,0.18), 0 6px 16px -6px rgba(20,28,30,0.06);
             color-scheme: light;
         }
 
@@ -1332,18 +1340,35 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .logo { display: inline-flex; align-items: center; gap: 12px; color: var(--text); text-decoration: none; font-weight: 600; font-size: 1.05rem; letter-spacing: -0.01em; }
         /* Brand mark: cove/bay silhouette in a circle. Classes are scoped to
            .logo-mark so they don't collide with unrelated elements. Colors
-           are fixed (not theme-driven) so the logo reads the same against
-           both dark and light page backgrounds. */
+           are driven by CSS variables with sensible defaults, so each theme
+           can override individual layers without touching the inline SVG. */
         .logo-mark { width: 34px; height: 34px; display: block; flex-shrink: 0; }
-        .logo-mark .water { fill: oklch(62% 0.11 190); }
-        .logo-mark .land  { fill: #fbfaf7; }
-        .logo-mark .wave  { stroke: #fbfaf7; }
-        .logo-mark .ring  { stroke: oklch(45% 0.11 190); }
-        .theme-btn { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; padding: 0.45rem; border-radius: 8px; font-size: 1rem; line-height: 1; }
-        .theme-btn:hover { color: var(--text); background: var(--panel); }
+        .logo-mark .disc    { fill: var(--mark-disc, oklch(96% 0.015 85)); }
+        .logo-mark .water   { fill: var(--mark-water, oklch(62% 0.11 190)); }
+        .logo-mark .land    { fill: var(--mark-land, oklch(72% 0.10 150)); }
+        .logo-mark .horizon { stroke: var(--mark-horizon, oklch(35% 0.08 190)); fill: none; }
+        .logo-mark .wave    { stroke: var(--mark-wave, oklch(35% 0.08 190)); fill: none; }
+        .logo-mark .ring    { stroke: var(--mark-ring, oklch(35% 0.08 190)); fill: none; stroke-width: 3; }
+        html[data-theme="dark"] .logo-mark {
+            --mark-disc:    oklch(22% 0.01 85);
+            --mark-land:    oklch(64% 0.09 150);
+            --mark-ring:    color-mix(in oklab, var(--text) 72%, transparent);
+            --mark-horizon: color-mix(in oklab, var(--text) 72%, transparent);
+            --mark-wave:    color-mix(in oklab, var(--text) 65%, transparent);
+        }
+        /* Square icon button that cross-fades a moon (light mode) with a sun
+           (dark mode). Both SVGs are stacked absolutely so the button size
+           stays constant during the transition. */
+        .theme-btn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 7px; border: 1px solid var(--panel-border); color: var(--text-dim); background: var(--panel); cursor: pointer; padding: 0; position: relative; flex: none; transition: border-color 120ms, background 120ms, color 120ms; }
+        .theme-btn:hover { color: var(--text); background: var(--bg-sunk); }
+        .theme-btn svg { width: 15px; height: 15px; position: absolute; transition: opacity 200ms ease, transform 300ms ease; }
+        .theme-btn .icon-sun  { opacity: 0; transform: rotate(-40deg) scale(0.7); }
+        .theme-btn .icon-moon { opacity: 1; transform: rotate(0) scale(1); }
+        html[data-theme="dark"] .theme-btn .icon-sun  { opacity: 1; transform: rotate(0) scale(1); }
+        html[data-theme="dark"] .theme-btn .icon-moon { opacity: 0; transform: rotate(40deg) scale(0.7); }
 
         /* Card */
-        .card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-lg); overflow: hidden; }
+        .card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-lg); overflow: hidden; box-shadow: var(--shadow-lg); }
         .card-head { display: flex; align-items: center; justify-content: space-between; padding: 1.1rem 1.5rem; border-bottom: 1px solid var(--panel-border); gap: 1rem; }
         .card-title { font-family: var(--font-serif); font-style: italic; font-weight: 500; font-size: 1.45rem; margin: 0; letter-spacing: -0.01em; }
         .card-actions { display: flex; align-items: center; gap: 0.45rem; }
@@ -1357,14 +1382,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
         /* Filter row */
         .filter-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1.5rem; border-bottom: 1px solid var(--panel-border); }
-        .filter-input { flex: 1; background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.88rem; padding: 0.15rem 0; outline: 0; }
+        .filter-input { flex: 1; min-width: 0; background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.88rem; padding: 0.15rem 0; outline: 0; }
         .filter-input::placeholder { color: var(--text-faint); }
         .filter-kbd { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); border: 1px solid var(--panel-border); border-radius: 4px; padding: 0.1rem 0.35rem; }
         .filter-clear { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; font-size: 1.05rem; line-height: 1; padding: 0 0.35rem; border-radius: 5px; }
         .filter-clear:hover { color: var(--text); background: var(--panel-hover); }
+        /* Chip showing an active type-only filter (set by clicking a row pill).
+           Separate state from the free-text filter so users can't hand-edit the
+           "type:xxx" tokens and get into a weird parse state. */
+        .filter-chip { display: inline-flex; align-items: center; gap: 0.1rem; padding: 0.18rem 0.22rem 0.18rem 0.65rem; background: var(--pill-wp-bg); color: var(--pill-wp-fg); border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.76rem; font-weight: 500; letter-spacing: 0.02em; white-space: nowrap; }
+        .filter-chip-x { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; background: transparent; border: 0; color: inherit; cursor: pointer; border-radius: 50%; font-size: 0.95rem; line-height: 1; padding: 0; }
+        .filter-chip-x:hover { background: color-mix(in oklch, var(--accent) 28%, transparent); }
 
         /* Add row */
-        .add-row { padding: 0.9rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--panel-hover); }
+        .add-row { padding: 0.9rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
         .add-row form { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
         .add-row input[type="text"] { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.9rem; padding: 0.5rem 0.8rem; border-radius: var(--radius-md); min-width: 200px; flex: 1; }
         .add-row input[type="text"]:focus { outline: 0; border-color: var(--accent); }
@@ -1378,7 +1409,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-row { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; padding: 0.8rem 1.5rem; border-bottom: 1px solid var(--panel-border); transition: background 100ms; cursor: pointer; }
         .site-row:last-child { border-bottom: 0; }
         .site-row:hover { background: var(--panel-hover); }
-        .site-domain { font-family: var(--font-mono); font-size: 0.88rem; color: var(--text); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .site-domain { font-family: var(--font-mono); font-size: 0.88rem; color: var(--text-dim); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .site-domain .host-accent { color: var(--accent); }
         .site-domain:hover { color: var(--accent); }
         .site-domain mark { background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: 3px; }
         .site-type { display: inline-flex; justify-content: center; min-width: 64px; padding: 0.2rem 0.55rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.68rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; user-select: none; transition: filter 120ms; }
@@ -1460,24 +1492,27 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <div class="wrap">
         <nav class="nav">
             <a class="logo" href="/">
-                <svg class="logo-mark" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+                <svg class="logo-mark" viewBox="0 0 64 64" aria-hidden="true" focusable="false" stroke-linecap="round" stroke-linejoin="round">
                     <defs>
-                        <clipPath id="cove-clip"><circle cx="32" cy="32" r="27"/></clipPath>
+                        <clipPath id="cove-clip"><circle cx="32" cy="32" r="28"/></clipPath>
                     </defs>
                     <g clip-path="url(#cove-clip)">
-                        <rect x="0" y="0" width="64" height="64" class="water"/>
-                        <path class="land" d="M-2 34 C 6 28, 10 20, 18 20 C 24 20, 26 26, 32 26 C 38 26, 42 18, 50 20 C 58 22, 62 28, 66 32 L 66 -2 L -2 -2 Z"/>
-                        <g class="wave" fill="none" stroke-width="2.4" stroke-linecap="round">
-                            <path d="M10 42 Q 18 38, 26 42 T 42 42 T 58 42"/>
-                            <path d="M12 50 Q 20 46, 28 50 T 44 50 T 58 50"/>
+                        <rect x="0" y="0" width="64" height="64" class="disc"/>
+                        <rect x="0" y="32" width="64" height="32" class="water"/>
+                        <path class="land" d="M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z"/>
+                        <line class="horizon" x1="2" y1="32" x2="62" y2="32" stroke-width="2.5"/>
+                        <g class="wave" stroke-width="2.6">
+                            <path d="M 10 42 Q 18 38, 26 42 T 42 42 T 56 42"/>
+                            <path d="M 14 50 Q 22 46, 30 50 T 46 50 T 56 50"/>
                         </g>
                     </g>
-                    <circle cx="32" cy="32" r="27" fill="none" class="ring" stroke-width="3.5"/>
+                    <circle cx="32" cy="32" r="28" class="ring"/>
                 </svg>
                 <span>Cove</span>
             </a>
             <button class="theme-btn" @click="toggleTheme()" :title="theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'" aria-label="Toggle theme">
-                <span x-text="theme === 'light' ? '☾' : '☀'"></span>
+                <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5a5.75 5.75 0 1 0 6.7 6.7Z"/></svg>
+                <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.8M8 12.7v1.8M2.6 2.6l1.3 1.3M12.1 12.1l1.3 1.3M1.5 8h1.8M12.7 8h1.8M2.6 13.4l1.3-1.3M12.1 3.9l1.3-1.3"/></svg>
             </button>
         </nav>
 
@@ -1493,17 +1528,25 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </header>
 
             <div class="filter-row">
+                <span class="filter-chip" x-show="typeFilter" x-transition.opacity aria-label="Active type filter" style="display: none;">
+                    <span x-text="typeFilterLabel"></span>
+                    <button type="button" class="filter-chip-x" @click="typeFilter = null; $refs.filterInput.focus()" aria-label="Remove type filter" title="Remove">×</button>
+                </span>
                 <input
                     class="filter-input"
                     type="text"
                     x-model="filter"
                     x-ref="filterInput"
                     placeholder="filter sites by name or type…"
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
                     @keydown.escape.prevent="filter = ''; $event.target.blur()"
                     aria-label="Filter sites"
                 >
-                <span class="filter-kbd" x-show="!filter" aria-hidden="true">/</span>
-                <button class="filter-clear" x-show="filter" @click="filter = ''; $refs.filterInput.focus()" aria-label="Clear filter" title="Clear (Esc)">×</button>
+                <span class="filter-kbd" x-show="!filter && !typeFilter" aria-hidden="true">/</span>
+                <button class="filter-clear" x-show="filter || typeFilter" @click="clearAllFilters(); $refs.filterInput.focus()" aria-label="Clear filter" title="Clear all (Esc)">×</button>
             </div>
 
             <div x-show="adding" x-transition.opacity class="add-row" style="display: none;">
@@ -1520,8 +1563,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <ul class="site-list">
                 <template x-for="site in filteredSites" :key="site.name">
                     <li class="site-row" @click="openSite(site)">
-                        <a class="site-domain" :href="site.domain" target="_blank" rel="noopener" @click.stop x-html="highlightMatch(site.domain.replace(/^https?:\/\//, ''), filter)"></a>
-                        <span class="site-type" :class="site.type === 'WordPress' ? 'wp' : 'static'" @click.stop="filter = 'type:' + (site.type === 'WordPress' ? 'wp' : 'static')" :title="'Filter to ' + (site.type === 'WordPress' ? 'WordPress' : 'static') + ' sites'" x-text="site.type === 'WordPress' ? 'WP' : 'STATIC'"></span>
+                        <a class="site-domain" :href="site.domain" target="_blank" rel="noopener" @click.stop x-html="highlightedDomain(site.domain, filter)"></a>
+                        <span class="site-type" :class="site.type === 'WordPress' ? 'wp' : 'static'" @click.stop="typeFilter = site.type" :title="'Filter to ' + (site.type === 'WordPress' ? 'WordPress' : 'static') + ' sites'" x-text="site.type === 'WordPress' ? 'WP' : 'STATIC'"></span>
                         <span class="site-modified" x-text="formatRelative(site.modified_at)" :title="site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : ''"></span>
                         <span class="site-size" x-text="formatSize(site.size_bytes)"></span>
                         <div class="site-actions">
@@ -1593,6 +1636,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
     <script>
         const PORT_SUFFIX = '<?= $__cove_port_suffix ?>';
+        const SITES_DIR = 'SITES_DIR_PLACEHOLDER';
 
         document.addEventListener('alpine:init', () => {
             Alpine.data('dashboard', () => ({
@@ -1604,6 +1648,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 showDbModal: false,
                 isRefreshingSizes: false,
                 filter: '',
+                typeFilter: null, // null | 'WordPress' | 'Plain' — set via the row type pills, cleared via the chip × or overall filter clear
                 sort: 'name',
                 sortModes: ['name', 'size', 'modified'],
                 newSite: { name: '', isPlain: false, isLoading: false },
@@ -1615,24 +1660,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
                 get totalBytes() { return this.sites.reduce((t, s) => t + (s.size_bytes || 0), 0); },
                 get filteredSites() {
-                    // `type:wp` / `type:static` → exact type match (set by the pill
-                    // click in the rows). Plain text → substring match against name
-                    // or type. Using the prefix prevents false positives like
-                    // typing "wp" also catching sites named *wp* regardless of type.
-                    const raw = this.filter.trim();
-                    const q = raw.toLowerCase();
-                    const typeAlias = { wp: 'wordpress', static: 'plain' };
-                    let base;
-                    if (q.startsWith('type:')) {
-                        const want = q.slice(5).trim();
-                        const target = typeAlias[want] || want;
-                        base = this.sites.filter(s => (s.type || '').toLowerCase() === target);
-                    } else if (q) {
-                        base = this.sites.filter(s =>
+                    // Two independent filters ANDed together: typeFilter (chip,
+                    // exact match on site.type) and filter (free text, substring
+                    // match on name OR type). Keeping them separate means the
+                    // user can type anything in the input without worrying about
+                    // stepping on the type constraint.
+                    let base = [...this.sites];
+                    if (this.typeFilter) {
+                        base = base.filter(s => s.type === this.typeFilter);
+                    }
+                    const q = this.filter.trim().toLowerCase();
+                    if (q) {
+                        base = base.filter(s =>
                             s.name.toLowerCase().includes(q) ||
                             (s.type || '').toLowerCase().includes(q));
-                    } else {
-                        base = [...this.sites];
                     }
                     if (this.sort === 'size') {
                         base.sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0));
@@ -1642,6 +1683,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         base.sort((a, b) => a.name.localeCompare(b.name));
                     }
                     return base;
+                },
+
+                get typeFilterLabel() {
+                    return this.typeFilter === 'WordPress' ? 'type: wp' : 'type: static';
+                },
+
+                clearAllFilters() {
+                    this.filter = '';
+                    this.typeFilter = null;
                 },
                 get siteCountLabel() {
                     const total = this.sites.length;
@@ -1720,9 +1770,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 // only controls WHERE to split).
                 highlightMatch(text, query) {
                     const q = (query || '').trim();
-                    // type: filters aren't substrings of the domain, so skip
-                    // highlighting to avoid confusing partial-match underlines.
-                    if (!q || q.toLowerCase().startsWith('type:')) return this.escapeHtml(text);
+                    if (!q) return this.escapeHtml(text);
                     const lower = text.toLowerCase();
                     const lowerQ = q.toLowerCase();
                     let out = '';
@@ -1735,6 +1783,19 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         i = idx + q.length;
                     }
                     return out;
+                },
+
+                // Wrap the site name in <span class="host-accent"> so it reads
+                // teal while the .localhost suffix stays dim — matches the
+                // landing-page dashboard mock. Split at the first dot; if
+                // there's none, the whole string is treated as the name.
+                highlightedDomain(domain, query) {
+                    const stripped = String(domain).replace(/^https?:\/\//, '');
+                    const dotIdx = stripped.indexOf('.');
+                    if (dotIdx === -1) return '<span class="host-accent">' + this.highlightMatch(stripped, query) + '</span>';
+                    const name = stripped.slice(0, dotIdx);
+                    const suffix = stripped.slice(dotIdx);
+                    return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
                 },
 
                 cycleSort() {
@@ -1786,15 +1847,30 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 async addSite() {
                     if (!this.newSite.name) return;
                     this.newSite.isLoading = true;
-                    const add = await this.apiPost('add_site', { site_name: this.newSite.name, is_plain: this.newSite.isPlain });
+                    const name = this.newSite.name;
+                    const isPlain = this.newSite.isPlain;
+
+                    const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain });
                     if (add.success) {
-                        this.showSnack('Site created · reloading Caddy…');
+                        // Optimistic insert: we already know every field the row
+                        // template uses. No auto-refresh — the Caddy reload that
+                        // follows can take tens of seconds on fleets with lots of
+                        // sites and would either hang the fetch or drop the UI
+                        // into an ERR_CONNECTION_REFUSED during the config swap.
+                        this.sites.push({
+                            name,
+                            domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
+                            type: isPlain ? 'Plain' : 'WordPress',
+                            display_path: '~/Cove/Sites/' + name + '.localhost',
+                            full_path: SITES_DIR + '/' + name + '.localhost',
+                            size_bytes: null,
+                            modified_at: Math.floor(Date.now() / 1000),
+                            isLoggingIn: false,
+                        });
+                        this.showSnack('Site created.');
                         this.newSite.name = '';
                         this.adding = false;
-                        const reload = await this.apiPost('reload_server');
-                        if (reload.success) {
-                            setTimeout(() => this.getSites(), 1500);
-                        }
+                        this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
                     }
                     this.newSite.isLoading = false;
                 },
