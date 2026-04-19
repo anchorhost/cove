@@ -1,95 +1,50 @@
 <p align="center">
-  <h2 align="center">Catppuccin for Adminer</h2>
+  <h2 align="center">Cove for Adminer</h2>
 </p>
 
 <p align="center">
-  <a href="https://github.com/catppuccin/catppuccin">
-    <img src="https://raw.githubusercontent.com/catppuccin/catppuccin/main/assets/palette/macchiato.png" width="400" />
-  </a>
+  A <a href="https://cove.run">Cove</a>-native skin for <a href="https://www.adminer.org/">Adminer</a> — matching the Cove landing page and dashboard.
 </p>
-
-<p align="center">
-  Soothing pastel theme for <a href="https://www.adminer.org/">Adminer</a>
-</p>
-
-## Previews
-
-<details>
-<summary>Latte (Light)</summary>
-<img src="assets/latte.webp"/>
-</details>
-<details>
-<summary>Mocha (Dark)</summary>
-<img src="assets/mocha.webp"/>
-</details>
 
 ## About
 
-This theme provides automatic light/dark mode switching based on your system preferences:
+Dark and light themes, automatic or toggled:
 
-- **Light mode**: Catppuccin Latte
-- **Dark mode**: Catppuccin Mocha
+- **Dark** — deep green-black (`#0f1210`), teal accents, the same palette as `cove.run`.
+- **Light** — warm cream (`#fbfaf7`), teal accents.
 
-## Usage
-
-### Option 1: Direct Download
-
-1. Download `adminer.css` from this repository
-2. Place it in the same directory as your `adminer.php` file
-3. Adminer will automatically load the CSS file
-
-### Option 2: curl
-
-```bash
-curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.css" -o adminer.css
-```
+Typography uses Geist, Geist Mono, and Fraunces italic (matching the Cove theme tokens). First-time visits follow `prefers-color-scheme`; the toggle in the top-right persists an explicit choice.
 
 ## Features
 
-- Automatic light/dark mode switching via `prefers-color-scheme`
-- Full SQL syntax highlighting with Catppuccin colors
-- Styled tables, forms, buttons, and messages
-- Fixed sidebar navigation
-- Responsive design for smaller screens
-- Print-friendly styles
+- Cove design tokens (colors, radii, shadows, type stack) shared with the Cove WordPress theme.
+- Explicit light/dark toggle with a sun/moon icon, persisted in `localStorage`.
+- Drag-to-resize sidebar (180–480px), double-click the handle to reset. Width persisted in `localStorage`.
+- Hidden Logout button (Cove's autologin makes it a no-op).
+- Brand title links back to the server home.
+- CSP-safe: all injected scripts use Adminer's `nonce()`.
 
-## Color Mapping
+## Usage
 
-| UI Element | Catppuccin Color |
-|------------|------------------|
-| Background | Base |
-| Sidebar | Mantle |
-| Text | Text |
-| Links | Blue |
-| SQL Keywords | Mauve |
-| Strings | Green |
-| Numbers | Peach |
-| Comments | Overlay1 |
-| Functions | Blue |
-| Success | Green |
-| Errors | Red |
-| Warnings | Yellow |
+Adminer auto-loads any `adminer.css` next to its entry point. Drop both files in:
+
+```bash
+curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.css" -o adminer.css
+curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.js"  -o adminer.js
+```
+
+`adminer.js` is loaded via an override on the `Adminer::head()` method — see Cove's `commands/install` for the entry-point PHP that wires it in.
 
 ## Compatibility
 
-- Adminer 4.x and 5.x
-- All modern browsers with CSS custom properties support
-- AdminerEvo (fork)
+- Adminer 5.x (uses the `Adminer\` namespace).
+- Modern browsers — CSS custom properties, `oklch()`, `color-mix()`, pointer events.
 
 ## License
 
-MIT License
+MIT.
 
 ## Credits
 
-- [Catppuccin](https://github.com/catppuccin/catppuccin) - The beautiful color palette
-- [Adminer](https://www.adminer.org/) - Database management in a single PHP file
-- [Cove](https://github.com/anchorhost/cove) - Local WordPress development environment
-
----
-
-<p align="center">
-  <a href="https://github.com/catppuccin/catppuccin/blob/main/docs/style-guide.md">
-    <img src="https://raw.githubusercontent.com/catppuccin/catppuccin/main/assets/footers/gray0_ctp_on_line.svg?sanitize=true" />
-  </a>
-</p>
+- [Adminer](https://www.adminer.org/) — database management in a single PHP file.
+- [Cove](https://github.com/anchorhost/cove) — local WordPress development.
