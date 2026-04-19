@@ -838,6 +838,25 @@ is_caddy_running() {
     (echo > /dev/tcp/127.0.0.1/2019) &>/dev/null
 }
 
+# Repair ownership of ~/Cove state that a pre-1.10 root-run FrankenPHP may
+# have left owned by root. The most user-visible symptom is the size cache
+# (~/Cove/cache/site-sizes.json) becoming unwritable — refresh_sizes computes
+# correctly, @file_put_contents silently fails, and list_sites returns stale
+# nulls. Safe to call repeatedly; only runs chown when the ownership is
+# actually wrong. macOS never needs this because launchd runs as the user.
+heal_cove_state_ownership() {
+    [ "$OS" = "linux" ] || return 0
+    local uid; uid=$(id -u)
+    local gid; gid=$(id -g)
+    local target
+    for target in "$COVE_DIR/cache" "$COVE_DIR/.reload.lock" "$COVE_DIR/.reload.lock.d" "$COVE_DIR/.reload.pending" "$COVE_DIR/caddy.pid"; do
+        [ -e "$target" ] || continue
+        # Cheap short-circuit: only invoke sudo if the top-level is wrong.
+        [ "$(stat -c %u "$target" 2>/dev/null)" = "$uid" ] && continue
+        $SUDO_CMD -n chown -R "$uid:$gid" "$target" 2>/dev/null || true
+    done
+}
+
 # (Re)start the Caddy/FrankenPHP service. Safe to call when already running —
 # both platforms stop any existing instance first. Called from `cove enable`
 # and from regenerate_caddyfile when Caddy isn't up yet.

@@ -1,41 +1,52 @@
 cove_reload() {
-    # Serialize reloads with an atomic mkdir lock. The dashboard fires reload
-    # in the background after every site add/delete, so rapid actions can spawn
-    # many concurrent `cove reload` processes. Two concurrent `frankenphp reload`
-    # calls reliably deadlock Caddy's admin server (10s shutdown timeout in
-    # caddy-process.log), which wedges further reloads AND blocks HTTP requests
-    # routed through FrankenPHP.
+    # Auto-heal any root-owned state left over from a pre-1.10 install.
+    heal_cove_state_ownership
+    # Serialize reloads to keep Caddy's admin server healthy. The dashboard
+    # fires reload in the background after every site add/delete, so rapid
+    # actions can spawn many concurrent cove-reload processes; two concurrent
+    # `frankenphp reload` calls reliably deadlock Caddy's admin endpoint with
+    # a 10s shutdown timeout.
     #
-    # Strategy: first caller holds the lock and does the work. Subsequent callers
-    # touch a "pending" marker and exit immediately. When the holder finishes, it
-    # re-runs once if the marker is set, so the final state always converges on
-    # the latest on-disk Sites listing.
-    local lock_dir="$COVE_DIR/.reload.lock.d"
+    # Strategy: first caller holds the lock and does the work. Subsequent
+    # callers touch a "pending" marker and exit immediately. When the holder
+    # finishes it re-runs once if the marker is set, so the final state
+    # converges on the latest on-disk Sites listing.
+    #
+    # Implementation note: we use a single lock *file* (not a dir) opened with
+    # set -C (noclobber) so the pid is written atomically with the lock's
+    # creation. Earlier `mkdir + echo > pid` left a TOCTOU window where a
+    # competing reload could read an empty pid, decide the holder was dead,
+    # and stomp the lock — letting 3+ reloads run and race create_gui_file's
+    # .tmp files.
+    local lock_file="$COVE_DIR/.reload.lock"
     local pending="$COVE_DIR/.reload.pending"
 
-    if ! mkdir "$lock_dir" 2>/dev/null; then
-        # Another reload is in flight — unless it died and left a stale lock.
+    acquire_reload_lock() {
+        (set -C; echo "$$" > "$lock_file") 2>/dev/null
+    }
+
+    if ! acquire_reload_lock; then
         local holder_pid
-        holder_pid=$(cat "$lock_dir/pid" 2>/dev/null)
+        holder_pid=$(cat "$lock_file" 2>/dev/null)
         if [ -n "$holder_pid" ] && kill -0 "$holder_pid" 2>/dev/null; then
-            touch "$pending"
+            # A real holder is running — leave a breadcrumb and bail.
+            touch "$pending" 2>/dev/null || true
             return 0
         fi
-        # Holder PID is dead — reclaim. A pre-1.10 dashboard-fired reload ran
-        # as root (FrankenPHP was sudo-started), so the lock dir may be owned
-        # by root even though we're running as the user. Try a sudo -n fallback
-        # so a fresh install doesn't inherit a permanently-wedged lock.
-        rm -rf "$lock_dir" 2>/dev/null || $SUDO_CMD -n rm -rf "$lock_dir" 2>/dev/null || true
-        if ! mkdir "$lock_dir" 2>/dev/null; then
-            # Lost the race to another reclaimer (or still couldn't clear it);
-            # defer to them.
+        # Stale (holder died, or was a pre-1.10 root-owned file). Reclaim,
+        # falling back to sudo in case ownership blocks us.
+        rm -f "$lock_file" 2>/dev/null || $SUDO_CMD -n rm -f "$lock_file" 2>/dev/null || true
+        if ! acquire_reload_lock; then
+            # Lost the race to another reclaimer — they've got it.
             touch "$pending" 2>/dev/null || true
             return 0
         fi
     fi
 
-    echo $$ > "$lock_dir/pid"
-    trap 'rm -rf "$lock_dir"; trap - EXIT INT TERM' EXIT INT TERM
+    # Trap for abnormal exits (Ctrl-C, signals). The happy-path cleanup
+    # happens at the function end since the trap was observed not firing
+    # reliably when cove_reload is invoked via shell_exec(…&) from PHP.
+    trap 'rm -f "$lock_file" 2>/dev/null; trap - EXIT INT TERM' EXIT INT TERM
 
     while :; do
         rm -f "$pending"
@@ -44,4 +55,8 @@ cove_reload() {
         update_etc_hosts
         [ -f "$pending" ] || break
     done
+
+    # Explicit unlock — belt-and-suspenders with the trap.
+    rm -f "$lock_file" 2>/dev/null
+    trap - EXIT INT TERM
 }
