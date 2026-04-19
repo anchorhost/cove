@@ -1292,6 +1292,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
                 $type_flag = ($input['is_plain'] ?? false) ? '--plain' : '';
                 $command = sprintf('HOME=%s %s add %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag);
+                // Remember we're adding so the post-exec block below can
+                // measure the new site's size and fold it into the cache.
+                $add_site_target = $site_name;
             } else { $response['message'] = 'Invalid site name provided.'; }
             break;
         case 'delete_site':
@@ -1371,8 +1374,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exec($command, $output, $return_code);
         if ($return_code === 0) {
             $response = ['success' => true, 'message' => 'Operation completed successfully.'];
+            // For add_site: measure the new site's footprint inline and fold
+            // it into the size cache so the UI shows "4.0 KB" (or whatever)
+            // immediately instead of "—" until the next refresh_sizes pass.
+            if (isset($add_site_target)) {
+                $new_path = $sitedir . '/' . $add_site_target . '.localhost';
+                if (is_dir($new_path)) {
+                    $size_out = []; $size_rc = 0;
+                    exec('du -sk ' . escapeshellarg($new_path) . ' 2>/dev/null', $size_out, $size_rc);
+                    if ($size_rc === 0 && !empty($size_out[0])) {
+                        $parts = preg_split('/\s+/', trim($size_out[0]));
+                        if (ctype_digit($parts[0] ?? '')) {
+                            $bytes = ((int) $parts[0]) * 1024;
+                            $response['size_bytes'] = $bytes;
+                            $cache = cove_read_size_cache($__cove_sizes_cache);
+                            $cache[$add_site_target . '.localhost'] = $bytes;
+                            cove_write_size_cache($__cove_sizes_cache, $cache);
+                        }
+                    }
+                }
+            }
         } else {
-            $response = ['success' => false, 'message' => 'An error occurred.', 'output' => implode("\n", $output)];
+            // Translate known failure signatures into user-friendly messages.
+            // Generic "An error occurred" isn't actionable, but "Site name is
+            // taken" tells the user exactly what to do next.
+            $err_text = implode("\n", $output);
+            $msg = 'An error occurred.';
+            if (isset($add_site_target)) {
+                $msg = 'Could not create site.';
+                if (stripos($err_text, 'already exists') !== false) {
+                    $msg = 'Site name is taken.';
+                } elseif (stripos($err_text, 'reserved name') !== false) {
+                    $msg = 'That name is reserved. Pick another.';
+                } elseif (stripos($err_text, 'invalid site name') !== false) {
+                    $msg = 'Invalid site name.';
+                } elseif (stripos($err_text, 'WordPress installation failed') !== false) {
+                    $msg = 'WordPress installation failed — check the logs.';
+                }
+            }
+            $response = ['success' => false, 'message' => $msg, 'output' => $err_text];
         }
     }
     echo json_encode($response);
@@ -1395,8 +1435,24 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="color-scheme" content="dark light">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cove — sites</title>
+    <script>
+        // Set data-theme synchronously before any CSS paints, so the correct
+        // theme's background is used from the very first frame (no FOUC).
+        // Alpine re-reads the same localStorage key in init() — values stay
+        // in sync with no extra flip.
+        (function () {
+            try {
+                var s = localStorage.getItem('theme');
+                var t = (s === 'dark' || s === 'light')
+                    ? s
+                    : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) {}
+        })();
+    </script>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%238bb382'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1523,6 +1579,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .pill.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 500; }
         .pill.primary:hover { filter: brightness(1.08); color: var(--accent-fg); border-color: var(--accent); }
         .pill:disabled { opacity: 0.5; cursor: not-allowed; }
+        .pill-icon { width: 13px; height: 13px; flex: none; opacity: 0.85; }
+        .pill:hover .pill-icon { opacity: 1; }
 
         /* Filter row */
         .filter-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1.5rem; border-bottom: 1px solid var(--panel-border); }
@@ -1539,7 +1597,39 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .filter-chip-x:hover { background: color-mix(in oklch, var(--accent) 28%, transparent); }
 
         /* Add row */
-        .add-row { padding: 0.9rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
+        /* New-site alert: appears after creating a WP site so the one-time
+           login is one click away, without hunting for the new row. */
+        .new-site-alert { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--panel-border); background: color-mix(in oklab, var(--accent) 12%, var(--panel)); color: var(--text); font-size: 0.92rem; }
+        .new-site-alert-icon { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: var(--accent-fg); flex: none; }
+        .new-site-alert-text { flex: 1; min-width: 0; }
+        .new-site-alert-text strong { font-family: var(--font-mono); font-weight: 500; }
+        .new-site-alert-close { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; font-size: 1.15rem; line-height: 1; padding: 0.25rem 0.55rem; border-radius: 5px; flex: none; }
+        .new-site-alert-close:hover { color: var(--text); background: var(--panel-hover); }
+
+        .add-row { position: relative; padding: 0.9rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
+        .add-row.is-creating { overflow: hidden; }
+        /* Indeterminate progress stripe across the top while cove add is
+           running — site creation takes 5-10s so we need a clear "working"
+           cue beyond just the button text swap. Solid accent block slides
+           across; a gradient-fade version blended with the row background
+           and looked the wrong green. */
+        .add-row.is-creating::before {
+            content: '';
+            position: absolute; top: 0; height: 3px; width: 30%;
+            /* A thin 2px stripe of var(--accent) perceptually muted to olive
+               against the cream bg-sunk; a brighter, more saturated teal at
+               3px reads unambiguously as teal (same hue as the brand, just
+               higher chroma so it survives the narrow band). */
+            background: oklch(72% 0.15 190);
+            animation: add-row-slide 1.3s linear infinite;
+        }
+        @keyframes add-row-slide {
+            from { left: -30%; }
+            to   { left: 100%; }
+        }
+        /* Inline spinner for the create button (reuses the .site-action-btn
+           .btn-spinner pattern but scoped so pill button layout isn't altered). */
+        .pill .btn-spinner { display: inline-block; width: 11px; height: 11px; border: 1.5px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; flex: none; }
         .add-row form { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
         .add-row input[type="text"] { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.9rem; padding: 0.5rem 0.8rem; border-radius: var(--radius-md); min-width: 200px; flex: 1; }
         .add-row input[type="text"]:focus { outline: 0; border-color: var(--accent); }
@@ -1665,11 +1755,35 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 <h1 class="card-title">Sites</h1>
                 <div class="card-actions">
                     <button class="pill" @click="cycleSort()" :title="'Sort by — click to cycle'" x-text="'sort: ' + sort"></button>
-                    <a class="pill" :href="adminerUrl" target="_blank" rel="noopener" title="Open Adminer">db</a>
-                    <a class="pill" :href="mailpitUrl" target="_blank" rel="noopener" title="Open Mailpit">mail</a>
+                    <a class="pill" href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Adminer">
+                        <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5v-9"/><path d="M3 8c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5"/></svg>
+                        db
+                    </a>
+                    <a class="pill" href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Mailpit">
+                        <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="12" height="9" rx="1.5"/><path d="M2.5 5 8 9l5.5-4"/></svg>
+                        mail
+                    </a>
                     <button class="pill primary" @click="toggleAdd()" x-text="adding ? 'cancel' : '+ add site'"></button>
                 </div>
             </header>
+
+            <template x-for="alert in alerts" :key="alert.id">
+                <div class="new-site-alert" x-transition.opacity>
+                    <span class="new-site-alert-icon" aria-hidden="true">
+                        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.2l3 3 7-7"/></svg>
+                    </span>
+                    <div class="new-site-alert-text">
+                        <strong x-text="alert.name + '.localhost'"></strong> is ready.
+                    </div>
+                    <template x-if="!alert.isPlain">
+                        <button class="pill primary" :disabled="alert.isLoggingIn" @click="loginToNewSite(alert)" x-text="alert.isLoggingIn ? 'opening…' : 'log in to admin'"></button>
+                    </template>
+                    <template x-if="alert.isPlain">
+                        <a class="pill primary" :href="'https://' + alert.name + '.localhost' + PORT_SUFFIX" target="_blank" rel="noopener" @click="dismissAlert(alert.id)">open site</a>
+                    </template>
+                    <button class="new-site-alert-close" @click="dismissAlert(alert.id)" aria-label="Dismiss" title="Dismiss">×</button>
+                </div>
+            </template>
 
             <div class="filter-row">
                 <span class="filter-chip" x-show="typeFilter" x-transition.opacity aria-label="Active type filter" style="display: none;">
@@ -1693,14 +1807,17 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 <button class="filter-clear" x-show="filter || typeFilter" @click="clearAllFilters(); $refs.filterInput.focus()" aria-label="Clear filter" title="Clear all (Esc)">×</button>
             </div>
 
-            <div x-show="adding" x-transition.opacity class="add-row" style="display: none;">
+            <div x-show="adding" x-transition.opacity class="add-row" :class="{ 'is-creating': newSite.isLoading }" style="display: none;">
                 <form @submit.prevent="addSite()">
                     <input type="text" x-model="newSite.name" @input="newSite.name = newSite.name.toLowerCase().replace(/[^a-z0-9-]/g, '')" placeholder="site-name" required :disabled="newSite.isLoading" x-ref="newSiteInput">
                     <label class="plain-toggle">
                         <input type="checkbox" x-model="newSite.isPlain" :disabled="newSite.isLoading">
                         plain (no WordPress)
                     </label>
-                    <button class="pill primary" type="submit" :disabled="!newSite.name || newSite.isLoading" x-text="newSite.isLoading ? 'creating…' : 'create'"></button>
+                    <button class="pill primary" type="submit" :disabled="!newSite.name || newSite.isLoading">
+                        <span class="btn-spinner" x-show="newSite.isLoading" aria-hidden="true" style="display: none;"></span>
+                        <span x-text="newSite.isLoading ? 'creating…' : 'create'"></span>
+                    </button>
                 </form>
             </div>
 
@@ -1797,6 +1914,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 sortModes: ['name', 'size', 'modified'],
                 newSite: { name: '', isPlain: false, isLoading: false },
                 snackbar: { visible: false, message: '', isError: false, timer: null },
+                // Persistent dismissible banners for newly-created sites — the
+                // snackbar only lives ~3.5s, not long enough to reach for the
+                // admin login after spinning up a fresh install.
+                alerts: [],
                 deleteQueue: [],
                 isProcessingQueue: false,
 
@@ -2007,7 +2128,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             type: isPlain ? 'Plain' : 'WordPress',
                             display_path: '~/Cove/Sites/' + name + '.localhost',
                             full_path: SITES_DIR + '/' + name + '.localhost',
-                            size_bytes: null,
+                            // Server calculates size in add_site and returns it
+                            // alongside success. Fall back to null so the row
+                            // shows "—" until the next refresh if anything failed.
+                            size_bytes: (typeof add.size_bytes === 'number') ? add.size_bytes : null,
                             modified_at: Math.floor(Date.now() / 1000),
                             isLoggingIn: false,
                         });
@@ -2015,8 +2139,35 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         this.newSite.name = '';
                         this.adding = false;
                         this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
+
+                        // Surface a persistent alert so the user can jump
+                        // straight into the new site without hunting for the
+                        // row. WP sites get a one-time admin login; plain
+                        // sites get a simple "open site" link.
+                        this.alerts.push({
+                            id: Date.now() + Math.random(),
+                            name,
+                            isPlain,
+                            isLoggingIn: false,
+                        });
                     }
                     this.newSite.isLoading = false;
+                },
+
+                async loginToNewSite(alert) {
+                    alert.isLoggingIn = true;
+                    const res = await this.apiPost('get_login_link', { site_name: alert.name });
+                    if (res.success && res.url) {
+                        window.open(res.url, '_blank');
+                        // Acted on — banner's job is done. The new tab has the
+                        // one-time URL; dashboard can drop the prompt.
+                        this.dismissAlert(alert.id);
+                    }
+                    alert.isLoggingIn = false;
+                },
+
+                dismissAlert(id) {
+                    this.alerts = this.alerts.filter(a => a.id !== id);
                 },
 
                 async deleteSite(name) {
