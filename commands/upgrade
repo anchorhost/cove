@@ -277,4 +277,11 @@ cove_upgrade() {
             fi
         fi
     fi
+
+    # --- Reload to pull in any UI updates ---
+    # Invoke the on-disk binary so a freshly-upgraded script's new functions are used
+    # (the currently-running process still holds the pre-upgrade functions in memory).
+    echo ""
+    echo "🔄 Reloading Cove to apply UI updates..."
+    "$install_path" reload
 }
