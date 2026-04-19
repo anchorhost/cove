@@ -104,6 +104,7 @@ Cove provides a simple set of commands to manage your local environment.
 | Command | Description |
 | --- | --- |
 | `cove ports [--http N --https N]` | Interactively reconfigure HTTP/HTTPS ports. Migrates every WordPress site's stored URLs via `wp search-replace` so existing sites keep working. Supports `--dry-run` and `--skip-urls`. |
+| `cove memory [set <value>]` | Audits `memory_limit` across Cove's ini, the FrankenPHP web server, and every `php` on your PATH. `set 2G` bumps Cove's ini and offers to update each Homebrew/system ini. |
 | `cove directive <add\|update\|delete\|list> [site]` | Manages custom Caddyfile rules for a specific site. |
 | `cove mappings <site> [add\|remove] [domain]` | Manages additional domain mappings for a site. |
 | `cove proxy <add\|list\|delete>` | Manages standalone reverse proxy entries in the Caddyfile. |

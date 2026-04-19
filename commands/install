@@ -388,7 +388,7 @@ cove_install() {
     # doesn't flood every command on PHP 8.5+.
     echo "⚙️ Writing Cove PHP ini..."
     cat > "$PHP_INI_FILE" <<'INI'
-memory_limit = 512M
+memory_limit = 1G
 display_errors = 0
 error_reporting = 6143
 INI
