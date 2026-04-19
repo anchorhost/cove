@@ -2321,6 +2321,7 @@ show_general_help() {
     echo "  enable           Starts the Caddy, MariaDB, and Mailpit background services."
     echo "  disable          Stops all background services managed by Cove."
     echo "  status           Check the status of all background services."
+    echo "  trust            Install Cove's local CA into browser + system trust stores."
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
     echo "  delete           Deletes a site's directory and associated database."
@@ -2370,6 +2371,13 @@ display_command_help() {
             echo "Usage: cove status"
             echo ""
             echo "Checks the status of all background services."
+            ;;
+        trust)
+            echo "Usage: cove trust"
+            echo ""
+            echo "Installs Cove's local root certificate into the system trust store"
+            echo "and browser NSS databases (Firefox, Chromium — including snap)."
+            echo "Run once after install; re-run anytime to refresh."
             ;;
         list)
             echo "Usage: cove list [--totals]"
@@ -2738,6 +2746,10 @@ main() {
         status)
             check_dependencies
             cove_status
+            ;;
+        trust)
+            check_dependencies
+            cove_trust
             ;;
         db)
             check_dependencies

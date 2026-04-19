@@ -537,6 +537,13 @@ EOM
     echo "✅ Initial configuration complete. Starting services..."
     cove_enable
 
+    # Install the local CA into the system trust store and any browser NSS
+    # databases we can find. Needs Caddy up (for the admin API trust call)
+    # and the root cert to exist (Caddy generated it during the initial
+    # cove_enable above). Idempotent — users can re-run via `cove trust`.
+    echo ""
+    cove_trust
+
     # If the user changed HTTPS ports during install AND there are pre-existing
     # WordPress sites in $SITES_DIR, migrate their stored URLs to the new port.
     # On a fresh install with no sites, this is a silent no-op.

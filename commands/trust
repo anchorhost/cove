@@ -1,0 +1,71 @@
+cove_trust() {
+    echo "🔐 Installing Cove's local root certificate..."
+
+    # FrankenPHP's `trust` subcommand writes the Caddy local root into the
+    # system store and any NSS DBs it discovers at the standard paths. On
+    # macOS that's the login keychain; on Linux it's /usr/local/share/ca-
+    # certificates + ~/.pki/nssdb + ~/.mozilla/firefox/*.
+    #
+    # Safe to re-run — all writes are idempotent.
+
+    if [ "$OS" = "linux" ]; then
+        # certutil (libnss3-tools / nss-tools) is needed to touch NSS DBs.
+        # Without it Firefox and Chromium keep showing the "Not Secure"
+        # warning even though curl and Chrome-with-system-roots are fine.
+        if ! command -v certutil &>/dev/null; then
+            echo "   - Installing NSS tools for browser trust..."
+            if [ "$PKG_MANAGER" = "apt" ]; then
+                $SUDO_CMD apt install -y libnss3-tools &>/dev/null || true
+            elif [ "$PKG_MANAGER" = "dnf" ]; then
+                $SUDO_CMD dnf install -y nss-tools &>/dev/null || true
+            fi
+        fi
+    fi
+
+    # Run the built-in trust installer. Needs sudo on Linux to write to
+    # /usr/local/share/ca-certificates and re-run update-ca-certificates.
+    echo "   - Running frankenphp trust..."
+    if [ "$OS" = "linux" ]; then
+        $SUDO_CMD "$CADDY_CMD" trust 2>&1 | grep -vE '^\{|^$' || true
+    else
+        "$CADDY_CMD" trust 2>&1 | grep -vE '^\{|^$' || true
+    fi
+
+    # Linux-only: Firefox and Chromium ship as snaps on Ubuntu 22+ and
+    # store their NSS DBs under ~/snap/... — a path that neither Caddy nor
+    # mkcert scans. Inject the root explicitly for each profile we find.
+    if [ "$OS" = "linux" ] && command -v certutil &>/dev/null; then
+        local root_cert
+        root_cert=$(find "$HOME/.local/share/caddy/pki/authorities/local" \
+            -maxdepth 1 -name 'root.crt' 2>/dev/null | head -1)
+        # Fallback: the system-trust copy Caddy drops on first auto-install.
+        if [ -z "$root_cert" ]; then
+            root_cert=$(find /usr/local/share/ca-certificates \
+                -maxdepth 1 -name 'Caddy_Local_Authority*.crt' 2>/dev/null | head -1)
+        fi
+
+        if [ -n "$root_cert" ] && [ -r "$root_cert" ]; then
+            # Snap Firefox, snap Chromium, plus any other NSS DB under ~/snap.
+            # The `sql:` prefix tells certutil the DB is the modern cert9 format.
+            local db
+            while IFS= read -r db; do
+                [ -z "$db" ] && continue
+                local profile_dir
+                profile_dir=$(dirname "$db")
+                echo "   - Trusting in $(echo "$profile_dir" | sed "s|$HOME|~|")"
+                # Remove any prior entry under our nickname so re-runs don't
+                # layer stale copies, then add the current root.
+                certutil -D -d sql:"$profile_dir" -n "Cove Local Authority" 2>/dev/null || true
+                certutil -A -d sql:"$profile_dir" -n "Cove Local Authority" -t "C,," -i "$root_cert" 2>/dev/null || true
+            done < <(find "$HOME/snap" "$HOME/.mozilla/firefox" \
+                -name 'cert9.db' 2>/dev/null)
+        else
+            gum style --foreground yellow "⚠️ Could not locate Caddy root.crt — snap Firefox/Chromium trust skipped."
+        fi
+    fi
+
+    echo ""
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "✅ Local SSL trust installed" \
+        "If a browser was open during this run, restart it to pick up the new CA."
+}
