@@ -1,0 +1,239 @@
+cove_memory() {
+    # -----------------------------------------------------------------
+    #  cove memory [set <value>]
+    #  Show or tweak PHP memory_limit across every ini Cove or the
+    #  user's Homebrew PHPs load. Cove's own ini lives at
+    #  ~/Cove/php.ini and is read by FrankenPHP (both CLI via PHPRC and
+    #  the web server via the php_ini directive in the Caddyfile, which
+    #  reads its values from the same file through cove_ini_get).
+    # -----------------------------------------------------------------
+
+    local action="show"
+    local new_value=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                display_command_help memory
+                exit 0
+                ;;
+            set)
+                action="set"
+                new_value="$2"
+                shift 2 || { gum style --foreground red "❌ 'set' requires a value (e.g. 2G)"; exit 1; }
+                ;;
+            *)
+                gum style --foreground red "❌ Unknown argument: $1"
+                echo "Usage: cove memory [set <value>]"
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ "$action" = "set" ]; then
+        cove_memory_set "$new_value"
+    else
+        cove_memory_show
+    fi
+}
+
+# Resolves the canonical path of a binary. Falls back to the original path
+# if neither GNU readlink nor BSD-era greadlink is available.
+cove_memory_realpath() {
+    local p="$1"
+    if readlink -f "$p" >/dev/null 2>&1; then
+        readlink -f "$p"
+    elif command -v greadlink >/dev/null 2>&1; then
+        greadlink -f "$p"
+    else
+        echo "$p"
+    fi
+}
+
+# Prints the php.ini path a given php binary loads, with surrounding
+# whitespace and quotes trimmed (php --ini quotes the path when it
+# contains special chars). PHPRC is unset so we see the ini each binary
+# loads by default — without Cove's CLI override leaking in.
+cove_memory_ini_for() {
+    local php="$1"
+    env -u PHPRC "$php" --ini 2>/dev/null \
+        | awk -F': ' '/^Loaded Configuration File:/ {sub(/^[[:space:]]+/,"",$2); print $2}' \
+        | sed -E 's/^"(.*)"$/\1/'
+}
+
+# Runs an inline PHP snippet against $1 without Cove's PHPRC, so the
+# returned ini values reflect what the binary sees when the user invokes
+# it from their own shell.
+cove_memory_php_probe() {
+    env -u PHPRC "$1" -r "$2" 2>/dev/null
+}
+
+cove_memory_show() {
+    gum style --foreground "212" --bold "PHP memory_limit audit"
+    echo ""
+
+    # 1) Cove CLI ini
+    local cove_mem
+    cove_mem=$(cove_ini_get memory_limit "")
+    echo "📁 Cove CLI  ($PHP_INI_FILE)"
+    if [ -f "$PHP_INI_FILE" ]; then
+        echo "   memory_limit         = ${cove_mem:-(unset — FrankenPHP default applies)}"
+        echo "   upload_max_filesize  = $(cove_ini_get upload_max_filesize '(unset)')"
+        echo "   post_max_size        = $(cove_ini_get post_max_size '(unset)')"
+    else
+        echo "   (file missing — run 'cove install')"
+    fi
+
+    # 2) Cove web server (Caddyfile frankenphp block)
+    echo ""
+    echo "🌐 Cove web ($CADDYFILE_PATH, frankenphp block)"
+    if [ -f "$CADDYFILE_PATH" ]; then
+        local caddy_mem
+        caddy_mem=$(awk '/^[[:space:]]*php_ini[[:space:]]+memory_limit[[:space:]]+/ {print $3; exit}' "$CADDYFILE_PATH")
+        if [ -n "$caddy_mem" ]; then
+            echo "   memory_limit = $caddy_mem"
+        else
+            echo "   (no explicit memory_limit — inherits from ~/Cove/php.ini)"
+        fi
+    else
+        echo "   (Caddyfile missing)"
+    fi
+
+    # 3) PHPs on PATH (dedup by canonical binary path)
+    echo ""
+    echo "🔍 PHP binaries on PATH"
+    local seen_paths=""
+    local php_path found=false
+    while IFS= read -r php_path; do
+        [ -z "$php_path" ] && continue
+        local real_path
+        real_path=$(cove_memory_realpath "$php_path")
+        case ",$seen_paths," in *",$real_path,"*) continue ;; esac
+        seen_paths="$seen_paths,$real_path"
+
+        local php_ver php_ini php_mem
+        php_ver=$(cove_memory_php_probe "$php_path" 'echo PHP_VERSION;')
+        php_ini=$(cove_memory_ini_for "$php_path")
+        php_mem=$(cove_memory_php_probe "$php_path" 'echo ini_get("memory_limit");')
+
+        echo "   • $php_path"
+        echo "       version       = ${php_ver:-unknown}"
+        echo "       php.ini       = ${php_ini:-<none>}"
+        echo "       memory_limit  = ${php_mem:-unknown}"
+        found=true
+    done < <(which -a php 2>/dev/null)
+    if ! $found; then
+        echo "   (no 'php' binary on PATH)"
+    fi
+
+    # 4) wp-cli's effective memory_limit (uses whichever php its shebang resolves)
+    echo ""
+    echo "🧰 wp-cli"
+    local wp_bin
+    wp_bin=$(command -v wp 2>/dev/null)
+    if [ -n "$wp_bin" ]; then
+        local wp_info wp_php wp_ver wp_mem
+        wp_info=$(env -u PHPRC "$wp_bin" cli info 2>/dev/null)
+        wp_php=$(echo "$wp_info" | awk -F':\t' '/^PHP binary:/ {sub(/^[[:space:]]+/,"",$2); print $2; exit}')
+        wp_ver=$(echo "$wp_info" | awk -F':\t' '/^PHP version:/ {sub(/^[[:space:]]+/,"",$2); print $2; exit}')
+        if [ -n "$wp_php" ] && [ -x "$wp_php" ]; then
+            wp_mem=$(cove_memory_php_probe "$wp_php" 'echo ini_get("memory_limit");')
+        fi
+        echo "   wp             = $wp_bin"
+        echo "   php binary     = ${wp_php:-unknown}"
+        echo "   php version    = ${wp_ver:-unknown}"
+        echo "   memory_limit   = ${wp_mem:-unknown}"
+    else
+        echo "   (wp-cli not found on PATH)"
+    fi
+
+    echo ""
+    gum style --faint "To raise the limit everywhere: cove memory set 2G"
+}
+
+cove_memory_set() {
+    local value="$1"
+
+    if [ -z "$value" ]; then
+        gum style --foreground red "❌ Missing value. Usage: cove memory set <value> (e.g. 2G)"
+        exit 1
+    fi
+    if [ "$value" != "-1" ] && [[ ! "$value" =~ ^[0-9]+[KMG]?$ ]]; then
+        gum style --foreground red "❌ Invalid value '$value'. Use e.g. 512M, 2G, or -1 for unlimited."
+        exit 1
+    fi
+
+    echo ""
+    gum style --foreground "212" --bold "Setting memory_limit = $value"
+    echo ""
+
+    # 1) Cove CLI ini — source of truth for Cove
+    mkdir -p "$(dirname "$PHP_INI_FILE")"
+    touch "$PHP_INI_FILE"
+    echo "📁 Updating $PHP_INI_FILE"
+    local k
+    for k in memory_limit upload_max_filesize post_max_size; do
+        if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
+            sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${value}|" "$PHP_INI_FILE"
+        else
+            echo "${k} = ${value}" >> "$PHP_INI_FILE"
+        fi
+        echo "   ✓ ${k} = ${value}"
+    done
+    rm -f "${PHP_INI_FILE}.bak"
+
+    # 2) Regenerate Caddyfile so FrankenPHP web server picks up the new values
+    echo ""
+    regenerate_caddyfile
+
+    # 3) External PHP inis (Homebrew, distro-packaged) — opt-in per file.
+    # Reads 'which -a php' on fd 3 so gum confirm inside the loop body can
+    # read from the real stdin without swallowing the remaining PHP paths.
+    echo ""
+    echo "🔍 Scanning Homebrew / system PHP inis on PATH…"
+    local seen_paths="" seen_inis=""
+    local php_path
+    while IFS= read -r php_path <&3; do
+        [ -z "$php_path" ] && continue
+        local real_path
+        real_path=$(cove_memory_realpath "$php_path")
+        case ",$seen_paths," in *",$real_path,"*) continue ;; esac
+        seen_paths="$seen_paths,$real_path"
+
+        local ini
+        ini=$(cove_memory_ini_for "$php_path")
+        [ -z "$ini" ] && continue
+        # Skip Cove's ini (already handled) and duplicates
+        [ "$(cove_memory_realpath "$ini")" = "$(cove_memory_realpath "$PHP_INI_FILE")" ] && continue
+        case ",$seen_inis," in *",$ini,"*) continue ;; esac
+        seen_inis="$seen_inis,$ini"
+
+        local current
+        current=$(grep -E "^[[:space:]]*memory_limit[[:space:]]*=" "$ini" 2>/dev/null \
+            | tail -1 \
+            | sed -E 's|^[[:space:]]*memory_limit[[:space:]]*=[[:space:]]*||' \
+            | tr -d ' "')
+        echo ""
+        echo "   • $ini (current: ${current:-unset})"
+
+        if ! [ -w "$ini" ]; then
+            gum style --faint "     (not writable by this user — skipping. Run: sudo sed -i.bak -E 's|^[[:space:]]*memory_limit[[:space:]]*=.*|memory_limit = ${value}|' \"$ini\")"
+            continue
+        fi
+
+        if gum confirm "     Update this ini's memory_limit to ${value}?"; then
+            if grep -qE "^[[:space:]]*memory_limit[[:space:]]*=" "$ini"; then
+                sed -i.bak -E "s|^[[:space:]]*memory_limit[[:space:]]*=.*|memory_limit = ${value}|" "$ini"
+            else
+                echo "memory_limit = ${value}" >> "$ini"
+            fi
+            rm -f "${ini}.bak"
+            gum style --foreground green "     ✓ Updated"
+        else
+            gum style --faint "     (skipped)"
+        fi
+    done 3< <(which -a php 2>/dev/null)
+
+    echo ""
+    gum style --foreground green "✅ Done. Run 'cove memory' to verify."
+}
