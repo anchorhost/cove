@@ -286,6 +286,52 @@ cove_upgrade() {
     echo "🎨 Refreshing Cove Adminer theme..."
     deploy_adminer_theme
 
+    # --- Floor Cove's PHP ini at the current installer default ---
+    # Pre-1.10 installers wrote memory_limit=512M (also upload/post=unset).
+    # Raise to the 1G floor the fresh installer uses today, but leave any
+    # value already >= 1G alone so a user who bumped to 2G stays at 2G.
+    local install_default_memory="1G"
+    local floor_bytes=$(( 1024 * 1024 * 1024 ))
+
+    mem_to_bytes() {
+        local s="${1:-0}" n suffix
+        n="${s%[KMGkmg]}"; suffix="${s#$n}"
+        case "$suffix" in
+            K|k) echo $((n * 1024)) ;;
+            M|m) echo $((n * 1024 * 1024)) ;;
+            G|g) echo $((n * 1024 * 1024 * 1024)) ;;
+            *)   echo "${n:-0}" ;;
+        esac
+    }
+
+    echo ""
+    echo "🧠 Checking PHP memory floor…"
+    local bumped_any=false
+    local k
+    for k in memory_limit upload_max_filesize post_max_size; do
+        local current
+        current=$(cove_ini_get "$k" "")
+        local current_bytes
+        current_bytes=$(mem_to_bytes "$current")
+        if [ -z "$current" ] || [ "$current_bytes" -lt "$floor_bytes" ]; then
+            mkdir -p "$(dirname "$PHP_INI_FILE")"
+            touch "$PHP_INI_FILE"
+            if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
+                sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${install_default_memory}|" "$PHP_INI_FILE"
+            else
+                echo "${k} = ${install_default_memory}" >> "$PHP_INI_FILE"
+            fi
+            rm -f "${PHP_INI_FILE}.bak"
+            echo "   ↑ ${k}: ${current:-unset} → ${install_default_memory}"
+            bumped_any=true
+        else
+            echo "   ✓ ${k}: ${current} (already ≥ ${install_default_memory})"
+        fi
+    done
+    if [ "$bumped_any" = true ]; then
+        echo "   (cove reload below regenerates the Caddyfile so the web server picks up the new limits.)"
+    fi
+
     # --- Reload to pull in any UI updates ---
     # Invoke the on-disk binary so a freshly-upgraded script's new functions are used
     # (the currently-running process still holds the pre-upgrade functions in memory).
