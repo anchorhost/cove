@@ -1913,22 +1913,31 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
                     let anyFailed = false;
                     try {
+                        // Outer loop catches deletes queued while we were awaiting the
+                        // reload below — otherwise they'd sit forever because the next
+                        // deleteSite() call short-circuits on isProcessingQueue.
                         while (this.deleteQueue.length > 0) {
-                            const target = this.deleteQueue.shift();
-                            const del = await this.apiPost('delete_site', { site_name: target });
-                            if (del.success) {
-                                this.showSnack('Site deleted.');
-                            } else {
-                                anyFailed = true; // apiPost already surfaced the error
+                            while (this.deleteQueue.length > 0) {
+                                const target = this.deleteQueue.shift();
+                                const del = await this.apiPost('delete_site', { site_name: target });
+                                if (del.success) {
+                                    this.showSnack('Site deleted.');
+                                } else {
+                                    anyFailed = true; // apiPost already surfaced the error
+                                }
                             }
+                            // Kick a reload at the end of the batch. Race-safety
+                            // lives server-side: cove_reload() uses a mkdir lock
+                            // with a pending marker to coalesce concurrent calls,
+                            // since reload_server itself backgrounds the shell
+                            // command (shell_exec '...&') and returns instantly.
+                            // Two unsynchronized frankenphp reload calls otherwise
+                            // deadlock Caddy's admin server (10s shutdown timeout).
+                            await this.apiPost('reload_server');
                         }
                     } finally {
                         this.isProcessingQueue = false;
                     }
-
-                    // One reload for the whole batch — avoids N overlapping Caddyfile
-                    // regenerations when the user bulk-deletes several sites quickly.
-                    this.apiPost('reload_server');
 
                     // If anything failed mid-queue the optimistic UI is now out of sync
                     // with the backend (e.g. a survivor is missing from our list).
