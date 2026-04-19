@@ -10,6 +10,7 @@ cove_memory() {
 
     local action="show"
     local new_value=""
+    local auto_yes=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -22,16 +23,20 @@ cove_memory() {
                 new_value="$2"
                 shift 2 || { gum style --foreground red "❌ 'set' requires a value (e.g. 2G)"; exit 1; }
                 ;;
+            --yes|-y|--force|--all)
+                auto_yes=true
+                shift
+                ;;
             *)
                 gum style --foreground red "❌ Unknown argument: $1"
-                echo "Usage: cove memory [set <value>]"
+                echo "Usage: cove memory [set <value>] [--yes]"
                 exit 1
                 ;;
         esac
     done
 
     if [ "$action" = "set" ]; then
-        cove_memory_set "$new_value"
+        cove_memory_set "$new_value" "$auto_yes"
     else
         cove_memory_show
     fi
@@ -153,11 +158,16 @@ cove_memory_show() {
 
 cove_memory_set() {
     local value="$1"
+    local auto_yes="${2:-false}"
 
     if [ -z "$value" ]; then
         gum style --foreground red "❌ Missing value. Usage: cove memory set <value> (e.g. 2G)"
         exit 1
     fi
+
+    # Non-interactive callers have no TTY; gum confirm aborts there. Auto-yes
+    # so scripted fleet updates can bump every writable ini without hanging.
+    [ -t 0 ] || auto_yes=true
     if [ "$value" != "-1" ] && [[ ! "$value" =~ ^[0-9]+[KMG]?$ ]]; then
         gum style --foreground red "❌ Invalid value '$value'. Use e.g. 512M, 2G, or -1 for unlimited."
         exit 1
@@ -221,7 +231,14 @@ cove_memory_set() {
             continue
         fi
 
-        if gum confirm "     Update this ini's memory_limit to ${value}?"; then
+        local do_update=false
+        if [ "$auto_yes" = true ]; then
+            do_update=true
+        elif gum confirm "     Update this ini's memory_limit to ${value}?"; then
+            do_update=true
+        fi
+
+        if $do_update; then
             if grep -qE "^[[:space:]]*memory_limit[[:space:]]*=" "$ini"; then
                 sed -i.bak -E "s|^[[:space:]]*memory_limit[[:space:]]*=.*|memory_limit = ${value}|" "$ini"
             else

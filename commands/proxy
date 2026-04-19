@@ -15,12 +15,17 @@ cove_proxy_add() {
     local domain=""
     local target=""
     local tls_mode="internal"
+    local force=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-tls)
                 tls_mode="none"
+                shift
+                ;;
+            --force|--yes|-y)
+                force=true
                 shift
                 ;;
             *)
@@ -35,6 +40,10 @@ cove_proxy_add() {
                 ;;
         esac
     done
+
+    # Without a TTY, gum confirm can't prompt — treat as --force so scripted
+    # callers (dashboard, CI) can overwrite safely.
+    [ -t 0 ] || force=true
 
     # Interactive mode if arguments not provided
     if [ -z "$name" ]; then
@@ -56,7 +65,7 @@ cove_proxy_add() {
     local proxy_file="$PROXY_DIR/$name"
 
     # Check if proxy already exists
-    if [ -f "$proxy_file" ]; then
+    if [ -f "$proxy_file" ] && ! $force; then
         if ! gum confirm "⚠️ Proxy '$name' already exists. Overwrite?"; then
             echo "🚫 Cancelled."
             exit 0
@@ -138,7 +147,19 @@ cove_proxy_list() {
 }
 
 cove_proxy_delete() {
-    local name="$1"
+    local name=""
+    local force=false
+    for arg in "$@"; do
+        case "$arg" in
+            --force|--yes|-y) force=true ;;
+            -*)
+                gum style --foreground red "❌ Unknown option: $arg"
+                echo "Usage: cove proxy delete <name> [--force]"
+                exit 1
+                ;;
+            *) [ -z "$name" ] && name="$arg" ;;
+        esac
+    done
 
     if [ -z "$name" ]; then
         # Interactive mode - let user select from existing proxies
@@ -149,7 +170,7 @@ cove_proxy_delete() {
 
         echo "🗑️ Select a proxy to delete:"
         name=$(ls "$PROXY_DIR" | gum choose)
-        
+
         if [ -z "$name" ]; then
             echo "🚫 Cancelled."
             exit 0
@@ -168,13 +189,18 @@ cove_proxy_delete() {
     cat "$proxy_file"
     echo ""
 
-    if gum confirm "🚨 Are you sure you want to delete proxy '$name'?"; then
-        rm "$proxy_file"
-        echo "✅ Proxy '$name' deleted."
-        regenerate_caddyfile
-    else
-        echo "🚫 Deletion cancelled."
+    # Non-interactive callers have no TTY; auto-force so scripted deletes work.
+    [ -t 0 ] || force=true
+
+    if ! $force; then
+        if ! gum confirm "🚨 Are you sure you want to delete proxy '$name'?"; then
+            echo "🚫 Deletion cancelled."
+            return 0
+        fi
     fi
+    rm "$proxy_file"
+    echo "✅ Proxy '$name' deleted."
+    regenerate_caddyfile
 }
 
 cove_proxy() {
@@ -203,11 +229,16 @@ cove_proxy() {
             echo "  list                           List all proxy entries"
             echo "  delete <name>                  Delete a proxy entry"
             echo ""
+            echo "Flags:"
+            echo "  --no-tls   Disable TLS for this proxy (add only)"
+            echo "  --force    Skip confirmation prompts (add overwrite, delete)"
+            echo ""
             echo "Examples:"
             echo "  cove proxy add opencode myhost.tailnet.ts.net 127.0.0.1:4096"
             echo "  cove proxy add api api.example.com localhost:3000 --no-tls"
+            echo "  cove proxy add api api.example.com localhost:3000 --force"
             echo "  cove proxy list"
-            echo "  cove proxy delete opencode"
+            echo "  cove proxy delete opencode --force"
             exit 0
             ;;
     esac

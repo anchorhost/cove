@@ -47,24 +47,43 @@ cove_directive_add_or_update() {
 
 # This new function handles deleting directives
 cove_directive_delete() {
-    local site_name="$1"
+    local site_name=""
+    local force_delete=false
+    for arg in "$@"; do
+        case "$arg" in
+            --force|--yes|-y) force_delete=true ;;
+            -*)
+                gum style --foreground red "❌ Unknown option: $arg"
+                echo "Usage: cove directive delete <name> [--force]"
+                exit 1
+                ;;
+            *) [ -z "$site_name" ] && site_name="$arg" ;;
+        esac
+    done
+
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: Please provide a site name."
-        echo "Usage: cove directive delete <name>"
+        echo "Usage: cove directive delete <name> [--force]"
         exit 1
     fi
 
     local site_hostname="${site_name}.localhost"
     local custom_conf_file="$CUSTOM_CADDY_DIR/$site_hostname"
 
+    # Non-interactive callers (dashboard shell_exec, CI) have no TTY — gum
+    # confirm aborts there. Auto-promote to --force so scripted deletes work.
+    [ -t 0 ] || force_delete=true
+
     if [ -f "$custom_conf_file" ]; then
-        if gum confirm "🚨 Are you sure you want to delete the custom directives for '$site_hostname'?"; then
-            rm "$custom_conf_file"
-            echo "✅ Custom directives deleted for $site_hostname."
-            regenerate_caddyfile
-        else
-            echo "🚫 Deletion cancelled."
+        if ! $force_delete; then
+            if ! gum confirm "🚨 Are you sure you want to delete the custom directives for '$site_hostname'?"; then
+                echo "🚫 Deletion cancelled."
+                return 0
+            fi
         fi
+        rm "$custom_conf_file"
+        echo "✅ Custom directives deleted for $site_hostname."
+        regenerate_caddyfile
     else
         echo "ℹ️ No custom directives found for $site_hostname."
     fi

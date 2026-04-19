@@ -97,6 +97,16 @@ upgrade_frankenphp() {
 }
 
 cove_upgrade() {
+    local auto_yes=false
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y|--force) auto_yes=true ;;
+        esac
+    done
+    # Non-interactive callers have no TTY — auto-yes so the Adminer prompt
+    # (only shown when the local version can't be parsed) doesn't hang.
+    [ -t 0 ] || auto_yes=true
+
     echo "🔎 Checking for the latest version of Cove..."
 
     local download_url="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
@@ -268,7 +278,13 @@ cove_upgrade() {
         fi
     else
         # If version unknown, offer to upgrade anyway
-        if gum confirm "Current version unknown. Would you like to download the latest Adminer ($latest_adminer_version)?"; then
+        local do_download=false
+        if [ "$auto_yes" = true ]; then
+            do_download=true
+        elif gum confirm "Current version unknown. Would you like to download the latest Adminer ($latest_adminer_version)?"; then
+            do_download=true
+        fi
+        if $do_download; then
             echo "🚀 Downloading Adminer $latest_adminer_version..."
             if curl -sL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file"; then
                 echo "✅ Adminer downloaded successfully."

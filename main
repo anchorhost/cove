@@ -2508,10 +2508,13 @@ display_command_help() {
             echo "Opens an editor to add/edit rules which are then included in the main Caddyfile."
             echo
             echo "Subcommands:"
-            echo "  add         Adds a rule to the Caddyfile for the specified site."
-            echo "  update      Updates a rule in the Caddyfile for the specified site."
-            echo "  delete      Deletes custom rules from the Caddyfile for the specified site."
-            echo "  list        Lists all custom directives for all managed sites."
+            echo "  add                 Adds a rule to the Caddyfile for the specified site."
+            echo "  update              Updates a rule in the Caddyfile for the specified site."
+            echo "  delete <name>       Deletes custom rules from the Caddyfile for the specified site."
+            echo "  list                Lists all custom directives for all managed sites."
+            echo ""
+            echo "Flags:"
+            echo "  --force             Skip confirmation prompt (delete only)."
             ;;
         proxy)
             echo "Usage: cove proxy <subcommand>"
@@ -2527,11 +2530,13 @@ display_command_help() {
             echo ""
             echo "Options:"
             echo "  --no-tls     Disable TLS for this proxy (default uses internal TLS)"
+            echo "  --force      Skip confirmation prompts (add overwrite, delete)"
             echo ""
             echo "Examples:"
             echo "  cove proxy add opencode myhost.tailnet.ts.net 127.0.0.1:4096"
+            echo "  cove proxy add api api.example.com localhost:3000 --force"
             echo "  cove proxy list"
-            echo "  cove proxy delete opencode"
+            echo "  cove proxy delete opencode --force"
             ;;
         tailscale)
             echo "Usage: cove tailscale <subcommand>"
@@ -2618,7 +2623,7 @@ display_command_help() {
             echo "Tip: run 'cove db backup' first if you want a safety net before the DB update."
             ;;
         memory)
-            echo "Usage: cove memory [set <value>]"
+            echo "Usage: cove memory [set <value>] [--yes]"
             echo ""
             echo "Show or raise PHP memory_limit across every ini that affects Cove and"
             echo "the wp-cli on your PATH. With no arguments, prints a report covering:"
@@ -2635,9 +2640,13 @@ display_command_help() {
             echo ""
             echo "Values accept standard PHP shorthand: 512M, 2G, -1 for unlimited."
             echo ""
+            echo "Flags:"
+            echo "  --yes, -y    Update every writable ini without per-file confirmation."
+            echo ""
             echo "Examples:"
             echo "  cove memory              Audit current limits"
             echo "  cove memory set 2G       Bump Cove + offer to bump Homebrew PHPs"
+            echo "  cove memory set 2G --yes Bump Cove + every writable ini (non-interactive)"
             echo "  cove memory set -1       Unlimited (use sparingly)"
             ;;
         log)
@@ -2723,9 +2732,13 @@ display_command_help() {
             echo "Prints the HTTPS URL for the given site."
             ;;
         upgrade)
-            echo "Usage: cove upgrade"
+            echo "Usage: cove upgrade [--yes]"
             echo ""
             echo "Checks for the latest version of Cove on GitHub and replaces the current executable if a newer version is available."
+            echo "Also checks FrankenPHP and Adminer and upgrades them if newer versions are published."
+            echo ""
+            echo "Flags:"
+            echo "  --yes, -y    Skip the prompt shown when the local Adminer version can't be parsed."
             ;;
         version)
             echo "Usage: cove version"
@@ -2908,7 +2921,7 @@ main() {
             cove_url "$@"
             ;;
         upgrade)
-            cove_upgrade
+            cove_upgrade "$@"
             ;;
         version)
             cove_version
