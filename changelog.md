@@ -1,5 +1,41 @@
 # Changelog
 
+## [1.9] - 2026-04-18
+
+### ✨ New Features
+
+* **Redesigned Dashboard:** The built-in web dashboard at `https://cove.localhost` has been fully rewritten to match the Cove landing page.
+    * Warm-dark-first palette with a teal accent (`oklch(72% 0.12 190)` in dark mode), Fraunces/Geist/JetBrains Mono typography, and a new SVG cove/bay brand mark with disc/land/horizon/water/waves/ring layers and theme-aware colour overrides.
+    * Single rounded card with a soft elevation shadow, three-tier backgrounds (`--bg` / `--panel` / `--bg-sunk`), and subgrid columns so every WP/STATIC pill, modified stamp, size, and action row lines up across rows instead of sizing independently.
+    * Per-site size cache at `~/Cove/cache/site-sizes.json`, populated by a new `refresh_sizes` API action. The dashboard shows cached bytes, auto-refreshes on an empty cache, and exposes a manual ↻ button in the footer.
+    * "Last modified" column backed by a `modified_at` field in `list_sites` (mtime of `public/` falling back to the site dir), rendered as relative time with the full timestamp on hover.
+    * Filter input with `/` focus shortcut (GitHub-style), Esc to clear, and clickable WP/STATIC pills that set a dedicated `type:` chip for exact-type matching rather than substring.
+    * Sort pill cycles name / size / modified.
+    * Matched substrings in domain names are wrapped in `<mark>` so the letters you typed are highlighted as you filter. The site-name portion of each domain is accented in teal while the `.localhost` suffix stays dim.
+    * Optimistic single-flight delete queue: rows pop out instantly, the backend runs deletes sequentially so concurrent deletes can't race on Caddyfile regeneration or `/etc/hosts` writes, and a single reload fires at the end.
+    * Click anywhere on a row to open the site — skipped when text is selected so drag-to-copy still works.
+    * Login button uses an inline-grid label/spinner stack so the loading state can't shift neighbouring actions.
+    * Snackbar fades in/out (no sliding) and is centered without transform so Alpine's transition styles don't fight CSS centering.
+    * Theme defaults to `prefers-color-scheme` on first visit; the moon/sun toggle cross-fades between two stroked SVGs in a 32×32 bordered button.
+    * Inline SVG favicon ships with the dashboard — no extra asset to deploy.
+* **Installer `--main` Mode:** `install-cove.sh` now accepts `--main` to pull `cove.sh` from the `main` branch instead of the latest GitHub release, giving testers a one-liner for verifying unreleased changes.
+
+### 🛠️ Improvements & Changes
+
+* **`cove.sh` PATH Hardening:** `cove.sh` now prepends `/opt/homebrew/bin`, `/usr/local/bin`, and `~/.local/bin` to `PATH` at the top of the script. Callers with a minimal `PATH` — launchd plists, systemd units, and the dashboard's `shell_exec` — can now find `gum`, `wp`, `frankenphp`, and `mariadb` without per-platform shims.
+* **Shared Caddy Start Helpers:** New `is_caddy_running` and `start_caddy_service` helpers in `main`. `regenerate_caddyfile` probes `localhost:2019` before reloading and starts Caddy if it's down (the start reads the fresh Caddyfile, so no separate reload is needed). `cove enable` delegates to the shared helper instead of duplicating the macOS/Linux start block.
+
+### 🐛 Bug Fixes
+
+* **`cove add` No Longer Lies About Success on a Stopped Stack:** On a stopped stack, `cove add` used to print "Caddy configuration reload initiated" while the reload silently failed, leaving the new site unreachable until the user noticed and ran `cove enable`. `regenerate_caddyfile` now detects a down Caddy and starts it, and the reload itself is no longer backgrounded — we wait for the admin API to return and surface a real error if it fails. The deadlock that originally motivated backgrounding is now handled at the PHP layer (the dashboard's `reload_server` already backgrounds `cove reload` via `shell_exec '…&'`).
+* **First TLS Request After `cove add` Hitting `tlsv1 alert internal error`:** On a busy running stack, the old backgrounded reload plus `sleep 0.25` returned before Caddy had issued the new hostname's internal-CA cert. `cove add` now polls the site's HTTPS URL for up to ~2s after reload so the cert is warmed up before the command returns. Happy-path cost is one ~5ms probe.
+* **`cove db backup` Overwriting Previous Snapshots:** Backups were always written to `../private/database-backup.sql`, so a second run silently clobbered the earlier snapshot. Each backup now includes a `YYYYMMDD-HHMMSS` suffix so repeat runs accumulate instead of overwriting.
+* **Orphan `/etc/hosts` Entries After `cove delete`:** `cove reload` appends `127.0.0.1` entries for every site hostname and custom mapping, but `cove delete` previously only removed the site directory and the custom Caddy directive file — the `/etc/hosts` lines lingered forever. Delete now reads the mappings file before `rm -rf`, then uses `sudo sed -i.bak -E` to strip the matching `127.0.0.1` lines in one pass, only prompting for sudo when entries actually need removing.
+* **Dashboard Delete Hanging on Sudo Prompt:** The `/etc/hosts` cleanup inside `cove delete` used plain `sudo sed`, which hangs the caller when there's no TTY — notably the dashboard's PHP `shell_exec`, which was locking up the UI waiting for a password prompt nothing could answer. `cove delete` now checks `[ -t 0 ]` and drops to `sudo -n` otherwise, so it fails fast with a warning instead of blocking the whole delete flow.
+* **`cove rename` Temp File Collisions and Symlink Risk:** The old database dump was written to a predictable `/tmp/${old_db_name}.sql` path, which collides if two renames run in parallel and is a symlink-attack vector on shared systems. Switched to `mktemp` with a `trap EXIT` cleanup so the temp file is removed on any exit path, not just the happy path.
+* **Shell Injection in `cove pull` and `cove push`:** Interpolating `$remote_path` into `ssh "cd $remote_path && …"` passed shell metacharacters — spaces, semicolons, `$(…)` — straight through to the remote shell. A path with a space would break the `cd`; a path with a `;` or `$(…)` would execute arbitrary commands on the remote server. A new `shell_quote` helper wraps values in single quotes and rewrites interior `'` as `'\''`, and `pull`/`push` now route `$remote_path` and `$backup_filename` through it at every `ssh` call site.
+* **Installer Prompts Silently Falling Through Under `curl | bash`:** When the installer is run the documented way — `bash <(curl -sL https://cove.run/install-cove.sh)` — bash's stdin is the piped script, so every `gum confirm/choose/input` during `cove install` received a closed stdin and silently fell through. `install-cove.sh` now wires the child `cove install` call to `/dev/tty` when it's readable so the interactive port-conflict and option prompts actually work during the fresh install.
+
 ## [1.8] - 2026-04-15
 
 ### ✨ New Features

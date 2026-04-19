@@ -6,6 +6,18 @@
 #  and the main command routing logic.
 # ====================================================
 
+# Ensure Homebrew/user bin dirs are on PATH. Callers like launchd and
+# systemd hand down a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), which
+# means the dashboard's shell_exec of cove fails to find gum/wp/frankenphp.
+# We only prepend dirs that actually exist and aren't already on PATH.
+for _cove_bin in /opt/homebrew/bin /usr/local/bin /usr/local/sbin "$HOME/.local/bin"; do
+    if [ -d "$_cove_bin" ] && [[ ":$PATH:" != *":$_cove_bin:"* ]]; then
+        PATH="$_cove_bin:$PATH"
+    fi
+done
+unset _cove_bin
+export PATH
+
 # --- OS & Package Manager Detection ---
 OS=""
 PKG_MANAGER=""
@@ -89,7 +101,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.8"
+COVE_VERSION="1.9"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -600,6 +612,13 @@ get_wp_cmd() {
     fi
 }
 
+# Safely single-quote a value for interpolation into a remote shell command.
+# Interior single quotes become the standard '\'' escape sequence, so the
+# result can be dropped into ssh "... $(shell_quote "$v") ..." without injection.
+shell_quote() {
+    printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
 # Helper function to get the correct MariaDB service name on Linux
 # Different distros may use 'mariadb', 'mysql', or 'mysqld' as the service name
 get_mariadb_service_name() {
@@ -666,6 +685,64 @@ update_etc_hosts() {
         echo "   - ✅ Done."
     else
         echo "   - ✅ All entries are present."
+    fi
+}
+
+# Probe Caddy's admin API to see if the server is running.
+# Uses bash's built-in /dev/tcp so we don't depend on nc/curl being installed.
+is_caddy_running() {
+    (echo > /dev/tcp/127.0.0.1/2019) &>/dev/null
+}
+
+# (Re)start the Caddy/FrankenPHP service. Safe to call when already running —
+# both platforms stop any existing instance first. Called from `cove enable`
+# and from regenerate_caddyfile when Caddy isn't up yet.
+start_caddy_service() {
+    echo "   - Starting Caddy/FrankenPHP..."
+    mkdir -p "$LOGS_DIR"
+
+    if [ "$OS" == "macos" ]; then
+        local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
+        local frankenphp_bin
+        frankenphp_bin=$(command -v "$CADDY_CMD")
+
+        launchctl unload "$caddy_plist_path" &>/dev/null
+        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
+
+        cat > "$caddy_plist_path" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>KeepAlive</key>
+        <true/>
+        <key>Label</key>
+        <string>com.cove.caddy</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>$frankenphp_bin</string>
+                <string>run</string>
+                <string>--config</string>
+                <string>$CADDYFILE_PATH</string>
+                <string>--pidfile</string>
+                <string>$COVE_DIR/caddy.pid</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>$LOGS_DIR/caddy-process.log</string>
+        <key>StandardOutPath</key>
+        <string>$LOGS_DIR/caddy-process.log</string>
+</dict>
+</plist>
+EOM
+        launchctl load "$caddy_plist_path"
+        launchctl start com.cove.caddy
+    fi
+
+    if [ "$OS" == "linux" ]; then
+        $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
+        $SUDO_CMD "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
     fi
 }
 
@@ -947,15 +1024,29 @@ EOM
         echo "" >> "$CADDYFILE_PATH"
     fi
 
-    # Reload Caddy with the new configuration.
-    # We run this in the background (&) to prevent a deadlock when the GUI,
-    # which is run by Caddy/FrankenPHP, executes a command that tries to reload the server.
-    # The server can't wait for a command that it needs to process itself.
-    $SUDO_CMD "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log" &
-    
-    # Because the command is backgrounded, we can't check its exit code directly.
-    # We'll assume success and let the user check 'cove status' or logs if needed.
-    echo "✅ Caddy configuration reload initiated."
+    # If Caddy is already running, reload against the new config. If it isn't,
+    # start it — the start command reads $CADDYFILE_PATH itself, so no reload
+    # is needed. Without this probe, `cove add` on a stopped stack would
+    # silently "succeed" while the site was actually unreachable.
+    #
+    # The reload runs synchronously so callers only see success after the new
+    # config is actually live. The previous implementation backgrounded it to
+    # avoid a self-deadlock when the dashboard (running inside FrankenPHP)
+    # triggered a reload; that deadlock is now handled at the PHP layer, which
+    # already backgrounds `cove reload` via shell_exec '…&' (see create_gui_file).
+    # With hundreds of sites the Caddyfile adapt takes a few seconds — racing
+    # the exit against a subsequent curl produced TLS internal errors.
+    if is_caddy_running; then
+        if $SUDO_CMD "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log"; then
+            echo "✅ Caddy configuration reloaded."
+        else
+            gum style --foreground red "❌ Caddy reload failed. See $LOGS_DIR/caddy-reload.log for details."
+            return 1
+        fi
+    else
+        echo "ℹ️  Caddy is not running — starting it now."
+        start_caddy_service
+    fi
 }
 
 # --- GUI Generation ---
@@ -982,23 +1073,52 @@ if (file_exists($__cove_cfg_path)) {
 }
 $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_port;
 
+// Per-site disk sizes are cached so list_sites stays fast even on hosts with
+// ~100 sites. The cache is refreshed on demand by the dashboard's 'refresh_sizes'
+// action; stale entries are tolerable because list_sites filters by what's on
+// disk and the UI falls back to '—' when an entry is missing.
+$__cove_sizes_cache = $user_home . '/Cove/cache/site-sizes.json';
+
+function cove_read_size_cache($path) {
+    if (!file_exists($path)) return [];
+    $data = @json_decode(@file_get_contents($path), true);
+    return (is_array($data) && isset($data['sites']) && is_array($data['sites'])) ? $data['sites'] : [];
+}
+
+function cove_write_size_cache($path, array $sizes) {
+    @mkdir(dirname($path), 0755, true);
+    @file_put_contents($path, json_encode([
+        'sites' => $sizes,
+        'updated_at' => time(),
+    ], JSON_UNESCAPED_SLASHES));
+}
+
 // Handle GET requests for listing sites
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $action = $_GET['action'] ?? '';
     if ($action === 'list_sites') {
         $sites_info = [];
+        $size_cache = cove_read_size_cache($__cove_sizes_cache);
         if (file_exists($sitedir) && is_dir($sitedir)) {
             $items = scandir($sitedir);
             foreach ($items as $item) {
                 if ($item === '.' || $item === '..') continue;
                 $site_path = $sitedir . '/' . $item;
                 if (is_dir($site_path)) {
+                    // Prefer the public/ dir's mtime since it gets touched whenever
+                    // files are added/removed at the doc root — closer to "when did I
+                    // last work on this site" than the site dir itself.
+                    $mtime = @filemtime($site_path . '/public');
+                    if (!$mtime) $mtime = @filemtime($site_path);
+
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
                         'domain' => 'https://' . $item . $__cove_port_suffix,
                         'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
                         'display_path' => '~/Cove/Sites/' . $item,
-                        'full_path' => $site_path
+                        'full_path' => $site_path,
+                        'size_bytes' => isset($size_cache[$item]) ? (int) $size_cache[$item] : null,
+                        'modified_at' => $mtime ?: null,
                     ];
                 }
             }
@@ -1078,6 +1198,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $response = ['success' => true, 'message' => 'Server reload initiated.'];
             echo json_encode($response);
             exit; // Exit immediately
+        case 'refresh_sizes':
+            // Walk every site directory with `du -sk` (portable on macOS + Linux — -k
+            // forces 1024-byte blocks) and cache the result as bytes. Runs sequentially
+            // so 80+ sites take a few seconds; acceptable because this is user-triggered.
+            $sizes = [];
+            if (file_exists($sitedir) && is_dir($sitedir)) {
+                foreach (scandir($sitedir) as $item) {
+                    if ($item === '.' || $item === '..') continue;
+                    $p = $sitedir . '/' . $item;
+                    if (!is_dir($p)) continue;
+                    $out = []; $rc = 0;
+                    exec('du -sk ' . escapeshellarg($p) . ' 2>/dev/null', $out, $rc);
+                    if ($rc === 0 && !empty($out[0])) {
+                        $parts = preg_split('/\s+/', trim($out[0]));
+                        if (ctype_digit($parts[0] ?? '')) {
+                            $sizes[$item] = ((int) $parts[0]) * 1024;
+                        }
+                    }
+                }
+            }
+            cove_write_size_cache($__cove_sizes_cache, $sizes);
+            echo json_encode(['success' => true, 'sites' => $sizes, 'updated_at' => time()]);
+            exit;
     }
 
     if (!empty($command)) {
@@ -1105,198 +1248,709 @@ $__cove_https_port = isset($config_data['HTTPS_PORT']) ? (int) $config_data['HTT
 $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_port;
 ?>
 <!DOCTYPE html>
-<html lang="en" x-data="{ theme: localStorage.getItem('theme') || 'dark' }" x-init="$watch('theme', val => localStorage.setItem('theme', val))" :data-theme="theme">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cove Dashboard</title>
+    <title>Cove — sites</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%238bb382'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fira+Code&family=Inter:wght@400;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"/>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <script src="//unpkg.com/alpinejs" defer></script>
     <style>
-        :root { --pico-font-family: 'Inter', sans-serif; --pico-font-size: 95%; --pico-spacing: 0.75rem; --pico-card-padding: 1.25rem; --pico-form-element-spacing-vertical: 0.75rem; --pico-form-element-spacing-horizontal: 1rem; --pico-form-element-spacing-vertical: 0.5rem; --pico-form-element-spacing-horizontal: 0.75rem;}
-        code, pre, kbd { font-family: 'Fira Code', monospace; }
-        [data-theme="light"], :root:not([data-theme="dark"]) { --pico-primary: #163c52; --pico-primary-hover: #1f5472; --pico-primary-focus: rgba(22, 60, 82, 0.25); --pico-card-background-color: #fdf4e9; --pico-card-border-color: #e9e2d9; --pico-code-background-color: #e9e2d9; }
-        [data-theme="dark"] { --pico-primary: #00a9ff; --pico-primary-hover: #33bbff; --pico-primary-focus: rgba(0, 169, 255, 0.25); --pico-background-color: #1a1b26; --pico-card-background-color: #24283b; --pico-card-border-color: #414868; --pico-code-color: #ff9e64; --pico-code-background-color: #2e3247; }
-        body { padding: 1rem; background-color: var(--pico-background-color); max-width: 1000px; margin: auto; }
-        header { text-align: center; margin: 2rem 0; }
-        section { margin-bottom: 36px; }
-        .theme-toggle { position: absolute; top: 1rem; right: 1rem; background: transparent; border: none; padding: 0.5rem; cursor: pointer; font-size: 1.25rem; line-height: 1; width: auto; height: auto; }
-        table { --pico-table-border-color: var(--pico-card-border-color); }
-        article, figure { border-color: var(--pico-card-border-color); }
-        .clickable-code { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; }
-        .clickable-code:hover { color: var(--pico-primary); }
-        .snackbar { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); padding: 0.75rem 1.25rem; border-radius: var(--pico-border-radius); background-color: var(--pico-primary); color: var(--pico-primary-inverse); box-shadow: var(--pico-box-shadow); z-index: 1000; font-size: 0.9em; }
-        .snackbar.error { background-color: #d32f2f; color: white; }
-        button[aria-busy='true'] { pointer-events: none; }
+        *, *::before, *::after { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; }
+        html { background: #0f1210; }
+        html[data-theme="light"] { background: #fbfaf7; }
+
+        :root {
+            --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            --font-serif: 'Fraunces', Georgia, serif;
+            --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+            --accent: oklch(62% 0.11 190);
+            --accent-fg: #0a1a1c;
+            --radius-lg: 20px;
+            --radius-md: 10px;
+            --radius-pill: 999px;
+        }
+
+        html[data-theme="dark"], html:not([data-theme]) {
+            --bg: #0f1210;
+            --bg-sunk: #0b0e0c;
+            --panel: #181c19;
+            --panel-hover: #1e2320;
+            --panel-border: #252925;
+            --text: #edeee9;
+            --text-dim: #8a8e85;
+            --text-faint: #5d615a;
+            /* Dark-mode teal is brighter so it reads cleanly against the
+               warmer panel — matches the landing page palette. */
+            --accent: oklch(72% 0.12 190);
+            --pill-bg: #1e2320;
+            --pill-wp-bg: color-mix(in oklch, var(--accent) 18%, transparent);
+            --pill-wp-fg: color-mix(in oklch, var(--accent) 80%, white);
+            --pill-static-bg: #1e2320;
+            --pill-static-fg: #9a9d94;
+            --input-bg: #0b0e0c;
+            --danger: #d66a6a;
+            --shadow-lg: 0 28px 60px -24px rgba(0,0,0,0.7), 0 6px 16px -6px rgba(0,0,0,0.4);
+            color-scheme: dark;
+        }
+
+        html[data-theme="light"] {
+            --bg: #fbfaf7;
+            --bg-sunk: #f4f2ec;
+            --panel: #ffffff;
+            --panel-hover: #f6f4ee;
+            --panel-border: #e8e4da;
+            --text: #1a1c1b;
+            --text-dim: #6b6f6a;
+            --text-faint: #9a9d97;
+            /* White on teal reads stronger than the dark accent-fg does on
+               the lighter background — override just for light mode. */
+            --accent-fg: #ffffff;
+            --pill-bg: #f1ede5;
+            --pill-wp-bg: color-mix(in oklch, var(--accent) 14%, transparent);
+            --pill-wp-fg: color-mix(in oklch, var(--accent) 55%, black);
+            --pill-static-bg: #f1ede5;
+            --pill-static-fg: #8a8781;
+            --input-bg: #fbfaf7;
+            --danger: #b44848;
+            --shadow-lg: 0 24px 50px -24px rgba(20,28,30,0.18), 0 6px 16px -6px rgba(20,28,30,0.06);
+            color-scheme: light;
+        }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: var(--font-sans);
+            font-size: 15px;
+            line-height: 1.5;
+            min-height: 100vh;
+            padding: 2.5rem 1.25rem 4rem;
+            -webkit-font-smoothing: antialiased;
+            font-feature-settings: "ss01", "cv11";
+        }
+
+        .wrap { max-width: 820px; margin: 0 auto; }
+
+        /* Top nav */
+        .nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2rem; }
+        .logo { display: inline-flex; align-items: center; gap: 12px; color: var(--text); text-decoration: none; font-weight: 600; font-size: 1.05rem; letter-spacing: -0.01em; }
+        /* Brand mark: cove/bay silhouette in a circle. Classes are scoped to
+           .logo-mark so they don't collide with unrelated elements. Colors
+           are driven by CSS variables with sensible defaults, so each theme
+           can override individual layers without touching the inline SVG. */
+        .logo-mark { width: 34px; height: 34px; display: block; flex-shrink: 0; }
+        .logo-mark .disc    { fill: var(--mark-disc, oklch(96% 0.015 85)); }
+        .logo-mark .water   { fill: var(--mark-water, oklch(62% 0.11 190)); }
+        .logo-mark .land    { fill: var(--mark-land, oklch(72% 0.10 150)); }
+        .logo-mark .horizon { stroke: var(--mark-horizon, oklch(35% 0.08 190)); fill: none; }
+        .logo-mark .wave    { stroke: var(--mark-wave, oklch(35% 0.08 190)); fill: none; }
+        .logo-mark .ring    { stroke: var(--mark-ring, oklch(35% 0.08 190)); fill: none; stroke-width: 3; }
+        html[data-theme="dark"] .logo-mark {
+            --mark-disc:    oklch(22% 0.01 85);
+            --mark-land:    oklch(64% 0.09 150);
+            --mark-ring:    color-mix(in oklab, var(--text) 72%, transparent);
+            --mark-horizon: color-mix(in oklab, var(--text) 72%, transparent);
+            --mark-wave:    color-mix(in oklab, var(--text) 65%, transparent);
+        }
+        /* Square icon button that cross-fades a moon (light mode) with a sun
+           (dark mode). Both SVGs are stacked absolutely so the button size
+           stays constant during the transition. */
+        .theme-btn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 7px; border: 1px solid var(--panel-border); color: var(--text-dim); background: var(--panel); cursor: pointer; padding: 0; position: relative; flex: none; transition: border-color 120ms, background 120ms, color 120ms; }
+        .theme-btn:hover { color: var(--text); background: var(--bg-sunk); }
+        .theme-btn svg { width: 15px; height: 15px; position: absolute; transition: opacity 200ms ease, transform 300ms ease; }
+        .theme-btn .icon-sun  { opacity: 0; transform: rotate(-40deg) scale(0.7); }
+        .theme-btn .icon-moon { opacity: 1; transform: rotate(0) scale(1); }
+        html[data-theme="dark"] .theme-btn .icon-sun  { opacity: 1; transform: rotate(0) scale(1); }
+        html[data-theme="dark"] .theme-btn .icon-moon { opacity: 0; transform: rotate(40deg) scale(0.7); }
+
+        /* Card */
+        .card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-lg); overflow: hidden; box-shadow: var(--shadow-lg); }
+        .card-head { display: flex; align-items: center; justify-content: space-between; padding: 1.1rem 1.5rem; border-bottom: 1px solid var(--panel-border); gap: 1rem; }
+        .card-title { font-family: var(--font-serif); font-style: italic; font-weight: 500; font-size: 1.45rem; margin: 0; letter-spacing: -0.01em; }
+        .card-actions { display: flex; align-items: center; gap: 0.45rem; }
+
+        /* Pills */
+        .pill { display: inline-flex; align-items: center; gap: 0.4em; padding: 0.38rem 0.8rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.8rem; font-weight: 400; border: 1px solid var(--panel-border); background: transparent; color: var(--text-dim); text-decoration: none; cursor: pointer; transition: color 120ms, border-color 120ms, background 120ms; white-space: nowrap; }
+        .pill:hover { color: var(--text); border-color: var(--text-faint); }
+        .pill.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 500; }
+        .pill.primary:hover { filter: brightness(1.08); color: var(--accent-fg); border-color: var(--accent); }
+        .pill:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* Filter row */
+        .filter-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1.5rem; border-bottom: 1px solid var(--panel-border); }
+        .filter-input { flex: 1; min-width: 0; background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.88rem; padding: 0.15rem 0; outline: 0; }
+        .filter-input::placeholder { color: var(--text-faint); }
+        .filter-kbd { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); border: 1px solid var(--panel-border); border-radius: 4px; padding: 0.1rem 0.35rem; }
+        .filter-clear { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; font-size: 1.05rem; line-height: 1; padding: 0 0.35rem; border-radius: 5px; }
+        .filter-clear:hover { color: var(--text); background: var(--panel-hover); }
+        /* Chip showing an active type-only filter (set by clicking a row pill).
+           Separate state from the free-text filter so users can't hand-edit the
+           "type:xxx" tokens and get into a weird parse state. */
+        .filter-chip { display: inline-flex; align-items: center; gap: 0.1rem; padding: 0.18rem 0.22rem 0.18rem 0.65rem; background: var(--pill-wp-bg); color: var(--pill-wp-fg); border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.76rem; font-weight: 500; letter-spacing: 0.02em; white-space: nowrap; }
+        .filter-chip-x { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; background: transparent; border: 0; color: inherit; cursor: pointer; border-radius: 50%; font-size: 0.95rem; line-height: 1; padding: 0; }
+        .filter-chip-x:hover { background: color-mix(in oklch, var(--accent) 28%, transparent); }
+
+        /* Add row */
+        .add-row { padding: 0.9rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
+        .add-row form { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+        .add-row input[type="text"] { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.9rem; padding: 0.5rem 0.8rem; border-radius: var(--radius-md); min-width: 200px; flex: 1; }
+        .add-row input[type="text"]:focus { outline: 0; border-color: var(--accent); }
+        .add-row .plain-toggle { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--text-dim); font-size: 0.85rem; cursor: pointer; }
+        .add-row .plain-toggle input { accent-color: var(--accent); }
+
+        /* Site list — one grid on the <ul>, rows inherit its columns via
+           subgrid so type/modified/size/actions align vertically across rows
+           instead of each row sizing independently. */
+        .site-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr auto auto auto auto; column-gap: 0.9rem; }
+        .site-row { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; padding: 0.8rem 1.5rem; border-bottom: 1px solid var(--panel-border); transition: background 100ms; cursor: pointer; }
+        .site-row:last-child { border-bottom: 0; }
+        .site-row:hover { background: var(--panel-hover); }
+        .site-domain { font-family: var(--font-mono); font-size: 0.88rem; color: var(--text-dim); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .site-domain .host-accent { color: var(--accent); }
+        .site-domain:hover { color: var(--accent); }
+        .site-domain mark { background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: 3px; }
+        .site-type { display: inline-flex; justify-content: center; min-width: 64px; padding: 0.2rem 0.55rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.68rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; user-select: none; transition: filter 120ms; }
+        .site-type:hover { filter: brightness(1.15); }
+        .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
+        .site-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); }
+        .site-modified { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-faint); min-width: 44px; text-align: right; }
+        .site-size { font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-dim); min-width: 64px; text-align: right; }
+        .site-actions { display: flex; gap: 0.15rem; opacity: 0; transition: opacity 100ms; }
+        .site-row:hover .site-actions, .site-row:focus-within .site-actions { opacity: 1; }
+        /* Fixed button size + both children stacked in one grid cell. Since
+           grid-area "stack" collocates them at the same position and size is
+           locked by width/height, toggling opacity on .loading can't shift
+           any neighbour. */
+        .site-action-btn { display: inline-grid; grid-template-areas: "stack"; place-items: center; box-sizing: border-box; width: 3.5em; height: 1.75em; padding: 0; background: transparent; border: 0; color: var(--text-dim); cursor: pointer; border-radius: 7px; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1; }
+        .site-action-btn > * { grid-area: stack; }
+        .site-action-btn:hover { background: var(--panel-border); color: var(--text); }
+        .site-action-btn.danger:hover { color: var(--danger); }
+        .site-action-btn:disabled { cursor: wait; }
+        .site-action-btn .btn-spinner { width: 10px; height: 10px; border: 1.5px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; opacity: 0; pointer-events: none; }
+        .site-action-btn.loading .btn-label { opacity: 0; }
+        .site-action-btn.loading .btn-spinner { opacity: 1; }
+
+        /* Empty + loading states — scoped to direct children of .site-list so
+           the global .loading class doesn't leak into unrelated elements
+           (notably .site-action-btn.loading, which uses its own state class). */
+        .site-list > .empty, .site-list > .loading { grid-column: 1 / -1; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .empty-hint { margin-top: 0.35rem; font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-faint); }
+        .empty-hint code { background: var(--panel-hover); padding: 0.1rem 0.4rem; border-radius: 5px; }
+
+        /* Footer */
+        .card-foot { display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1.5rem; border-top: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.78rem; gap: 1rem; flex-wrap: wrap; }
+        .services { display: flex; gap: 1.1rem; flex-wrap: wrap; }
+        .dot { display: inline-flex; align-items: center; gap: 0.45rem; color: var(--text-dim); text-decoration: none; background: transparent; border: 0; padding: 0; font-family: inherit; font-size: inherit; cursor: default; }
+        .dot.link, .dot[role="button"] { cursor: pointer; }
+        .dot.link:hover, .dot[role="button"]:hover { color: var(--text); }
+        .dot::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px color-mix(in oklch, var(--accent) 60%, transparent); }
+        .totals { display: inline-flex; align-items: center; gap: 0.5rem; }
+        .refresh-btn { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; padding: 0.15rem 0.35rem; font-size: 0.95rem; border-radius: 5px; }
+        .refresh-btn:hover { color: var(--text); background: var(--panel-hover); }
+        .refresh-btn.spinning { animation: spin 1s linear infinite; pointer-events: none; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Modal */
+        .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: grid; place-items: center; z-index: 80; padding: 1rem; }
+        html[data-theme="light"] .modal-backdrop { background: rgba(20,20,18,0.35); }
+        .modal { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-lg); padding: 1.5rem; min-width: min(420px, 90vw); max-width: 540px; }
+        .modal h3 { font-family: var(--font-serif); font-style: italic; font-weight: 500; font-size: 1.25rem; margin: 0 0 0.3rem; }
+        .modal .modal-sub { color: var(--text-dim); font-size: 0.85rem; margin: 0 0 1rem; }
+        .modal pre { background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.85rem 1rem; margin: 0; font-family: var(--font-mono); font-size: 0.82rem; color: var(--text); overflow-x: auto; }
+        .db-creds { background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.9rem 1rem; display: flex; flex-direction: column; gap: 0.7rem; }
+        .db-cred-row { display: grid; grid-template-columns: 85px 1fr; align-items: baseline; gap: 0.75rem; font-family: var(--font-mono); font-size: 0.82rem; }
+        .db-cred-label { color: var(--text-dim); font-weight: 500; }
+        .db-cred-value { color: var(--text); word-break: break-all; background: transparent; padding: 0; }
+        .modal .modal-foot { margin-top: 1rem; display: flex; justify-content: space-between; align-items: center; color: var(--text-faint); font-family: var(--font-mono); font-size: 0.75rem; }
+
+        /* Snackbar */
+        /* Centered via auto margins + fit-content width, NOT transform — Alpine
+           writes transform inline during x-transition, which would wipe out a
+           translateX(-50%) centering and slide the snackbar in from the edge. */
+        .snackbar { position: fixed; bottom: 1.5rem; left: 0; right: 0; margin-inline: auto; width: max-content; max-width: 90vw; background: var(--text); color: var(--bg); padding: 0.7rem 1.15rem; border-radius: 10px; font-size: 0.88rem; z-index: 200; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+        .snackbar.error { background: var(--danger); color: white; }
+
+        /* Responsive */
+        @media (max-width: 620px) {
+            body { padding: 1.25rem 0.75rem 3rem; }
+            .card-head { padding: 0.9rem 1rem; flex-wrap: wrap; }
+            .card-actions { width: 100%; justify-content: flex-end; }
+            .site-list { grid-template-columns: 1fr auto auto; column-gap: 0.6rem; }
+            .site-row { padding: 0.7rem 1rem; }
+            .site-size, .site-modified { display: none; }
+            .site-actions { opacity: 1; }
+            .add-row { padding: 0.8rem 1rem; }
+            .card-foot { padding: 0.75rem 1rem; }
+        }
     </style>
 </head>
-<body>
-    <main class="container" x-data="sitesManager" x-init="getSites">
-        <button class="theme-toggle" @click="theme = (theme === 'light' ? 'dark' : 'light')" x-text="theme === 'light' ? '🌙' : '☀️'"></button>
-        <header><h1><img src="https://cove.run/content/15/uploads/2025/07/cropped-cove-1-192x192.webp" style="width: 38px;"> Cove</h1>
-        <p>Local Development Powered by Caddy</p></header>
-        
-        <section>
-            <h2>🚀 Quick Links</h2>
-            <div class="grid">
-                <a href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">🗃️ Manage Databases (Adminer)</a>
-                <a href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener noreferrer" role="button" class="secondary outline">✉️ Inspect Emails (Mailpit)</a>
+<body x-data="dashboard" x-init="init()">
+    <div class="wrap">
+        <nav class="nav">
+            <a class="logo" href="/">
+                <svg class="logo-mark" viewBox="0 0 64 64" aria-hidden="true" focusable="false" stroke-linecap="round" stroke-linejoin="round">
+                    <defs>
+                        <clipPath id="cove-clip"><circle cx="32" cy="32" r="28"/></clipPath>
+                    </defs>
+                    <g clip-path="url(#cove-clip)">
+                        <rect x="0" y="0" width="64" height="64" class="disc"/>
+                        <rect x="0" y="32" width="64" height="32" class="water"/>
+                        <path class="land" d="M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z"/>
+                        <line class="horizon" x1="2" y1="32" x2="62" y2="32" stroke-width="2.5"/>
+                        <g class="wave" stroke-width="2.6">
+                            <path d="M 10 42 Q 18 38, 26 42 T 42 42 T 56 42"/>
+                            <path d="M 14 50 Q 22 46, 30 50 T 46 50 T 56 50"/>
+                        </g>
+                    </g>
+                    <circle cx="32" cy="32" r="28" class="ring"/>
+                </svg>
+                <span>Cove</span>
+            </a>
+            <button class="theme-btn" @click="toggleTheme()" :title="theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'" aria-label="Toggle theme">
+                <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5a5.75 5.75 0 1 0 6.7 6.7Z"/></svg>
+                <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.8M8 12.7v1.8M2.6 2.6l1.3 1.3M12.1 12.1l1.3 1.3M1.5 8h1.8M12.7 8h1.8M2.6 13.4l1.3-1.3M12.1 3.9l1.3-1.3"/></svg>
+            </button>
+        </nav>
+
+        <section class="card">
+            <header class="card-head">
+                <h1 class="card-title">Sites</h1>
+                <div class="card-actions">
+                    <button class="pill" @click="cycleSort()" :title="'Sort by — click to cycle'" x-text="'sort: ' + sort"></button>
+                    <a class="pill" :href="adminerUrl" target="_blank" rel="noopener" title="Open Adminer">db</a>
+                    <a class="pill" :href="mailpitUrl" target="_blank" rel="noopener" title="Open Mailpit">mail</a>
+                    <button class="pill primary" @click="toggleAdd()" x-text="adding ? 'cancel' : '+ add site'"></button>
+                </div>
+            </header>
+
+            <div class="filter-row">
+                <span class="filter-chip" x-show="typeFilter" x-transition.opacity aria-label="Active type filter" style="display: none;">
+                    <span x-text="typeFilterLabel"></span>
+                    <button type="button" class="filter-chip-x" @click="typeFilter = null; $refs.filterInput.focus()" aria-label="Remove type filter" title="Remove">×</button>
+                </span>
+                <input
+                    class="filter-input"
+                    type="text"
+                    x-model="filter"
+                    x-ref="filterInput"
+                    placeholder="filter sites by name or type…"
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    @keydown.escape.prevent="filter = ''; $event.target.blur()"
+                    aria-label="Filter sites"
+                >
+                <span class="filter-kbd" x-show="!filter && !typeFilter" aria-hidden="true">/</span>
+                <button class="filter-clear" x-show="filter || typeFilter" @click="clearAllFilters(); $refs.filterInput.focus()" aria-label="Clear filter" title="Clear all (Esc)">×</button>
             </div>
-        </section>
 
-        <section>
-            <h2>✨ Add New Site</h2>
-            <article>
-                <form @submit.prevent="addSite">
-                    <div class="grid">
-                        <label>Site Name
-                            <input type="text" name="site_name" required x-model="newSite.name" @input="newSite.name = newSite.name.toLowerCase().replace(/[^a-z0-9-]/g, '')" :disabled="newSite.isLoading">
-                            <small>This will create <code x-text="newSite.name ? newSite.name + '.localhost' : '.localhost'"></code></small>
-                        </label>
-                        <label><input type="checkbox" name="is_plain" x-model="newSite.isPlain" :disabled="newSite.isLoading">Plain Site</label>
-                    </div>
-                    <button type="submit" :aria-busy="newSite.isLoading" x-text="newSite.isLoading ? 'Creating...' : 'Create Site'"></button>
+            <div x-show="adding" x-transition.opacity class="add-row" style="display: none;">
+                <form @submit.prevent="addSite()">
+                    <input type="text" x-model="newSite.name" @input="newSite.name = newSite.name.toLowerCase().replace(/[^a-z0-9-]/g, '')" placeholder="site-name" required :disabled="newSite.isLoading" x-ref="newSiteInput">
+                    <label class="plain-toggle">
+                        <input type="checkbox" x-model="newSite.isPlain" :disabled="newSite.isLoading">
+                        plain (no WordPress)
+                    </label>
+                    <button class="pill primary" type="submit" :disabled="!newSite.name || newSite.isLoading" x-text="newSite.isLoading ? 'creating…' : 'create'"></button>
                 </form>
-            </article>
-        </section>
+            </div>
 
-        <section>
-            <h2>🗂️ Managed Sites</h2>
-            <figure>
-                <table role="grid">
-                    <thead><tr><th scope="col">Site Domain</th><th scope="col">Type</th><th scope="col">Path</th><th scope="col"></th></tr></thead>
-                    <tbody>
-                        <template x-for="site in sites" :key="site.name">
-                            <tr>
-                                <td><a :href="site.domain" target="_blank" rel="noopener noreferrer" x-text="'🔗 ' + site.domain.replace('https://', '')"></a></td>
-                                <td x-text="site.type"></td>
-                                <td>
-                                    <div @click="$store.snackbar.show('✅ Path copied!'); navigator.clipboard.writeText(site.full_path)" style="cursor: pointer;display:inline-flex;" title="Click to copy path">
-                                        <small><code class="clickable-code" x-text="site.display_path"></code></small>
-                                    </div>
-                                </td>
-                                <td style="width: 140px;">
-                                    <div style="display: flex; justify-content: flex-end; gap: 0.5rem; align-items: center;">
-                                        <template x-if="site.type === 'WordPress'">
-                                            <button @click="getLoginLink(site.name)" :aria-busy="site.isLoggingIn" style="min-width: 85px; margin: 0;">Login</button>
-                                        </template>
-                                        <form @submit.prevent="deleteSite(site.name)" style="margin: 0;">
-                                            <button type="submit" class="secondary outline" style="margin: 0;">🗑️</button>
-                                        </form>
-                                    </div>
-                                </td>
-                            </tr>
-                        </template>
-                        <tr x-show="sites.length === 0 && !isLoading">
-                            <td colspan="4"><article>No sites found. Add one above!</article></td>
-                        </tr>
-                        <tr x-show="isLoading">
-                            <td colspan="4"><progress></progress></td>
-                        </tr>
-                    </tbody>
-                </table>
-            </figure>
-        </section>
+            <ul class="site-list">
+                <template x-for="site in filteredSites" :key="site.name">
+                    <li class="site-row" @click="openSite(site)">
+                        <a class="site-domain" :href="site.domain" target="_blank" rel="noopener" @click.stop x-html="highlightedDomain(site.domain, filter)"></a>
+                        <span class="site-type" :class="site.type === 'WordPress' ? 'wp' : 'static'" @click.stop="typeFilter = site.type" :title="'Filter to ' + (site.type === 'WordPress' ? 'WordPress' : 'static') + ' sites'" x-text="site.type === 'WordPress' ? 'WP' : 'STATIC'"></span>
+                        <span class="site-modified" x-text="formatRelative(site.modified_at)" :title="site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : ''"></span>
+                        <span class="site-size" x-text="formatSize(site.size_bytes)"></span>
+                        <div class="site-actions">
+                            <template x-if="site.type === 'WordPress'">
+                                <button class="site-action-btn" :class="{ loading: site.isLoggingIn }" @click.stop="getLoginLink(site.name)" :disabled="site.isLoggingIn" :title="'One-time admin login for ' + site.name">
+                                    <span class="btn-label">login</span>
+                                    <span class="btn-spinner" aria-hidden="true"></span>
+                                </button>
+                            </template>
+                            <button class="site-action-btn" @click.stop="copyPath(site.full_path)" title="Copy site path to clipboard">path</button>
+                            <button class="site-action-btn danger" @click.stop="deleteSite(site.name)" :title="'Delete ' + site.name">delete</button>
+                        </div>
+                    </li>
+                </template>
+                <template x-if="isLoading">
+                    <li class="loading">Loading sites…</li>
+                </template>
+                <template x-if="!isLoading && sites.length === 0">
+                    <li class="empty">
+                        <div>No sites yet.</div>
+                        <div class="empty-hint">Click <em>+ add site</em>, or run <code>cove add myblog</code>.</div>
+                    </li>
+                </template>
+                <template x-if="!isLoading && sites.length > 0 && filteredSites.length === 0">
+                    <li class="empty">
+                        <div>No matches for <code x-text="filter"></code>.</div>
+                        <div class="empty-hint">Press Esc to clear.</div>
+                    </li>
+                </template>
+            </ul>
 
-        <section>
-            <h2>⚙️ Cove Configuration</h2>
-            <article>
-                <p>These are the credentials Cove uses to create new WordPress databases.</p>
-                <pre><code><strong>Database User:</strong> <?= htmlspecialchars($config_data['DB_USER'] ?? 'Not set') ?>&#x000A;<strong>Database Password:</strong> <?= htmlspecialchars($config_data['DB_PASSWORD'] ?? 'Not set') ?></code></pre>
-                <p><small>Configuration stored in <code><?= htmlspecialchars($config_file) ?></code>.</small></p>
-            </article>
+            <footer class="card-foot">
+                <div class="services">
+                    <span class="dot" title="Caddy is serving this page — it's running">caddy</span>
+                    <button type="button" class="dot link" @click="showDbModal = true" title="Database credentials">mariadb</button>
+                    <a class="dot link" :href="mailpitUrl" target="_blank" rel="noopener" title="Open Mailpit">mailpit</a>
+                </div>
+                <div class="totals">
+                    <span x-text="siteCountLabel"></span>
+                    <span x-show="totalBytes > 0" x-text="'· ' + formatSize(totalBytes)"></span>
+                    <button type="button" class="refresh-btn" :class="{ spinning: isRefreshingSizes }" @click="refreshSizes()" :disabled="isRefreshingSizes" :title="isRefreshingSizes ? 'Refreshing…' : 'Refresh disk sizes'">↻</button>
+                </div>
+            </footer>
         </section>
-    </main>
-
-    <div x-show="$store.snackbar.visible" x-transition class="snackbar" :class="{ 'error': $store.snackbar.isError }" style="display: none;">
-        <span x-text="$store.snackbar.message"></span>
     </div>
 
+    <div x-show="showDbModal" x-transition.opacity class="modal-backdrop" @click.self="showDbModal = false" @keydown.escape.window="showDbModal = false" style="display: none;">
+        <div class="modal">
+            <h3>Database credentials</h3>
+            <p class="modal-sub">Cove uses these to create new WordPress databases.</p>
+            <div class="db-creds">
+                <div class="db-cred-row">
+                    <span class="db-cred-label">user</span>
+                    <code class="db-cred-value"><?= htmlspecialchars($config_data['DB_USER'] ?? '—') ?></code>
+                </div>
+                <div class="db-cred-row">
+                    <span class="db-cred-label">password</span>
+                    <code class="db-cred-value"><?= htmlspecialchars($config_data['DB_PASSWORD'] ?? '—') ?></code>
+                </div>
+            </div>
+            <div class="modal-foot">
+                <span>stored in <?= htmlspecialchars(str_replace(getenv('HOME'), '~', $config_file)) ?></span>
+                <button class="pill" @click="showDbModal = false">close</button>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="snackbar.visible" x-transition.opacity.duration.200ms class="snackbar" :class="{ error: snackbar.isError }" x-text="snackbar.message" style="display: none;"></div>
+
     <script>
+        const PORT_SUFFIX = '<?= $__cove_port_suffix ?>';
+        const SITES_DIR = 'SITES_DIR_PLACEHOLDER';
+
         document.addEventListener('alpine:init', () => {
-            Alpine.data('sitesManager', () => ({
+            Alpine.data('dashboard', () => ({
+                // Respect the OS theme preference on first visit, dark otherwise.
+                theme: localStorage.getItem('theme') || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'),
                 sites: [],
                 isLoading: true,
+                adding: false,
+                showDbModal: false,
+                isRefreshingSizes: false,
+                filter: '',
+                typeFilter: null, // null | 'WordPress' | 'Plain' — set via the row type pills, cleared via the chip × or overall filter clear
+                sort: 'name',
+                sortModes: ['name', 'size', 'modified'],
                 newSite: { name: '', isPlain: false, isLoading: false },
+                snackbar: { visible: false, message: '', isError: false, timer: null },
+                deleteQueue: [],
+                isProcessingQueue: false,
 
-                async apiCall(action, payload = {}) {
+                get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
+                get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
+                get totalBytes() { return this.sites.reduce((t, s) => t + (s.size_bytes || 0), 0); },
+                get filteredSites() {
+                    // Two independent filters ANDed together: typeFilter (chip,
+                    // exact match on site.type) and filter (free text, substring
+                    // match on name OR type). Keeping them separate means the
+                    // user can type anything in the input without worrying about
+                    // stepping on the type constraint.
+                    let base = [...this.sites];
+                    if (this.typeFilter) {
+                        base = base.filter(s => s.type === this.typeFilter);
+                    }
+                    const q = this.filter.trim().toLowerCase();
+                    if (q) {
+                        base = base.filter(s =>
+                            s.name.toLowerCase().includes(q) ||
+                            (s.type || '').toLowerCase().includes(q));
+                    }
+                    if (this.sort === 'size') {
+                        base.sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0));
+                    } else if (this.sort === 'modified') {
+                        base.sort((a, b) => (b.modified_at || 0) - (a.modified_at || 0));
+                    } else {
+                        base.sort((a, b) => a.name.localeCompare(b.name));
+                    }
+                    return base;
+                },
+
+                get typeFilterLabel() {
+                    return this.typeFilter === 'WordPress' ? 'type: wp' : 'type: static';
+                },
+
+                clearAllFilters() {
+                    this.filter = '';
+                    this.typeFilter = null;
+                },
+                get siteCountLabel() {
+                    const total = this.sites.length;
+                    const visible = this.filteredSites.length;
+                    const suffix = ' site' + (total === 1 ? '' : 's');
+                    return visible === total ? total + suffix : visible + ' of ' + total + suffix;
+                },
+
+                init() {
+                    this.applyTheme();
+                    this.$watch('theme', () => { this.applyTheme(); localStorage.setItem('theme', this.theme); });
+
+                    // `/` focuses the filter (GitHub-style). Ignored when typing
+                    // in a form field or holding a modifier key.
+                    window.addEventListener('keydown', (e) => {
+                        if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+                        const el = document.activeElement;
+                        const tag = el && el.tagName;
+                        if (tag === 'INPUT' || tag === 'TEXTAREA' || (el && el.isContentEditable)) return;
+                        e.preventDefault();
+                        this.$refs.filterInput && this.$refs.filterInput.focus();
+                    });
+
+                    this.getSites().then(() => {
+                        // If the size cache is empty (fresh install or just deleted),
+                        // kick off a background refresh so sizes populate without
+                        // making the user hunt for the ↻ button.
+                        if (this.sites.length > 0 && this.sites.every(s => s.size_bytes === null)) {
+                            this.refreshSizes();
+                        }
+                    });
+                },
+
+                applyTheme() {
+                    document.documentElement.dataset.theme = this.theme;
+                },
+
+                toggleTheme() {
+                    this.theme = this.theme === 'light' ? 'dark' : 'light';
+                },
+
+                toggleAdd() {
+                    this.adding = !this.adding;
+                    if (this.adding) {
+                        this.$nextTick(() => { if (this.$refs.newSiteInput) this.$refs.newSiteInput.focus(); });
+                    }
+                },
+
+                formatSize(bytes) {
+                    if (bytes === null || bytes === undefined) return '—';
+                    if (bytes === 0) return '0 B';
+                    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+                    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+                    const v = bytes / Math.pow(1024, i);
+                    return (v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + units[i];
+                },
+
+                formatRelative(ts) {
+                    if (!ts) return '—';
+                    const s = Math.max(0, Date.now() / 1000 - ts);
+                    if (s < 60) return 'now';
+                    if (s < 3600) return Math.floor(s / 60) + 'm';
+                    if (s < 86400) return Math.floor(s / 3600) + 'h';
+                    if (s < 86400 * 30) return Math.floor(s / 86400) + 'd';
+                    if (s < 86400 * 365) return Math.floor(s / 86400 / 30) + 'mo';
+                    return Math.floor(s / 86400 / 365) + 'y';
+                },
+
+                escapeHtml(s) {
+                    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+                },
+
+                // Wrap every case-insensitive occurrence of `query` in <mark> while
+                // escaping every other substring. Safe for x-html use because the
+                // inner text comes from the trusted domain, not from query (query
+                // only controls WHERE to split).
+                highlightMatch(text, query) {
+                    const q = (query || '').trim();
+                    if (!q) return this.escapeHtml(text);
+                    const lower = text.toLowerCase();
+                    const lowerQ = q.toLowerCase();
+                    let out = '';
+                    let i = 0;
+                    while (i < text.length) {
+                        const idx = lower.indexOf(lowerQ, i);
+                        if (idx === -1) { out += this.escapeHtml(text.slice(i)); break; }
+                        out += this.escapeHtml(text.slice(i, idx));
+                        out += '<mark>' + this.escapeHtml(text.slice(idx, idx + q.length)) + '</mark>';
+                        i = idx + q.length;
+                    }
+                    return out;
+                },
+
+                // Wrap the site name in <span class="host-accent"> so it reads
+                // teal while the .localhost suffix stays dim — matches the
+                // landing-page dashboard mock. Split at the first dot; if
+                // there's none, the whole string is treated as the name.
+                highlightedDomain(domain, query) {
+                    const stripped = String(domain).replace(/^https?:\/\//, '');
+                    const dotIdx = stripped.indexOf('.');
+                    if (dotIdx === -1) return '<span class="host-accent">' + this.highlightMatch(stripped, query) + '</span>';
+                    const name = stripped.slice(0, dotIdx);
+                    const suffix = stripped.slice(dotIdx);
+                    return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
+                },
+
+                cycleSort() {
+                    const i = this.sortModes.indexOf(this.sort);
+                    this.sort = this.sortModes[(i + 1) % this.sortModes.length];
+                },
+
+                openSite(site) {
+                    // Don't navigate when the click was part of a drag-to-select,
+                    // so users can still grab the domain/size text to copy.
+                    if (window.getSelection && window.getSelection().toString()) return;
+                    window.open(site.domain, '_blank', 'noopener');
+                },
+
+                showSnack(msg, isError = false) {
+                    if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
+                    this.snackbar = { visible: true, message: msg, isError, timer: null };
+                    this.snackbar.timer = setTimeout(() => { this.snackbar.visible = false; }, 3500);
+                },
+
+                async apiPost(action, payload = {}) {
                     try {
-                        const response = await fetch('api.php', {
+                        const res = await fetch('api.php', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ action, ...payload })
-                        }).then(res => res.json());
-                        if (!response.success) {
-                            Alpine.store('snackbar').show(`❌ Error: ${response.message || 'Unknown error'}`, true);
-                        }
-                        return response;
+                        }).then(r => r.json());
+                        if (!res.success) this.showSnack(res.message || 'An error occurred.', true);
+                        return res;
                     } catch (e) {
-                        Alpine.store('snackbar').show('❌ A network error occurred.', true);
+                        this.showSnack('Network error.', true);
                         return { success: false };
                     }
                 },
-                
+
                 async getSites() {
                     this.isLoading = true;
                     try {
                         const r = await fetch('api.php?action=list_sites');
-                        const siteData = await r.json();
-                        this.sites = siteData.map(site => ({ ...site, isLoggingIn: false }));
+                        const data = await r.json();
+                        this.sites = data.map(s => ({ ...s, isLoggingIn: false }));
                     } catch (e) {
-                        Alpine.store('snackbar').show('❌ Could not fetch site list.', true);
+                        this.showSnack('Could not fetch sites.', true);
                     } finally {
                         this.isLoading = false;
                     }
                 },
-                
+
                 async addSite() {
+                    if (!this.newSite.name) return;
                     this.newSite.isLoading = true;
-                    const addResponse = await this.apiCall('add_site', { site_name: this.newSite.name, is_plain: this.newSite.isPlain });
-                    if (addResponse.success) {
+                    const name = this.newSite.name;
+                    const isPlain = this.newSite.isPlain;
+
+                    const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain });
+                    if (add.success) {
+                        // Optimistic insert: we already know every field the row
+                        // template uses. No auto-refresh — the Caddy reload that
+                        // follows can take tens of seconds on fleets with lots of
+                        // sites and would either hang the fetch or drop the UI
+                        // into an ERR_CONNECTION_REFUSED during the config swap.
+                        this.sites.push({
+                            name,
+                            domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
+                            type: isPlain ? 'Plain' : 'WordPress',
+                            display_path: '~/Cove/Sites/' + name + '.localhost',
+                            full_path: SITES_DIR + '/' + name + '.localhost',
+                            size_bytes: null,
+                            modified_at: Math.floor(Date.now() / 1000),
+                            isLoggingIn: false,
+                        });
+                        this.showSnack('Site created.');
                         this.newSite.name = '';
-                        Alpine.store('snackbar').show("✅ Site created. Initiating server reload...");
-                        const reloadResponse = await this.apiCall('reload_server');
-                        if (reloadResponse.success) {
-                            Alpine.store('snackbar').show("✅ Reload initiated. List will refresh shortly.");
-                            setTimeout(() => this.getSites(), 2000); // Refresh list after a delay
-                        }
+                        this.adding = false;
+                        this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
                     }
                     this.newSite.isLoading = false;
                 },
 
-                async deleteSite(siteName) {
-                    if (!confirm(`Are you sure you want to permanently delete ${siteName}? This cannot be undone.`)) return;
-                    const deleteResponse = await this.apiCall('delete_site', { site_name: siteName });
-                    if (deleteResponse.success) {
-                        Alpine.store('snackbar').show("✅ Site deleted. Initiating server reload...");
-                        const reloadResponse = await this.apiCall('reload_server');
-                        if (reloadResponse.success) {
-                            Alpine.store('snackbar').show("✅ Reload initiated. List will refresh shortly.");
-                            setTimeout(() => this.getSites(), 2000); // Refresh list after a delay
+                async deleteSite(name) {
+                    if (!confirm(`Delete ${name}? This removes its files and database.`)) return;
+
+                    // Optimistic: pull from the local list immediately so the UI feels
+                    // instant, and enqueue the backend work. processDeleteQueue below
+                    // drains the queue single-file so concurrent deletes don't race on
+                    // shared state (Caddyfile regeneration, /etc/hosts edits).
+                    const idx = this.sites.findIndex(s => s.name === name);
+                    if (idx === -1) return;
+                    this.sites.splice(idx, 1);
+                    this.deleteQueue.push(name);
+                    this.processDeleteQueue();
+                },
+
+                async processDeleteQueue() {
+                    // Single-flight runner: whichever call picks up the lock drains the
+                    // full queue. Concurrent deleteSite() calls just enqueue and return.
+                    if (this.isProcessingQueue) return;
+                    this.isProcessingQueue = true;
+
+                    let anyFailed = false;
+                    try {
+                        while (this.deleteQueue.length > 0) {
+                            const target = this.deleteQueue.shift();
+                            const del = await this.apiPost('delete_site', { site_name: target });
+                            if (del.success) {
+                                this.showSnack('Site deleted.');
+                            } else {
+                                anyFailed = true; // apiPost already surfaced the error
+                            }
                         }
+                    } finally {
+                        this.isProcessingQueue = false;
+                    }
+
+                    // One reload for the whole batch — avoids N overlapping Caddyfile
+                    // regenerations when the user bulk-deletes several sites quickly.
+                    this.apiPost('reload_server');
+
+                    // If anything failed mid-queue the optimistic UI is now out of sync
+                    // with the backend (e.g. a survivor is missing from our list).
+                    // Cheapest correct fix: re-fetch the authoritative list.
+                    if (anyFailed) await this.getSites();
+                },
+
+                async getLoginLink(name) {
+                    const site = this.sites.find(s => s.name === name);
+                    if (!site) return;
+                    site.isLoggingIn = true;
+                    const res = await this.apiPost('get_login_link', { site_name: name });
+                    if (res.success && res.url) {
+                        window.open(res.url, '_blank');
+                        this.showSnack('Login link opened in a new tab.');
+                    }
+                    site.isLoggingIn = false;
+                },
+
+                async copyPath(path) {
+                    try {
+                        await navigator.clipboard.writeText(path);
+                        this.showSnack('Path copied to clipboard.');
+                    } catch (e) {
+                        this.showSnack('Could not copy path.', true);
                     }
                 },
 
-                async getLoginLink(siteName) {
-                    const site = this.sites.find(s => s.name === siteName);
-                    if (!site) return;
-                    site.isLoggingIn = true;
-                    const response = await this.apiCall('get_login_link', { site_name: siteName });
-                    if (response.success && response.url) {
-                        window.open(response.url, '_blank');
-                        Alpine.store('snackbar').show('✅ Login link opened in a new tab.');
+                async refreshSizes() {
+                    this.isRefreshingSizes = true;
+                    const res = await this.apiPost('refresh_sizes');
+                    if (res.success) {
+                        await this.getSites();
+                        this.showSnack('Disk sizes updated.');
                     }
-                    // apiCall already shows an error snackbar on failure
-                    site.isLoggingIn = false;
+                    this.isRefreshingSizes = false;
                 }
             }));
-            Alpine.store('snackbar', {
-                visible: false, message: '', isError: false,
-                show(message, isError = false) { this.message = message; this.isError = isError; this.visible = true; setTimeout(() => this.visible = false, 4000); }
-            });
         });
     </script>
 </body>
@@ -1946,9 +2600,22 @@ PHP
     # Only run the reload if the --no-reload flag was NOT passed.
     if [ "$no_reload_flag" = false ]; then
         regenerate_caddyfile
+
+        # Caddy's reload admin API returns as soon as the new config is live,
+        # but its internal CA issues the TLS cert for the new hostname
+        # asynchronously after that. Racing a request in that window surfaces
+        # as "tlsv1 alert internal error". Poll HTTPS briefly so we only return
+        # once Caddy can actually complete a handshake for the new domain.
+        local warm_url
+        warm_url=$(url_for "$full_hostname")
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -ks --max-time 1 -o /dev/null "$warm_url/" 2>/dev/null; then
+                break
+            fi
+            sleep 0.2
+        done
     fi
 
-    sleep 0.25
     echo "✅ Site '$full_hostname' created successfully!"
     
     if [ "$site_type" == "wordpress" ]; then
@@ -2010,7 +2677,9 @@ cove_db_backup() {
                     return 1
                 fi
                 
-                local backup_file="../private/database-backup.sql"
+                local backup_timestamp
+                backup_timestamp=$(date +%Y%m%d-%H%M%S)
+                local backup_file="../private/database-backup-${backup_timestamp}.sql"
                 echo "   Saving backup to: $(basename "$site_path")/private/$(basename "$backup_file")"
 
                 # Execute the dump command
@@ -2181,6 +2850,16 @@ cove_delete() {
         fi
     fi
 
+    # Collect hostnames to strip from /etc/hosts BEFORE we rm -rf the site dir
+    local hosts_to_remove=("$site_name.localhost")
+    if [ -f "$site_dir/mappings" ]; then
+        while IFS= read -r mapping || [ -n "$mapping" ]; do
+            if [ -n "$mapping" ]; then
+                hosts_to_remove+=("$mapping")
+            fi
+        done < "$site_dir/mappings"
+    fi
+
     echo "🔥 Deleting site: $site_name.localhost"
     if [ -f "$site_dir/public/wp-config.php" ]; then
         local db_name
@@ -2197,6 +2876,36 @@ cove_delete() {
     if [ -f "$custom_conf_file" ]; then
         rm "$custom_conf_file"
         echo "⚙️ Custom directives deleted."
+    fi
+
+    # --- Clean /etc/hosts entries ---
+    local entries_exist=false
+    local host
+    for host in "${hosts_to_remove[@]}"; do
+        if grep -qE "^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$" /etc/hosts 2>/dev/null; then
+            entries_exist=true
+            break
+        fi
+    done
+
+    if $entries_exist; then
+        echo "🧹 Removing /etc/hosts entries (requires sudo)..."
+        local sed_args=()
+        for host in "${hosts_to_remove[@]}"; do
+            sed_args+=(-e "/^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$/d")
+        done
+        # Use non-interactive sudo when we don't have a TTY (e.g., the dashboard's
+        # PHP shell_exec). In that context an interactive sudo prompt can hang
+        # the caller waiting for a password that will never arrive. From a real
+        # terminal the flag is empty, so sudo prompts as normal.
+        local sudo_flag=""
+        [ -t 0 ] || sudo_flag="-n"
+        if sudo $sudo_flag sed -i.bak -E "${sed_args[@]}" /etc/hosts 2>/dev/null; then
+            sudo $sudo_flag rm -f /etc/hosts.bak 2>/dev/null
+            echo "   - ✅ /etc/hosts cleaned."
+        else
+            gum style --foreground yellow "   - ⚠️ Skipped /etc/hosts cleanup (sudo unavailable from this context). Run 'cove reload' from a terminal to sync."
+        fi
     fi
 
     echo "✅ Site '$site_name.localhost' has been removed."
@@ -2418,52 +3127,7 @@ EOM
         $SUDO_CMD systemctl restart mailpit
     fi
     
-    echo "   - Starting Caddy/FrankenPHP..."
-
-    if [ "$OS" == "macos" ]; then
-        local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
-        local frankenphp_bin
-        frankenphp_bin=$(command -v "$CADDY_CMD")
-
-        # Stop any existing instance
-        launchctl unload "$caddy_plist_path" &>/dev/null
-        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
-
-        cat > "$caddy_plist_path" << EOM
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-        <key>KeepAlive</key>
-        <true/>
-        <key>Label</key>
-        <string>com.cove.caddy</string>
-        <key>ProgramArguments</key>
-        <array>
-                <string>$frankenphp_bin</string>
-                <string>run</string>
-                <string>--config</string>
-                <string>$CADDYFILE_PATH</string>
-                <string>--pidfile</string>
-                <string>$COVE_DIR/caddy.pid</string>
-        </array>
-        <key>RunAtLoad</key>
-        <true/>
-        <key>StandardErrorPath</key>
-        <string>$LOGS_DIR/caddy-process.log</string>
-        <key>StandardOutPath</key>
-        <string>$LOGS_DIR/caddy-process.log</string>
-</dict>
-</plist>
-EOM
-        launchctl load "$caddy_plist_path"
-        launchctl start com.cove.caddy
-    fi
-
-    if [ "$OS" == "linux" ]; then
-        $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
-        $SUDO_CMD "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
-    fi
+    start_caddy_service
 
     if [ $? -eq 0 ]; then
         echo ""
@@ -4262,11 +4926,13 @@ cove_pull() {
     local remote_path
     remote_path=$(gum input --value "public/" --prompt "Path to WordPress Root: ")
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
-    
+    local remote_path_q
+    remote_path_q=$(shell_quote "$remote_path")
+
     # --- 2. Validate Remote Site ---
     log_step "Validating remote WordPress site..."
     local remote_url
-    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path && wp option get home 2>/dev/null")
+    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path_q && wp option get home 2>/dev/null")
     domain=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//')
     
     if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
@@ -4326,7 +4992,7 @@ cove_pull() {
     fi
 
     local backup_url
-    backup_url=$(ssh $ssh_opts $remote_ssh "curl -sL https://captaincore.io/do | bash -s -- backup $remote_path --quiet $backup_extra_args")
+    backup_url=$(ssh $ssh_opts $remote_ssh "curl -sL https://captaincore.io/do | bash -s -- backup $remote_path_q --quiet $backup_extra_args")
 
     if [[ -z "$backup_url" || ! "$backup_url" == *.zip ]]; then
         log_error "Failed to generate backup or received an invalid backup URL."
@@ -4376,7 +5042,9 @@ EOM
     # --- 7. Cleanup ---
     log_step "Cleaning up remote backup file..."
     local filename="${backup_url##*/}"
-    ssh $ssh_opts $remote_ssh "rm -f $remote_path/${filename}" 2>/dev/null
+    local remote_backup_q
+    remote_backup_q=$(shell_quote "$remote_path/$filename")
+    ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q" 2>/dev/null
     log_success "Cleanup complete."
  
     # --- 8. Finalize ---
@@ -4435,11 +5103,13 @@ cove_push() {
     local remote_path
     remote_path=$(gum input --value "public/" --prompt "Path to Remote WordPress Root: ")
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
-    
+    local remote_path_q
+    remote_path_q=$(shell_quote "$remote_path")
+
     # --- 3. Validate Remote Site ---
     log_step "Validating remote WordPress site..."
     local remote_url
-    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path && wp option get home 2>/dev/null")
+    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path_q && wp option get home 2>/dev/null")
     
     if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
         log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
@@ -4464,9 +5134,14 @@ cove_push() {
     size=$(ls -lh "$backup_filename" | awk '{print $5}')
     log_success "Local backup created: ${backup_filename} ($size)"
 
+    local backup_filename_q
+    backup_filename_q=$(shell_quote "$backup_filename")
+    local remote_backup_q
+    remote_backup_q=$(shell_quote "$remote_path/$backup_filename")
+
     # --- 6. Upload Backup ---
     log_step "Uploading backup to remote server..."
-    if ! cat "$backup_filename" | ssh $ssh_opts $remote_ssh "cat > '$remote_path/$backup_filename'"; then
+    if ! cat "$backup_filename" | ssh $ssh_opts $remote_ssh "cat > $remote_backup_q"; then
         # Clean up local backup on failure
         rm -f "$backup_filename"
         log_error "Failed to upload backup."
@@ -4475,7 +5150,7 @@ cove_push() {
 
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
-    if ! ssh $ssh_opts $remote_ssh "cd '$remote_path' && curl -sL https://captaincore.io/do | bash -s -- migrate --url='$backup_filename' --update-urls"; then
+    if ! ssh $ssh_opts $remote_ssh "cd $remote_path_q && curl -sL https://captaincore.io/do | bash -s -- migrate --url=$backup_filename_q --update-urls"; then
         log_error "The remote migration script failed to execute correctly."
     fi
     log_success "Remote restore complete."
@@ -4483,7 +5158,7 @@ cove_push() {
     # --- 8. Cleanup ---
     log_step "Cleaning up backup files..."
     rm -f "$backup_filename"
-    ssh $ssh_opts $remote_ssh "rm -f '$remote_path/$backup_filename'"
+    ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q"
     log_success "Cleanup complete."
 
     # --- 9. Finalize ---
@@ -4556,7 +5231,13 @@ cove_rename() {
         old_db_name=$(echo "cove_$old_name" | tr -c '[:alnum:]_' '_')
         local new_db_name
         new_db_name=$(echo "cove_$new_name" | tr -c '[:alnum:]_' '_')
-        local temp_sql_dump="/tmp/${old_db_name}.sql"
+        local temp_sql_dump
+        temp_sql_dump=$(mktemp) || {
+            gum style --foreground red "❌ Error: Could not create a temporary file for the database dump."
+            mv "$new_site_dir" "$old_site_dir"
+            exit 1
+        }
+        trap 'rm -f "$temp_sql_dump"' EXIT
 
         echo "   - Backing up old database '$old_db_name'..."
         if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$old_db_name" > "$temp_sql_dump"; then
@@ -4568,7 +5249,6 @@ cove_rename() {
         echo "   - Creating and importing to new database '$new_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db_name" < "$temp_sql_dump"
-        rm "$temp_sql_dump"
 
         echo "   - Updating wp-config.php..."
         (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet)
