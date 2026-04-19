@@ -15,10 +15,16 @@ cove_disable() {
 
     # Stop services on Linux
     if [ "$OS" == "linux" ]; then
+        # Stop FrankenPHP — Cove runs it as the user (v1.10+) or as root
+        # (pre-1.10); try both so upgrades don't leave a stray process behind.
+        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+            || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+            || true
+
         # Get the correct MariaDB service name
         local mariadb_service
         mariadb_service=$(get_mariadb_service_name)
-        
+
         echo "   - Stopping MariaDB ($mariadb_service)..."
         $SUDO_CMD systemctl stop "$mariadb_service" &>/dev/null
         echo "   - Stopping Mailpit..."

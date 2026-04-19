@@ -343,6 +343,30 @@ cove_install() {
             gum style --foreground yellow "   Try: sudo apt install php-zts-mysqli (for apt)"
             gum style --foreground yellow "   Or:  sudo dnf install php-zts-mysqli (for dnf)"
         fi
+
+        # Let FrankenPHP bind ports 80/443 as the user. Without this cap,
+        # Cove would need to sudo-start the server, which makes every
+        # dashboard-triggered file (sites, lock dirs, pidfile) root-owned.
+        if command -v setcap &>/dev/null; then
+            local fp_bin
+            fp_bin=$(command -v frankenphp)
+            if [ -n "$fp_bin" ]; then
+                echo "🔐 Granting FrankenPHP cap_net_bind_service..."
+                $SUDO_CMD setcap 'cap_net_bind_service=+ep' "$fp_bin" 2>/dev/null || \
+                    gum style --foreground yellow "⚠️ setcap failed — Cove may fall back to needing sudo."
+            fi
+        fi
+
+        # The apt `frankenphp` package ships a systemd unit that runs as
+        # user `frankenphp` reading /etc/frankenphp/Caddyfile. That contends
+        # with Cove for ports 80/443. Mask it so it stays out of our way.
+        if systemctl list-unit-files frankenphp.service &>/dev/null \
+            && systemctl cat frankenphp.service 2>/dev/null | grep -q '^\[Unit\]'; then
+            echo "🚫 Masking conflicting apt frankenphp.service..."
+            $SUDO_CMD systemctl stop frankenphp.service &>/dev/null || true
+            $SUDO_CMD systemctl disable frankenphp.service &>/dev/null || true
+            $SUDO_CMD systemctl mask frankenphp.service &>/dev/null || true
+        fi
     fi
 
     # MariaDB - Database server

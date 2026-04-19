@@ -885,8 +885,22 @@ EOM
     fi
 
     if [ "$OS" == "linux" ]; then
-        $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
-        $SUDO_CMD "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
+        # Run FrankenPHP as the current user. `cove install` applies
+        # cap_net_bind_service to the binary so it can bind 80/443 without
+        # sudo. Prior versions sudo-started the server, which made all
+        # dashboard-created sites and the reload lock root-owned.
+        #
+        # If an older sudo-started instance is still running, a plain `stop`
+        # can't reach it. Retry through sudo -n so upgrades don't wedge.
+        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null \
+            || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null \
+            || true
+        # A root-owned pidfile left behind by pre-1.10 would block the new
+        # user-owned process; remove it before the fresh start.
+        if [ -e "$COVE_DIR/caddy.pid" ] && [ ! -w "$COVE_DIR/caddy.pid" ]; then
+            $SUDO_CMD -n rm -f "$COVE_DIR/caddy.pid" 2>/dev/null || true
+        fi
+        "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
     fi
 }
 
@@ -1181,7 +1195,10 @@ EOM
     # With hundreds of sites the Caddyfile adapt takes a few seconds — racing
     # the exit against a subsequent curl produced TLS internal errors.
     if is_caddy_running; then
-        if $SUDO_CMD "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log"; then
+        # Reload talks to the admin API on localhost:2019 and doesn't need
+        # root. Dropping sudo here keeps the caller (incl. the dashboard's
+        # shell_exec) running as the invoking user.
+        if "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log"; then
             echo "✅ Caddy configuration reloaded."
         else
             gum style --foreground red "❌ Caddy reload failed. See $LOGS_DIR/caddy-reload.log for details."
@@ -1299,7 +1316,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
         case 'delete_site':
             if (!empty($site_name)) {
-                $command = sprintf('HOME=%s %s delete %s --force 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
+                // --no-reload: cove_delete otherwise auto-reloads Caddy after
+                // each delete to prevent zombie log-dir skeletons from being
+                // recreated. The dashboard batches one reload after the whole
+                // delete queue drains, so skip per-item reloads here.
+                $command = sprintf('HOME=%s %s delete %s --force --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
             } else { $response['message'] = 'Site name not provided for deletion.'; }
             break;
         case 'get_login_link':

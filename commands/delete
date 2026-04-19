@@ -9,9 +9,11 @@ cove_delete() {
     done
 
     local force_delete=false
-    if [ "$2" == "--force" ]; then
-        force_delete=true
-    fi
+    local no_reload=false
+    for arg in "$@"; do
+        [ "$arg" = "--force" ] && force_delete=true
+        [ "$arg" = "--no-reload" ] && no_reload=true
+    done
 
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir" ]; then
@@ -44,7 +46,17 @@ cove_delete() {
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
     fi
 
-    rm -rf "$site_dir"
+    # Don't trust the bare rm — a pre-1.10 dashboard-created site would be
+    # root-owned (sudo-started FrankenPHP), and a silent rm failure would
+    # previously still report "removed" while leaving the dir on disk. Try
+    # sudo -n as a fallback, then surface the failure to the caller.
+    if ! rm -rf "$site_dir" 2>/dev/null; then
+        if ! $SUDO_CMD -n rm -rf "$site_dir" 2>/dev/null; then
+            gum style --foreground red "❌ Failed to delete '$site_dir' — permission denied."
+            gum style --foreground yellow "   Run: sudo rm -rf '$site_dir'"
+            exit 1
+        fi
+    fi
     echo "✅ Directory deleted."
 
     # --- Delete Custom Caddy Directives ---
@@ -82,6 +94,15 @@ cove_delete() {
         else
             gum style --foreground yellow "   - ⚠️ Skipped /etc/hosts cleanup (sudo unavailable from this context). Run 'cove reload' from a terminal to sync."
         fi
+    fi
+
+    # Regenerate the Caddyfile so Caddy stops holding log file handles for
+    # this site. Without this, a later Caddy restart would re-create the
+    # deleted directory skeleton from the stale Caddyfile entry. The
+    # dashboard passes --no-reload because it batches one reload per
+    # delete queue drain.
+    if [ "$no_reload" = false ]; then
+        regenerate_caddyfile &>/dev/null
     fi
 
     echo "✅ Site '$site_name.localhost' has been removed."

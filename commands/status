@@ -5,13 +5,12 @@ cove_status() {
     local mariadb_status="❌ Stopped"
     local mailpit_status="❌ Stopped"
 
-    # Check Caddy status by PID file
-    if [ -f "$COVE_DIR/caddy.pid" ]; then
-        local caddy_pid
-        caddy_pid=$(cat "$COVE_DIR/caddy.pid" 2>/dev/null)
-        if [ -n "$caddy_pid" ] && ps -p "$caddy_pid" > /dev/null 2>&1; then
-            caddy_status="✅ Running"
-        fi
+    # Probe Caddy's admin endpoint. The prior pidfile check fell over on
+    # Linux where `sudo frankenphp start` left the pidfile root-owned (0600),
+    # so the user reading it as austin got "" and the status falsely showed
+    # Stopped. The TCP probe is readable by any local user.
+    if is_caddy_running; then
+        caddy_status="✅ Running"
     fi
 
     # Check MariaDB and Mailpit status on MacOS

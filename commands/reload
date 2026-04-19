@@ -21,11 +21,15 @@ cove_reload() {
             touch "$pending"
             return 0
         fi
-        # Holder PID is dead — reclaim.
-        rm -rf "$lock_dir"
+        # Holder PID is dead — reclaim. A pre-1.10 dashboard-fired reload ran
+        # as root (FrankenPHP was sudo-started), so the lock dir may be owned
+        # by root even though we're running as the user. Try a sudo -n fallback
+        # so a fresh install doesn't inherit a permanently-wedged lock.
+        rm -rf "$lock_dir" 2>/dev/null || $SUDO_CMD -n rm -rf "$lock_dir" 2>/dev/null || true
         if ! mkdir "$lock_dir" 2>/dev/null; then
-            # Lost the race to another reclaimer; defer to them.
-            touch "$pending"
+            # Lost the race to another reclaimer (or still couldn't clear it);
+            # defer to them.
+            touch "$pending" 2>/dev/null || true
             return 0
         fi
     fi
