@@ -17,6 +17,7 @@ cove_ports() {
     local explicit_https=""
     local skip_urls=false
     local dry_run=false
+    local auto_yes=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -36,17 +37,28 @@ cove_ports() {
                 dry_run=true
                 shift
                 ;;
+            --yes|-y|--force)
+                auto_yes=true
+                shift
+                ;;
             -h|--help)
                 display_command_help ports
                 exit 0
                 ;;
             *)
                 gum style --foreground red "❌ Unknown option: $1"
-                echo "Usage: cove ports [--http PORT] [--https PORT] [--skip-urls] [--dry-run]"
+                echo "Usage: cove ports [--http PORT] [--https PORT] [--skip-urls] [--dry-run] [--yes]"
                 exit 1
                 ;;
         esac
     done
+
+    # Non-interactive shells (PHP shell_exec, ssh piped stdin, systemd) have
+    # no TTY; gum confirm aborts there with "could not open a new TTY". Auto-
+    # promote to --yes so the caller's flags are respected.
+    if [ ! -t 0 ]; then
+        auto_yes=true
+    fi
 
     local original_http="$HTTP_PORT"
     local original_https="$HTTPS_PORT"
@@ -184,12 +196,14 @@ cove_ports() {
 
     # --- Confirm ---
     echo ""
-    if ! gum confirm "Proceed with the port change?"; then
-        # Revert globals so nothing leaks to the caller
-        HTTP_PORT="$original_http"
-        HTTPS_PORT="$original_https"
-        echo "🚫 Cancelled."
-        exit 0
+    if [ "$auto_yes" = false ]; then
+        if ! gum confirm "Proceed with the port change?"; then
+            # Revert globals so nothing leaks to the caller
+            HTTP_PORT="$original_http"
+            HTTPS_PORT="$original_https"
+            echo "🚫 Cancelled."
+            exit 0
+        fi
     fi
 
     # --- Commit ---
