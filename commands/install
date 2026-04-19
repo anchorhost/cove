@@ -392,8 +392,8 @@ memory_limit = 1G
 display_errors = 0
 error_reporting = 6143
 INI
-    echo "🗃️ Downloading Adminer 5.4.1..."
-    curl -sL "https://github.com/vrana/adminer/releases/download/v5.4.1/adminer-5.4.1.php" -o "$ADMINER_DIR/adminer-core.php"
+    echo "🗃️ Downloading Adminer 5.4.2..."
+    curl -sL "https://github.com/vrana/adminer/releases/download/v5.4.2/adminer-5.4.2.php" -o "$ADMINER_DIR/adminer-core.php"
     echo "⚙️ Creating Adminer autologin..."
     # Create a custom index.php to handle autologin
     # Note: Adminer 5.x uses the Adminer\Adminer namespace
@@ -416,6 +416,17 @@ function adminer_object() {
             return ['localhost', null, null];
         }
         function login($login, $password) { return true; }
+        function head($title = null) {
+            // Inject the Cove theme toggle. Inline init runs before adminer.css
+            // applies so the saved choice (or system preference) is honored
+            // without a theme flash on load.
+            $nonce = \Adminer\nonce();
+            $init = "(function(){try{var s=localStorage.getItem('cove-adminer-theme');var t=(s==='dark'||s==='light')?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();";
+            echo "<script{$nonce}>{$init}</script>\n";
+            $v = @filemtime(__DIR__ . '/adminer.js') ?: 1;
+            echo "<script src='adminer.js?v={$v}'{$nonce}></script>\n";
+            return true;
+        }
     }
     return new AdminerCoveLogin();
 }
@@ -423,8 +434,9 @@ function adminer_object() {
 include "./adminer-core.php";
 EOM
 
-    echo "🎨 Downloading Adminer Catppuccin theme..."
+    echo "🎨 Downloading Adminer Cove theme..."
     curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.css" -o "$ADMINER_DIR/adminer.css"
+    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.js" -o "$ADMINER_DIR/adminer.js"
 
     echo "✨ Downloading Whoops error handler..."
     rm -rf "$APP_DIR/whoops" # Remove any old versions first
