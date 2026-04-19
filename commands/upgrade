@@ -278,6 +278,14 @@ cove_upgrade() {
         fi
     fi
 
+    # Always refresh the Cove Adminer theme + entry point. Pre-1.10 installs
+    # shipped the Catppuccin CSS and a bare index.php without the head()
+    # hook — without this step upgraders would keep the old UI even after
+    # adminer-core.php gets the latest version.
+    echo ""
+    echo "🎨 Refreshing Cove Adminer theme..."
+    deploy_adminer_theme
+
     # --- Reload to pull in any UI updates ---
     # Invoke the on-disk binary so a freshly-upgraded script's new functions are used
     # (the currently-running process still holds the pre-upgrade functions in memory).

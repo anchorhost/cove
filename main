@@ -838,6 +838,58 @@ is_caddy_running() {
     (echo > /dev/tcp/127.0.0.1/2019) &>/dev/null
 }
 
+# Write the Cove-themed Adminer entry point (index.php with the head() hook
+# that injects the theme toggle, plus autologin) and refresh the theme
+# assets (adminer.css, adminer.js) from GitHub. Shared by cove_install
+# (initial deploy) and cove_upgrade (so upgraders pick up theme changes
+# without a reinstall). Idempotent — overwrites existing files.
+deploy_adminer_theme() {
+    local adminer_dir="${1:-$ADMINER_DIR}"
+    mkdir -p "$adminer_dir"
+
+    echo "⚙️ Writing Adminer entry point..."
+    cat > "$adminer_dir/index.php" << 'ADMINER_INDEX_EOF'
+<?php
+// This is the custom entry point for Adminer with autologin.
+function adminer_object() {
+    // Adminer 5.x uses the Adminer namespace
+    class AdminerCoveLogin extends Adminer\Adminer {
+        function name() { return 'Cove DB Manager'; }
+        function permanentLogin($i = false) { return "cove-local-development-key"; }
+        function credentials() {
+            $configFile = getenv('HOME') . '/Cove/config';
+            if (file_exists($configFile)) {
+                $config = parse_ini_file($configFile);
+                $db_user = $config['DB_USER'] ?? null;
+                $db_pass = $config['DB_PASSWORD'] ?? null;
+                return ['localhost', $db_user, $db_pass];
+            }
+            return ['localhost', null, null];
+        }
+        function login($login, $password) { return true; }
+        function head($title = null) {
+            // Inject the Cove theme toggle. Inline init runs before adminer.css
+            // applies so the saved choice (or system preference) is honored
+            // without a theme flash on load.
+            $nonce = \Adminer\nonce();
+            $init = "(function(){try{var s=localStorage.getItem('cove-adminer-theme');var t=(s==='dark'||s==='light')?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();";
+            echo "<script{$nonce}>{$init}</script>\n";
+            $v = @filemtime(__DIR__ . '/adminer.js') ?: 1;
+            echo "<script src='adminer.js?v={$v}'{$nonce}></script>\n";
+            return true;
+        }
+    }
+    return new AdminerCoveLogin();
+}
+// Include the original Adminer core file to run the application.
+include "./adminer-core.php";
+ADMINER_INDEX_EOF
+
+    echo "🎨 Downloading Cove Adminer theme..."
+    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.css" -o "$adminer_dir/adminer.css"
+    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.js"  -o "$adminer_dir/adminer.js"
+}
+
 # Repair ownership of ~/Cove state that a pre-1.10 root-run FrankenPHP may
 # have left owned by root. The most user-visible symptom is the size cache
 # (~/Cove/cache/site-sizes.json) becoming unwritable — refresh_sizes computes

@@ -418,49 +418,9 @@ error_reporting = 6143
 INI
     echo "🗃️ Downloading Adminer 5.4.2..."
     curl -sL "https://github.com/vrana/adminer/releases/download/v5.4.2/adminer-5.4.2.php" -o "$ADMINER_DIR/adminer-core.php"
-    echo "⚙️ Creating Adminer autologin..."
-    # Create a custom index.php to handle autologin
-    # Note: Adminer 5.x uses the Adminer\Adminer namespace
-    cat > "$ADMINER_DIR/index.php" << 'EOM'
-<?php
-// This is the custom entry point for Adminer with autologin.
-function adminer_object() {
-    // Adminer 5.x uses the Adminer namespace
-    class AdminerCoveLogin extends Adminer\Adminer {
-        function name() { return 'Cove DB Manager'; }
-        function permanentLogin($i = false) { return "cove-local-development-key"; }
-        function credentials() {
-            $configFile = getenv('HOME') . '/Cove/config';
-            if (file_exists($configFile)) {
-                $config = parse_ini_file($configFile);
-                $db_user = $config['DB_USER'] ?? null;
-                $db_pass = $config['DB_PASSWORD'] ?? null;
-                return ['localhost', $db_user, $db_pass];
-            }
-            return ['localhost', null, null];
-        }
-        function login($login, $password) { return true; }
-        function head($title = null) {
-            // Inject the Cove theme toggle. Inline init runs before adminer.css
-            // applies so the saved choice (or system preference) is honored
-            // without a theme flash on load.
-            $nonce = \Adminer\nonce();
-            $init = "(function(){try{var s=localStorage.getItem('cove-adminer-theme');var t=(s==='dark'||s==='light')?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();";
-            echo "<script{$nonce}>{$init}</script>\n";
-            $v = @filemtime(__DIR__ . '/adminer.js') ?: 1;
-            echo "<script src='adminer.js?v={$v}'{$nonce}></script>\n";
-            return true;
-        }
-    }
-    return new AdminerCoveLogin();
-}
-// Include the original Adminer core file to run the application.
-include "./adminer-core.php";
-EOM
-
-    echo "🎨 Downloading Adminer Cove theme..."
-    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.css" -o "$ADMINER_DIR/adminer.css"
-    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.js" -o "$ADMINER_DIR/adminer.js"
+    # Entry point + theme assets. Keep in sync with cove_upgrade so upgraders
+    # pick up index.php/head() and CSS/JS changes without a full reinstall.
+    deploy_adminer_theme
 
     echo "✨ Downloading Whoops error handler..."
     rm -rf "$APP_DIR/whoops" # Remove any old versions first
