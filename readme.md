@@ -1,13 +1,13 @@
 # Cove 🏝️
 
-**Local Development Powered by Caddy**
+**The calmest way to run local WordPress.**
 
-Cove is a command-line tool that simplifies the creation and management of local development websites. It leverages Caddy, MariaDB, and Mailpit to provide a robust environment for both WordPress and plain static sites.
+Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one-click admin login, zero Docker. It bundles Caddy, FrankenPHP, MariaDB, and Mailpit into one self-contained toolchain for WordPress and plain static sites.
 
 ## ✨ Features
 
   * **Simple CLI**: Manage everything from your terminal with a handful of short commands.
-  * **Web Dashboard**: A PicoCSS-styled GUI at `https://cove.localhost` to view, add, and delete sites, plus one-click admin logins.
+  * **Web Dashboard**: A built-in GUI at `https://cove.localhost` to view, filter, sort, add, and delete sites — with one-click admin logins, disk-size totals, and quick links to Adminer and Mailpit.
   * **Automatic HTTPS**: Every site is served over HTTPS using Caddy's internal CA — no cert wrangling.
   * **WordPress & Static Sites**: Spin up a fresh WordPress install or a plain static site with one command.
   * **WordPress Migration**: Pull a remote site down via SSH (`cove pull`) or push a local site up (`cove push`).
@@ -39,6 +39,12 @@ bash <(curl -sL https://cove.run/install-cove.sh)
 ```
 
 On macOS, the installer will offer to install Homebrew first if it's not already present. On Linux, make sure `curl` is installed before running it.
+
+To preview an unreleased build from the `main` branch — useful for verifying a fix before it's tagged — pass `--main`:
+
+```bash
+bash <(curl -sL https://cove.run/install-cove.sh) --main
+```
 
 ## 🚀 Quick Start
 
@@ -195,13 +201,14 @@ cove tailscale disable
 
 The web dashboard, available at `https://cove.localhost` (or `https://cove.localhost:8453` when you're on alternative ports), provides a quick and easy way to:
 
-  * View all your managed sites, with clickable domains that open each site in a new tab.
+  * View every site Cove manages, with per-site disk usage and a "last modified" timestamp.
+  * Filter by name (press `/` from anywhere) or by type (click a `WP` / `STATIC` pill).
+  * Sort by name, size, or last modified — one click on the `sort:` pill cycles modes.
   * Add new WordPress or plain sites via a simple form.
   * Delete existing sites with one click (with a confirmation prompt).
   * Generate a one-time admin login URL for any WordPress site — no password needed.
-  * Access quick links to Adminer and Mailpit.
-  * See your shared MariaDB connection credentials at a glance.
-  * Toggle between light and dark themes (your choice is remembered).
+  * Access quick links to Adminer and Mailpit, and view your shared MariaDB credentials.
+  * Toggle between light and dark themes with a cross-fading moon/sun button (your choice is remembered).
 
 ## 🛠️ Development
 
