@@ -51,6 +51,10 @@ cove_add() {
     echo "➕ Creating $site_type site: $full_hostname"
     mkdir -p "$site_dir/public" "$site_dir/logs"
 
+    if [ "$site_type" == "plain" ]; then
+        write_plain_site_landing "$site_dir/public"
+    fi
+
     local admin_user="admin"
     local admin_pass
     local one_time_login_url=""
