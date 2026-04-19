@@ -81,14 +81,59 @@ EOM
         
         $SUDO_CMD mv "$temp_service" "$service_path"
         $SUDO_CMD chmod 644 "$service_path"
-        
-        # Reload systemd, then enable and start the service
+
+        # --- FrankenPHP / Cove systemd unit ---
+        # Mirrors the mailpit pattern so the stack survives a reboot. The
+        # apt frankenphp.service was masked during `cove install` so there
+        # is no name conflict; we use `cove.service` to keep the scope
+        # clear ("this is Cove's managed FrankenPHP").
+        local cove_service_path="/etc/systemd/system/cove.service"
+        local frankenphp_bin
+        frankenphp_bin=$(command -v "$CADDY_CMD")
+
+        echo "   - Generating Cove FrankenPHP service file..."
+        local temp_cove_service
+        temp_cove_service=$(mktemp)
+        cat > "$temp_cove_service" << EOM
+[Unit]
+Description=FrankenPHP for Cove
+After=network.target mariadb.service
+Wants=mariadb.service
+
+[Service]
+Type=simple
+ExecStart=$frankenphp_bin run --config $CADDYFILE_PATH --pidfile $COVE_DIR/caddy.pid
+ExecReload=$frankenphp_bin reload --config $CADDYFILE_PATH --address localhost:2019
+Restart=on-failure
+RestartSec=2s
+User=$current_user
+Environment=HOME=/home/$current_user
+Environment=PHPRC=$PHP_INI_FILE
+
+[Install]
+WantedBy=multi-user.target
+EOM
+
+        $SUDO_CMD mv "$temp_cove_service" "$cove_service_path"
+        $SUDO_CMD chmod 644 "$cove_service_path"
+
+        # Reload systemd, then enable and start both Cove-managed services
         $SUDO_CMD systemctl daemon-reload
         $SUDO_CMD systemctl enable mailpit &>/dev/null
         $SUDO_CMD systemctl restart mailpit
+        $SUDO_CMD systemctl enable cove.service &>/dev/null
+        # Stop any ad-hoc frankenphp started by a pre-1.10 cove_enable so
+        # systemctl can take ownership of the listening sockets cleanly.
+        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+            || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+            || true
+        $SUDO_CMD systemctl restart cove.service
     fi
-    
-    start_caddy_service
+
+    # Skip the ad-hoc Caddy start on Linux — systemd handles it now.
+    if [ "$OS" != "linux" ]; then
+        start_caddy_service
+    fi
 
     if [ $? -eq 0 ]; then
         echo ""

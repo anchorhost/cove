@@ -15,9 +15,11 @@ cove_disable() {
 
     # Stop services on Linux
     if [ "$OS" == "linux" ]; then
-        # Stop FrankenPHP — Cove runs it as the user (v1.10+) or as root
-        # (pre-1.10); try both so upgrades don't leave a stray process behind.
-        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+        # v1.10+: FrankenPHP runs as cove.service under systemd. Try that
+        # first; fall back to `frankenphp stop` in case a user skipped
+        # cove_enable since the upgrade and still has an ad-hoc instance.
+        $SUDO_CMD systemctl stop cove.service &>/dev/null \
+            || "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
             || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
             || true
 

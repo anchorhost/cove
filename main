@@ -904,22 +904,23 @@ EOM
     fi
 
     if [ "$OS" == "linux" ]; then
-        # Run FrankenPHP as the current user. `cove install` applies
-        # cap_net_bind_service to the binary so it can bind 80/443 without
-        # sudo. Prior versions sudo-started the server, which made all
-        # dashboard-created sites and the reload lock root-owned.
-        #
-        # If an older sudo-started instance is still running, a plain `stop`
-        # can't reach it. Retry through sudo -n so upgrades don't wedge.
-        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null \
-            || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null \
-            || true
-        # A root-owned pidfile left behind by pre-1.10 would block the new
-        # user-owned process; remove it before the fresh start.
-        if [ -e "$COVE_DIR/caddy.pid" ] && [ ! -w "$COVE_DIR/caddy.pid" ]; then
-            $SUDO_CMD -n rm -f "$COVE_DIR/caddy.pid" 2>/dev/null || true
+        # v1.10+: Caddy runs as cove.service under systemd (installed by
+        # cove_enable), so it survives reboots. Prefer systemctl when the
+        # unit is present; fall back to an ad-hoc foreground start only if
+        # someone invoked this before cove_enable wrote the unit.
+        if systemctl list-unit-files cove.service &>/dev/null 2>&1 \
+            && systemctl cat cove.service &>/dev/null 2>&1; then
+            $SUDO_CMD systemctl restart cove.service
+        else
+            # A pre-1.10 root-owned pidfile would block a user-run start.
+            if [ -e "$COVE_DIR/caddy.pid" ] && [ ! -w "$COVE_DIR/caddy.pid" ]; then
+                $SUDO_CMD -n rm -f "$COVE_DIR/caddy.pid" 2>/dev/null || true
+            fi
+            "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+                || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+                || true
+            "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
         fi
-        "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
     fi
 }
 
