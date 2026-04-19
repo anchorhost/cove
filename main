@@ -983,6 +983,9 @@ regenerate_caddyfile() {
         gum style --foreground red "❌ Mailpit is not installed. Please run 'cove install' successfully first."
         return 1
     fi
+    # Ensure the user-owned PHP session dir referenced by the Caddyfile's
+    # `php_ini session.save_path` exists before FrankenPHP tries to use it.
+    mkdir -p "$COVE_DIR/cache/sessions" 2>/dev/null
     local mailpit_path
     mailpit_path=$(command -v mailpit)
 
@@ -1007,6 +1010,12 @@ ${port_directives}    frankenphp {
         php_ini memory_limit $(cove_ini_get memory_limit 1G)
         php_ini upload_max_filesize $(cove_ini_get upload_max_filesize 1G)
         php_ini post_max_size $(cove_ini_get post_max_size 1G)
+        # User-owned session dir. Linux apt's php.ini points sessions at
+        # /var/lib/php-zts/session (owned by the frankenphp user); since
+        # Cove runs FrankenPHP as the invoking user, that path is
+        # unwritable and Adminer spams session_start warnings every
+        # request.
+        php_ini session.save_path "$COVE_DIR/cache/sessions"
     }
     order php_server before file_server
     servers {
