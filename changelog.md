@@ -1,5 +1,61 @@
 # Changelog
 
+## [1.10] - 2026-04-20
+
+### ✨ New Features
+
+* **`cove trust` Command:** A one-shot installer that drops Cove's local root certificate into the OS trust store and every NSS database it can find, so Firefox and Chromium stop showing "Not Secure" warnings on `*.localhost` without hand-rolling `certutil` commands.
+    * Wraps `frankenphp trust` for the baseline (macOS login keychain, Linux `/usr/local/share/ca-certificates` + `~/.pki/nssdb` + `~/.mozilla/firefox/*`).
+    * On Linux, auto-installs `libnss3-tools` / `nss-tools` if `certutil` is missing, then walks `~/snap/*/common/.mozilla/firefox/*/cert9.db` and `~/snap/chromium/*` to inject the root into snap-packaged browsers — a path Caddy's built-in scanner doesn't touch.
+    * Idempotent on re-run: existing "Cove Local Authority" entries are removed before the current root is re-added, so rotating the Caddy CA doesn't stack stale copies.
+    * `cove install` calls `cove_trust` at the end of first setup, so a fresh install is trusted everywhere with no extra step.
+* **`cove memory` Command:** A cross-cutting view + editor for PHP `memory_limit` everywhere it can bite you.
+    * `cove memory` prints a side-by-side report: Cove's own `~/Cove/php.ini`, the `memory_limit` baked into the Caddyfile's `frankenphp` block, every `php` binary on `PATH` (version + loaded ini + live value), and `wp-cli`'s effective PHP.
+    * `cove memory set <value>` writes `memory_limit`, `upload_max_filesize`, and `post_max_size` into Cove's ini (values accept `512M`, `2G`, or `-1` for unlimited), regenerates the Caddyfile so FrankenPHP picks up the new limits, then walks external inis on `PATH` and offers to update each one individually.
+    * New `cove_ini_get` helper in `main` makes Cove's ini the single source of truth: `regenerate_caddyfile` reads the current values at render time instead of hardcoding `512M`.
+    * `cove memory set --yes` accepts every writable ini non-interactively for scripted fleet updates.
+* **Cove-Branded Landing Page for Plain Sites:** `cove add --plain` now writes a designed `index.php` that matches the dashboard and landing page palette — Fraunces italic headline, Geist/Geist Mono body, teal accent, and the cove brand mark — instead of leaving an empty directory that serves a 404. The page reads `$_SERVER['HTTP_HOST']` and `__FILE__` at request time, so it self-identifies no matter which hostname or mapping serves it, and includes a `~`-shortened absolute path so users can jump straight to the file they need to edit.
+* **Linux `cove.service` Systemd Unit:** `cove enable` now generates `/etc/systemd/system/cove.service` alongside the existing `mailpit.service`, so the whole stack survives a reboot without a manual `cove enable` on each boot.
+    * Runs FrankenPHP as the invoking user (not root), `Restart=on-failure` with a 2s backoff, and passes `PHPRC` + `HOME` so `php-cli` sees the same ini Cove writes.
+    * `cove enable` stops any ad-hoc FrankenPHP left over from a pre-1.10 install before `systemctl` takes the listening sockets, and `cove disable` now stops `cove.service` first (with a fallback to `frankenphp stop` for users who never re-ran `cove enable`).
+    * `cove install` masks the distro-packaged `frankenphp.service` that ships with the apt package — previously that unit would fight Cove for ports 80/443.
+
+### 🛠️ Improvements & Changes
+
+* **Adminer 5.4.2 with a Native Cove Skin:** The old Catppuccin-derived theme has been replaced with a full redesign matching the dashboard and landing page — warm cream + teal palette in light mode, dark olive + teal in dark mode, Fraunces/Geist/Geist Mono typography.
+    * Explicit light/dark toggle in the Adminer header, persisted in `localStorage` and applied synchronously via a head-injected inline script so there's no theme flash on load.
+    * Drag-to-resize sidebar (persisted, clamped 180–480px) so wide table names don't truncate.
+    * Cove's `AdminerCoveLogin` class now overrides `head()` to inject the pre-paint theme script and `adminer.js` via `\Adminer\nonce()`, so the CSP nonce the Adminer core emits lines up with Cove's asset.
+    * Stale Catppuccin preview screenshots (`adminer-theme/assets/*.webp`) removed from the repo.
+* **Dashboard — Post-Create Alerts, Spinner, and Smart Errors:** After creating a site the dashboard now shows a persistent dismissible alert row with either "Log in to admin" (WP) or "Open site" (plain), so the one-time login URL is one click away instead of buried in the toast that fades in 3.5s.
+    * Inline spinner on the create button plus an animated teal progress stripe across the top of the add-row while `cove add` is running (site creation takes 5–10s; the extra cue makes the wait feel intentional).
+    * New-site row now carries the correct `size_bytes` from the server's inline `du -sk` measurement, so the size column shows "4.0 KB" immediately instead of `—` until the next refresh.
+    * Backend translates known `cove add` failure signatures into user-facing messages ("Site name is taken", "That name is reserved", "Invalid site name", "WordPress installation failed — check the logs") instead of a flat "An error occurred."
+    * Dashboard header pills for `db` and `mail` now carry inline SVG icons (barrel database, envelope) that inherit `currentColor` so they tint correctly in both themes.
+    * Inline `data-theme` bootstrap runs in `<head>` before any CSS paints, eliminating the first-frame FOUC on cold loads.
+* **`cove upgrade` Now Refreshes the Full Cove Surface:** Pre-1.10 `cove upgrade` only replaced `cove.sh` + `frankenphp` + `adminer-core.php`, which left upgraders stuck with the old Catppuccin CSS, the old Adminer `index.php`, and whatever `memory_limit` they'd set in the past.
+    * Extracted a shared `deploy_adminer_theme` helper used by both `cove install` and `cove upgrade`. Upgraders now pick up the new Cove skin, the theme toggle, and the resizable sidebar in a single `cove upgrade` — no reinstall required.
+    * Floors Cove's `memory_limit`/`upload_max_filesize`/`post_max_size` at `1G` (the fresh-install default) but leaves any user-set value `>= 1G` untouched, so a user who bumped to `2G` stays at `2G`.
+    * Runs `cove reload` at the end of the upgrade (via the on-disk binary so the newly-replaced script's functions are in use), so dashboard and Caddyfile changes apply without a second manual step.
+* **Scripted Flags on Confirmation-Only Prompts:** Following the `cove ports --yes` fix, the rest of the confirmation-only prompts now accept `--force` / `--yes` and auto-promote when stdin isn't a TTY, so dashboard-backed and CI-driven use never deadlocks on `gum confirm`.
+    * `cove directive delete <name> [--force]`
+    * `cove proxy add <name> <domain> <target> [--force]` (skips the overwrite confirm)
+    * `cove proxy delete <name> [--force]`
+    * `cove memory set <value> [--yes]` (accepts every writable ini in one shot)
+    * `cove upgrade [--yes]` (skips the prompt shown when the local Adminer version can't be parsed)
+
+### 🐛 Bug Fixes
+
+* **Linux — Pre-1.10 Sites and Reload Lock Were Root-Owned:** Before v1.10, Cove sudo-started FrankenPHP on Linux so it could bind 80/443. Every site created from the dashboard, every `/etc/hosts` edit, the reload lock dir, and the `caddy.pid` file ended up owned by root — which meant a later user-run `cove delete` silently failed (with a success message) and a user-run `cove reload` couldn't reclaim its own lock. v1.10 flips this entirely:
+    * `cove install` runs `setcap 'cap_net_bind_service=+ep'` on the FrankenPHP binary so it can bind low ports as the invoking user, without sudo.
+    * `cove enable` writes `cove.service` with `User=$current_user`, so the systemd-managed process is user-owned going forward.
+    * A new `heal_cove_state_ownership` helper runs at the top of `cove_reload` and repairs ownership of the reload lock, `caddy.pid`, and site directories left behind by a pre-1.10 install.
+    * `cove delete` now falls back to `sudo -n rm -rf` when the site dir is root-owned, and surfaces a real error (with the exact recovery command) instead of silently skipping the delete.
+* **Concurrent Reloads Deadlocking Caddy's Admin Server:** The dashboard fires `reload_server` in the background after every site add/delete (`shell_exec '…&'`), so bulk actions would spawn many concurrent `cove reload` processes. Two parallel `frankenphp reload` calls reliably deadlock Caddy's admin endpoint with its 10s shutdown timeout, wedging further reloads *and* HTTP requests. v1.10 serializes reloads with an atomic lock: first caller does the work, subsequent callers touch a `pending` marker and exit, and the holder re-runs once if the marker is set — so the final state always converges on the latest Sites listing.
+* **Reload Lock TOCTOU Allowing 3+ Concurrent Reloads:** The initial `mkdir + echo > pid` implementation of the reload lock left a window where a competing reload could `cat` an empty `pid` file, decide the holder was dead, and stomp the lock — letting two or more reloads run in parallel and race `create_gui_file`'s `.tmp` writes. Switched to a single lock file opened with `set -C` (noclobber) so the pid is written atomically with the lock's creation. The cleanup trap is also paired with an explicit `rm -f` at function end, since the trap was observed not firing reliably under `shell_exec('cove reload &')`.
+* **Dashboard Deletes Queued During Reload Were Lost:** `processDeleteQueue` would `shift()` every item once, `await apiPost('reload_server')`, and then return — but deletes queued *during* that await would sit forever, because the next `deleteSite()` call short-circuited on `isProcessingQueue`. Wrapped the drain in an outer loop so post-reload enqueues are picked up in the same batch.
+* **Adminer Session Warnings on Every Request:** The apt `php-zts` package defaults `session.save_path` to `/var/lib/php-zts/session`, owned by the `frankenphp` user. Since Cove now runs FrankenPHP as the *invoking* user, that path is unwritable and Adminer emits a `session_start(): Failed to read session data` warning on every request. The Caddyfile now pins `session.save_path` to `~/Cove/cache/sessions/` (auto-created by `regenerate_caddyfile`), so sessions land somewhere the process can actually write to.
+
 ## [1.9] - 2026-04-18
 
 ### ✨ New Features

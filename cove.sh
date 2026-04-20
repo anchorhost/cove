@@ -101,7 +101,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.9"
+COVE_VERSION="1.10"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -149,6 +149,22 @@ config_set() {
     fi
     echo "${key}='${val}'" >> "$tmp"
     mv "$tmp" "$CONFIG_FILE"
+}
+
+# Reads a directive from ~/Cove/php.ini (last-wins, ini-style), trims
+# surrounding whitespace/quotes, and returns the fallback if the key is
+# missing or the ini file doesn't exist yet. Used by regenerate_caddyfile
+# so `cove memory set` only needs to edit one source of truth.
+cove_ini_get() {
+    local key="$1" fallback="$2" val=""
+    if [ -f "$PHP_INI_FILE" ]; then
+        val=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$PHP_INI_FILE" 2>/dev/null \
+            | tail -1 \
+            | sed -E "s|^[[:space:]]*${key}[[:space:]]*=[[:space:]]*||" \
+            | tr -d '"' \
+            | sed -E 's/[[:space:]]+$//')
+    fi
+    echo "${val:-$fallback}"
 }
 
 # Returns the process name(s) listening on $1 for display purposes, or empty
@@ -557,6 +573,134 @@ heredoc
     echo "   - ✅ Injected one-time login MU-plugin."
 }
 
+# Write a Cove-branded landing index.php into a plain site's public dir.
+# The heredoc below is the user's PHP — it reads $_SERVER['HTTP_HOST'] and
+# __FILE__ at request time, so it self-identifies wherever it's served from.
+write_plain_site_landing() {
+    local public_dir="$1"
+    if [ -z "$public_dir" ] || [ ! -d "$public_dir" ]; then
+        return 1
+    fi
+
+read -r -d '' build_landing << 'LANDING_EOF'
+<?php
+$host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+$file = __FILE__;
+$dir  = dirname(__FILE__);
+$home = getenv('HOME') ?: '';
+$display_dir = ($home && str_starts_with($dir, $home)) ? '~' . substr($dir, strlen($home)) : $dir;
+?><!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title><?= htmlspecialchars($host) ?></title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%238bb382'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #fbfaf7; --bg-elev: #ffffff; --bg-sunk: #f4f2ec;
+  --border: #e8e4da; --text: #1a1c1b; --text-soft: #3a3d3a;
+  --muted: #6b6f6a; --dim: #9a9d97;
+  --accent: oklch(62% 0.11 190); --accent-ink: oklch(35% 0.08 190);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1210; --bg-elev: #161a17; --bg-sunk: #0b0e0c;
+    --border: #252925; --text: #edeee9; --text-soft: #c6c9c1;
+    --muted: #8a8e85; --dim: #5d615a;
+    --accent: oklch(72% 0.12 190); --accent-ink: oklch(82% 0.10 190);
+  }
+}
+html { background: var(--bg); }
+body {
+  font-family: 'Geist', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  color: var(--text); background: var(--bg);
+  min-height: 100vh; display: grid; place-items: center;
+  padding: 2rem; -webkit-font-smoothing: antialiased;
+  font-feature-settings: "ss01", "cv11";
+}
+main { max-width: 560px; text-align: center; }
+.mark { width: 56px; height: 56px; margin: 0 auto 1.75rem; display: block; }
+h1 {
+  font-family: 'Fraunces', 'Times New Roman', serif;
+  font-style: italic; font-weight: 500;
+  font-size: clamp(2.25rem, 5vw, 3.25rem);
+  letter-spacing: -0.025em; line-height: 1.02;
+  margin-bottom: 0.55rem;
+}
+.host {
+  font-family: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 0.9rem; color: var(--muted); margin-bottom: 1.75rem;
+}
+p { color: var(--text-soft); line-height: 1.55; font-size: 1.02rem; margin-bottom: 1rem; }
+.path {
+  display: inline-block;
+  font-family: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 0.82rem;
+  padding: 0.45rem 0.8rem;
+  background: var(--bg-sunk); border: 1px solid var(--border);
+  border-radius: 7px; color: var(--text-soft);
+  margin: 0.25rem 0 2rem; word-break: break-all;
+}
+.actions { display: inline-flex; gap: 0.5rem; flex-wrap: wrap; justify-content: center; }
+.pill {
+  display: inline-flex; align-items: center; gap: 0.45em;
+  padding: 0.55rem 1.05rem; border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev); color: var(--text-soft);
+  font-family: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 0.85rem; text-decoration: none;
+  transition: border-color 120ms, color 120ms, background 120ms;
+}
+.pill:hover { border-color: var(--accent); color: var(--accent-ink); background: var(--bg-sunk); }
+.pill.primary { background: var(--accent); border-color: var(--accent); color: #0a1a1c; }
+.pill.primary:hover { filter: brightness(1.08); background: var(--accent); color: #0a1a1c; }
+footer {
+  margin-top: 3rem;
+  font-family: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 0.72rem; color: var(--dim); letter-spacing: 0.05em;
+}
+footer a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--border); }
+footer a:hover { color: var(--text); }
+</style>
+</head>
+<body>
+<main>
+  <svg class="mark" viewBox="0 0 64 64" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <defs><clipPath id="c"><circle cx="32" cy="32" r="28"/></clipPath></defs>
+    <g clip-path="url(#c)">
+      <rect width="64" height="64" fill="#f6f1e8"/>
+      <rect y="32" width="64" height="32" fill="#3a97a9"/>
+      <path d="M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z" fill="#8bb382"/>
+      <line x1="2" y1="32" x2="62" y2="32" stroke="#1c4c58" stroke-width="2.5" fill="none"/>
+      <g stroke="#1c4c58" stroke-width="2.6" fill="none">
+        <path d="M 10 42 Q 18 38, 26 42 T 42 42 T 56 42"/>
+        <path d="M 14 50 Q 22 46, 30 50 T 46 50 T 56 50"/>
+      </g>
+    </g>
+    <circle cx="32" cy="32" r="28" stroke="#1c4c58" stroke-width="3" fill="none"/>
+  </svg>
+  <h1>Hello.</h1>
+  <div class="host"><?= htmlspecialchars($host) ?></div>
+  <p>Your site is ready. Start building by editing files in:</p>
+  <div class="path"><?= htmlspecialchars($display_dir) ?></div>
+  <div class="actions">
+    <a class="pill primary" href="https://cove.localhost/">Cove dashboard</a>
+    <a class="pill" href="https://cove.run/" target="_blank" rel="noopener">cove.run ↗</a>
+  </div>
+  <footer>Served by <a href="https://cove.run" target="_blank" rel="noopener">Cove</a></footer>
+</main>
+</body>
+</html>
+LANDING_EOF
+
+    echo "$build_landing" > "$public_dir/index.php"
+    echo "   - ✅ Wrote Cove landing page."
+}
+
 # Load configuration from ~/Cove/config
 source_config() {
     if [ -f "$CONFIG_FILE" ]; then
@@ -694,6 +838,77 @@ is_caddy_running() {
     (echo > /dev/tcp/127.0.0.1/2019) &>/dev/null
 }
 
+# Write the Cove-themed Adminer entry point (index.php with the head() hook
+# that injects the theme toggle, plus autologin) and refresh the theme
+# assets (adminer.css, adminer.js) from GitHub. Shared by cove_install
+# (initial deploy) and cove_upgrade (so upgraders pick up theme changes
+# without a reinstall). Idempotent — overwrites existing files.
+deploy_adminer_theme() {
+    local adminer_dir="${1:-$ADMINER_DIR}"
+    mkdir -p "$adminer_dir"
+
+    echo "⚙️ Writing Adminer entry point..."
+    cat > "$adminer_dir/index.php" << 'ADMINER_INDEX_EOF'
+<?php
+// This is the custom entry point for Adminer with autologin.
+function adminer_object() {
+    // Adminer 5.x uses the Adminer namespace
+    class AdminerCoveLogin extends Adminer\Adminer {
+        function name() { return 'Cove DB Manager'; }
+        function permanentLogin($i = false) { return "cove-local-development-key"; }
+        function credentials() {
+            $configFile = getenv('HOME') . '/Cove/config';
+            if (file_exists($configFile)) {
+                $config = parse_ini_file($configFile);
+                $db_user = $config['DB_USER'] ?? null;
+                $db_pass = $config['DB_PASSWORD'] ?? null;
+                return ['localhost', $db_user, $db_pass];
+            }
+            return ['localhost', null, null];
+        }
+        function login($login, $password) { return true; }
+        function head($title = null) {
+            // Inject the Cove theme toggle. Inline init runs before adminer.css
+            // applies so the saved choice (or system preference) is honored
+            // without a theme flash on load.
+            $nonce = \Adminer\nonce();
+            $init = "(function(){try{var s=localStorage.getItem('cove-adminer-theme');var t=(s==='dark'||s==='light')?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();";
+            echo "<script{$nonce}>{$init}</script>\n";
+            $v = @filemtime(__DIR__ . '/adminer.js') ?: 1;
+            echo "<script src='adminer.js?v={$v}'{$nonce}></script>\n";
+            return true;
+        }
+    }
+    return new AdminerCoveLogin();
+}
+// Include the original Adminer core file to run the application.
+include "./adminer-core.php";
+ADMINER_INDEX_EOF
+
+    echo "🎨 Downloading Cove Adminer theme..."
+    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.css" -o "$adminer_dir/adminer.css"
+    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.js"  -o "$adminer_dir/adminer.js"
+}
+
+# Repair ownership of ~/Cove state that a pre-1.10 root-run FrankenPHP may
+# have left owned by root. The most user-visible symptom is the size cache
+# (~/Cove/cache/site-sizes.json) becoming unwritable — refresh_sizes computes
+# correctly, @file_put_contents silently fails, and list_sites returns stale
+# nulls. Safe to call repeatedly; only runs chown when the ownership is
+# actually wrong. macOS never needs this because launchd runs as the user.
+heal_cove_state_ownership() {
+    [ "$OS" = "linux" ] || return 0
+    local uid; uid=$(id -u)
+    local gid; gid=$(id -g)
+    local target
+    for target in "$COVE_DIR/cache" "$COVE_DIR/.reload.lock" "$COVE_DIR/.reload.lock.d" "$COVE_DIR/.reload.pending" "$COVE_DIR/caddy.pid"; do
+        [ -e "$target" ] || continue
+        # Cheap short-circuit: only invoke sudo if the top-level is wrong.
+        [ "$(stat -c %u "$target" 2>/dev/null)" = "$uid" ] && continue
+        $SUDO_CMD -n chown -R "$uid:$gid" "$target" 2>/dev/null || true
+    done
+}
+
 # (Re)start the Caddy/FrankenPHP service. Safe to call when already running —
 # both platforms stop any existing instance first. Called from `cove enable`
 # and from regenerate_caddyfile when Caddy isn't up yet.
@@ -741,8 +956,23 @@ EOM
     fi
 
     if [ "$OS" == "linux" ]; then
-        $SUDO_CMD "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &> /dev/null
-        $SUDO_CMD "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
+        # v1.10+: Caddy runs as cove.service under systemd (installed by
+        # cove_enable), so it survives reboots. Prefer systemctl when the
+        # unit is present; fall back to an ad-hoc foreground start only if
+        # someone invoked this before cove_enable wrote the unit.
+        if systemctl list-unit-files cove.service &>/dev/null 2>&1 \
+            && systemctl cat cove.service &>/dev/null 2>&1; then
+            $SUDO_CMD systemctl restart cove.service
+        else
+            # A pre-1.10 root-owned pidfile would block a user-run start.
+            if [ -e "$COVE_DIR/caddy.pid" ] && [ ! -w "$COVE_DIR/caddy.pid" ]; then
+                $SUDO_CMD -n rm -f "$COVE_DIR/caddy.pid" 2>/dev/null || true
+            fi
+            "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+                || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+                || true
+            "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
+        fi
     fi
 }
 
@@ -753,6 +983,9 @@ regenerate_caddyfile() {
         gum style --foreground red "❌ Mailpit is not installed. Please run 'cove install' successfully first."
         return 1
     fi
+    # Ensure the user-owned PHP session dir referenced by the Caddyfile's
+    # `php_ini session.save_path` exists before FrankenPHP tries to use it.
+    mkdir -p "$COVE_DIR/cache/sessions" 2>/dev/null
     local mailpit_path
     mailpit_path=$(command -v mailpit)
 
@@ -774,9 +1007,15 @@ ${port_directives}    frankenphp {
         php_ini display_errors Off
         php_ini error_log "$LOGS_DIR/errors.log"
         php_ini auto_prepend_file "$APP_DIR/whoops_bootstrap.php"
-        php_ini memory_limit 512M
-        php_ini upload_max_filesize 512M
-        php_ini post_max_size 512M
+        php_ini memory_limit $(cove_ini_get memory_limit 1G)
+        php_ini upload_max_filesize $(cove_ini_get upload_max_filesize 1G)
+        php_ini post_max_size $(cove_ini_get post_max_size 1G)
+        # User-owned session dir. Linux apt's php.ini points sessions at
+        # /var/lib/php-zts/session (owned by the frankenphp user); since
+        # Cove runs FrankenPHP as the invoking user, that path is
+        # unwritable and Adminer spams session_start warnings every
+        # request.
+        php_ini session.save_path "$COVE_DIR/cache/sessions"
     }
     order php_server before file_server
     servers {
@@ -1037,7 +1276,10 @@ EOM
     # With hundreds of sites the Caddyfile adapt takes a few seconds — racing
     # the exit against a subsequent curl produced TLS internal errors.
     if is_caddy_running; then
-        if $SUDO_CMD "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log"; then
+        # Reload talks to the admin API on localhost:2019 and doesn't need
+        # root. Dropping sudo here keeps the caller (incl. the dashboard's
+        # shell_exec) running as the invoking user.
+        if "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log"; then
             echo "✅ Caddy configuration reloaded."
         else
             gum style --foreground red "❌ Caddy reload failed. See $LOGS_DIR/caddy-reload.log for details."
@@ -1148,11 +1390,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
                 $type_flag = ($input['is_plain'] ?? false) ? '--plain' : '';
                 $command = sprintf('HOME=%s %s add %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag);
+                // Remember we're adding so the post-exec block below can
+                // measure the new site's size and fold it into the cache.
+                $add_site_target = $site_name;
             } else { $response['message'] = 'Invalid site name provided.'; }
             break;
         case 'delete_site':
             if (!empty($site_name)) {
-                $command = sprintf('HOME=%s %s delete %s --force 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
+                // --no-reload: cove_delete otherwise auto-reloads Caddy after
+                // each delete to prevent zombie log-dir skeletons from being
+                // recreated. The dashboard batches one reload after the whole
+                // delete queue drains, so skip per-item reloads here.
+                $command = sprintf('HOME=%s %s delete %s --force --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
             } else { $response['message'] = 'Site name not provided for deletion.'; }
             break;
         case 'get_login_link':
@@ -1227,8 +1476,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exec($command, $output, $return_code);
         if ($return_code === 0) {
             $response = ['success' => true, 'message' => 'Operation completed successfully.'];
+            // For add_site: measure the new site's footprint inline and fold
+            // it into the size cache so the UI shows "4.0 KB" (or whatever)
+            // immediately instead of "—" until the next refresh_sizes pass.
+            if (isset($add_site_target)) {
+                $new_path = $sitedir . '/' . $add_site_target . '.localhost';
+                if (is_dir($new_path)) {
+                    $size_out = []; $size_rc = 0;
+                    exec('du -sk ' . escapeshellarg($new_path) . ' 2>/dev/null', $size_out, $size_rc);
+                    if ($size_rc === 0 && !empty($size_out[0])) {
+                        $parts = preg_split('/\s+/', trim($size_out[0]));
+                        if (ctype_digit($parts[0] ?? '')) {
+                            $bytes = ((int) $parts[0]) * 1024;
+                            $response['size_bytes'] = $bytes;
+                            $cache = cove_read_size_cache($__cove_sizes_cache);
+                            $cache[$add_site_target . '.localhost'] = $bytes;
+                            cove_write_size_cache($__cove_sizes_cache, $cache);
+                        }
+                    }
+                }
+            }
         } else {
-            $response = ['success' => false, 'message' => 'An error occurred.', 'output' => implode("\n", $output)];
+            // Translate known failure signatures into user-friendly messages.
+            // Generic "An error occurred" isn't actionable, but "Site name is
+            // taken" tells the user exactly what to do next.
+            $err_text = implode("\n", $output);
+            $msg = 'An error occurred.';
+            if (isset($add_site_target)) {
+                $msg = 'Could not create site.';
+                if (stripos($err_text, 'already exists') !== false) {
+                    $msg = 'Site name is taken.';
+                } elseif (stripos($err_text, 'reserved name') !== false) {
+                    $msg = 'That name is reserved. Pick another.';
+                } elseif (stripos($err_text, 'invalid site name') !== false) {
+                    $msg = 'Invalid site name.';
+                } elseif (stripos($err_text, 'WordPress installation failed') !== false) {
+                    $msg = 'WordPress installation failed — check the logs.';
+                }
+            }
+            $response = ['success' => false, 'message' => $msg, 'output' => $err_text];
         }
     }
     echo json_encode($response);
@@ -1251,8 +1537,24 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="color-scheme" content="dark light">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cove — sites</title>
+    <script>
+        // Set data-theme synchronously before any CSS paints, so the correct
+        // theme's background is used from the very first frame (no FOUC).
+        // Alpine re-reads the same localStorage key in init() — values stay
+        // in sync with no extra flip.
+        (function () {
+            try {
+                var s = localStorage.getItem('theme');
+                var t = (s === 'dark' || s === 'light')
+                    ? s
+                    : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) {}
+        })();
+    </script>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%238bb382'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1379,6 +1681,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .pill.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 500; }
         .pill.primary:hover { filter: brightness(1.08); color: var(--accent-fg); border-color: var(--accent); }
         .pill:disabled { opacity: 0.5; cursor: not-allowed; }
+        .pill-icon { width: 13px; height: 13px; flex: none; opacity: 0.85; }
+        .pill:hover .pill-icon { opacity: 1; }
 
         /* Filter row */
         .filter-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1.5rem; border-bottom: 1px solid var(--panel-border); }
@@ -1395,7 +1699,39 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .filter-chip-x:hover { background: color-mix(in oklch, var(--accent) 28%, transparent); }
 
         /* Add row */
-        .add-row { padding: 0.9rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
+        /* New-site alert: appears after creating a WP site so the one-time
+           login is one click away, without hunting for the new row. */
+        .new-site-alert { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--panel-border); background: color-mix(in oklab, var(--accent) 12%, var(--panel)); color: var(--text); font-size: 0.92rem; }
+        .new-site-alert-icon { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: var(--accent-fg); flex: none; }
+        .new-site-alert-text { flex: 1; min-width: 0; }
+        .new-site-alert-text strong { font-family: var(--font-mono); font-weight: 500; }
+        .new-site-alert-close { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; font-size: 1.15rem; line-height: 1; padding: 0.25rem 0.55rem; border-radius: 5px; flex: none; }
+        .new-site-alert-close:hover { color: var(--text); background: var(--panel-hover); }
+
+        .add-row { position: relative; padding: 0.9rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
+        .add-row.is-creating { overflow: hidden; }
+        /* Indeterminate progress stripe across the top while cove add is
+           running — site creation takes 5-10s so we need a clear "working"
+           cue beyond just the button text swap. Solid accent block slides
+           across; a gradient-fade version blended with the row background
+           and looked the wrong green. */
+        .add-row.is-creating::before {
+            content: '';
+            position: absolute; top: 0; height: 3px; width: 30%;
+            /* A thin 2px stripe of var(--accent) perceptually muted to olive
+               against the cream bg-sunk; a brighter, more saturated teal at
+               3px reads unambiguously as teal (same hue as the brand, just
+               higher chroma so it survives the narrow band). */
+            background: oklch(72% 0.15 190);
+            animation: add-row-slide 1.3s linear infinite;
+        }
+        @keyframes add-row-slide {
+            from { left: -30%; }
+            to   { left: 100%; }
+        }
+        /* Inline spinner for the create button (reuses the .site-action-btn
+           .btn-spinner pattern but scoped so pill button layout isn't altered). */
+        .pill .btn-spinner { display: inline-block; width: 11px; height: 11px; border: 1.5px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; flex: none; }
         .add-row form { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
         .add-row input[type="text"] { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.9rem; padding: 0.5rem 0.8rem; border-radius: var(--radius-md); min-width: 200px; flex: 1; }
         .add-row input[type="text"]:focus { outline: 0; border-color: var(--accent); }
@@ -1521,11 +1857,35 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 <h1 class="card-title">Sites</h1>
                 <div class="card-actions">
                     <button class="pill" @click="cycleSort()" :title="'Sort by — click to cycle'" x-text="'sort: ' + sort"></button>
-                    <a class="pill" :href="adminerUrl" target="_blank" rel="noopener" title="Open Adminer">db</a>
-                    <a class="pill" :href="mailpitUrl" target="_blank" rel="noopener" title="Open Mailpit">mail</a>
+                    <a class="pill" href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Adminer">
+                        <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5v-9"/><path d="M3 8c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5"/></svg>
+                        db
+                    </a>
+                    <a class="pill" href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Mailpit">
+                        <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="12" height="9" rx="1.5"/><path d="M2.5 5 8 9l5.5-4"/></svg>
+                        mail
+                    </a>
                     <button class="pill primary" @click="toggleAdd()" x-text="adding ? 'cancel' : '+ add site'"></button>
                 </div>
             </header>
+
+            <template x-for="alert in alerts" :key="alert.id">
+                <div class="new-site-alert" x-transition.opacity>
+                    <span class="new-site-alert-icon" aria-hidden="true">
+                        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.2l3 3 7-7"/></svg>
+                    </span>
+                    <div class="new-site-alert-text">
+                        <strong x-text="alert.name + '.localhost'"></strong> is ready.
+                    </div>
+                    <template x-if="!alert.isPlain">
+                        <button class="pill primary" :disabled="alert.isLoggingIn" @click="loginToNewSite(alert)" x-text="alert.isLoggingIn ? 'opening…' : 'log in to admin'"></button>
+                    </template>
+                    <template x-if="alert.isPlain">
+                        <a class="pill primary" :href="'https://' + alert.name + '.localhost' + PORT_SUFFIX" target="_blank" rel="noopener" @click="dismissAlert(alert.id)">open site</a>
+                    </template>
+                    <button class="new-site-alert-close" @click="dismissAlert(alert.id)" aria-label="Dismiss" title="Dismiss">×</button>
+                </div>
+            </template>
 
             <div class="filter-row">
                 <span class="filter-chip" x-show="typeFilter" x-transition.opacity aria-label="Active type filter" style="display: none;">
@@ -1549,14 +1909,17 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 <button class="filter-clear" x-show="filter || typeFilter" @click="clearAllFilters(); $refs.filterInput.focus()" aria-label="Clear filter" title="Clear all (Esc)">×</button>
             </div>
 
-            <div x-show="adding" x-transition.opacity class="add-row" style="display: none;">
+            <div x-show="adding" x-transition.opacity class="add-row" :class="{ 'is-creating': newSite.isLoading }" style="display: none;">
                 <form @submit.prevent="addSite()">
                     <input type="text" x-model="newSite.name" @input="newSite.name = newSite.name.toLowerCase().replace(/[^a-z0-9-]/g, '')" placeholder="site-name" required :disabled="newSite.isLoading" x-ref="newSiteInput">
                     <label class="plain-toggle">
                         <input type="checkbox" x-model="newSite.isPlain" :disabled="newSite.isLoading">
                         plain (no WordPress)
                     </label>
-                    <button class="pill primary" type="submit" :disabled="!newSite.name || newSite.isLoading" x-text="newSite.isLoading ? 'creating…' : 'create'"></button>
+                    <button class="pill primary" type="submit" :disabled="!newSite.name || newSite.isLoading">
+                        <span class="btn-spinner" x-show="newSite.isLoading" aria-hidden="true" style="display: none;"></span>
+                        <span x-text="newSite.isLoading ? 'creating…' : 'create'"></span>
+                    </button>
                 </form>
             </div>
 
@@ -1653,6 +2016,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 sortModes: ['name', 'size', 'modified'],
                 newSite: { name: '', isPlain: false, isLoading: false },
                 snackbar: { visible: false, message: '', isError: false, timer: null },
+                // Persistent dismissible banners for newly-created sites — the
+                // snackbar only lives ~3.5s, not long enough to reach for the
+                // admin login after spinning up a fresh install.
+                alerts: [],
                 deleteQueue: [],
                 isProcessingQueue: false,
 
@@ -1863,7 +2230,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             type: isPlain ? 'Plain' : 'WordPress',
                             display_path: '~/Cove/Sites/' + name + '.localhost',
                             full_path: SITES_DIR + '/' + name + '.localhost',
-                            size_bytes: null,
+                            // Server calculates size in add_site and returns it
+                            // alongside success. Fall back to null so the row
+                            // shows "—" until the next refresh if anything failed.
+                            size_bytes: (typeof add.size_bytes === 'number') ? add.size_bytes : null,
                             modified_at: Math.floor(Date.now() / 1000),
                             isLoggingIn: false,
                         });
@@ -1871,8 +2241,35 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         this.newSite.name = '';
                         this.adding = false;
                         this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
+
+                        // Surface a persistent alert so the user can jump
+                        // straight into the new site without hunting for the
+                        // row. WP sites get a one-time admin login; plain
+                        // sites get a simple "open site" link.
+                        this.alerts.push({
+                            id: Date.now() + Math.random(),
+                            name,
+                            isPlain,
+                            isLoggingIn: false,
+                        });
                     }
                     this.newSite.isLoading = false;
+                },
+
+                async loginToNewSite(alert) {
+                    alert.isLoggingIn = true;
+                    const res = await this.apiPost('get_login_link', { site_name: alert.name });
+                    if (res.success && res.url) {
+                        window.open(res.url, '_blank');
+                        // Acted on — banner's job is done. The new tab has the
+                        // one-time URL; dashboard can drop the prompt.
+                        this.dismissAlert(alert.id);
+                    }
+                    alert.isLoggingIn = false;
+                },
+
+                dismissAlert(id) {
+                    this.alerts = this.alerts.filter(a => a.id !== id);
                 },
 
                 async deleteSite(name) {
@@ -1897,22 +2294,31 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
                     let anyFailed = false;
                     try {
+                        // Outer loop catches deletes queued while we were awaiting the
+                        // reload below — otherwise they'd sit forever because the next
+                        // deleteSite() call short-circuits on isProcessingQueue.
                         while (this.deleteQueue.length > 0) {
-                            const target = this.deleteQueue.shift();
-                            const del = await this.apiPost('delete_site', { site_name: target });
-                            if (del.success) {
-                                this.showSnack('Site deleted.');
-                            } else {
-                                anyFailed = true; // apiPost already surfaced the error
+                            while (this.deleteQueue.length > 0) {
+                                const target = this.deleteQueue.shift();
+                                const del = await this.apiPost('delete_site', { site_name: target });
+                                if (del.success) {
+                                    this.showSnack('Site deleted.');
+                                } else {
+                                    anyFailed = true; // apiPost already surfaced the error
+                                }
                             }
+                            // Kick a reload at the end of the batch. Race-safety
+                            // lives server-side: cove_reload() uses a mkdir lock
+                            // with a pending marker to coalesce concurrent calls,
+                            // since reload_server itself backgrounds the shell
+                            // command (shell_exec '...&') and returns instantly.
+                            // Two unsynchronized frankenphp reload calls otherwise
+                            // deadlock Caddy's admin server (10s shutdown timeout).
+                            await this.apiPost('reload_server');
                         }
                     } finally {
                         this.isProcessingQueue = false;
                     }
-
-                    // One reload for the whole batch — avoids N overlapping Caddyfile
-                    // regenerations when the user bulk-deletes several sites quickly.
-                    this.apiPost('reload_server');
 
                     // If anything failed mid-queue the optimistic UI is now out of sync
                     // with the backend (e.g. a survivor is missing from our list).
@@ -1996,6 +2402,7 @@ show_general_help() {
     echo "  enable           Starts the Caddy, MariaDB, and Mailpit background services."
     echo "  disable          Stops all background services managed by Cove."
     echo "  status           Check the status of all background services."
+    echo "  trust            Install Cove's local CA into browser + system trust stores."
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
     echo "  delete           Deletes a site's directory and associated database."
@@ -2010,6 +2417,7 @@ show_general_help() {
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  ports            Reconfigure HTTP/HTTPS ports + update site URLs."
+    echo "  memory           Show or raise PHP memory_limit across Cove + Homebrew PHPs."
     echo "  log              View logs for a site or the global error log."
     echo "  share            Create a temporary public tunnel to share a site."
     if [ "$IS_WSL" = true ]; then
@@ -2044,6 +2452,13 @@ display_command_help() {
             echo "Usage: cove status"
             echo ""
             echo "Checks the status of all background services."
+            ;;
+        trust)
+            echo "Usage: cove trust"
+            echo ""
+            echo "Installs Cove's local root certificate into the system trust store"
+            echo "and browser NSS databases (Firefox, Chromium — including snap)."
+            echo "Run once after install; re-run anytime to refresh."
             ;;
         list)
             echo "Usage: cove list [--totals]"
@@ -2093,10 +2508,13 @@ display_command_help() {
             echo "Opens an editor to add/edit rules which are then included in the main Caddyfile."
             echo
             echo "Subcommands:"
-            echo "  add         Adds a rule to the Caddyfile for the specified site."
-            echo "  update      Updates a rule in the Caddyfile for the specified site."
-            echo "  delete      Deletes custom rules from the Caddyfile for the specified site."
-            echo "  list        Lists all custom directives for all managed sites."
+            echo "  add                 Adds a rule to the Caddyfile for the specified site."
+            echo "  update              Updates a rule in the Caddyfile for the specified site."
+            echo "  delete <name>       Deletes custom rules from the Caddyfile for the specified site."
+            echo "  list                Lists all custom directives for all managed sites."
+            echo ""
+            echo "Flags:"
+            echo "  --force             Skip confirmation prompt (delete only)."
             ;;
         proxy)
             echo "Usage: cove proxy <subcommand>"
@@ -2112,11 +2530,13 @@ display_command_help() {
             echo ""
             echo "Options:"
             echo "  --no-tls     Disable TLS for this proxy (default uses internal TLS)"
+            echo "  --force      Skip confirmation prompts (add overwrite, delete)"
             echo ""
             echo "Examples:"
             echo "  cove proxy add opencode myhost.tailnet.ts.net 127.0.0.1:4096"
+            echo "  cove proxy add api api.example.com localhost:3000 --force"
             echo "  cove proxy list"
-            echo "  cove proxy delete opencode"
+            echo "  cove proxy delete opencode --force"
             ;;
         tailscale)
             echo "Usage: cove tailscale <subcommand>"
@@ -2202,6 +2622,33 @@ display_command_help() {
             echo ""
             echo "Tip: run 'cove db backup' first if you want a safety net before the DB update."
             ;;
+        memory)
+            echo "Usage: cove memory [set <value>] [--yes]"
+            echo ""
+            echo "Show or raise PHP memory_limit across every ini that affects Cove and"
+            echo "the wp-cli on your PATH. With no arguments, prints a report covering:"
+            echo ""
+            echo "  • Cove's own CLI ini (~/Cove/php.ini), read by FrankenPHP"
+            echo "  • The memory_limit baked into the Caddyfile's frankenphp block"
+            echo "  • Every 'php' binary on PATH (version + loaded php.ini + memory_limit)"
+            echo "  • wp-cli's effective PHP binary and its memory_limit"
+            echo ""
+            echo "With 'set <value>', writes memory_limit / upload_max_filesize /"
+            echo "post_max_size into ~/Cove/php.ini, regenerates the Caddyfile so the"
+            echo "FrankenPHP web server picks up the new values, and offers to update"
+            echo "each external php.ini it finds on PATH (per-file confirmation)."
+            echo ""
+            echo "Values accept standard PHP shorthand: 512M, 2G, -1 for unlimited."
+            echo ""
+            echo "Flags:"
+            echo "  --yes, -y    Update every writable ini without per-file confirmation."
+            echo ""
+            echo "Examples:"
+            echo "  cove memory              Audit current limits"
+            echo "  cove memory set 2G       Bump Cove + offer to bump Homebrew PHPs"
+            echo "  cove memory set 2G --yes Bump Cove + every writable ini (non-interactive)"
+            echo "  cove memory set -1       Unlimited (use sparingly)"
+            ;;
         log)
             echo "Usage: cove log [site] [--follow]"
             echo ""
@@ -2285,9 +2732,13 @@ display_command_help() {
             echo "Prints the HTTPS URL for the given site."
             ;;
         upgrade)
-            echo "Usage: cove upgrade"
+            echo "Usage: cove upgrade [--yes]"
             echo ""
             echo "Checks for the latest version of Cove on GitHub and replaces the current executable if a newer version is available."
+            echo "Also checks FrankenPHP and Adminer and upgrades them if newer versions are published."
+            echo ""
+            echo "Flags:"
+            echo "  --yes, -y    Skip the prompt shown when the local Adminer version can't be parsed."
             ;;
         version)
             echo "Usage: cove version"
@@ -2390,6 +2841,10 @@ main() {
             check_dependencies
             cove_status
             ;;
+        trust)
+            check_dependencies
+            cove_trust
+            ;;
         db)
             check_dependencies
             local action="$1"
@@ -2448,6 +2903,10 @@ main() {
             check_dependencies
             cove_ports "$@"
             ;;
+        memory)
+            check_dependencies
+            cove_memory "$@"
+            ;;
         log)
             cove_log "$@"
             ;;
@@ -2462,7 +2921,7 @@ main() {
             cove_url "$@"
             ;;
         upgrade)
-            cove_upgrade
+            cove_upgrade "$@"
             ;;
         version)
             cove_version
@@ -2531,6 +2990,10 @@ cove_add() {
 
     echo "➕ Creating $site_type site: $full_hostname"
     mkdir -p "$site_dir/public" "$site_dir/logs"
+
+    if [ "$site_type" == "plain" ]; then
+        write_plain_site_landing "$site_dir/public"
+    fi
 
     local admin_user="admin"
     local admin_pass
@@ -2833,9 +3296,11 @@ cove_delete() {
     done
 
     local force_delete=false
-    if [ "$2" == "--force" ]; then
-        force_delete=true
-    fi
+    local no_reload=false
+    for arg in "$@"; do
+        [ "$arg" = "--force" ] && force_delete=true
+        [ "$arg" = "--no-reload" ] && no_reload=true
+    done
 
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir" ]; then
@@ -2868,7 +3333,17 @@ cove_delete() {
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
     fi
 
-    rm -rf "$site_dir"
+    # Don't trust the bare rm — a pre-1.10 dashboard-created site would be
+    # root-owned (sudo-started FrankenPHP), and a silent rm failure would
+    # previously still report "removed" while leaving the dir on disk. Try
+    # sudo -n as a fallback, then surface the failure to the caller.
+    if ! rm -rf "$site_dir" 2>/dev/null; then
+        if ! $SUDO_CMD -n rm -rf "$site_dir" 2>/dev/null; then
+            gum style --foreground red "❌ Failed to delete '$site_dir' — permission denied."
+            gum style --foreground yellow "   Run: sudo rm -rf '$site_dir'"
+            exit 1
+        fi
+    fi
     echo "✅ Directory deleted."
 
     # --- Delete Custom Caddy Directives ---
@@ -2906,6 +3381,15 @@ cove_delete() {
         else
             gum style --foreground yellow "   - ⚠️ Skipped /etc/hosts cleanup (sudo unavailable from this context). Run 'cove reload' from a terminal to sync."
         fi
+    fi
+
+    # Regenerate the Caddyfile so Caddy stops holding log file handles for
+    # this site. Without this, a later Caddy restart would re-create the
+    # deleted directory skeleton from the stale Caddyfile entry. The
+    # dashboard passes --no-reload because it batches one reload per
+    # delete queue drain.
+    if [ "$no_reload" = false ]; then
+        regenerate_caddyfile &>/dev/null
     fi
 
     echo "✅ Site '$site_name.localhost' has been removed."
@@ -2959,24 +3443,43 @@ cove_directive_add_or_update() {
 
 # This new function handles deleting directives
 cove_directive_delete() {
-    local site_name="$1"
+    local site_name=""
+    local force_delete=false
+    for arg in "$@"; do
+        case "$arg" in
+            --force|--yes|-y) force_delete=true ;;
+            -*)
+                gum style --foreground red "❌ Unknown option: $arg"
+                echo "Usage: cove directive delete <name> [--force]"
+                exit 1
+                ;;
+            *) [ -z "$site_name" ] && site_name="$arg" ;;
+        esac
+    done
+
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: Please provide a site name."
-        echo "Usage: cove directive delete <name>"
+        echo "Usage: cove directive delete <name> [--force]"
         exit 1
     fi
 
     local site_hostname="${site_name}.localhost"
     local custom_conf_file="$CUSTOM_CADDY_DIR/$site_hostname"
 
+    # Non-interactive callers (dashboard shell_exec, CI) have no TTY — gum
+    # confirm aborts there. Auto-promote to --force so scripted deletes work.
+    [ -t 0 ] || force_delete=true
+
     if [ -f "$custom_conf_file" ]; then
-        if gum confirm "🚨 Are you sure you want to delete the custom directives for '$site_hostname'?"; then
-            rm "$custom_conf_file"
-            echo "✅ Custom directives deleted for $site_hostname."
-            regenerate_caddyfile
-        else
-            echo "🚫 Deletion cancelled."
+        if ! $force_delete; then
+            if ! gum confirm "🚨 Are you sure you want to delete the custom directives for '$site_hostname'?"; then
+                echo "🚫 Deletion cancelled."
+                return 0
+            fi
         fi
+        rm "$custom_conf_file"
+        echo "✅ Custom directives deleted for $site_hostname."
+        regenerate_caddyfile
     else
         echo "ℹ️ No custom directives found for $site_hostname."
     fi
@@ -3025,10 +3528,18 @@ cove_disable() {
 
     # Stop services on Linux
     if [ "$OS" == "linux" ]; then
+        # v1.10+: FrankenPHP runs as cove.service under systemd. Try that
+        # first; fall back to `frankenphp stop` in case a user skipped
+        # cove_enable since the upgrade and still has an ad-hoc instance.
+        $SUDO_CMD systemctl stop cove.service &>/dev/null \
+            || "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+            || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+            || true
+
         # Get the correct MariaDB service name
         local mariadb_service
         mariadb_service=$(get_mariadb_service_name)
-        
+
         echo "   - Stopping MariaDB ($mariadb_service)..."
         $SUDO_CMD systemctl stop "$mariadb_service" &>/dev/null
         echo "   - Stopping Mailpit..."
@@ -3120,14 +3631,59 @@ EOM
         
         $SUDO_CMD mv "$temp_service" "$service_path"
         $SUDO_CMD chmod 644 "$service_path"
-        
-        # Reload systemd, then enable and start the service
+
+        # --- FrankenPHP / Cove systemd unit ---
+        # Mirrors the mailpit pattern so the stack survives a reboot. The
+        # apt frankenphp.service was masked during `cove install` so there
+        # is no name conflict; we use `cove.service` to keep the scope
+        # clear ("this is Cove's managed FrankenPHP").
+        local cove_service_path="/etc/systemd/system/cove.service"
+        local frankenphp_bin
+        frankenphp_bin=$(command -v "$CADDY_CMD")
+
+        echo "   - Generating Cove FrankenPHP service file..."
+        local temp_cove_service
+        temp_cove_service=$(mktemp)
+        cat > "$temp_cove_service" << EOM
+[Unit]
+Description=FrankenPHP for Cove
+After=network.target mariadb.service
+Wants=mariadb.service
+
+[Service]
+Type=simple
+ExecStart=$frankenphp_bin run --config $CADDYFILE_PATH --pidfile $COVE_DIR/caddy.pid
+ExecReload=$frankenphp_bin reload --config $CADDYFILE_PATH --address localhost:2019
+Restart=on-failure
+RestartSec=2s
+User=$current_user
+Environment=HOME=/home/$current_user
+Environment=PHPRC=$PHP_INI_FILE
+
+[Install]
+WantedBy=multi-user.target
+EOM
+
+        $SUDO_CMD mv "$temp_cove_service" "$cove_service_path"
+        $SUDO_CMD chmod 644 "$cove_service_path"
+
+        # Reload systemd, then enable and start both Cove-managed services
         $SUDO_CMD systemctl daemon-reload
         $SUDO_CMD systemctl enable mailpit &>/dev/null
         $SUDO_CMD systemctl restart mailpit
+        $SUDO_CMD systemctl enable cove.service &>/dev/null
+        # Stop any ad-hoc frankenphp started by a pre-1.10 cove_enable so
+        # systemctl can take ownership of the listening sockets cleanly.
+        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+            || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
+            || true
+        $SUDO_CMD systemctl restart cove.service
     fi
-    
-    start_caddy_service
+
+    # Skip the ad-hoc Caddy start on Linux — systemd handles it now.
+    if [ "$OS" != "linux" ]; then
+        start_caddy_service
+    fi
 
     if [ $? -eq 0 ]; then
         echo ""
@@ -3502,6 +4058,30 @@ cove_install() {
             gum style --foreground yellow "   Try: sudo apt install php-zts-mysqli (for apt)"
             gum style --foreground yellow "   Or:  sudo dnf install php-zts-mysqli (for dnf)"
         fi
+
+        # Let FrankenPHP bind ports 80/443 as the user. Without this cap,
+        # Cove would need to sudo-start the server, which makes every
+        # dashboard-triggered file (sites, lock dirs, pidfile) root-owned.
+        if command -v setcap &>/dev/null; then
+            local fp_bin
+            fp_bin=$(command -v frankenphp)
+            if [ -n "$fp_bin" ]; then
+                echo "🔐 Granting FrankenPHP cap_net_bind_service..."
+                $SUDO_CMD setcap 'cap_net_bind_service=+ep' "$fp_bin" 2>/dev/null || \
+                    gum style --foreground yellow "⚠️ setcap failed — Cove may fall back to needing sudo."
+            fi
+        fi
+
+        # The apt `frankenphp` package ships a systemd unit that runs as
+        # user `frankenphp` reading /etc/frankenphp/Caddyfile. That contends
+        # with Cove for ports 80/443. Mask it so it stays out of our way.
+        if systemctl list-unit-files frankenphp.service &>/dev/null \
+            && systemctl cat frankenphp.service 2>/dev/null | grep -q '^\[Unit\]'; then
+            echo "🚫 Masking conflicting apt frankenphp.service..."
+            $SUDO_CMD systemctl stop frankenphp.service &>/dev/null || true
+            $SUDO_CMD systemctl disable frankenphp.service &>/dev/null || true
+            $SUDO_CMD systemctl mask frankenphp.service &>/dev/null || true
+        fi
     fi
 
     # MariaDB - Database server
@@ -3547,43 +4127,15 @@ cove_install() {
     # doesn't flood every command on PHP 8.5+.
     echo "⚙️ Writing Cove PHP ini..."
     cat > "$PHP_INI_FILE" <<'INI'
-memory_limit = 512M
+memory_limit = 1G
 display_errors = 0
 error_reporting = 6143
 INI
-    echo "🗃️ Downloading Adminer 5.4.1..."
-    curl -sL "https://github.com/vrana/adminer/releases/download/v5.4.1/adminer-5.4.1.php" -o "$ADMINER_DIR/adminer-core.php"
-    echo "⚙️ Creating Adminer autologin..."
-    # Create a custom index.php to handle autologin
-    # Note: Adminer 5.x uses the Adminer\Adminer namespace
-    cat > "$ADMINER_DIR/index.php" << 'EOM'
-<?php
-// This is the custom entry point for Adminer with autologin.
-function adminer_object() {
-    // Adminer 5.x uses the Adminer namespace
-    class AdminerCoveLogin extends Adminer\Adminer {
-        function name() { return 'Cove DB Manager'; }
-        function permanentLogin($i = false) { return "cove-local-development-key"; }
-        function credentials() {
-            $configFile = getenv('HOME') . '/Cove/config';
-            if (file_exists($configFile)) {
-                $config = parse_ini_file($configFile);
-                $db_user = $config['DB_USER'] ?? null;
-                $db_pass = $config['DB_PASSWORD'] ?? null;
-                return ['localhost', $db_user, $db_pass];
-            }
-            return ['localhost', null, null];
-        }
-        function login($login, $password) { return true; }
-    }
-    return new AdminerCoveLogin();
-}
-// Include the original Adminer core file to run the application.
-include "./adminer-core.php";
-EOM
-
-    echo "🎨 Downloading Adminer Catppuccin theme..."
-    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.css" -o "$ADMINER_DIR/adminer.css"
+    echo "🗃️ Downloading Adminer 5.4.2..."
+    curl -sL "https://github.com/vrana/adminer/releases/download/v5.4.2/adminer-5.4.2.php" -o "$ADMINER_DIR/adminer-core.php"
+    # Entry point + theme assets. Keep in sync with cove_upgrade so upgraders
+    # pick up index.php/head() and CSS/JS changes without a full reinstall.
+    deploy_adminer_theme
 
     echo "✨ Downloading Whoops error handler..."
     rm -rf "$APP_DIR/whoops" # Remove any old versions first
@@ -3659,6 +4211,13 @@ EOM
 
     echo "✅ Initial configuration complete. Starting services..."
     cove_enable
+
+    # Install the local CA into the system trust store and any browser NSS
+    # databases we can find. Needs Caddy up (for the admin API trust call)
+    # and the root cert to exist (Caddy generated it during the initial
+    # cove_enable above). Idempotent — users can re-run via `cove trust`.
+    echo ""
+    cove_trust
 
     # If the user changed HTTPS ports during install AND there are pre-existing
     # WordPress sites in $SITES_DIR, migrate their stored URLs to the new port.
@@ -4434,6 +4993,263 @@ cove_mappings() {
     echo "Usage: cove mappings <site> [add|remove] [domain]"
     exit 1
 }
+cove_memory() {
+    # -----------------------------------------------------------------
+    #  cove memory [set <value>]
+    #  Show or tweak PHP memory_limit across every ini Cove or the
+    #  user's Homebrew PHPs load. Cove's own ini lives at
+    #  ~/Cove/php.ini and is read by FrankenPHP (both CLI via PHPRC and
+    #  the web server via the php_ini directive in the Caddyfile, which
+    #  reads its values from the same file through cove_ini_get).
+    # -----------------------------------------------------------------
+
+    local action="show"
+    local new_value=""
+    local auto_yes=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                display_command_help memory
+                exit 0
+                ;;
+            set)
+                action="set"
+                new_value="$2"
+                shift 2 || { gum style --foreground red "❌ 'set' requires a value (e.g. 2G)"; exit 1; }
+                ;;
+            --yes|-y|--force|--all)
+                auto_yes=true
+                shift
+                ;;
+            *)
+                gum style --foreground red "❌ Unknown argument: $1"
+                echo "Usage: cove memory [set <value>] [--yes]"
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ "$action" = "set" ]; then
+        cove_memory_set "$new_value" "$auto_yes"
+    else
+        cove_memory_show
+    fi
+}
+
+# Resolves the canonical path of a binary. Falls back to the original path
+# if neither GNU readlink nor BSD-era greadlink is available.
+cove_memory_realpath() {
+    local p="$1"
+    if readlink -f "$p" >/dev/null 2>&1; then
+        readlink -f "$p"
+    elif command -v greadlink >/dev/null 2>&1; then
+        greadlink -f "$p"
+    else
+        echo "$p"
+    fi
+}
+
+# Prints the php.ini path a given php binary loads, with surrounding
+# whitespace and quotes trimmed (php --ini quotes the path when it
+# contains special chars). PHPRC is unset so we see the ini each binary
+# loads by default — without Cove's CLI override leaking in.
+cove_memory_ini_for() {
+    local php="$1"
+    env -u PHPRC "$php" --ini 2>/dev/null \
+        | awk -F': ' '/^Loaded Configuration File:/ {sub(/^[[:space:]]+/,"",$2); print $2}' \
+        | sed -E 's/^"(.*)"$/\1/'
+}
+
+# Runs an inline PHP snippet against $1 without Cove's PHPRC, so the
+# returned ini values reflect what the binary sees when the user invokes
+# it from their own shell.
+cove_memory_php_probe() {
+    env -u PHPRC "$1" -r "$2" 2>/dev/null
+}
+
+cove_memory_show() {
+    gum style --foreground "212" --bold "PHP memory_limit audit"
+    echo ""
+
+    # 1) Cove CLI ini
+    local cove_mem
+    cove_mem=$(cove_ini_get memory_limit "")
+    echo "📁 Cove CLI  ($PHP_INI_FILE)"
+    if [ -f "$PHP_INI_FILE" ]; then
+        echo "   memory_limit         = ${cove_mem:-(unset — FrankenPHP default applies)}"
+        echo "   upload_max_filesize  = $(cove_ini_get upload_max_filesize '(unset)')"
+        echo "   post_max_size        = $(cove_ini_get post_max_size '(unset)')"
+    else
+        echo "   (file missing — run 'cove install')"
+    fi
+
+    # 2) Cove web server (Caddyfile frankenphp block)
+    echo ""
+    echo "🌐 Cove web ($CADDYFILE_PATH, frankenphp block)"
+    if [ -f "$CADDYFILE_PATH" ]; then
+        local caddy_mem
+        caddy_mem=$(awk '/^[[:space:]]*php_ini[[:space:]]+memory_limit[[:space:]]+/ {print $3; exit}' "$CADDYFILE_PATH")
+        if [ -n "$caddy_mem" ]; then
+            echo "   memory_limit = $caddy_mem"
+        else
+            echo "   (no explicit memory_limit — inherits from ~/Cove/php.ini)"
+        fi
+    else
+        echo "   (Caddyfile missing)"
+    fi
+
+    # 3) PHPs on PATH (dedup by canonical binary path)
+    echo ""
+    echo "🔍 PHP binaries on PATH"
+    local seen_paths=""
+    local php_path found=false
+    while IFS= read -r php_path; do
+        [ -z "$php_path" ] && continue
+        local real_path
+        real_path=$(cove_memory_realpath "$php_path")
+        case ",$seen_paths," in *",$real_path,"*) continue ;; esac
+        seen_paths="$seen_paths,$real_path"
+
+        local php_ver php_ini php_mem
+        php_ver=$(cove_memory_php_probe "$php_path" 'echo PHP_VERSION;')
+        php_ini=$(cove_memory_ini_for "$php_path")
+        php_mem=$(cove_memory_php_probe "$php_path" 'echo ini_get("memory_limit");')
+
+        echo "   • $php_path"
+        echo "       version       = ${php_ver:-unknown}"
+        echo "       php.ini       = ${php_ini:-<none>}"
+        echo "       memory_limit  = ${php_mem:-unknown}"
+        found=true
+    done < <(which -a php 2>/dev/null)
+    if ! $found; then
+        echo "   (no 'php' binary on PATH)"
+    fi
+
+    # 4) wp-cli's effective memory_limit (uses whichever php its shebang resolves)
+    echo ""
+    echo "🧰 wp-cli"
+    local wp_bin
+    wp_bin=$(command -v wp 2>/dev/null)
+    if [ -n "$wp_bin" ]; then
+        local wp_info wp_php wp_ver wp_mem
+        wp_info=$(env -u PHPRC "$wp_bin" cli info 2>/dev/null)
+        wp_php=$(echo "$wp_info" | awk -F':\t' '/^PHP binary:/ {sub(/^[[:space:]]+/,"",$2); print $2; exit}')
+        wp_ver=$(echo "$wp_info" | awk -F':\t' '/^PHP version:/ {sub(/^[[:space:]]+/,"",$2); print $2; exit}')
+        if [ -n "$wp_php" ] && [ -x "$wp_php" ]; then
+            wp_mem=$(cove_memory_php_probe "$wp_php" 'echo ini_get("memory_limit");')
+        fi
+        echo "   wp             = $wp_bin"
+        echo "   php binary     = ${wp_php:-unknown}"
+        echo "   php version    = ${wp_ver:-unknown}"
+        echo "   memory_limit   = ${wp_mem:-unknown}"
+    else
+        echo "   (wp-cli not found on PATH)"
+    fi
+
+    echo ""
+    gum style --faint "To raise the limit everywhere: cove memory set 2G"
+}
+
+cove_memory_set() {
+    local value="$1"
+    local auto_yes="${2:-false}"
+
+    if [ -z "$value" ]; then
+        gum style --foreground red "❌ Missing value. Usage: cove memory set <value> (e.g. 2G)"
+        exit 1
+    fi
+
+    # Non-interactive callers have no TTY; gum confirm aborts there. Auto-yes
+    # so scripted fleet updates can bump every writable ini without hanging.
+    [ -t 0 ] || auto_yes=true
+    if [ "$value" != "-1" ] && [[ ! "$value" =~ ^[0-9]+[KMG]?$ ]]; then
+        gum style --foreground red "❌ Invalid value '$value'. Use e.g. 512M, 2G, or -1 for unlimited."
+        exit 1
+    fi
+
+    echo ""
+    gum style --foreground "212" --bold "Setting memory_limit = $value"
+    echo ""
+
+    # 1) Cove CLI ini — source of truth for Cove
+    mkdir -p "$(dirname "$PHP_INI_FILE")"
+    touch "$PHP_INI_FILE"
+    echo "📁 Updating $PHP_INI_FILE"
+    local k
+    for k in memory_limit upload_max_filesize post_max_size; do
+        if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
+            sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${value}|" "$PHP_INI_FILE"
+        else
+            echo "${k} = ${value}" >> "$PHP_INI_FILE"
+        fi
+        echo "   ✓ ${k} = ${value}"
+    done
+    rm -f "${PHP_INI_FILE}.bak"
+
+    # 2) Regenerate Caddyfile so FrankenPHP web server picks up the new values
+    echo ""
+    regenerate_caddyfile
+
+    # 3) External PHP inis (Homebrew, distro-packaged) — opt-in per file.
+    # Reads 'which -a php' on fd 3 so gum confirm inside the loop body can
+    # read from the real stdin without swallowing the remaining PHP paths.
+    echo ""
+    echo "🔍 Scanning Homebrew / system PHP inis on PATH…"
+    local seen_paths="" seen_inis=""
+    local php_path
+    while IFS= read -r php_path <&3; do
+        [ -z "$php_path" ] && continue
+        local real_path
+        real_path=$(cove_memory_realpath "$php_path")
+        case ",$seen_paths," in *",$real_path,"*) continue ;; esac
+        seen_paths="$seen_paths,$real_path"
+
+        local ini
+        ini=$(cove_memory_ini_for "$php_path")
+        [ -z "$ini" ] && continue
+        # Skip Cove's ini (already handled) and duplicates
+        [ "$(cove_memory_realpath "$ini")" = "$(cove_memory_realpath "$PHP_INI_FILE")" ] && continue
+        case ",$seen_inis," in *",$ini,"*) continue ;; esac
+        seen_inis="$seen_inis,$ini"
+
+        local current
+        current=$(grep -E "^[[:space:]]*memory_limit[[:space:]]*=" "$ini" 2>/dev/null \
+            | tail -1 \
+            | sed -E 's|^[[:space:]]*memory_limit[[:space:]]*=[[:space:]]*||' \
+            | tr -d ' "')
+        echo ""
+        echo "   • $ini (current: ${current:-unset})"
+
+        if ! [ -w "$ini" ]; then
+            gum style --faint "     (not writable by this user — skipping. Run: sudo sed -i.bak -E 's|^[[:space:]]*memory_limit[[:space:]]*=.*|memory_limit = ${value}|' \"$ini\")"
+            continue
+        fi
+
+        local do_update=false
+        if [ "$auto_yes" = true ]; then
+            do_update=true
+        elif gum confirm "     Update this ini's memory_limit to ${value}?"; then
+            do_update=true
+        fi
+
+        if $do_update; then
+            if grep -qE "^[[:space:]]*memory_limit[[:space:]]*=" "$ini"; then
+                sed -i.bak -E "s|^[[:space:]]*memory_limit[[:space:]]*=.*|memory_limit = ${value}|" "$ini"
+            else
+                echo "memory_limit = ${value}" >> "$ini"
+            fi
+            rm -f "${ini}.bak"
+            gum style --foreground green "     ✓ Updated"
+        else
+            gum style --faint "     (skipped)"
+        fi
+    done 3< <(which -a php 2>/dev/null)
+
+    echo ""
+    gum style --foreground green "✅ Done. Run 'cove memory' to verify."
+}
+
 cove_path() {
     local site_name="$1"
 
@@ -4472,6 +5288,7 @@ cove_ports() {
     local explicit_https=""
     local skip_urls=false
     local dry_run=false
+    local auto_yes=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -4491,17 +5308,28 @@ cove_ports() {
                 dry_run=true
                 shift
                 ;;
+            --yes|-y|--force)
+                auto_yes=true
+                shift
+                ;;
             -h|--help)
                 display_command_help ports
                 exit 0
                 ;;
             *)
                 gum style --foreground red "❌ Unknown option: $1"
-                echo "Usage: cove ports [--http PORT] [--https PORT] [--skip-urls] [--dry-run]"
+                echo "Usage: cove ports [--http PORT] [--https PORT] [--skip-urls] [--dry-run] [--yes]"
                 exit 1
                 ;;
         esac
     done
+
+    # Non-interactive shells (PHP shell_exec, ssh piped stdin, systemd) have
+    # no TTY; gum confirm aborts there with "could not open a new TTY". Auto-
+    # promote to --yes so the caller's flags are respected.
+    if [ ! -t 0 ]; then
+        auto_yes=true
+    fi
 
     local original_http="$HTTP_PORT"
     local original_https="$HTTPS_PORT"
@@ -4639,12 +5467,14 @@ cove_ports() {
 
     # --- Confirm ---
     echo ""
-    if ! gum confirm "Proceed with the port change?"; then
-        # Revert globals so nothing leaks to the caller
-        HTTP_PORT="$original_http"
-        HTTPS_PORT="$original_https"
-        echo "🚫 Cancelled."
-        exit 0
+    if [ "$auto_yes" = false ]; then
+        if ! gum confirm "Proceed with the port change?"; then
+            # Revert globals so nothing leaks to the caller
+            HTTP_PORT="$original_http"
+            HTTPS_PORT="$original_https"
+            echo "🚫 Cancelled."
+            exit 0
+        fi
     fi
 
     # --- Commit ---
@@ -4689,12 +5519,17 @@ cove_proxy_add() {
     local domain=""
     local target=""
     local tls_mode="internal"
+    local force=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-tls)
                 tls_mode="none"
+                shift
+                ;;
+            --force|--yes|-y)
+                force=true
                 shift
                 ;;
             *)
@@ -4709,6 +5544,10 @@ cove_proxy_add() {
                 ;;
         esac
     done
+
+    # Without a TTY, gum confirm can't prompt — treat as --force so scripted
+    # callers (dashboard, CI) can overwrite safely.
+    [ -t 0 ] || force=true
 
     # Interactive mode if arguments not provided
     if [ -z "$name" ]; then
@@ -4730,7 +5569,7 @@ cove_proxy_add() {
     local proxy_file="$PROXY_DIR/$name"
 
     # Check if proxy already exists
-    if [ -f "$proxy_file" ]; then
+    if [ -f "$proxy_file" ] && ! $force; then
         if ! gum confirm "⚠️ Proxy '$name' already exists. Overwrite?"; then
             echo "🚫 Cancelled."
             exit 0
@@ -4812,7 +5651,19 @@ cove_proxy_list() {
 }
 
 cove_proxy_delete() {
-    local name="$1"
+    local name=""
+    local force=false
+    for arg in "$@"; do
+        case "$arg" in
+            --force|--yes|-y) force=true ;;
+            -*)
+                gum style --foreground red "❌ Unknown option: $arg"
+                echo "Usage: cove proxy delete <name> [--force]"
+                exit 1
+                ;;
+            *) [ -z "$name" ] && name="$arg" ;;
+        esac
+    done
 
     if [ -z "$name" ]; then
         # Interactive mode - let user select from existing proxies
@@ -4823,7 +5674,7 @@ cove_proxy_delete() {
 
         echo "🗑️ Select a proxy to delete:"
         name=$(ls "$PROXY_DIR" | gum choose)
-        
+
         if [ -z "$name" ]; then
             echo "🚫 Cancelled."
             exit 0
@@ -4842,13 +5693,18 @@ cove_proxy_delete() {
     cat "$proxy_file"
     echo ""
 
-    if gum confirm "🚨 Are you sure you want to delete proxy '$name'?"; then
-        rm "$proxy_file"
-        echo "✅ Proxy '$name' deleted."
-        regenerate_caddyfile
-    else
-        echo "🚫 Deletion cancelled."
+    # Non-interactive callers have no TTY; auto-force so scripted deletes work.
+    [ -t 0 ] || force=true
+
+    if ! $force; then
+        if ! gum confirm "🚨 Are you sure you want to delete proxy '$name'?"; then
+            echo "🚫 Deletion cancelled."
+            return 0
+        fi
     fi
+    rm "$proxy_file"
+    echo "✅ Proxy '$name' deleted."
+    regenerate_caddyfile
 }
 
 cove_proxy() {
@@ -4877,11 +5733,16 @@ cove_proxy() {
             echo "  list                           List all proxy entries"
             echo "  delete <name>                  Delete a proxy entry"
             echo ""
+            echo "Flags:"
+            echo "  --no-tls   Disable TLS for this proxy (add only)"
+            echo "  --force    Skip confirmation prompts (add overwrite, delete)"
+            echo ""
             echo "Examples:"
             echo "  cove proxy add opencode myhost.tailnet.ts.net 127.0.0.1:4096"
             echo "  cove proxy add api api.example.com localhost:3000 --no-tls"
+            echo "  cove proxy add api api.example.com localhost:3000 --force"
             echo "  cove proxy list"
-            echo "  cove proxy delete opencode"
+            echo "  cove proxy delete opencode --force"
             exit 0
             ;;
     esac
@@ -5165,10 +6026,68 @@ cove_push() {
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✨ All done! Your site has been pushed successfully." "Remote URL: ${remote_url}"
 }
 cove_reload() {
-    create_gui_file
-    regenerate_caddyfile
-    update_etc_hosts
+    # Auto-heal any root-owned state left over from a pre-1.10 install.
+    heal_cove_state_ownership
+    # Serialize reloads to keep Caddy's admin server healthy. The dashboard
+    # fires reload in the background after every site add/delete, so rapid
+    # actions can spawn many concurrent cove-reload processes; two concurrent
+    # `frankenphp reload` calls reliably deadlock Caddy's admin endpoint with
+    # a 10s shutdown timeout.
+    #
+    # Strategy: first caller holds the lock and does the work. Subsequent
+    # callers touch a "pending" marker and exit immediately. When the holder
+    # finishes it re-runs once if the marker is set, so the final state
+    # converges on the latest on-disk Sites listing.
+    #
+    # Implementation note: we use a single lock *file* (not a dir) opened with
+    # set -C (noclobber) so the pid is written atomically with the lock's
+    # creation. Earlier `mkdir + echo > pid` left a TOCTOU window where a
+    # competing reload could read an empty pid, decide the holder was dead,
+    # and stomp the lock — letting 3+ reloads run and race create_gui_file's
+    # .tmp files.
+    local lock_file="$COVE_DIR/.reload.lock"
+    local pending="$COVE_DIR/.reload.pending"
+
+    acquire_reload_lock() {
+        (set -C; echo "$$" > "$lock_file") 2>/dev/null
+    }
+
+    if ! acquire_reload_lock; then
+        local holder_pid
+        holder_pid=$(cat "$lock_file" 2>/dev/null)
+        if [ -n "$holder_pid" ] && kill -0 "$holder_pid" 2>/dev/null; then
+            # A real holder is running — leave a breadcrumb and bail.
+            touch "$pending" 2>/dev/null || true
+            return 0
+        fi
+        # Stale (holder died, or was a pre-1.10 root-owned file). Reclaim,
+        # falling back to sudo in case ownership blocks us.
+        rm -f "$lock_file" 2>/dev/null || $SUDO_CMD -n rm -f "$lock_file" 2>/dev/null || true
+        if ! acquire_reload_lock; then
+            # Lost the race to another reclaimer — they've got it.
+            touch "$pending" 2>/dev/null || true
+            return 0
+        fi
+    fi
+
+    # Trap for abnormal exits (Ctrl-C, signals). The happy-path cleanup
+    # happens at the function end since the trap was observed not firing
+    # reliably when cove_reload is invoked via shell_exec(…&) from PHP.
+    trap 'rm -f "$lock_file" 2>/dev/null; trap - EXIT INT TERM' EXIT INT TERM
+
+    while :; do
+        rm -f "$pending"
+        create_gui_file
+        regenerate_caddyfile
+        update_etc_hosts
+        [ -f "$pending" ] || break
+    done
+
+    # Explicit unlock — belt-and-suspenders with the trap.
+    rm -f "$lock_file" 2>/dev/null
+    trap - EXIT INT TERM
 }
+
 cove_rename() {
     local old_name="$1"
     local new_name="$2"
@@ -5608,13 +6527,12 @@ cove_status() {
     local mariadb_status="❌ Stopped"
     local mailpit_status="❌ Stopped"
 
-    # Check Caddy status by PID file
-    if [ -f "$COVE_DIR/caddy.pid" ]; then
-        local caddy_pid
-        caddy_pid=$(cat "$COVE_DIR/caddy.pid" 2>/dev/null)
-        if [ -n "$caddy_pid" ] && ps -p "$caddy_pid" > /dev/null 2>&1; then
-            caddy_status="✅ Running"
-        fi
+    # Probe Caddy's admin endpoint. The prior pidfile check fell over on
+    # Linux where `sudo frankenphp start` left the pidfile root-owned (0600),
+    # so the user reading it as austin got "" and the status falsely showed
+    # Stopped. The TCP probe is readable by any local user.
+    if is_caddy_running; then
+        caddy_status="✅ Running"
     fi
 
     # Check MariaDB and Mailpit status on MacOS
@@ -5816,6 +6734,78 @@ cove_tailscale() {
     esac
 }
 
+cove_trust() {
+    echo "🔐 Installing Cove's local root certificate..."
+
+    # FrankenPHP's `trust` subcommand writes the Caddy local root into the
+    # system store and any NSS DBs it discovers at the standard paths. On
+    # macOS that's the login keychain; on Linux it's /usr/local/share/ca-
+    # certificates + ~/.pki/nssdb + ~/.mozilla/firefox/*.
+    #
+    # Safe to re-run — all writes are idempotent.
+
+    if [ "$OS" = "linux" ]; then
+        # certutil (libnss3-tools / nss-tools) is needed to touch NSS DBs.
+        # Without it Firefox and Chromium keep showing the "Not Secure"
+        # warning even though curl and Chrome-with-system-roots are fine.
+        if ! command -v certutil &>/dev/null; then
+            echo "   - Installing NSS tools for browser trust..."
+            if [ "$PKG_MANAGER" = "apt" ]; then
+                $SUDO_CMD apt install -y libnss3-tools &>/dev/null || true
+            elif [ "$PKG_MANAGER" = "dnf" ]; then
+                $SUDO_CMD dnf install -y nss-tools &>/dev/null || true
+            fi
+        fi
+    fi
+
+    # Run the built-in trust installer. Needs sudo on Linux to write to
+    # /usr/local/share/ca-certificates and re-run update-ca-certificates.
+    echo "   - Running frankenphp trust..."
+    if [ "$OS" = "linux" ]; then
+        $SUDO_CMD "$CADDY_CMD" trust 2>&1 | grep -vE '^\{|^$' || true
+    else
+        "$CADDY_CMD" trust 2>&1 | grep -vE '^\{|^$' || true
+    fi
+
+    # Linux-only: Firefox and Chromium ship as snaps on Ubuntu 22+ and
+    # store their NSS DBs under ~/snap/... — a path that neither Caddy nor
+    # mkcert scans. Inject the root explicitly for each profile we find.
+    if [ "$OS" = "linux" ] && command -v certutil &>/dev/null; then
+        local root_cert
+        root_cert=$(find "$HOME/.local/share/caddy/pki/authorities/local" \
+            -maxdepth 1 -name 'root.crt' 2>/dev/null | head -1)
+        # Fallback: the system-trust copy Caddy drops on first auto-install.
+        if [ -z "$root_cert" ]; then
+            root_cert=$(find /usr/local/share/ca-certificates \
+                -maxdepth 1 -name 'Caddy_Local_Authority*.crt' 2>/dev/null | head -1)
+        fi
+
+        if [ -n "$root_cert" ] && [ -r "$root_cert" ]; then
+            # Snap Firefox, snap Chromium, plus any other NSS DB under ~/snap.
+            # The `sql:` prefix tells certutil the DB is the modern cert9 format.
+            local db
+            while IFS= read -r db; do
+                [ -z "$db" ] && continue
+                local profile_dir
+                profile_dir=$(dirname "$db")
+                echo "   - Trusting in $(echo "$profile_dir" | sed "s|$HOME|~|")"
+                # Remove any prior entry under our nickname so re-runs don't
+                # layer stale copies, then add the current root.
+                certutil -D -d sql:"$profile_dir" -n "Cove Local Authority" 2>/dev/null || true
+                certutil -A -d sql:"$profile_dir" -n "Cove Local Authority" -t "C,," -i "$root_cert" 2>/dev/null || true
+            done < <(find "$HOME/snap" "$HOME/.mozilla/firefox" \
+                -name 'cert9.db' 2>/dev/null)
+        else
+            gum style --foreground yellow "⚠️ Could not locate Caddy root.crt — snap Firefox/Chromium trust skipped."
+        fi
+    fi
+
+    echo ""
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+        "✅ Local SSL trust installed" \
+        "If a browser was open during this run, restart it to pick up the new CA."
+}
+
 upgrade_frankenphp() {
     local frankenphp_path
     frankenphp_path=$(command -v frankenphp)
@@ -5915,6 +6905,16 @@ upgrade_frankenphp() {
 }
 
 cove_upgrade() {
+    local auto_yes=false
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y|--force) auto_yes=true ;;
+        esac
+    done
+    # Non-interactive callers have no TTY — auto-yes so the Adminer prompt
+    # (only shown when the local version can't be parsed) doesn't hang.
+    [ -t 0 ] || auto_yes=true
+
     echo "🔎 Checking for the latest version of Cove..."
 
     local download_url="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
@@ -6086,7 +7086,13 @@ cove_upgrade() {
         fi
     else
         # If version unknown, offer to upgrade anyway
-        if gum confirm "Current version unknown. Would you like to download the latest Adminer ($latest_adminer_version)?"; then
+        local do_download=false
+        if [ "$auto_yes" = true ]; then
+            do_download=true
+        elif gum confirm "Current version unknown. Would you like to download the latest Adminer ($latest_adminer_version)?"; then
+            do_download=true
+        fi
+        if $do_download; then
             echo "🚀 Downloading Adminer $latest_adminer_version..."
             if curl -sL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file"; then
                 echo "✅ Adminer downloaded successfully."
@@ -6095,6 +7101,67 @@ cove_upgrade() {
             fi
         fi
     fi
+
+    # Always refresh the Cove Adminer theme + entry point. Pre-1.10 installs
+    # shipped the Catppuccin CSS and a bare index.php without the head()
+    # hook — without this step upgraders would keep the old UI even after
+    # adminer-core.php gets the latest version.
+    echo ""
+    echo "🎨 Refreshing Cove Adminer theme..."
+    deploy_adminer_theme
+
+    # --- Floor Cove's PHP ini at the current installer default ---
+    # Pre-1.10 installers wrote memory_limit=512M (also upload/post=unset).
+    # Raise to the 1G floor the fresh installer uses today, but leave any
+    # value already >= 1G alone so a user who bumped to 2G stays at 2G.
+    local install_default_memory="1G"
+    local floor_bytes=$(( 1024 * 1024 * 1024 ))
+
+    mem_to_bytes() {
+        local s="${1:-0}" n suffix
+        n="${s%[KMGkmg]}"; suffix="${s#$n}"
+        case "$suffix" in
+            K|k) echo $((n * 1024)) ;;
+            M|m) echo $((n * 1024 * 1024)) ;;
+            G|g) echo $((n * 1024 * 1024 * 1024)) ;;
+            *)   echo "${n:-0}" ;;
+        esac
+    }
+
+    echo ""
+    echo "🧠 Checking PHP memory floor…"
+    local bumped_any=false
+    local k
+    for k in memory_limit upload_max_filesize post_max_size; do
+        local current
+        current=$(cove_ini_get "$k" "")
+        local current_bytes
+        current_bytes=$(mem_to_bytes "$current")
+        if [ -z "$current" ] || [ "$current_bytes" -lt "$floor_bytes" ]; then
+            mkdir -p "$(dirname "$PHP_INI_FILE")"
+            touch "$PHP_INI_FILE"
+            if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
+                sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${install_default_memory}|" "$PHP_INI_FILE"
+            else
+                echo "${k} = ${install_default_memory}" >> "$PHP_INI_FILE"
+            fi
+            rm -f "${PHP_INI_FILE}.bak"
+            echo "   ↑ ${k}: ${current:-unset} → ${install_default_memory}"
+            bumped_any=true
+        else
+            echo "   ✓ ${k}: ${current} (already ≥ ${install_default_memory})"
+        fi
+    done
+    if [ "$bumped_any" = true ]; then
+        echo "   (cove reload below regenerates the Caddyfile so the web server picks up the new limits.)"
+    fi
+
+    # --- Reload to pull in any UI updates ---
+    # Invoke the on-disk binary so a freshly-upgraded script's new functions are used
+    # (the currently-running process still holds the pre-upgrade functions in memory).
+    echo ""
+    echo "🔄 Reloading Cove to apply UI updates..."
+    "$install_path" reload
 }
 cove_url() {
     # -----------------------------------------------------------------
