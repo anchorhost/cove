@@ -62,10 +62,13 @@ EOM
         current_user=$(whoami)
 
         echo "   - Generating custom Mailpit service file..."
-        # Note: Using a temp file approach to avoid issues with heredoc and sudo
-        local temp_service
-        temp_service=$(mktemp)
-        cat > "$temp_service" << EOM
+        # Write the unit file directly to its destination via sudo tee.
+        # Previously we used mktemp + sudo mv, but on Fedora/SELinux mv
+        # preserves the source file's user_tmp_t context from /tmp, and
+        # systemd refuses to load units outside the systemd_unit_file_t
+        # type. Writing fresh into /etc/systemd/system/ picks up that
+        # directory's type-transition rule automatically.
+        $SUDO_CMD tee "$service_path" >/dev/null << EOM
 [Unit]
 Description=Mailpit Service for Cove
 After=network.target
@@ -78,8 +81,6 @@ User=$current_user
 [Install]
 WantedBy=multi-user.target
 EOM
-        
-        $SUDO_CMD mv "$temp_service" "$service_path"
         $SUDO_CMD chmod 644 "$service_path"
 
         # --- FrankenPHP / Cove systemd unit ---
@@ -92,9 +93,9 @@ EOM
         frankenphp_bin=$(command -v "$CADDY_CMD")
 
         echo "   - Generating Cove FrankenPHP service file..."
-        local temp_cove_service
-        temp_cove_service=$(mktemp)
-        cat > "$temp_cove_service" << EOM
+        # Same sudo-tee pattern as the mailpit unit above; see the note
+        # there for why mktemp + sudo mv doesn't survive SELinux.
+        $SUDO_CMD tee "$cove_service_path" >/dev/null << EOM
 [Unit]
 Description=FrankenPHP for Cove
 After=network.target mariadb.service
@@ -113,8 +114,6 @@ Environment=PHPRC=$PHP_INI_FILE
 [Install]
 WantedBy=multi-user.target
 EOM
-
-        $SUDO_CMD mv "$temp_cove_service" "$cove_service_path"
         $SUDO_CMD chmod 644 "$cove_service_path"
 
         # Reload systemd, then enable and start both Cove-managed services

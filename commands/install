@@ -427,6 +427,30 @@ INI
     mkdir -p "$APP_DIR/whoops"
     curl -sL "https://github.com/filp/whoops/archive/refs/tags/2.15.3.tar.gz" | tar -xz -C "$APP_DIR/whoops" --strip-components=1
 
+    # --- Fedora/RHEL SELinux labeling ---
+    # The upstream FrankenPHP installer tags /usr/bin/frankenphp with the
+    # httpd_exec_t file context. On Fedora/RHEL that triggers an exec-time
+    # domain transition into httpd_t — a confined web-server domain that:
+    #   - can't read files labeled user_home_t (fails to open ~/Cove/Caddyfile
+    #     and ~/.local/share/caddy/pki/.../root.crt with "permission denied")
+    #   - silently RSTs TLS connections under some configs (TCP accepts but
+    #     the TLS ClientHello gets no response)
+    # Neither failure logs an AVC — both are dontaudit'd. Retagging the binary
+    # as bin_t keeps systemd running it in unconfined_service_t, which can
+    # read user files normally. On non-SELinux distros (Debian/Ubuntu)
+    # `semanage` isn't in $PATH and this block is a no-op.
+    if [ "$OS" = "linux" ] && command -v semanage &>/dev/null; then
+        local fp_bin
+        fp_bin=$(command -v "$CADDY_CMD")
+        if [ -n "$fp_bin" ]; then
+            echo "🔐 Relabeling FrankenPHP for SELinux..."
+            $SUDO_CMD semanage fcontext -a -t bin_t "$fp_bin" &>/dev/null \
+                || $SUDO_CMD semanage fcontext -m -t bin_t "$fp_bin" &>/dev/null \
+                || true
+            $SUDO_CMD restorecon "$fp_bin" &>/dev/null || true
+        fi
+    fi
+
     echo "⚙️ Starting services..."
     if [ "$OS" == "macos" ]; then
         if ! brew services restart mariadb; then
@@ -458,7 +482,7 @@ INI
         echo "   - ✅ MariaDB is ready."
         local db_user="cove_user"
         local db_pass
-        db_pass=$(openssl rand -base64 16)
+        db_pass=$(cove_random_password 16)
         local sql_command="DROP USER IF EXISTS '$db_user'@'localhost'; CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass'; GRANT ALL PRIVILEGES ON *.* TO '$db_user'@'localhost' WITH GRANT OPTION; FLUSH PRIVILEGES;"
         local user_created_successfully=false
 

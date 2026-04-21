@@ -24,12 +24,22 @@ cove_trust() {
 
     # Run the built-in trust installer. Needs sudo on Linux to write to
     # /usr/local/share/ca-certificates and re-run update-ca-certificates.
+    # `frankenphp trust` talks to the Caddy admin API on :2019 to fetch the
+    # current root — so if Caddy isn't up (common right after `cove install`
+    # fails to start the service) the call errors with "connection refused"
+    # and the remainder of the trust work is a no-op. Capture the exit code
+    # so the final success banner only fires when something was actually
+    # installed.
     echo "   - Running frankenphp trust..."
+    local trust_output trust_rc=0
     if [ "$OS" = "linux" ]; then
-        $SUDO_CMD "$CADDY_CMD" trust 2>&1 | grep -vE '^\{|^$' || true
+        trust_output=$($SUDO_CMD "$CADDY_CMD" trust 2>&1)
+        trust_rc=$?
     else
-        "$CADDY_CMD" trust 2>&1 | grep -vE '^\{|^$' || true
+        trust_output=$("$CADDY_CMD" trust 2>&1)
+        trust_rc=$?
     fi
+    echo "$trust_output" | grep -vE '^\{|^$' || true
 
     # Linux-only: Firefox and Chromium ship as snaps on Ubuntu 22+ and
     # store their NSS DBs under ~/snap/... — a path that neither Caddy nor
@@ -65,7 +75,21 @@ cove_trust() {
     fi
 
     echo ""
-    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
-        "✅ Local SSL trust installed" \
-        "If a browser was open during this run, restart it to pick up the new CA."
+    if [ "$trust_rc" -eq 0 ]; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Local SSL trust installed" \
+            "If a browser was open during this run, restart it to pick up the new CA."
+    else
+        # Tailor the hint based on what frankenphp actually said — "connection
+        # refused" almost always means Caddy's admin API isn't up yet.
+        if echo "$trust_output" | grep -q "connection refused"; then
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground yellow \
+                "⚠️ Trust install skipped — Cove server isn't running yet" \
+                "Run 'cove enable' then 'cove trust' to finish installing the local root."
+        else
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground yellow \
+                "⚠️ Trust install did not complete" \
+                "Re-run 'cove trust' once Cove is running to try again."
+        fi
+    fi
 }

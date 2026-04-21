@@ -67,7 +67,7 @@ cove_add() {
         echo "🗄️ Creating database: $db_name"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
         echo "Installing WordPress..."
-        admin_pass=$(openssl rand -base64 12)
+        admin_pass=$(cove_random_password 12)
         
         # get_wp_cmd routes wp-cli through `frankenphp php-cli` and PHPRC
         # (exported in main) sets display_errors=0 + error_reporting=6143.

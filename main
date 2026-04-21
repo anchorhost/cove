@@ -151,6 +151,19 @@ config_set() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
+# Emit a base64-encoded random password. Uses openssl when present, falls
+# back to /dev/urandom otherwise — Fedora Workstation doesn't ship openssl
+# in its base install, and a missing openssl used to yield an empty $db_pass
+# that then became a MariaDB user with *no* password.
+cove_random_password() {
+    local bytes="${1:-16}"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 "$bytes"
+    else
+        head -c "$bytes" /dev/urandom | base64 | tr -d '\n'
+    fi
+}
+
 # Reads a directive from ~/Cove/php.ini (last-wins, ini-style), trims
 # surrounding whitespace/quotes, and returns the fallback if the key is
 # missing or the ini file doesn't exist yet. Used by regenerate_caddyfile
@@ -371,9 +384,14 @@ $whoops = new \Whoops\Run;
 // We want to see all errors *except* for the noisy Deprecated and Notice warnings,
 // which are common with older plugins on modern PHP.
 // E_USER_NOTICE is used by WordPress's _doing_it_wrong() function.
+// E_USER_WARNING is triggered by WP_HTTP (wp_version_check, update checks, API
+// calls) whenever a request to api.wordpress.org or a plugin update endpoint
+// fails — e.g. on first wp-admin load before background crons settle, or on a
+// fresh install without system CA certs. That's a transient runtime condition,
+// not a bug to page on; leave it in the error log and let WordPress recover.
 $whoops->silenceErrorsInPaths(
     '/.*/', // A regex that matches all file paths
-    E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE
+    E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE | E_USER_WARNING
 );
 
 // The PrettyPageHandler will now only be triggered for fatal errors.
@@ -604,6 +622,11 @@ $display_dir = ($home && str_starts_with($dir, $home)) ? '~' . substr($dir, strl
   --bg: #fbfaf7; --bg-elev: #ffffff; --bg-sunk: #f4f2ec;
   --border: #e8e4da; --text: #1a1c1b; --text-soft: #3a3d3a;
   --muted: #6b6f6a; --dim: #9a9d97;
+  /* sRGB fallback first; the oklch override on the next line is ignored by
+     browsers without oklch() support (Firefox <113, Chrome <111, Safari <16.4)
+     so the hex value wins — otherwise the whole declaration would be invalid
+     and --accent would fall back to its initial value (unset). */
+  --accent: #3a97a9;       --accent-ink: #1c4c58;
   --accent: oklch(62% 0.11 190); --accent-ink: oklch(35% 0.08 190);
 }
 @media (prefers-color-scheme: dark) {
@@ -611,6 +634,7 @@ $display_dir = ($home && str_starts_with($dir, $home)) ? '~' . substr($dir, strl
     --bg: #0f1210; --bg-elev: #161a17; --bg-sunk: #0b0e0c;
     --border: #252925; --text: #edeee9; --text-soft: #c6c9c1;
     --muted: #8a8e85; --dim: #5d615a;
+    --accent: #4db0c2;       --accent-ink: #83d2e0;
     --accent: oklch(72% 0.12 190); --accent-ink: oklch(82% 0.10 190);
   }
 }
@@ -1570,6 +1594,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
             --font-serif: 'Fraunces', Georgia, serif;
             --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+            /* sRGB fallback first; browsers without oklch() support silently
+               drop the override on the next line and keep the hex value.
+               Without the fallback, the whole declaration would be invalid on
+               Firefox <113 / Chrome <111 / Safari <16.4 and --accent would be
+               unset — which reads as "transparent" for backgrounds and
+               "black" for SVG fills (hence the invisible add button and the
+               solid-black logo disc on older browsers). */
+            --accent: #3a97a9;
             --accent: oklch(62% 0.11 190);
             --accent-fg: #0a1a1c;
             --radius-lg: 20px;
@@ -1588,9 +1620,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --text-faint: #5d615a;
             /* Dark-mode teal is brighter so it reads cleanly against the
                warmer panel — matches the landing page palette. */
+            --accent: #4db0c2;
             --accent: oklch(72% 0.12 190);
             --pill-bg: #1e2320;
+            --pill-wp-bg: rgba(77, 176, 194, 0.18);
             --pill-wp-bg: color-mix(in oklch, var(--accent) 18%, transparent);
+            --pill-wp-fg: #71c0ce;
             --pill-wp-fg: color-mix(in oklch, var(--accent) 80%, white);
             --pill-static-bg: #1e2320;
             --pill-static-fg: #9a9d94;
@@ -1613,7 +1648,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                the lighter background — override just for light mode. */
             --accent-fg: #ffffff;
             --pill-bg: #f1ede5;
+            --pill-wp-bg: rgba(58, 151, 169, 0.14);
             --pill-wp-bg: color-mix(in oklch, var(--accent) 14%, transparent);
+            --pill-wp-fg: #20535d;
             --pill-wp-fg: color-mix(in oklch, var(--accent) 55%, black);
             --pill-static-bg: #f1ede5;
             --pill-static-fg: #8a8781;
@@ -1644,18 +1681,29 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            .logo-mark so they don't collide with unrelated elements. Colors
            are driven by CSS variables with sensible defaults, so each theme
            can override individual layers without touching the inline SVG. */
+        /* Each layer gets a pair of declarations — the sRGB hex applies
+           everywhere, then the oklch override kicks in on browsers that
+           understand it. Without the fallback, unsupported oklch() in a
+           var() default makes the whole `fill`/`stroke` declaration invalid
+           and SVG falls back to fill:black (which is what produces the
+           solid-black disc + missing layers on Firefox <113). */
         .logo-mark { width: 34px; height: 34px; display: block; flex-shrink: 0; }
-        .logo-mark .disc    { fill: var(--mark-disc, oklch(96% 0.015 85)); }
-        .logo-mark .water   { fill: var(--mark-water, oklch(62% 0.11 190)); }
-        .logo-mark .land    { fill: var(--mark-land, oklch(72% 0.10 150)); }
-        .logo-mark .horizon { stroke: var(--mark-horizon, oklch(35% 0.08 190)); fill: none; }
-        .logo-mark .wave    { stroke: var(--mark-wave, oklch(35% 0.08 190)); fill: none; }
-        .logo-mark .ring    { stroke: var(--mark-ring, oklch(35% 0.08 190)); fill: none; stroke-width: 3; }
+        .logo-mark .disc    { fill: var(--mark-disc, #f6f1e8); fill: var(--mark-disc, oklch(96% 0.015 85)); }
+        .logo-mark .water   { fill: var(--mark-water, #3a97a9); fill: var(--mark-water, oklch(62% 0.11 190)); }
+        .logo-mark .land    { fill: var(--mark-land, #8bb382); fill: var(--mark-land, oklch(72% 0.10 150)); }
+        .logo-mark .horizon { stroke: var(--mark-horizon, #1c4c58); stroke: var(--mark-horizon, oklch(35% 0.08 190)); fill: none; }
+        .logo-mark .wave    { stroke: var(--mark-wave, #1c4c58); stroke: var(--mark-wave, oklch(35% 0.08 190)); fill: none; }
+        .logo-mark .ring    { stroke: var(--mark-ring, #1c4c58); stroke: var(--mark-ring, oklch(35% 0.08 190)); fill: none; stroke-width: 3; }
         html[data-theme="dark"] .logo-mark {
+            --mark-disc:    #2b2925;
             --mark-disc:    oklch(22% 0.01 85);
+            --mark-land:    #6a9d70;
             --mark-land:    oklch(64% 0.09 150);
+            --mark-ring:    rgba(237, 238, 233, 0.72);
             --mark-ring:    color-mix(in oklab, var(--text) 72%, transparent);
+            --mark-horizon: rgba(237, 238, 233, 0.72);
             --mark-horizon: color-mix(in oklab, var(--text) 72%, transparent);
+            --mark-wave:    rgba(237, 238, 233, 0.65);
             --mark-wave:    color-mix(in oklab, var(--text) 65%, transparent);
         }
         /* Square icon button that cross-fades a moon (light mode) with a sun
@@ -1696,12 +1744,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            "type:xxx" tokens and get into a weird parse state. */
         .filter-chip { display: inline-flex; align-items: center; gap: 0.1rem; padding: 0.18rem 0.22rem 0.18rem 0.65rem; background: var(--pill-wp-bg); color: var(--pill-wp-fg); border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.76rem; font-weight: 500; letter-spacing: 0.02em; white-space: nowrap; }
         .filter-chip-x { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; background: transparent; border: 0; color: inherit; cursor: pointer; border-radius: 50%; font-size: 0.95rem; line-height: 1; padding: 0; }
-        .filter-chip-x:hover { background: color-mix(in oklch, var(--accent) 28%, transparent); }
+        .filter-chip-x:hover { background: rgba(58, 151, 169, 0.28); background: color-mix(in oklch, var(--accent) 28%, transparent); }
 
         /* Add row */
         /* New-site alert: appears after creating a WP site so the one-time
            login is one click away, without hunting for the new row. */
-        .new-site-alert { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--panel-border); background: color-mix(in oklab, var(--accent) 12%, var(--panel)); color: var(--text); font-size: 0.92rem; }
+        .new-site-alert { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); background: color-mix(in oklab, var(--accent) 12%, var(--panel)); color: var(--text); font-size: 0.92rem; }
         .new-site-alert-icon { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: var(--accent-fg); flex: none; }
         .new-site-alert-text { flex: 1; min-width: 0; }
         .new-site-alert-text strong { font-family: var(--font-mono); font-weight: 500; }
@@ -1722,6 +1770,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                against the cream bg-sunk; a brighter, more saturated teal at
                3px reads unambiguously as teal (same hue as the brand, just
                higher chroma so it survives the narrow band). */
+            background: #3fb6cf;
             background: oklch(72% 0.15 190);
             animation: add-row-slide 1.3s linear infinite;
         }
@@ -1748,7 +1797,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-domain { font-family: var(--font-mono); font-size: 0.88rem; color: var(--text-dim); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .site-domain .host-accent { color: var(--accent); }
         .site-domain:hover { color: var(--accent); }
-        .site-domain mark { background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: 3px; }
+        .site-domain mark { background: rgba(58, 151, 169, 0.28); background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: 3px; }
         .site-type { display: inline-flex; justify-content: center; min-width: 64px; padding: 0.2rem 0.55rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.68rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; user-select: none; transition: filter 120ms; }
         .site-type:hover { filter: brightness(1.15); }
         .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
@@ -1783,7 +1832,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .dot { display: inline-flex; align-items: center; gap: 0.45rem; color: var(--text-dim); text-decoration: none; background: transparent; border: 0; padding: 0; font-family: inherit; font-size: inherit; cursor: default; }
         .dot.link, .dot[role="button"] { cursor: pointer; }
         .dot.link:hover, .dot[role="button"]:hover { color: var(--text); }
-        .dot::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px color-mix(in oklch, var(--accent) 60%, transparent); }
+        .dot::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px rgba(58, 151, 169, 0.6); box-shadow: 0 0 6px color-mix(in oklch, var(--accent) 60%, transparent); }
         .totals { display: inline-flex; align-items: center; gap: 0.5rem; }
         .refresh-btn { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; padding: 0.15rem 0.35rem; font-size: 0.95rem; border-radius: 5px; }
         .refresh-btn:hover { color: var(--text); background: var(--panel-hover); }
