@@ -51,30 +51,16 @@ cove_login() {
         echo "✅ Found admin: '$admin_to_login'."
     fi
 
-    # 3. Attempt to generate the login URL.
+    # 3. Refresh the MU-plugin before generating the URL. Always overwrite
+    # the file so sites created with older Cove versions pick up changes to
+    # the plugin (token format, query-arg name, etc.) without needing a
+    # re-add. The file is small and idempotent to regenerate.
+    inject_mu_plugin "$public_dir"
+
+    # 4. Generate the login URL.
     echo "   Generating login link..."
     local login_url
-    # Suppress stderr on the first try so we can handle the error gracefully.
-    login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" ) 2>/dev/null )
-    local exit_code=$?
-
-    # 4. If the command failed, check for the mu-plugin and retry.
-    if [ $exit_code -ne 0 ]; then
-        echo "   ⚠️ Login command failed. Checking for missing MU-plugin..."
-        local mu_plugin_path="$public_dir/wp-content/mu-plugins/captaincore-helper.php"
-        
-        if [ ! -f "$mu_plugin_path" ]; then
-            # The plugin is missing, so inject it.
-            inject_mu_plugin "$public_dir"
-            
-            echo "   - Retrying login link generation..."
-            # Run the command again, but this time, show errors if it fails.
-            login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" --skip-plugins --skip-themes) )
-        else
-            # The plugin exists, so the failure is for another reason.
-            echo "   - MU-plugin is already present. The issue may be with WP-CLI or the site's database."
-        fi
-    fi
+    login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" --skip-plugins --skip-themes) )
 
     # 5. Display the final URL or an error message.
     if [ -n "$login_url" ]; then

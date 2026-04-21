@@ -437,12 +437,15 @@ function captaincore_quick_login_action_callback() {
 	$post->user_login = str_replace( "%20", " ", $post->user_login );
 	$user     = get_user_by( 'login', $post->user_login );
 	$password = wp_generate_password();
-	$token    = sha1( $password );
+	// Short token: sha1 is 40 hex chars; 7 is still 16^7 ≈ 268M combinations,
+	// plenty for a one-time-use local-dev login link, and short enough to fit
+	// a narrow terminal without wrapping.
+	$token    = substr( sha1( $password ), 0, 7 );
 
-	update_user_meta( $user->ID, 'captaincore_login_token', $token );
+	update_user_meta( $user->ID, 'cove_login_token', $token );
 	$query_args = [
-			'user_id'                 => $user->ID,
-			'captaincore_login_token' => $token,
+			'user_id'          => $user->ID,
+			'cove_login_token' => $token,
 		];
 	$login_url    = wp_login_url();
 		$one_time_url = add_query_arg( $query_args, $login_url );
@@ -459,7 +462,7 @@ add_action( 'wp_ajax_nopriv_captaincore_quick_login', 'captaincore_quick_login_a
 function captaincore_login_handle_token() {
 
 	global $pagenow;
-	if ( 'wp-login.php' !== $pagenow || empty( $_GET['user_id'] ) || empty( $_GET['captaincore_login_token'] ) ) {
+	if ( 'wp-login.php' !== $pagenow || empty( $_GET['user_id'] ) || empty( $_GET['cove_login_token'] ) ) {
 		return;
 	}
 
@@ -475,9 +478,9 @@ function captaincore_login_handle_token() {
 		wp_die( $error );
 	}
 
-	$token    = get_user_meta( $user->ID, 'captaincore_login_token', true );
+	$token    = get_user_meta( $user->ID, 'cove_login_token', true );
 	$is_valid = false;
-		if ( hash_equals( $token, $_GET['captaincore_login_token'] ) ) {
+		if ( hash_equals( $token, $_GET['cove_login_token'] ) ) {
 			$is_valid = true;
 		}
 
@@ -485,7 +488,7 @@ function captaincore_login_handle_token() {
 		wp_die( $error );
 	}
 
-	delete_user_meta( $user->ID, 'captaincore_login_token' );
+	delete_user_meta( $user->ID, 'cove_login_token' );
 	wp_set_auth_cookie( $user->ID, 1 );
 	wp_safe_redirect( admin_url() );
 	exit;
@@ -529,16 +532,18 @@ if (defined('WP_CLI') && WP_CLI) {
             return;
         }
 
-        // Generate tokens
+        // Generate tokens. Short token (7 hex chars from sha1) keeps the
+        // one-time URL readable on narrow terminals while still leaving
+        // ~268M combinations for a one-time-use local-dev link.
         $password = wp_generate_password();
-        $token    = sha1($password);
+        $token    = substr( sha1( $password ), 0, 7 );
 
         // Update user meta with the new token
-        update_user_meta( $user->ID, 'captaincore_login_token', $token );
+        update_user_meta( $user->ID, 'cove_login_token', $token );
         // Construct the one-time login URL
         $query_args = [
-            'user_id'                 => $user->ID,
-            'captaincore_login_token' => $token,
+            'user_id'          => $user->ID,
+            'cove_login_token' => $token,
         ];
         $login_url    = wp_login_url();
         $one_time_url = add_query_arg($query_args, $login_url);
