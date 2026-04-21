@@ -2482,10 +2482,14 @@ display_command_help() {
     local cmd="$1"
     case "$cmd" in
         install)
-            echo "Usage: cove install"
+            echo "Usage: cove install [--yes]"
             echo ""
             echo "Installs and configures Homebrew dependencies like Caddy, MariaDB, and Mailpit."
             echo "It also sets up the required directory structure inside '~/Cove'."
+            echo ""
+            echo "Options:"
+            echo "  --yes, -y, --force   Skip confirmation prompts for scripted installs."
+            echo "                       Auto-enabled when stdin is not a TTY."
             ;;
         enable)
             echo "Usage: cove enable"
@@ -2868,7 +2872,7 @@ main() {
             cove_push "$@"
             ;;
         install)
-            cove_install
+            cove_install "$@"
             ;;
         login)
             check_dependencies

@@ -11,9 +11,14 @@ cove_delete() {
     local force_delete=false
     local no_reload=false
     for arg in "$@"; do
-        [ "$arg" = "--force" ] && force_delete=true
-        [ "$arg" = "--no-reload" ] && no_reload=true
+        case "$arg" in
+            --force|--yes|-y) force_delete=true ;;
+            --no-reload) no_reload=true ;;
+        esac
     done
+    # Non-interactive callers (dashboard shell_exec, scripted cleanup) have no
+    # TTY; gum confirm aborts there. Auto-promote so the delete doesn't hang.
+    [ -t 0 ] || force_delete=true
 
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir" ]; then

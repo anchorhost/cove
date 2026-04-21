@@ -131,6 +131,26 @@ install_dependency() {
 }
 
 cove_install() {
+    local auto_yes=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y|--force)
+                auto_yes=true
+                shift
+                ;;
+            *)
+                echo "❌ Unknown argument: $1" >&2
+                echo "Usage: cove install [--yes]" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    # Non-interactive callers (CI, installer piping, dashboards) have no TTY;
+    # gum confirm / gum choose abort there. Auto-promote so the install doesn't
+    # hang.
+    [ -t 0 ] || auto_yes=true
+
     echo "🚀 Starting Cove installation..."
 
     # --- WSL/Systemd Check ---
@@ -149,11 +169,15 @@ cove_install() {
                 echo ""
                 echo "   Then restart WSL with: wsl --shutdown"
                 echo ""
-                read -p "Do you want to continue anyway? (y/N) " -n 1 -r
-                echo
-                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                    echo "🚫 Installation cancelled."
-                    exit 0
+                if $auto_yes; then
+                    echo "   (--yes set — continuing anyway.)"
+                else
+                    read -p "Do you want to continue anyway? (y/N) " -n 1 -r
+                    echo
+                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                        echo "🚫 Installation cancelled."
+                        exit 0
+                    fi
                 fi
             fi
         fi
@@ -281,8 +305,12 @@ cove_install() {
     config_set HTTPS_PORT "$HTTPS_PORT"
 
     # --- Pre-install Checks ---
-    if [ -d "$COVE_DIR" ]; then
-        if ! gum confirm "⚠️ The Cove directory (~/Cove) already exists. Proceeding may overwrite some configurations. Continue?"; then
+    # $COVE_DIR alone isn't a reliable "previous install" marker — config_set
+    # above creates it just to persist HTTP_PORT/HTTPS_PORT. Check for a
+    # directory that only a completed install writes (Adminer), so the prompt
+    # only fires when it's actually meaningful.
+    if [ -d "$ADMINER_DIR" ]; then
+        if ! $auto_yes && ! gum confirm "⚠️ Cove already appears to be installed at ~/Cove. Proceeding may overwrite some configurations. Continue?"; then
             echo "🚫 Installation cancelled."
             exit 0
         fi
@@ -465,7 +493,14 @@ INI
     fi
 
     # --- Database Configuration ---
-    if [ -f "$CONFIG_FILE" ] && gum confirm "Existing Cove database config found. Use it and skip database setup?"; then
+    # Reuse saved DB creds if present. $CONFIG_FILE always exists at this
+    # point (config_set above wrote HTTP_PORT/HTTPS_PORT), so probe for the
+    # DB keys specifically rather than just the file.
+    local has_db_config=false
+    if [ -f "$CONFIG_FILE" ] && grep -q '^DB_USER=' "$CONFIG_FILE" 2>/dev/null; then
+        has_db_config=true
+    fi
+    if $has_db_config && { $auto_yes || gum confirm "Existing Cove database config found. Use it and skip database setup?"; }; then
         echo "✅ Using existing database configuration."
     else
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Configuring MariaDB"
