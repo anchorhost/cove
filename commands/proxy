@@ -48,7 +48,7 @@ cove_proxy_add() {
     # Interactive mode if arguments not provided
     if [ -z "$name" ]; then
         echo "📝 Adding a new reverse proxy entry..."
-        name=$(gum input --placeholder "Proxy name (e.g., opencode)")
+        name=$(gum input --width 0 --placeholder "Proxy name (e.g., opencode)")
     fi
 
     if [ -z "$name" ]; then
@@ -73,7 +73,7 @@ cove_proxy_add() {
     fi
 
     if [ -z "$domain" ]; then
-        domain=$(gum input --placeholder "Domain to listen on (e.g., myhost.tailnet.ts.net)")
+        domain=$(gum input --width 0 --placeholder "Domain to listen on (e.g., myhost.tailnet.ts.net)")
     fi
 
     if [ -z "$domain" ]; then
@@ -82,7 +82,7 @@ cove_proxy_add() {
     fi
 
     if [ -z "$target" ]; then
-        target=$(gum input --placeholder "Target to proxy to (e.g., 127.0.0.1:4096)")
+        target=$(gum input --width 0 --placeholder "Target to proxy to (e.g., 127.0.0.1:4096)")
     fi
 
     if [ -z "$target" ]; then

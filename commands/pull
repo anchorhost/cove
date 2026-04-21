@@ -21,21 +21,32 @@ cove_pull() {
         fi
     done
 
-    # Define quiet SSH options to prevent host key warnings
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    # Define quiet SSH options to prevent host key warnings. ControlMaster
+    # shares a single authenticated connection across every ssh call below
+    # so the user enters their password (or unlocks their key) once — the
+    # validate, backup, and cleanup steps all piggyback on the first
+    # connection instead of re-prompting. The socket lives in a per-run
+    # path so parallel `cove pull` invocations don't collide.
+    local ssh_ctl
+    ssh_ctl=$(mktemp -u "${TMPDIR:-/tmp}/cove-ssh-XXXXXXXX")
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
+    # Remove the socket on any exit path (success, failure, Ctrl-C). Any
+    # orphaned master process times out on its own via ControlPersist.
+    # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
+    trap "rm -f '$ssh_ctl'" EXIT
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pulling a remote WordPress site into Cove."
     # --- 1. Gather Remote Info ---
     log_step "Enter remote server details"
     local remote_ssh
-    remote_ssh=$(gum input --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
     if [ -z "$remote_ssh" ]; then log_error "SSH connection cannot be empty."; fi
 
     # Trim the "ssh " prefix if the user includes it.
     remote_ssh="${remote_ssh##ssh }"
 
     local remote_path
-    remote_path=$(gum input --value "public/" --prompt "Path to WordPress Root: ")
+    remote_path=$(gum input --width 0 --value "public/" --prompt "Path to WordPress Root: ")
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
     local remote_path_q
     remote_path_q=$(shell_quote "$remote_path")
@@ -72,7 +83,7 @@ cove_pull() {
     if [ "$destination_choice" == "New Site" ]; then
         local proposed_name
         proposed_name=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//; s/\./-/g')
-        site_name=$(gum input --value "$proposed_name" --prompt "Enter a name for the new local site: ")
+        site_name=$(gum input --width 0 --value "$proposed_name" --prompt "Enter a name for the new local site: ")
         if [ -z "$site_name" ]; then log_error "Site name cannot be empty."; fi
 
         log_step "Creating new placeholder site: ${site_name}.localhost"

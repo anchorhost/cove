@@ -17,7 +17,7 @@ cove_tailscale_enable() {
     if [ -z "$hostname" ]; then
         echo "📝 Enter your Tailscale machine hostname"
         echo "   (e.g., mycomputer.tail1234.ts.net)"
-        hostname=$(gum input --placeholder "your-machine.tailnet.ts.net")
+        hostname=$(gum input --width 0 --placeholder "your-machine.tailnet.ts.net")
     fi
 
     if [ -z "$hostname" ]; then
