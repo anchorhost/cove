@@ -10,7 +10,7 @@ cove_disable() {
         launchctl unload "$COVE_DIR/com.cove.caddy.plist" &>/dev/null
         "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
         echo "   - Stopping MariaDB..."
-        brew services stop mariadb &>/dev/null
+        pkg_service stop mariadb &>/dev/null
         echo "   - Stopping Mailpit..."
         launchctl unload "$COVE_DIR/com.cove.mailpit.plist" &>/dev/null
     fi

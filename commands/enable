@@ -12,7 +12,7 @@ cove_enable() {
 
     if [ "$OS" == "macos" ]; then
         echo "   - Starting MariaDB..."
-        brew services start mariadb
+        start_macos_mariadb
 
         local plist_path="$COVE_DIR/com.cove.mailpit.plist"
         local mailpit_bin
@@ -20,7 +20,7 @@ cove_enable() {
 
         # Stop and unload any existing service to ensure our custom one is used.
         launchctl unload "$plist_path" &>/dev/null
-        brew services stop mailpit &>/dev/null
+        pkg_service stop mailpit &>/dev/null
 
         echo "   - Generating custom Mailpit service file..."
         cat > "$plist_path" << EOM

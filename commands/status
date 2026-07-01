@@ -15,7 +15,7 @@ cove_status() {
 
     # Check MariaDB and Mailpit status on MacOS
     if [ "$OS" == "macos" ]; then
-        if brew services list 2>/dev/null | grep -q "mariadb.*started"; then 
+        if pkg_service list 2>/dev/null | grep -q "mariadb.*started"; then
             mariadb_status="✅ Running"
         fi
         if launchctl list 2>/dev/null | grep -q "com.cove.mailpit"; then 

@@ -51,7 +51,10 @@ cove_share() {
         local install_cmd=""
         local install_name=""
         
-        if command -v brew &> /dev/null; then
+        if [ "$OS" == "macos" ] && command -v "$MAC_BREW" &> /dev/null; then
+            install_cmd="$MAC_BREW install cloudflared"
+            install_name=$([ "$MAC_BREW" = "nb" ] && echo "nanobrew" || echo "Homebrew")
+        elif command -v brew &> /dev/null; then
             install_cmd="brew install cloudflared"
             install_name="Homebrew"
         elif command -v apt-get &> /dev/null; then

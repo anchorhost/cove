@@ -10,7 +10,7 @@
 # systemd hand down a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), which
 # means the dashboard's shell_exec of cove fails to find gum/wp/frankenphp.
 # We only prepend dirs that actually exist and aren't already on PATH.
-for _cove_bin in /opt/homebrew/bin /usr/local/bin /usr/local/sbin "$HOME/.local/bin"; do
+for _cove_bin in /opt/homebrew/bin /opt/nanobrew/bin /opt/nanobrew/prefix/bin /usr/local/bin /usr/local/sbin "$HOME/.local/bin"; do
     if [ -d "$_cove_bin" ] && [[ ":$PATH:" != *":$_cove_bin:"* ]]; then
         PATH="$_cove_bin:$PATH"
     fi
@@ -21,6 +21,11 @@ export PATH
 # --- OS & Package Manager Detection ---
 OS=""
 PKG_MANAGER=""
+# macOS package/service manager. Either "brew" (Homebrew, the default) or
+# "nb" (nanobrew). nanobrew reuses Homebrew's formulas/bottles and supports
+# `nb install` + `nb services`, so Cove can drive it through the same code
+# paths. Left empty on Linux. See setup_environment for the detection rules.
+MAC_BREW=""
 SUDO_CMD="sudo"
 IS_WSL=false
 BIN_DIR="/usr/local/bin"
@@ -34,6 +39,28 @@ setup_environment() {
         OS="macos"
         PKG_MANAGER="brew"
         SUDO_CMD=""
+
+        # Pick the macOS package/service manager. Homebrew stays the default
+        # whenever it's present (its mariadb post_install hook initializes the
+        # data dir for us). nanobrew is used when the user forces it via
+        # COVE_PKG_MANAGER=nanobrew|nb, or when only `nb` is installed.
+        case "${COVE_PKG_MANAGER:-}" in
+            nanobrew|nb)
+                MAC_BREW="nb"
+                ;;
+            brew|homebrew)
+                MAC_BREW="brew"
+                ;;
+            *)
+                if command -v brew &>/dev/null; then
+                    MAC_BREW="brew"
+                elif command -v nb &>/dev/null; then
+                    MAC_BREW="nb"
+                else
+                    MAC_BREW="brew" # default; install will guide the user
+                fi
+                ;;
+        esac
 
         # Architecture detection for MacOS Homebrew paths
         if [ "$(uname -m)" = "arm64" ]; then
@@ -80,6 +107,60 @@ setup_environment() {
     # --- If neither of the above, it's an unsupported OS ---
     echo "❌ ERROR: Unsupported OS: $os_name" >&2
     exit 1
+}
+
+# macOS service control across Homebrew (`brew services`) and nanobrew
+# (`nb services`). nanobrew has no `restart` subcommand, so emulate it with
+# stop+start. Mirrors `brew services <action> <svc>` for every caller.
+pkg_service() {
+    local action="$1"   # start | stop | restart | list
+    local svc="$2"      # service name (omitted for list)
+
+    # Collect args without a trailing empty string — `brew services list ""`
+    # treats "" as a service filter and returns nothing.
+    local -a args=("$action")
+    [ -n "$svc" ] && args+=("$svc")
+
+    if [ "$MAC_BREW" = "nb" ]; then
+        if [ "$action" = "restart" ]; then
+            nb services stop "$svc" &>/dev/null
+            nb services start "$svc"
+            return $?
+        fi
+        nb services "${args[@]}"
+        return $?
+    fi
+
+    brew services "${args[@]}"
+}
+
+# Block until MariaDB accepts connections, or give up after $1 seconds.
+mariadb_wait_ready() {
+    local max="${1:-10}" i=0
+    while ! mysqladmin ping --silent &>/dev/null; do
+        sleep 1
+        i=$((i + 1))
+        [ "$i" -ge "$max" ] && return 1
+    done
+    return 0
+}
+
+# Start MariaDB on macOS via the active package manager. Homebrew's mariadb
+# formula initializes the data directory in its post_install hook, but
+# nanobrew skips Ruby post_install hooks — so on a fresh nanobrew install the
+# service starts yet never accepts connections. Detect that, run
+# mariadb-install-db ourselves, and restart. The Homebrew path is unchanged.
+start_macos_mariadb() {
+    pkg_service restart mariadb || return 1
+
+    if [ "$MAC_BREW" = "nb" ] && ! mariadb_wait_ready 8; then
+        echo "   - Initializing MariaDB data directory (nanobrew post_install fallback)..."
+        if command -v mariadb-install-db &>/dev/null; then
+            mariadb-install-db &>/dev/null || true
+        fi
+        pkg_service restart mariadb || return 1
+    fi
+    return 0
 }
 
 setup_environment

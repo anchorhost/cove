@@ -35,7 +35,7 @@ install_dependency() {
 
     # 2. Attempt installation with the native package manager.
     if [ "$OS" == "macos" ]; then
-        if brew install "$brew_pkg"; then
+        if "$MAC_BREW" install "$brew_pkg"; then
             installed_successfully=true
         fi
     else # For Linux (apt/dnf)
@@ -481,8 +481,8 @@ INI
 
     echo "⚙️ Starting services..."
     if [ "$OS" == "macos" ]; then
-        if ! brew services restart mariadb; then
-            gum style --foreground red "❌ Failed to start MariaDB via Homebrew."
+        if ! start_macos_mariadb; then
+            gum style --foreground red "❌ Failed to start MariaDB via ${MAC_BREW}."
             exit 1
         fi
     else # Linux
