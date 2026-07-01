@@ -1,10 +1,12 @@
 cove_disable() {
     echo "🛑 Disabling Cove services..."
-    
+
     echo "   - Stopping Caddy/FrankenPHP..."
 
     # Stop services on MacOS
     if [ "$OS" == "macos" ]; then
+        # Unload the watchdog first so it doesn't SIGKILL Caddy mid-shutdown.
+        launchctl unload "$COVE_DIR/com.cove.watchdog.plist" &>/dev/null
         launchctl unload "$COVE_DIR/com.cove.caddy.plist" &>/dev/null
         "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
         echo "   - Stopping MariaDB..."
@@ -15,6 +17,9 @@ cove_disable() {
 
     # Stop services on Linux
     if [ "$OS" == "linux" ]; then
+        # Stop the watchdog first so it doesn't SIGKILL cove.service as we
+        # bring it down.
+        $SUDO_CMD systemctl stop cove-watchdog.timer &>/dev/null || true
         # v1.10+: FrankenPHP runs as cove.service under systemd. Try that
         # first; fall back to `frankenphp stop` in case a user skipped
         # cove_enable since the upgrade and still has an ad-hoc instance.
