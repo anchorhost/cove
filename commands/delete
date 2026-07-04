@@ -52,8 +52,17 @@ cove_delete() {
 
     echo "🔥 Deleting site: $site_name.localhost"
     if [ -f "$site_dir/public/wp-config.php" ]; then
-        local db_name
-        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        local db_name wp_cmd
+        wp_cmd=$(get_wp_cmd)
+        # Prefer the DB actually named in wp-config.php. Deriving cove_<name>
+        # blindly (as before) would orphan the real database for any site whose
+        # DB_NAME was changed — and could drop an unrelated database that
+        # happened to match the derived name. Fall back to the derived name only
+        # if wp-config can't be read.
+        db_name=$( (cd "$site_dir/public" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        if [ -z "$db_name" ]; then
+            db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        fi
         echo "🗄️ Deleting database: $db_name"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
     fi
