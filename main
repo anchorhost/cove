@@ -948,6 +948,20 @@ is_caddy_running() {
     (echo > /dev/tcp/127.0.0.1/2019) &>/dev/null
 }
 
+# Cheap MariaDB liveness probe. Never shell out to `brew services list` for
+# this: that launches a full Homebrew Ruby interpreter (~1-2s idle, minutes
+# under load), and with the menu bar app polling `cove status` every few
+# seconds the invocations stacked up and drove the machine into a load
+# spiral. mysqladmin ping is a single client handshake, answers even when
+# auth is denied, and covers socket-only setups.
+is_mariadb_running() {
+    if command -v mysqladmin &>/dev/null; then
+        mysqladmin ping --silent &>/dev/null
+    else
+        pgrep -x mariadbd &>/dev/null
+    fi
+}
+
 # Write a standalone watchdog script to $COVE_DIR so launchd (macOS) and
 # systemd (Linux) can invoke it without depending on the cove binary's
 # location. This matters because on dev installs cove.sh may live under
