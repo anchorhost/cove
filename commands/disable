@@ -28,6 +28,15 @@ cove_disable() {
             || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
             || true
 
+        # Also disable the Cove-owned units so they stay down across a reboot —
+        # cove_enable runs `systemctl enable` on these, so stop-only left them
+        # to re-grab ports 80/443 (the reason to disable in the first place) on
+        # the next boot. MariaDB is intentionally left enabled: it's shared
+        # infrastructure that doesn't conflict with another web server, so we
+        # don't surprise users who rely on it outside Cove.
+        $SUDO_CMD systemctl disable cove-watchdog.timer &>/dev/null || true
+        $SUDO_CMD systemctl disable cove.service &>/dev/null || true
+
         # Get the correct MariaDB service name
         local mariadb_service
         mariadb_service=$(get_mariadb_service_name)
