@@ -48,10 +48,15 @@ cove_reload() {
     # reliably when cove_reload is invoked via shell_exec(…&) from PHP.
     trap 'rm -f "$lock_file" 2>/dev/null; trap - EXIT INT TERM' EXIT INT TERM
 
+    # Track the last regenerate's result so a failed Caddy reload (bad
+    # directive, port conflict) surfaces to the caller instead of being
+    # swallowed — cove_reload used to always return 0, so upgrade/CLI callers
+    # couldn't tell the new config never went live.
+    local reload_rc=0
     while :; do
         rm -f "$pending"
         create_gui_file
-        regenerate_caddyfile
+        regenerate_caddyfile; reload_rc=$?
         update_etc_hosts
         [ -f "$pending" ] || break
     done
@@ -59,4 +64,9 @@ cove_reload() {
     # Explicit unlock — belt-and-suspenders with the trap.
     rm -f "$lock_file" 2>/dev/null
     trap - EXIT INT TERM
+
+    if [ "$reload_rc" -ne 0 ]; then
+        gum style --foreground red "❌ Caddy reload failed — check $LOGS_DIR/caddy-reload.log for the adapt/reload error." >&2
+    fi
+    return "$reload_rc"
 }

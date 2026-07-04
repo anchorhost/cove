@@ -149,7 +149,17 @@ EOM
     # fires. See cove_watchdog_tick() for why this exists.
     install_watchdog_service
 
-    if [ $? -eq 0 ]; then
+    # Base the "Services are running" banner on Caddy actually answering, not
+    # on the watchdog install's exit code (which is almost always 0 even when a
+    # bad Caddyfile kept FrankenPHP from starting). Poll briefly — the admin
+    # endpoint binds early but not instantly, especially on large installs.
+    local caddy_up=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if is_caddy_running; then caddy_up=true; break; fi
+        sleep 0.3
+    done
+
+    if [ "$caddy_up" = true ]; then
         echo ""
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
             "✅ Services are running" \
