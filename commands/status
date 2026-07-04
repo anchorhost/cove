@@ -18,7 +18,10 @@ cove_status() {
         if is_mariadb_running; then
             mariadb_status="✅ Running"
         fi
-        if launchctl list 2>/dev/null | grep -q "com.cove.mailpit"; then 
+        # Probe the process, not the launchd label: `launchctl list` shows the
+        # job as long as it's loaded even while it's crash-looping/throttled, so
+        # it reported "Running" for a dead Mailpit. pgrep reflects real liveness.
+        if pgrep -x mailpit &>/dev/null; then
             mailpit_status="✅ Running"
         fi
     fi

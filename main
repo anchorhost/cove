@@ -1580,7 +1580,7 @@ EOM
                     local direct_proxy_target=""
                     if [ -f "$directive_file" ]; then
                         # Extract target if directive is just "reverse_proxy <target>"
-                        direct_proxy_target=$(grep -E '^reverse_proxy [0-9a-zA-Z.:]+$' "$directive_file" 2>/dev/null | awk '{print $2}')
+                        direct_proxy_target=$(grep -E '^reverse_proxy [0-9a-zA-Z._:-]+$' "$directive_file" 2>/dev/null | awk '{print $2}')
                     fi
                     
                     echo "# Tailscale: ${site_base_name} -> port ${ts_port}" >> "$CADDYFILE_PATH"
