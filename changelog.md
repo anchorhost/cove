@@ -14,6 +14,15 @@
 * **Shorter One-Time Login URLs:** `cove login` tokens are now 7 characters (`cove_login_token`), making magic-login URLs comfortably paste-able.
 * **Wider `gum` Inputs + Shared SSH Auth Across `cove pull` / `cove push`:** Remote-sync prompts render at a usable width, and pull/push share a single SSH authentication flow instead of prompting separately.
 
+### 🔒 Security & Bug Fixes
+
+* **Unauthenticated Admin-Login Bypass in the Injected mu-plugin (Fixed):** The `wp_ajax_nopriv_captaincore_quick_login` handler gated on `$post->token != md5(AUTH_KEY)` with a loose `!=`, so a JSON body `{"token":true}` coerced to `true != <hash>` → `false` and slipped past the check, minting a working one-time admin login URL with no credentials. This mu-plugin is injected into every Cove WordPress site, so any site exposed via `cove lan` / `cove share` / Tailscale was reachable. Now uses `hash_equals()` with a string-type guard.
+* **`cove upgrade` Now Installs the FrankenPHP Watchdog:** The watchdog was only ever written by `cove enable`, which upgraders never re-run — so a 1.10 install could `cove upgrade` to the new binary yet never get the watchdog, leaving it exposed to the exact zombie-FrankenPHP lockup the watchdog exists to auto-recover from. Watchdog registration is now a shared `install_watchdog_service` helper called by both `cove enable` and `cove upgrade` (via the freshly-installed on-disk binary so the new function runs).
+* **Shared `validate_site_name` — Path-Traversal Hardening:** `cove delete`, `cove login`, and the dashboard's `delete_site` never validated the site name's character set (unlike `cove add`), so a name like `../evil` escaped the `Sites/` tree — and `cove delete` would `rm -rf` it, escalating to `sudo -n rm` on failure. A single `validate_site_name` helper (mirroring `cove add`'s rules) now guards every command that turns a name into a filesystem path, and the dashboard applies the same regex it uses for `add_site`.
+* **`cove pull` No Longer Drops the Local Database Before the Backup Exists:** When overwriting an existing site, pull ran `DROP DATABASE; CREATE DATABASE` *before* generating the remote backup — so if the backup step then failed, the local database was already gone with no rollback, leaving the site more broken than a no-op. The destructive reset is now deferred until a valid backup URL is in hand.
+
+## [1.10] - 2026-04-20
+
 ### ✨ New Features
 
 * **`cove trust` Command:** A one-shot installer that drops Cove's local root certificate into the OS trust store and every NSS database it can find, so Firefox and Chromium stop showing "Not Secure" warnings on `*.localhost` without hand-rolling `certutil` commands.
