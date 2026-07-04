@@ -77,13 +77,31 @@ cove_rename() {
 
         echo "   - Creating and importing to new database '$new_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db_name" < "$temp_sql_dump"
+        # Gate the destructive DROP below on a verified import + config update.
+        # Previously the import was unchecked, so a failed import (disk full,
+        # packet size) still fell through to dropping the old database — losing
+        # the site's only good copy. On failure here, abort with the old
+        # database and wp-config left intact.
+        if ! mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db_name" < "$temp_sql_dump"; then
+            gum style --foreground red "❌ Error: Failed to import into '$new_db_name'. Aborting; old database left intact."
+            mv "$new_site_dir" "$old_site_dir" # Revert directory rename
+            exit 1
+        fi
 
         echo "   - Updating wp-config.php..."
-        (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet)
+        if ! (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet); then
+            gum style --foreground red "❌ Error: Failed to update wp-config.php. Aborting; old database left intact."
+            mv "$new_site_dir" "$old_site_dir" # Revert directory rename
+            exit 1
+        fi
 
         echo "   - Running search-replace for site URL..."
-        (cd "$new_site_dir/public" && $wp_cmd search-replace "$(url_for "$old_name.localhost")" "$(url_for "$new_name.localhost")" --all-tables --skip-plugins --skip-themes --quiet)
+        # Non-fatal: the data already lives in the new DB and wp-config points
+        # at it, so a search-replace hiccup shouldn't block the rename or strand
+        # the old database — just warn.
+        if ! (cd "$new_site_dir/public" && $wp_cmd search-replace "$(url_for "$old_name.localhost")" "$(url_for "$new_name.localhost")" --all-tables --skip-plugins --skip-themes --quiet); then
+            gum style --foreground yellow "⚠️  search-replace did not complete cleanly; verify the site URL under the new name."
+        fi
 
         echo "   - Dropping old database '$old_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
