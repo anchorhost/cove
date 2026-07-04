@@ -79,6 +79,7 @@ cove_pull() {
     local dest_path
     local local_url
     local db_name
+    local reset_db=false
 
     if [ "$destination_choice" == "New Site" ]; then
         local proposed_name
@@ -99,7 +100,10 @@ cove_pull() {
         
         log_step "Preparing to overwrite existing site: ${site_name}.localhost"
         db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\`;"
+        # Defer the destructive DROP/CREATE until the remote backup is in hand
+        # (below). Dropping here left the local DB gone with no rollback if the
+        # backup step then failed — the pull broke the site worse than a no-op.
+        reset_db=true
     fi
 
     dest_path="$SITES_DIR/$site_name.localhost/public"
@@ -120,6 +124,11 @@ cove_pull() {
         log_error "Failed to generate backup or received an invalid backup URL."
     fi
     log_success "Backup created: ${backup_url}"
+
+    # Only now that a valid backup exists is it safe to wipe the local DB.
+    if [ "$reset_db" = true ]; then
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\`;"
+    fi
 
     log_step "Restoring backup to ${site_name}.localhost..."
     # Execute the migration script directly instead of using a variable with a pipe
