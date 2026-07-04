@@ -9,6 +9,14 @@ cove_login() {
         exit 1
     fi
 
+    # Reject traversal / metacharacters before the name builds a path we cd into
+    # and run wp-cli against — otherwise `cove login ../x` targets a WordPress
+    # install outside the Sites tree.
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
     

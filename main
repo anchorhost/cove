@@ -509,10 +509,11 @@ read -r -d '' build_mu_plugin << 'heredoc'
 function captaincore_quick_login_action_callback() {
 
 	$post = json_decode( file_get_contents( 'php://input' ) );
-	// Error if token not valid
-	if ( ! isset( $post->token ) || $post->token != md5( AUTH_KEY ) ) {
-		return new WP_Error( 'token_invalid', 'Invalid Token', [ 'status' => 404 ] );
-		wp_die();
+	// Error if token not valid. Use hash_equals with a string cast: a loose
+	// `!=` let a JSON `{"token":true}` coerce to `true != <hash>` → false and
+	// bypass the check entirely, minting an admin login link unauthenticated.
+	if ( ! isset( $post->token ) || ! is_string( $post->token ) || ! hash_equals( md5( AUTH_KEY ), $post->token ) ) {
+		wp_die( '', '', [ 'response' => 404 ] );
 	}
 
 	$post->user_login = str_replace( "%20", " ", $post->user_login );
@@ -1782,13 +1783,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } else { $response['message'] = 'Invalid site name provided.'; }
             break;
         case 'delete_site':
-            if (!empty($site_name)) {
+            // Same charset gate as add_site: escapeshellarg blocks shell
+            // injection, but the name is still passed positionally to
+            // `cove delete`, which builds a path from it — so reject `../`
+            // traversal here too rather than relying on the CLI alone.
+            if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
                 // --no-reload: cove_delete otherwise auto-reloads Caddy after
                 // each delete to prevent zombie log-dir skeletons from being
                 // recreated. The dashboard batches one reload after the whole
                 // delete queue drains, so skip per-item reloads here.
                 $command = sprintf('HOME=%s %s delete %s --force --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
-            } else { $response['message'] = 'Site name not provided for deletion.'; }
+            } else { $response['message'] = 'Invalid site name provided for deletion.'; }
             break;
         case 'get_login_link':
             $response = ['success' => false, 'message' => 'An unknown error occurred.'];

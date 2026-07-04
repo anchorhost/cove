@@ -1,6 +1,13 @@
 cove_delete() {
     source_config
     local site_name="$1"
+    # Reject traversal / metacharacters before the name reaches rm -rf and
+    # DROP DATABASE below — cove delete never validated it, so `../x` escaped
+    # the Sites tree (and the sudo -n rm fallback made that worse).
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
     for protected_name in $PROTECTED_NAMES; do
         if [ "$site_name" == "$protected_name" ]; then
             gum style --foreground red "❌ Error: '$site_name' is a reserved name and cannot be deleted."
