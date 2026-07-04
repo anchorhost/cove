@@ -1,6 +1,18 @@
 # Changelog
 
-## [1.10] - 2026-04-20
+## [Unreleased]
+
+### ✨ New Features
+
+* **nanobrew Opt-In Package-Manager Support:** On macOS, Cove can now drive services through [nanobrew](https://github.com/nanobrew/nanobrew) (`nb`) instead of Homebrew — opt in via `COVE_PKG_MANAGER=nanobrew`, or it's picked automatically when only `nb` is installed. A new `pkg_service` helper abstracts `brew services` / `nb services` for every caller (including emulating the missing `nb services restart`), and `cove install` initializes the MariaDB data directory itself on nanobrew since `nb` skips Homebrew's Ruby `post_install` hooks.
+* **FrankenPHP Watchdog:** A standalone watchdog script (installed by `cove enable`, run by launchd/systemd) detects "zombie" FrankenPHP — process alive and accepting TCP connects, but HTTPS requests hang, as happens on the rare "panic during panic" crash path — and SIGKILLs it so the service manager respawns a fresh instance. Uses an HTTP-level probe with a startup grace period so it never kills a server that's still provisioning certs for hundreds of sites. Ships alongside FD-limit and signal-handling hardening for large installs.
+* **`--yes` on `cove install` / `cove delete`:** Both commands now accept `--yes` for scripted callers, skipping interactive confirmation.
+
+### 🛠️ Improvements & Changes
+
+* **Cheap `cove status` — No More Homebrew on the Polling Path:** On macOS, `cove status` checked MariaDB by shelling out to `brew services list`, which boots a full Homebrew Ruby interpreter (~1–2s idle, far longer under load). With the menu bar app polling status every few seconds, slow calls stacked into a feedback loop that drove load average past 50 and starved FrankenPHP until the watchdog restarted it. MariaDB is now probed with a new `is_mariadb_running` helper — a single `mysqladmin ping` handshake (with a `pgrep mariadbd` fallback) — bringing a full `cove status` run down to well under a second no matter how often it's polled.
+* **Shorter One-Time Login URLs:** `cove login` tokens are now 7 characters (`cove_login_token`), making magic-login URLs comfortably paste-able.
+* **Wider `gum` Inputs + Shared SSH Auth Across `cove pull` / `cove push`:** Remote-sync prompts render at a usable width, and pull/push share a single SSH authentication flow instead of prompting separately.
 
 ### ✨ New Features
 
