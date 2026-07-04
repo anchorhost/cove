@@ -525,6 +525,10 @@ function captaincore_quick_login_action_callback() {
 	$token    = substr( sha1( $password ), 0, 7 );
 
 	update_user_meta( $user->ID, 'cove_login_token', $token );
+	// Stamp the mint time so the token can expire — see the TTL check in
+	// captaincore_login_handle_token(). Without it an unused link stayed a
+	// valid standing credential forever.
+	update_user_meta( $user->ID, 'cove_login_token_time', time() );
 	$query_args = [
 			'user_id'          => $user->ID,
 			'cove_login_token' => $token,
@@ -560,17 +564,23 @@ function captaincore_login_handle_token() {
 		wp_die( $error );
 	}
 
-	$token    = get_user_meta( $user->ID, 'cove_login_token', true );
-	$is_valid = false;
-		if ( hash_equals( $token, $_GET['cove_login_token'] ) ) {
-			$is_valid = true;
-		}
+	$token      = get_user_meta( $user->ID, 'cove_login_token', true );
+	$token_time = (int) get_user_meta( $user->ID, 'cove_login_token_time', true );
 
-	if ( ! $is_valid ) {
+	// Expire stale/unused tokens (15 min) so a cove login link that was never
+	// clicked can't be replayed later as a standing credential.
+	if ( '' === $token || ( time() - $token_time ) > 15 * MINUTE_IN_SECONDS ) {
+		delete_user_meta( $user->ID, 'cove_login_token' );
+		delete_user_meta( $user->ID, 'cove_login_token_time' );
+		wp_die( $error );
+	}
+
+	if ( ! hash_equals( $token, (string) $_GET['cove_login_token'] ) ) {
 		wp_die( $error );
 	}
 
 	delete_user_meta( $user->ID, 'cove_login_token' );
+	delete_user_meta( $user->ID, 'cove_login_token_time' );
 	wp_set_auth_cookie( $user->ID, 1 );
 	wp_safe_redirect( admin_url() );
 	exit;
