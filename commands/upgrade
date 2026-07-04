@@ -329,7 +329,12 @@ cove_upgrade() {
         current=$(cove_ini_get "$k" "")
         local current_bytes
         current_bytes=$(mem_to_bytes "$current")
-        if [ -z "$current" ] || [ "$current_bytes" -lt "$floor_bytes" ]; then
+        # -1 means unlimited (valid for memory_limit) — it's above any floor,
+        # not below it. mem_to_bytes("-1") returns -1, which would otherwise
+        # test as < 1G and silently cap a user's unlimited limit at 1G.
+        if [ "$current" = "-1" ]; then
+            echo "   ✓ ${k}: -1 (unlimited)"
+        elif [ -z "$current" ] || [ "$current_bytes" -lt "$floor_bytes" ]; then
             mkdir -p "$(dirname "$PHP_INI_FILE")"
             touch "$PHP_INI_FILE"
             if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
