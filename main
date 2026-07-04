@@ -182,7 +182,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.10"
+COVE_VERSION="1.11"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -1093,6 +1093,104 @@ kill -KILL "\$pid" 2>/dev/null || true
 EOM
     chmod +x "$script_path"
     echo "$script_path"
+}
+
+# Register the watchdog with the OS service manager (launchd on macOS, a
+# systemd timer on Linux) so it ticks every 5s. Extracted from cove_enable so
+# cove_upgrade can install it too: pre-1.11 upgraders would otherwise get the
+# new cove.sh but never the watchdog, leaving them exposed to the exact zombie
+# FrankenPHP lockup the watchdog exists to auto-recover from. Idempotent —
+# safe to re-run. Writes write_watchdog_script's output first.
+install_watchdog_service() {
+    local watchdog_bin
+    watchdog_bin=$(write_watchdog_script)
+
+    if [ "$OS" == "macos" ]; then
+        local watchdog_plist_path="$COVE_DIR/com.cove.watchdog.plist"
+
+        launchctl unload "$watchdog_plist_path" &>/dev/null
+
+        echo "   - Generating Cove watchdog service file..."
+        cat > "$watchdog_plist_path" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>Label</key>
+        <string>com.cove.watchdog</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>/bin/bash</string>
+                <string>$watchdog_bin</string>
+        </array>
+        <key>StartInterval</key>
+        <integer>5</integer>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>$LOGS_DIR/watchdog.log</string>
+</dict>
+</plist>
+EOM
+        launchctl load "$watchdog_plist_path"
+    fi
+
+    if [ "$OS" == "linux" ]; then
+        local current_user
+        current_user=$(whoami)
+        local watchdog_service_path="/etc/systemd/system/cove-watchdog.service"
+        local watchdog_timer_path="/etc/systemd/system/cove-watchdog.timer"
+
+        echo "   - Generating Cove watchdog service + timer..."
+        # Same sudo-tee pattern as the mailpit/cove units above; see note
+        # on mailpit.service for why mktemp + sudo mv doesn't survive SELinux.
+        $SUDO_CMD tee "$watchdog_service_path" >/dev/null << EOM
+[Unit]
+Description=Cove FrankenPHP watchdog (detects zombie process, forces respawn)
+After=cove.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $watchdog_bin
+User=$current_user
+Environment=HOME=/home/$current_user
+EOM
+        $SUDO_CMD chmod 644 "$watchdog_service_path"
+
+        $SUDO_CMD tee "$watchdog_timer_path" >/dev/null << EOM
+[Unit]
+Description=Run Cove watchdog every 5 seconds
+Requires=cove-watchdog.service
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Unit=cove-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOM
+        $SUDO_CMD chmod 644 "$watchdog_timer_path"
+
+        $SUDO_CMD systemctl daemon-reload
+        $SUDO_CMD systemctl enable cove-watchdog.timer &>/dev/null
+        $SUDO_CMD systemctl restart cove-watchdog.timer
+    fi
+}
+
+# Validate a Cove site name: lowercase letters, digits, and hyphens only, no
+# leading/trailing hyphen. Mirrors the rules cove_add enforces (add:14-23) and
+# the dashboard's add_site regex, so every command that turns a name into a
+# filesystem path or database name rejects `../` traversal and shell/SQL
+# metacharacters uniformly. Returns non-zero on rejection; caller decides how
+# to report. Keep in sync with add's inline checks.
+validate_site_name() {
+    local name="$1"
+    [ -n "$name" ] || return 1
+    [[ "$name" =~ [^a-z0-9-] ]] && return 1
+    [[ "$name" == -* || "$name" == *- ]] && return 1
+    return 0
 }
 
 # Write the Cove-themed Adminer entry point (index.php with the head() hook
@@ -3153,6 +3251,12 @@ main() {
         reload)
             check_dependencies
             cove_reload
+            ;;
+        install-watchdog)
+            # Internal: cove_upgrade calls this through the freshly-installed
+            # on-disk binary so the new install_watchdog_service runs (the
+            # running upgrade process predates it). Not part of the public CLI.
+            install_watchdog_service
             ;;
         status)
             check_dependencies

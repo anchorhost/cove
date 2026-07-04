@@ -4,12 +4,6 @@ cove_enable() {
     # Ensure log directory exists
     mkdir -p "$LOGS_DIR"
 
-    # Write the standalone watchdog script that launchd/systemd will invoke.
-    # Lives in ~/Cove so macOS TCC (which blocks launchd from executing
-    # anything under ~/Documents) doesn't break dev installs.
-    local watchdog_bin
-    watchdog_bin=$(write_watchdog_script)
-
     if [ "$OS" == "macos" ]; then
         echo "   - Starting MariaDB..."
         start_macos_mariadb
@@ -153,76 +147,7 @@ EOM
     # --- Watchdog ---
     # Installed last so the target service is already up when the first tick
     # fires. See cove_watchdog_tick() for why this exists.
-    if [ "$OS" == "macos" ]; then
-        local watchdog_plist_path="$COVE_DIR/com.cove.watchdog.plist"
-
-        launchctl unload "$watchdog_plist_path" &>/dev/null
-
-        echo "   - Generating Cove watchdog service file..."
-        cat > "$watchdog_plist_path" << EOM
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-        <key>Label</key>
-        <string>com.cove.watchdog</string>
-        <key>ProgramArguments</key>
-        <array>
-                <string>/bin/bash</string>
-                <string>$watchdog_bin</string>
-        </array>
-        <key>StartInterval</key>
-        <integer>5</integer>
-        <key>RunAtLoad</key>
-        <true/>
-        <key>StandardErrorPath</key>
-        <string>$LOGS_DIR/watchdog.log</string>
-</dict>
-</plist>
-EOM
-        launchctl load "$watchdog_plist_path"
-    fi
-
-    if [ "$OS" == "linux" ]; then
-        local watchdog_service_path="/etc/systemd/system/cove-watchdog.service"
-        local watchdog_timer_path="/etc/systemd/system/cove-watchdog.timer"
-
-        echo "   - Generating Cove watchdog service + timer..."
-        # Same sudo-tee pattern as the mailpit/cove units above; see note
-        # on mailpit.service for why mktemp + sudo mv doesn't survive SELinux.
-        $SUDO_CMD tee "$watchdog_service_path" >/dev/null << EOM
-[Unit]
-Description=Cove FrankenPHP watchdog (detects zombie process, forces respawn)
-After=cove.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $watchdog_bin
-User=$current_user
-Environment=HOME=/home/$current_user
-EOM
-        $SUDO_CMD chmod 644 "$watchdog_service_path"
-
-        $SUDO_CMD tee "$watchdog_timer_path" >/dev/null << EOM
-[Unit]
-Description=Run Cove watchdog every 5 seconds
-Requires=cove-watchdog.service
-
-[Timer]
-OnBootSec=30s
-OnUnitActiveSec=5s
-AccuracySec=1s
-Unit=cove-watchdog.service
-
-[Install]
-WantedBy=timers.target
-EOM
-        $SUDO_CMD chmod 644 "$watchdog_timer_path"
-
-        $SUDO_CMD systemctl daemon-reload
-        $SUDO_CMD systemctl enable cove-watchdog.timer &>/dev/null
-        $SUDO_CMD systemctl restart cove-watchdog.timer
-    fi
+    install_watchdog_service
 
     if [ $? -eq 0 ]; then
         echo ""

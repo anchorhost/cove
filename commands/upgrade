@@ -348,6 +348,16 @@ cove_upgrade() {
         echo "   (cove reload below regenerates the Caddyfile so the web server picks up the new limits.)"
     fi
 
+    # --- Refresh service units ---
+    # cove_enable is the only other caller; upgraders never run it, so without
+    # this a pre-1.11 install would get the new cove.sh but no watchdog (and no
+    # refresh of any future unit change). Invoke the on-disk binary so the
+    # freshly-upgraded install_watchdog_service runs — the still-running upgrade
+    # process holds the old script, which may not define it. Idempotent.
+    echo ""
+    echo "🐕 Installing/refreshing the FrankenPHP watchdog service..."
+    "$install_path" install-watchdog
+
     # --- Reload to pull in any UI updates ---
     # Invoke the on-disk binary so a freshly-upgraded script's new functions are used
     # (the currently-running process still holds the pre-upgrade functions in memory).
