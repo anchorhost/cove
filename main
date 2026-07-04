@@ -1116,6 +1116,14 @@ install_watchdog_service() {
     local watchdog_bin
     watchdog_bin=$(write_watchdog_script)
 
+    # Reset the watchdog's saved state on every (re)install. After a
+    # disable/enable cycle a stale "<pid> up <n>" line could match a freshly
+    # spawned FrankenPHP that the OS assigned the same pid — defeating the
+    # never-kill-while-starting guard and letting the watchdog SIGKILL a server
+    # that's merely still provisioning certs. A clean slate re-evaluates health
+    # from scratch.
+    rm -f "$COVE_DIR/.watchdog.state"
+
     if [ "$OS" == "macos" ]; then
         local watchdog_plist_path="$COVE_DIR/com.cove.watchdog.plist"
 
