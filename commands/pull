@@ -133,6 +133,11 @@ cove_pull() {
     log_step "Restoring backup to ${site_name}.localhost..."
     # Execute the migration script directly instead of using a variable with a pipe
     if ! (cd "$dest_path" && curl -sL https://captaincore.io/do | bash -s -- migrate --url="$backup_url" --update-urls); then
+        # Remove the remote backup (full DB dump + wp-config) so a failed
+        # restore doesn't leave it downloadable in the remote web root.
+        local failed_backup_q
+        failed_backup_q=$(shell_quote "$remote_path/${backup_url##*/}")
+        ssh $ssh_opts $remote_ssh "rm -f $failed_backup_q" 2>/dev/null
         log_error "The migration script failed to execute correctly."
     fi
     log_success "Restore complete."

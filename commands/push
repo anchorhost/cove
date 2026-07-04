@@ -8,8 +8,7 @@ cove_push() {
         gum style --foreground "green" "✅ $1" 
     }
     log_error() {
-        gum style --foreground "red" "❌ ERROR: $1" 
-        >&2
+        gum style --foreground "red" "❌ ERROR: $1" >&2
         exit 1
     }
 
@@ -104,6 +103,10 @@ cove_push() {
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
     if ! ssh $ssh_opts $remote_ssh "cd $remote_path_q && curl -sL https://captaincore.io/do | bash -s -- migrate --url=$backup_filename_q --update-urls"; then
+        # Don't leave a full DB dump + wp-config zip sitting in the remote web
+        # root (or locally) after a failed restore — it's directly downloadable.
+        rm -f "$backup_filename"
+        ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q" 2>/dev/null
         log_error "The remote migration script failed to execute correctly."
     fi
     log_success "Remote restore complete."
