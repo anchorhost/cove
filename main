@@ -1766,6 +1766,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
 
 // Handle POST requests for adding/deleting/reloading
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // CSRF / cross-origin guard. Every POST action here mutates state (add /
+    // delete sites, reload), and the body is read via php://input regardless
+    // of Content-Type — so a cross-site page could drive it with a CORS
+    // "simple" text/plain POST that skips preflight. Browsers still stamp such
+    // a request with an Origin (and always a Referer on same-origin), so
+    // require one of them to match this host before doing anything. Compare
+    // host only; HTTP_HOST may carry a :port that the Origin/Referer host omits.
+    $__cove_host_only = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST'] ?? '');
+    $__cove_src = $_SERVER['HTTP_ORIGIN'] ?? ($_SERVER['HTTP_REFERER'] ?? '');
+    $__cove_src_host = $__cove_src !== '' ? parse_url($__cove_src, PHP_URL_HOST) : '';
+    if (empty($__cove_src_host) || empty($__cove_host_only) || strcasecmp($__cove_src_host, $__cove_host_only) !== 0) {
+        http_response_code(403);
+        echo json_encode(['success' => false, 'message' => 'Cross-origin request blocked.']);
+        exit;
+    }
+
     $input = json_decode(file_get_contents('php://input'), true);
     $action = $input['action'] ?? '';
     $response = ['success' => false, 'message' => 'Invalid request.'];
