@@ -98,11 +98,17 @@ define( 'WP_DEBUG_DISPLAY', false );
 PHP
 
             # 3. Install WordPress
-            $wp_cmd core install --url="$(url_for "$full_hostname")" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
+            if ! $wp_cmd core install --url="$(url_for "$full_hostname")" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email; then
+                echo "❌ Error: WordPress core install failed."
+                exit 1
+            fi
 
-            # 4. Delete default plugins
+            # 4. Delete default plugins. Cosmetic cleanup — never let it decide
+            # the subshell's exit status (it was the last command, so a benign
+            # "already deleted" non-zero used to trigger the rollback below and
+            # destroy a fully-installed site). Tolerate failure.
             echo "   - Deleting default plugins (Hello Dolly, Akismet)..."
-            $wp_cmd plugin delete hello akismet --quiet
+            $wp_cmd plugin delete hello akismet --quiet || true
         ) 2> >(grep -v -E '^(PHP )?Deprecated:' >&2)
 
         # Check the exit code of the subshell. If it's not 0, something failed.
