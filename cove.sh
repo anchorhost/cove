@@ -10,7 +10,7 @@
 # systemd hand down a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), which
 # means the dashboard's shell_exec of cove fails to find gum/wp/frankenphp.
 # We only prepend dirs that actually exist and aren't already on PATH.
-for _cove_bin in /opt/homebrew/bin /usr/local/bin /usr/local/sbin "$HOME/.local/bin"; do
+for _cove_bin in /opt/homebrew/bin /opt/nanobrew/bin /opt/nanobrew/prefix/bin /usr/local/bin /usr/local/sbin "$HOME/.local/bin"; do
     if [ -d "$_cove_bin" ] && [[ ":$PATH:" != *":$_cove_bin:"* ]]; then
         PATH="$_cove_bin:$PATH"
     fi
@@ -21,6 +21,11 @@ export PATH
 # --- OS & Package Manager Detection ---
 OS=""
 PKG_MANAGER=""
+# macOS package/service manager. Either "brew" (Homebrew, the default) or
+# "nb" (nanobrew). nanobrew reuses Homebrew's formulas/bottles and supports
+# `nb install` + `nb services`, so Cove can drive it through the same code
+# paths. Left empty on Linux. See setup_environment for the detection rules.
+MAC_BREW=""
 SUDO_CMD="sudo"
 IS_WSL=false
 BIN_DIR="/usr/local/bin"
@@ -34,14 +39,36 @@ setup_environment() {
         OS="macos"
         PKG_MANAGER="brew"
         SUDO_CMD=""
-        
+
+        # Pick the macOS package/service manager. Homebrew stays the default
+        # whenever it's present (its mariadb post_install hook initializes the
+        # data dir for us). nanobrew is used when the user forces it via
+        # COVE_PKG_MANAGER=nanobrew|nb, or when only `nb` is installed.
+        case "${COVE_PKG_MANAGER:-}" in
+            nanobrew|nb)
+                MAC_BREW="nb"
+                ;;
+            brew|homebrew)
+                MAC_BREW="brew"
+                ;;
+            *)
+                if command -v brew &>/dev/null; then
+                    MAC_BREW="brew"
+                elif command -v nb &>/dev/null; then
+                    MAC_BREW="nb"
+                else
+                    MAC_BREW="brew" # default; install will guide the user
+                fi
+                ;;
+        esac
+
         # Architecture detection for MacOS Homebrew paths
         if [ "$(uname -m)" = "arm64" ]; then
             BIN_DIR="/opt/homebrew/bin"
         else
             BIN_DIR="/usr/local/bin"
         fi
-        
+
         return 0 # Success, exit function
     fi
 
@@ -82,6 +109,60 @@ setup_environment() {
     exit 1
 }
 
+# macOS service control across Homebrew (`brew services`) and nanobrew
+# (`nb services`). nanobrew has no `restart` subcommand, so emulate it with
+# stop+start. Mirrors `brew services <action> <svc>` for every caller.
+pkg_service() {
+    local action="$1"   # start | stop | restart | list
+    local svc="$2"      # service name (omitted for list)
+
+    # Collect args without a trailing empty string — `brew services list ""`
+    # treats "" as a service filter and returns nothing.
+    local -a args=("$action")
+    [ -n "$svc" ] && args+=("$svc")
+
+    if [ "$MAC_BREW" = "nb" ]; then
+        if [ "$action" = "restart" ]; then
+            nb services stop "$svc" &>/dev/null
+            nb services start "$svc"
+            return $?
+        fi
+        nb services "${args[@]}"
+        return $?
+    fi
+
+    brew services "${args[@]}"
+}
+
+# Block until MariaDB accepts connections, or give up after $1 seconds.
+mariadb_wait_ready() {
+    local max="${1:-10}" i=0
+    while ! mysqladmin ping --silent &>/dev/null; do
+        sleep 1
+        i=$((i + 1))
+        [ "$i" -ge "$max" ] && return 1
+    done
+    return 0
+}
+
+# Start MariaDB on macOS via the active package manager. Homebrew's mariadb
+# formula initializes the data directory in its post_install hook, but
+# nanobrew skips Ruby post_install hooks — so on a fresh nanobrew install the
+# service starts yet never accepts connections. Detect that, run
+# mariadb-install-db ourselves, and restart. The Homebrew path is unchanged.
+start_macos_mariadb() {
+    pkg_service restart mariadb || return 1
+
+    if [ "$MAC_BREW" = "nb" ] && ! mariadb_wait_ready 8; then
+        echo "   - Initializing MariaDB data directory (nanobrew post_install fallback)..."
+        if command -v mariadb-install-db &>/dev/null; then
+            mariadb-install-db &>/dev/null || true
+        fi
+        pkg_service restart mariadb || return 1
+    fi
+    return 0
+}
+
 setup_environment
 # --- End OS Detection ---
 
@@ -101,7 +182,16 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.10"
+COVE_VERSION="1.11"
+# Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
+# the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
+# 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
+WHOOPS_VERSION="2.18.0"
+# Version of the injected one-time-login MU-plugin (captaincore-helper.php).
+# MUST match the `Version:` header in build_mu_plugin's heredoc — refresh_all_mu_plugins
+# compares the two to decide which sites need the plugin re-pushed on upgrade.
+# Bump whenever the mu-plugin code changes so existing sites pick it up.
+MU_PLUGIN_VERSION="0.4.0"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -149,6 +239,19 @@ config_set() {
     fi
     echo "${key}='${val}'" >> "$tmp"
     mv "$tmp" "$CONFIG_FILE"
+}
+
+# Emit a base64-encoded random password. Uses openssl when present, falls
+# back to /dev/urandom otherwise — Fedora Workstation doesn't ship openssl
+# in its base install, and a missing openssl used to yield an empty $db_pass
+# that then became a MariaDB user with *no* password.
+cove_random_password() {
+    local bytes="${1:-16}"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 "$bytes"
+    else
+        head -c "$bytes" /dev/urandom | base64 | tr -d '\n'
+    fi
 }
 
 # Reads a directive from ~/Cove/php.ini (last-wins, ini-style), trims
@@ -341,6 +444,27 @@ update_wp_site_urls_for_port_change() {
     return 0
 }
 
+# Download the pinned Whoops release into $APP_DIR/whoops. Shared by cove
+# install and cove upgrade so both stay on WHOOPS_VERSION — upgrade previously
+# never refreshed Whoops, so upgraders whose FrankenPHP jumped to PHP 8.5 kept
+# an incompatible 2.15.3 and 500-ed every site.
+deploy_whoops() {
+    echo "✨ Downloading Whoops error handler (v$WHOOPS_VERSION)..."
+    local tmp
+    tmp=$(mktemp -d)
+    if curl -sL "https://github.com/filp/whoops/archive/refs/tags/${WHOOPS_VERSION}.tar.gz" | tar -xz -C "$tmp" --strip-components=1 \
+        && [ -f "$tmp/src/Whoops/Run.php" ]; then
+        rm -rf "$APP_DIR/whoops"
+        mkdir -p "$APP_DIR/whoops"
+        cp -R "$tmp"/. "$APP_DIR/whoops/"
+    else
+        echo "   ⚠️  Whoops download failed; leaving the existing copy in place." >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+}
+
 # --- Whoops Bootstrap Generation ---
 create_whoops_bootstrap() {
     echo "📜 Creating Whoops bootstrap file..."
@@ -366,19 +490,36 @@ spl_autoload_register(function ($class) {
     }
 });
 
-$whoops = new \Whoops\Run;
+// Whoops is a dev-time convenience (pretty error pages), not essential to
+// serving a request — so it must never be able to take a site down. A bundled
+// Whoops incompatible with the running PHP (e.g. 2.15.3 under PHP 8.5) threw a
+// TypeError from register() here, and because this file is auto_prepend'd to
+// every request it 500-ed every site at once. Catch anything so a failure
+// degrades to "no pretty pages" instead of a site-wide outage; the underlying
+// error still lands in the PHP error log.
+try {
+    $whoops = new \Whoops\Run;
 
-// We want to see all errors *except* for the noisy Deprecated and Notice warnings,
-// which are common with older plugins on modern PHP.
-// E_USER_NOTICE is used by WordPress's _doing_it_wrong() function.
-$whoops->silenceErrorsInPaths(
-    '/.*/', // A regex that matches all file paths
-    E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE
-);
+    // We want to see all errors *except* for the noisy Deprecated and Notice
+    // warnings, which are common with older plugins on modern PHP.
+    // E_USER_NOTICE is used by WordPress's _doing_it_wrong() function.
+    // E_USER_WARNING is triggered by WP_HTTP (wp_version_check, update checks,
+    // API calls) whenever a request to api.wordpress.org or a plugin update
+    // endpoint fails — e.g. on first wp-admin load before background crons
+    // settle, or on a fresh install without system CA certs. That's a transient
+    // runtime condition, not a bug to page on; leave it in the error log and
+    // let WordPress recover.
+    $whoops->silenceErrorsInPaths(
+        '/.*/', // A regex that matches all file paths
+        E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE | E_USER_WARNING
+    );
 
-// The PrettyPageHandler will now only be triggered for fatal errors.
-$whoops->pushHandler(new \Whoops\Handler\PrettyPageHandler);
-$whoops->register();
+    // The PrettyPageHandler will now only be triggered for fatal errors.
+    $whoops->pushHandler(new \Whoops\Handler\PrettyPageHandler);
+    $whoops->register();
+} catch (\Throwable $e) {
+    error_log('Cove: Whoops failed to initialize, continuing without it: ' . $e->getMessage());
+}
 EOM
 }
 
@@ -398,7 +539,7 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.3.0
+ * Version: 0.4.0
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
@@ -410,21 +551,29 @@ read -r -d '' build_mu_plugin << 'heredoc'
 function captaincore_quick_login_action_callback() {
 
 	$post = json_decode( file_get_contents( 'php://input' ) );
-	// Error if token not valid
-	if ( ! isset( $post->token ) || $post->token != md5( AUTH_KEY ) ) {
-		return new WP_Error( 'token_invalid', 'Invalid Token', [ 'status' => 404 ] );
-		wp_die();
+	// Error if token not valid. Use hash_equals with a string cast: a loose
+	// `!=` let a JSON `{"token":true}` coerce to `true != <hash>` → false and
+	// bypass the check entirely, minting an admin login link unauthenticated.
+	if ( ! isset( $post->token ) || ! is_string( $post->token ) || ! hash_equals( md5( AUTH_KEY ), $post->token ) ) {
+		wp_die( '', '', [ 'response' => 404 ] );
 	}
 
 	$post->user_login = str_replace( "%20", " ", $post->user_login );
 	$user     = get_user_by( 'login', $post->user_login );
 	$password = wp_generate_password();
-	$token    = sha1( $password );
+	// Short token: sha1 is 40 hex chars; 7 is still 16^7 ≈ 268M combinations,
+	// plenty for a one-time-use local-dev login link, and short enough to fit
+	// a narrow terminal without wrapping.
+	$token    = substr( sha1( $password ), 0, 7 );
 
-	update_user_meta( $user->ID, 'captaincore_login_token', $token );
+	update_user_meta( $user->ID, 'cove_login_token', $token );
+	// Stamp the mint time so the token can expire — see the TTL check in
+	// captaincore_login_handle_token(). Without it an unused link stayed a
+	// valid standing credential forever.
+	update_user_meta( $user->ID, 'cove_login_token_time', time() );
 	$query_args = [
-			'user_id'                 => $user->ID,
-			'captaincore_login_token' => $token,
+			'user_id'          => $user->ID,
+			'cove_login_token' => $token,
 		];
 	$login_url    = wp_login_url();
 		$one_time_url = add_query_arg( $query_args, $login_url );
@@ -441,7 +590,7 @@ add_action( 'wp_ajax_nopriv_captaincore_quick_login', 'captaincore_quick_login_a
 function captaincore_login_handle_token() {
 
 	global $pagenow;
-	if ( 'wp-login.php' !== $pagenow || empty( $_GET['user_id'] ) || empty( $_GET['captaincore_login_token'] ) ) {
+	if ( 'wp-login.php' !== $pagenow || empty( $_GET['user_id'] ) || empty( $_GET['cove_login_token'] ) ) {
 		return;
 	}
 
@@ -457,17 +606,23 @@ function captaincore_login_handle_token() {
 		wp_die( $error );
 	}
 
-	$token    = get_user_meta( $user->ID, 'captaincore_login_token', true );
-	$is_valid = false;
-		if ( hash_equals( $token, $_GET['captaincore_login_token'] ) ) {
-			$is_valid = true;
-		}
+	$token      = get_user_meta( $user->ID, 'cove_login_token', true );
+	$token_time = (int) get_user_meta( $user->ID, 'cove_login_token_time', true );
 
-	if ( ! $is_valid ) {
+	// Expire stale/unused tokens (15 min) so a cove login link that was never
+	// clicked can't be replayed later as a standing credential.
+	if ( '' === $token || ( time() - $token_time ) > 15 * MINUTE_IN_SECONDS ) {
+		delete_user_meta( $user->ID, 'cove_login_token' );
+		delete_user_meta( $user->ID, 'cove_login_token_time' );
 		wp_die( $error );
 	}
 
-	delete_user_meta( $user->ID, 'captaincore_login_token' );
+	if ( ! hash_equals( $token, (string) $_GET['cove_login_token'] ) ) {
+		wp_die( $error );
+	}
+
+	delete_user_meta( $user->ID, 'cove_login_token' );
+	delete_user_meta( $user->ID, 'cove_login_token_time' );
 	wp_set_auth_cookie( $user->ID, 1 );
 	wp_safe_redirect( admin_url() );
 	exit;
@@ -511,16 +666,22 @@ if (defined('WP_CLI') && WP_CLI) {
             return;
         }
 
-        // Generate tokens
+        // Generate tokens. Short token (7 hex chars from sha1) keeps the
+        // one-time URL readable on narrow terminals while still leaving
+        // ~268M combinations for a one-time-use local-dev link.
         $password = wp_generate_password();
-        $token    = sha1($password);
+        $token    = substr( sha1( $password ), 0, 7 );
 
-        // Update user meta with the new token
-        update_user_meta( $user->ID, 'captaincore_login_token', $token );
+        // Update user meta with the new token. Stamp the mint time too — the
+        // token validator expires anything without a recent cove_login_token_time
+        // (see captaincore_login_handle_token), so omitting it here made every
+        // `wp user login` / `cove add` link read as already expired.
+        update_user_meta( $user->ID, 'cove_login_token', $token );
+        update_user_meta( $user->ID, 'cove_login_token_time', time() );
         // Construct the one-time login URL
         $query_args = [
-            'user_id'                 => $user->ID,
-            'captaincore_login_token' => $token,
+            'user_id'          => $user->ID,
+            'cove_login_token' => $token,
         ];
         $login_url    = wp_login_url();
         $one_time_url = add_query_arg($query_args, $login_url);
@@ -573,6 +734,33 @@ heredoc
     echo "   - ✅ Injected one-time login MU-plugin."
 }
 
+# Re-push the one-time-login MU-plugin to every WordPress site whose deployed
+# copy is out of date. cove login re-injects lazily, but only for sites you log
+# into — this proactively updates the rest, which matters because the plugin
+# carries security-sensitive code (the nopriv login handler) and runtime filters
+# (option_home/siteurl) that are live regardless of whether anyone triggers a
+# login. Gated on the Version: header so unchanged sites aren't rewritten.
+refresh_all_mu_plugins() {
+    echo "🔌 Refreshing one-time-login MU-plugin (v$MU_PLUGIN_VERSION) across sites..."
+    local total=0 updated=0 site public deployed ver
+    for site in "$SITES_DIR"/*.localhost; do
+        [ -d "$site" ] || continue
+        public="$site/public"
+        [ -f "$public/wp-config.php" ] || continue   # WordPress sites only
+        total=$((total + 1))
+        deployed="$public/wp-content/mu-plugins/captaincore-helper.php"
+        ver=""
+        if [ -f "$deployed" ]; then
+            ver=$(grep -m1 -E '^[[:space:]]*\*[[:space:]]*Version:' "$deployed" \
+                | sed -E 's/.*Version:[[:space:]]*//; s/[[:space:]]*$//')
+        fi
+        if [ "$ver" != "$MU_PLUGIN_VERSION" ]; then
+            inject_mu_plugin "$public" >/dev/null && updated=$((updated + 1))
+        fi
+    done
+    echo "   - ✅ MU-plugin current on $total WordPress site(s); updated $updated."
+}
+
 # Write a Cove-branded landing index.php into a plain site's public dir.
 # The heredoc below is the user's PHP — it reads $_SERVER['HTTP_HOST'] and
 # __FILE__ at request time, so it self-identifies wherever it's served from.
@@ -604,6 +792,11 @@ $display_dir = ($home && str_starts_with($dir, $home)) ? '~' . substr($dir, strl
   --bg: #fbfaf7; --bg-elev: #ffffff; --bg-sunk: #f4f2ec;
   --border: #e8e4da; --text: #1a1c1b; --text-soft: #3a3d3a;
   --muted: #6b6f6a; --dim: #9a9d97;
+  /* sRGB fallback first; the oklch override on the next line is ignored by
+     browsers without oklch() support (Firefox <113, Chrome <111, Safari <16.4)
+     so the hex value wins — otherwise the whole declaration would be invalid
+     and --accent would fall back to its initial value (unset). */
+  --accent: #3a97a9;       --accent-ink: #1c4c58;
   --accent: oklch(62% 0.11 190); --accent-ink: oklch(35% 0.08 190);
 }
 @media (prefers-color-scheme: dark) {
@@ -611,6 +804,7 @@ $display_dir = ($home && str_starts_with($dir, $home)) ? '~' . substr($dir, strl
     --bg: #0f1210; --bg-elev: #161a17; --bg-sunk: #0b0e0c;
     --border: #252925; --text: #edeee9; --text-soft: #c6c9c1;
     --muted: #8a8e85; --dim: #5d615a;
+    --accent: #4db0c2;       --accent-ink: #83d2e0;
     --accent: oklch(72% 0.12 190); --accent-ink: oklch(82% 0.10 190);
   }
 }
@@ -838,6 +1032,259 @@ is_caddy_running() {
     (echo > /dev/tcp/127.0.0.1/2019) &>/dev/null
 }
 
+# Cheap MariaDB liveness probe. Never shell out to `brew services list` for
+# this: that launches a full Homebrew Ruby interpreter (~1-2s idle, minutes
+# under load), and with the menu bar app polling `cove status` every few
+# seconds the invocations stacked up and drove the machine into a load
+# spiral. mysqladmin ping is a single client handshake, answers even when
+# auth is denied, and covers socket-only setups.
+is_mariadb_running() {
+    if command -v mysqladmin &>/dev/null; then
+        mysqladmin ping --silent &>/dev/null
+    else
+        pgrep -x mariadbd &>/dev/null
+    fi
+}
+
+# Write a standalone watchdog script to $COVE_DIR so launchd (macOS) and
+# systemd (Linux) can invoke it without depending on the cove binary's
+# location. This matters because on dev installs cove.sh may live under
+# ~/Documents, which macOS TCC blocks launchd from executing.
+#
+# The watchdog detects a "zombie" FrankenPHP — process alive but HTTPS
+# requests hang — and SIGKILLs it so the service manager respawns a fresh
+# instance. FrankenPHP occasionally panics with
+#   "fatal error: non-Go code set up signal handler without SA_ONSTACK flag"
+# (a Go/cgo-into-PHP signal-handling bug). Most panics exit cleanly and
+# KeepAlive/Restart=on-failure bring it back, but the "panic during panic"
+# path pegs the process at 100% CPU dumping goroutine stacks for hours
+# while the kernel keeps accepting TCP connects on the listener fd — so a
+# plain /dev/tcp probe still returns healthy. We need an HTTP-level probe
+# that times out, otherwise the only recovery is `cove enable`.
+#
+# CRITICAL: the watchdog must NOT kill a server that is still starting up.
+# With 200+ sites, FrankenPHP spends ~45s provisioning internal-CA certs and
+# wiring auto-HTTPS for every site block before it binds the HTTPS listener.
+# The old version killed on the first failed probe every 5s, so at scale it
+# SIGKILLed FrankenPHP mid-startup forever and 443 never came up. The rules
+# below make the kill conditional on the server having been healthy at least
+# once (i.e. it finished startup and *then* wedged), plus a sustained run of
+# consecutive failures so a single blip under load can't trigger a kill.
+write_watchdog_script() {
+    local script_path="$COVE_DIR/watchdog.sh"
+    mkdir -p "$COVE_DIR"
+    cat > "$script_path" << EOM
+#!/bin/bash
+# Auto-generated by cove_enable. See write_watchdog_script() in main.
+pidfile="$COVE_DIR/caddy.pid"
+https_port="$HTTPS_PORT"
+log_file="$LOGS_DIR/watchdog.log"
+# State: "<pid> <mode> <count>".
+#   mode=starting : pid has not yet answered a probe. count is consecutive
+#                   not-healthy ticks. Never killed until count crosses
+#                   never_healthy_ticks (~10min) — a stuck-startup safety net.
+#                   This is what makes a slow 200-site startup (~45s to bind
+#                   443) safe: a still-starting server is never SIGKILLed.
+#   mode=up       : pid answered a probe at least once. count is consecutive
+#                   probe failures; SIGKILL once it reaches fail_threshold —
+#                   the "healthy then wedged" (panic-during-panic) case.
+# Elapsed time is tracked as ticks in this file rather than via \`ps\`, since
+# ps' elapsed-seconds column (etimes) is not portable across macOS/Linux.
+state_file="$COVE_DIR/.watchdog.state"
+process_log="$LOGS_DIR/caddy-process.log"
+fail_threshold=3          # ~15s of sustained failure (3 x 5s) before a kill
+never_healthy_ticks=120   # ~10min (120 x 5s) stuck in startup -> retry once
+log_cap_bytes=52428800    # 50MB — a restart storm must not fill the disk
+
+[ -f "\$pidfile" ] || exit 0
+pid=\$(cat "\$pidfile" 2>/dev/null)
+[ -n "\$pid" ] || exit 0
+# If the pid already exited the service manager will respawn it — nothing to do.
+kill -0 "\$pid" 2>/dev/null || exit 0
+
+mkdir -p "$LOGS_DIR"
+
+# Cap the FrankenPHP process log. It grows unbounded (info-level auto-HTTPS
+# lines on every startup) and a restart storm can push it into the GBs, which
+# is itself a drag on the box. Keep the most recent 5MB.
+if [ -f "\$process_log" ]; then
+    lsize=\$(stat -f%z "\$process_log" 2>/dev/null || stat -c%s "\$process_log" 2>/dev/null || echo 0)
+    if [ "\$lsize" -gt "\$log_cap_bytes" ]; then
+        tail -c 5242880 "\$process_log" > "\$process_log.tmp" 2>/dev/null \\
+            && mv "\$process_log.tmp" "\$process_log" 2>/dev/null
+    fi
+fi
+
+# Load prior state.
+s_pid=""; s_mode="starting"; s_count=0
+if [ -f "\$state_file" ]; then
+    read -r s_pid s_mode s_count < "\$state_file" 2>/dev/null
+fi
+[ -n "\$s_count" ] || s_count=0
+[ -n "\$s_mode" ] || s_mode="starting"
+
+# HTTP-level probe: in the panic-during-panic case the kernel still accepts
+# TCP connects on the listener fd while the Go runtime is dead, so a plain
+# /dev/tcp probe returns "healthy" forever. curl with --max-time catches both
+# the no-listener case (connect refused) and the wedged case (request hangs).
+# --resolve pins to loopback so the probe doesn't depend on /etc/hosts, and
+# uses the dashboard hostname so it matches a real Caddyfile site block.
+# 10s timeout tolerates a busy-but-alive server under load.
+if curl -sk --max-time 10 -o /dev/null \\
+    --resolve "cove.localhost:\$https_port:127.0.0.1" \\
+    "https://cove.localhost:\$https_port/" 2>/dev/null; then
+    # Healthy: mark this pid up, clear the failure streak.
+    echo "\$pid up 0" > "\$state_file"
+    exit 0
+fi
+
+ts=\$(date '+%Y-%m-%dT%H:%M:%S%z')
+
+# Probe failed. A new pid, or one that has never been healthy, is still
+# starting up (or its config is broken) — do NOT kill it, or we just restart
+# the slow startup forever. Only intervene if it stays stuck far past any
+# plausible startup window.
+if [ "\$s_pid" != "\$pid" ] || [ "\$s_mode" = "starting" ]; then
+    if [ "\$s_pid" = "\$pid" ] && [ "\$s_mode" = "starting" ]; then
+        s_count=\$((s_count + 1))
+    else
+        s_count=1
+    fi
+    echo "\$pid starting \$s_count" > "\$state_file"
+    if [ "\$s_count" -ge "\$never_healthy_ticks" ]; then
+        echo "[\$ts] watchdog: pid=\$pid never became healthy after \$s_count ticks; SIGKILL for a fresh start" \\
+            >> "\$log_file"
+        kill -KILL "\$pid" 2>/dev/null || true
+        : > "\$state_file"
+    fi
+    exit 0
+fi
+
+# s_pid == pid and mode=up: it was healthy and is now failing — the wedge case.
+# Require a sustained streak before killing so a single transient timeout under
+# load can't trigger a respawn.
+s_count=\$((s_count + 1))
+echo "\$pid up \$s_count" > "\$state_file"
+if [ "\$s_count" -lt "\$fail_threshold" ]; then
+    echo "[\$ts] watchdog: pid=\$pid probe failed (\$s_count/\$fail_threshold)" >> "\$log_file"
+    exit 0
+fi
+
+echo "[\$ts] watchdog: pid=\$pid was healthy but failed \$s_count consecutive HTTPS probes; SIGKILL for respawn" \\
+    >> "\$log_file"
+kill -KILL "\$pid" 2>/dev/null || true
+: > "\$state_file"
+EOM
+    chmod +x "$script_path"
+    echo "$script_path"
+}
+
+# Register the watchdog with the OS service manager (launchd on macOS, a
+# systemd timer on Linux) so it ticks every 5s. Extracted from cove_enable so
+# cove_upgrade can install it too: pre-1.11 upgraders would otherwise get the
+# new cove.sh but never the watchdog, leaving them exposed to the exact zombie
+# FrankenPHP lockup the watchdog exists to auto-recover from. Idempotent —
+# safe to re-run. Writes write_watchdog_script's output first.
+install_watchdog_service() {
+    local watchdog_bin
+    watchdog_bin=$(write_watchdog_script)
+
+    # Reset the watchdog's saved state on every (re)install. After a
+    # disable/enable cycle a stale "<pid> up <n>" line could match a freshly
+    # spawned FrankenPHP that the OS assigned the same pid — defeating the
+    # never-kill-while-starting guard and letting the watchdog SIGKILL a server
+    # that's merely still provisioning certs. A clean slate re-evaluates health
+    # from scratch.
+    rm -f "$COVE_DIR/.watchdog.state"
+
+    if [ "$OS" == "macos" ]; then
+        local watchdog_plist_path="$COVE_DIR/com.cove.watchdog.plist"
+
+        launchctl unload "$watchdog_plist_path" &>/dev/null
+
+        echo "   - Generating Cove watchdog service file..."
+        cat > "$watchdog_plist_path" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>Label</key>
+        <string>com.cove.watchdog</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>/bin/bash</string>
+                <string>$watchdog_bin</string>
+        </array>
+        <key>StartInterval</key>
+        <integer>5</integer>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>$LOGS_DIR/watchdog.log</string>
+</dict>
+</plist>
+EOM
+        launchctl load "$watchdog_plist_path"
+    fi
+
+    if [ "$OS" == "linux" ]; then
+        local current_user
+        current_user=$(whoami)
+        local watchdog_service_path="/etc/systemd/system/cove-watchdog.service"
+        local watchdog_timer_path="/etc/systemd/system/cove-watchdog.timer"
+
+        echo "   - Generating Cove watchdog service + timer..."
+        # Same sudo-tee pattern as the mailpit/cove units above; see note
+        # on mailpit.service for why mktemp + sudo mv doesn't survive SELinux.
+        $SUDO_CMD tee "$watchdog_service_path" >/dev/null << EOM
+[Unit]
+Description=Cove FrankenPHP watchdog (detects zombie process, forces respawn)
+After=cove.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $watchdog_bin
+User=$current_user
+Environment=HOME=/home/$current_user
+EOM
+        $SUDO_CMD chmod 644 "$watchdog_service_path"
+
+        $SUDO_CMD tee "$watchdog_timer_path" >/dev/null << EOM
+[Unit]
+Description=Run Cove watchdog every 5 seconds
+Requires=cove-watchdog.service
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Unit=cove-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOM
+        $SUDO_CMD chmod 644 "$watchdog_timer_path"
+
+        $SUDO_CMD systemctl daemon-reload
+        $SUDO_CMD systemctl enable cove-watchdog.timer &>/dev/null
+        $SUDO_CMD systemctl restart cove-watchdog.timer
+    fi
+}
+
+# Validate a Cove site name: lowercase letters, digits, and hyphens only, no
+# leading/trailing hyphen. Mirrors the rules cove_add enforces (add:14-23) and
+# the dashboard's add_site regex, so every command that turns a name into a
+# filesystem path or database name rejects `../` traversal and shell/SQL
+# metacharacters uniformly. Returns non-zero on rejection; caller decides how
+# to report. Keep in sync with add's inline checks.
+validate_site_name() {
+    local name="$1"
+    [ -n "$name" ] || return 1
+    [[ "$name" =~ [^a-z0-9-] ]] && return 1
+    [[ "$name" == -* || "$name" == *- ]] && return 1
+    return 0
+}
+
 # Write the Cove-themed Adminer entry point (index.php with the head() hook
 # that injects the theme toggle, plus autologin) and refresh the theme
 # assets (adminer.css, adminer.js) from GitHub. Shared by cove_install
@@ -901,7 +1348,7 @@ heal_cove_state_ownership() {
     local uid; uid=$(id -u)
     local gid; gid=$(id -g)
     local target
-    for target in "$COVE_DIR/cache" "$COVE_DIR/.reload.lock" "$COVE_DIR/.reload.lock.d" "$COVE_DIR/.reload.pending" "$COVE_DIR/caddy.pid"; do
+    for target in "$COVE_DIR/cache" "$COVE_DIR/.reload.lock" "$COVE_DIR/.reload.lock.d" "$COVE_DIR/.reload.pending" "$COVE_DIR/caddy.pid" "$COVE_DIR/.watchdog.state"; do
         [ -e "$target" ] || continue
         # Cheap short-circuit: only invoke sudo if the top-level is wrong.
         [ "$(stat -c %u "$target" 2>/dev/null)" = "$uid" ] && continue
@@ -929,6 +1376,35 @@ start_caddy_service() {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+        <key>EnvironmentVariables</key>
+        <dict>
+                <!-- ImageMagick installs process-wide SIGSEGV/SIGABRT handlers
+                     without SA_ONSTACK. In FrankenPHP's threaded (ZTS) server a
+                     fault on a Go worker thread then trips the Go runtime's
+                     "non-Go code set up signal handler without SA_ONSTACK flag"
+                     fatal — and the "panic during panic" path wedges a core at
+                     100% for minutes. Disabling IM's handlers lets a fault
+                     surface as a clean crash the service manager restarts fast. -->
+                <key>MAGICK_SIGNAL_HANDLERS</key>
+                <string>0</string>
+        </dict>
+        <!-- launchd's default soft file-descriptor limit is 256. FrankenPHP
+             holds ~1 FD per site (listener/cert) plus one per in-flight
+             request, so a Cove install with a couple hundred sites idles near
+             the ceiling and hits EMFILE ("too many open files") under any
+             concurrency — which wedges the Go runtime (connections accept at
+             the kernel but request handlers stall). Raise the soft limit well
+             clear of that; the hard limit is already unlimited on macOS. -->
+        <key>SoftResourceLimits</key>
+        <dict>
+                <key>NumberOfFiles</key>
+                <integer>65536</integer>
+        </dict>
+        <key>HardResourceLimits</key>
+        <dict>
+                <key>NumberOfFiles</key>
+                <integer>65536</integer>
+        </dict>
         <key>KeepAlive</key>
         <true/>
         <key>Label</key>
@@ -971,7 +1447,9 @@ EOM
             "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
                 || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
                 || true
-            "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
+            # MAGICK_SIGNAL_HANDLERS=0: see the macOS plist above — keeps an
+            # ImageMagick fault from tripping the Go runtime's SA_ONSTACK fatal.
+            MAGICK_SIGNAL_HANDLERS=0 "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
         fi
     fi
 }
@@ -1193,7 +1671,7 @@ EOM
                     local direct_proxy_target=""
                     if [ -f "$directive_file" ]; then
                         # Extract target if directive is just "reverse_proxy <target>"
-                        direct_proxy_target=$(grep -E '^reverse_proxy [0-9a-zA-Z.:]+$' "$directive_file" 2>/dev/null | awk '{print $2}')
+                        direct_proxy_target=$(grep -E '^reverse_proxy [0-9a-zA-Z._:-]+$' "$directive_file" 2>/dev/null | awk '{print $2}')
                     fi
                     
                     echo "# Tailscale: ${site_base_name} -> port ${ts_port}" >> "$CADDYFILE_PATH"
@@ -1379,6 +1857,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
 
 // Handle POST requests for adding/deleting/reloading
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // CSRF / cross-origin guard. Every POST action here mutates state (add /
+    // delete sites, reload), and the body is read via php://input regardless
+    // of Content-Type — so a cross-site page could drive it with a CORS
+    // "simple" text/plain POST that skips preflight. Browsers still stamp such
+    // a request with an Origin (and always a Referer on same-origin), so
+    // require one of them to match this host before doing anything. Compare
+    // host only; HTTP_HOST may carry a :port that the Origin/Referer host omits.
+    $__cove_host_only = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST'] ?? '');
+    $__cove_src = $_SERVER['HTTP_ORIGIN'] ?? ($_SERVER['HTTP_REFERER'] ?? '');
+    $__cove_src_host = $__cove_src !== '' ? parse_url($__cove_src, PHP_URL_HOST) : '';
+    if (empty($__cove_src_host) || empty($__cove_host_only) || strcasecmp($__cove_src_host, $__cove_host_only) !== 0) {
+        http_response_code(403);
+        echo json_encode(['success' => false, 'message' => 'Cross-origin request blocked.']);
+        exit;
+    }
+
     $input = json_decode(file_get_contents('php://input'), true);
     $action = $input['action'] ?? '';
     $response = ['success' => false, 'message' => 'Invalid request.'];
@@ -1396,13 +1890,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } else { $response['message'] = 'Invalid site name provided.'; }
             break;
         case 'delete_site':
-            if (!empty($site_name)) {
+            // Same charset gate as add_site: escapeshellarg blocks shell
+            // injection, but the name is still passed positionally to
+            // `cove delete`, which builds a path from it — so reject `../`
+            // traversal here too rather than relying on the CLI alone.
+            if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
                 // --no-reload: cove_delete otherwise auto-reloads Caddy after
                 // each delete to prevent zombie log-dir skeletons from being
                 // recreated. The dashboard batches one reload after the whole
                 // delete queue drains, so skip per-item reloads here.
                 $command = sprintf('HOME=%s %s delete %s --force --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
-            } else { $response['message'] = 'Site name not provided for deletion.'; }
+            } else { $response['message'] = 'Invalid site name provided for deletion.'; }
             break;
         case 'get_login_link':
             $response = ['success' => false, 'message' => 'An unknown error occurred.'];
@@ -1570,6 +2068,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
             --font-serif: 'Fraunces', Georgia, serif;
             --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+            /* sRGB fallback first; browsers without oklch() support silently
+               drop the override on the next line and keep the hex value.
+               Without the fallback, the whole declaration would be invalid on
+               Firefox <113 / Chrome <111 / Safari <16.4 and --accent would be
+               unset — which reads as "transparent" for backgrounds and
+               "black" for SVG fills (hence the invisible add button and the
+               solid-black logo disc on older browsers). */
+            --accent: #3a97a9;
             --accent: oklch(62% 0.11 190);
             --accent-fg: #0a1a1c;
             --radius-lg: 20px;
@@ -1588,9 +2094,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --text-faint: #5d615a;
             /* Dark-mode teal is brighter so it reads cleanly against the
                warmer panel — matches the landing page palette. */
+            --accent: #4db0c2;
             --accent: oklch(72% 0.12 190);
             --pill-bg: #1e2320;
+            --pill-wp-bg: rgba(77, 176, 194, 0.18);
             --pill-wp-bg: color-mix(in oklch, var(--accent) 18%, transparent);
+            --pill-wp-fg: #71c0ce;
             --pill-wp-fg: color-mix(in oklch, var(--accent) 80%, white);
             --pill-static-bg: #1e2320;
             --pill-static-fg: #9a9d94;
@@ -1613,7 +2122,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                the lighter background — override just for light mode. */
             --accent-fg: #ffffff;
             --pill-bg: #f1ede5;
+            --pill-wp-bg: rgba(58, 151, 169, 0.14);
             --pill-wp-bg: color-mix(in oklch, var(--accent) 14%, transparent);
+            --pill-wp-fg: #20535d;
             --pill-wp-fg: color-mix(in oklch, var(--accent) 55%, black);
             --pill-static-bg: #f1ede5;
             --pill-static-fg: #8a8781;
@@ -1644,18 +2155,29 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            .logo-mark so they don't collide with unrelated elements. Colors
            are driven by CSS variables with sensible defaults, so each theme
            can override individual layers without touching the inline SVG. */
+        /* Each layer gets a pair of declarations — the sRGB hex applies
+           everywhere, then the oklch override kicks in on browsers that
+           understand it. Without the fallback, unsupported oklch() in a
+           var() default makes the whole `fill`/`stroke` declaration invalid
+           and SVG falls back to fill:black (which is what produces the
+           solid-black disc + missing layers on Firefox <113). */
         .logo-mark { width: 34px; height: 34px; display: block; flex-shrink: 0; }
-        .logo-mark .disc    { fill: var(--mark-disc, oklch(96% 0.015 85)); }
-        .logo-mark .water   { fill: var(--mark-water, oklch(62% 0.11 190)); }
-        .logo-mark .land    { fill: var(--mark-land, oklch(72% 0.10 150)); }
-        .logo-mark .horizon { stroke: var(--mark-horizon, oklch(35% 0.08 190)); fill: none; }
-        .logo-mark .wave    { stroke: var(--mark-wave, oklch(35% 0.08 190)); fill: none; }
-        .logo-mark .ring    { stroke: var(--mark-ring, oklch(35% 0.08 190)); fill: none; stroke-width: 3; }
+        .logo-mark .disc    { fill: var(--mark-disc, #f6f1e8); fill: var(--mark-disc, oklch(96% 0.015 85)); }
+        .logo-mark .water   { fill: var(--mark-water, #3a97a9); fill: var(--mark-water, oklch(62% 0.11 190)); }
+        .logo-mark .land    { fill: var(--mark-land, #8bb382); fill: var(--mark-land, oklch(72% 0.10 150)); }
+        .logo-mark .horizon { stroke: var(--mark-horizon, #1c4c58); stroke: var(--mark-horizon, oklch(35% 0.08 190)); fill: none; }
+        .logo-mark .wave    { stroke: var(--mark-wave, #1c4c58); stroke: var(--mark-wave, oklch(35% 0.08 190)); fill: none; }
+        .logo-mark .ring    { stroke: var(--mark-ring, #1c4c58); stroke: var(--mark-ring, oklch(35% 0.08 190)); fill: none; stroke-width: 3; }
         html[data-theme="dark"] .logo-mark {
+            --mark-disc:    #2b2925;
             --mark-disc:    oklch(22% 0.01 85);
+            --mark-land:    #6a9d70;
             --mark-land:    oklch(64% 0.09 150);
+            --mark-ring:    rgba(237, 238, 233, 0.72);
             --mark-ring:    color-mix(in oklab, var(--text) 72%, transparent);
+            --mark-horizon: rgba(237, 238, 233, 0.72);
             --mark-horizon: color-mix(in oklab, var(--text) 72%, transparent);
+            --mark-wave:    rgba(237, 238, 233, 0.65);
             --mark-wave:    color-mix(in oklab, var(--text) 65%, transparent);
         }
         /* Square icon button that cross-fades a moon (light mode) with a sun
@@ -1696,12 +2218,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            "type:xxx" tokens and get into a weird parse state. */
         .filter-chip { display: inline-flex; align-items: center; gap: 0.1rem; padding: 0.18rem 0.22rem 0.18rem 0.65rem; background: var(--pill-wp-bg); color: var(--pill-wp-fg); border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.76rem; font-weight: 500; letter-spacing: 0.02em; white-space: nowrap; }
         .filter-chip-x { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; background: transparent; border: 0; color: inherit; cursor: pointer; border-radius: 50%; font-size: 0.95rem; line-height: 1; padding: 0; }
-        .filter-chip-x:hover { background: color-mix(in oklch, var(--accent) 28%, transparent); }
+        .filter-chip-x:hover { background: rgba(58, 151, 169, 0.28); background: color-mix(in oklch, var(--accent) 28%, transparent); }
 
         /* Add row */
         /* New-site alert: appears after creating a WP site so the one-time
            login is one click away, without hunting for the new row. */
-        .new-site-alert { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--panel-border); background: color-mix(in oklab, var(--accent) 12%, var(--panel)); color: var(--text); font-size: 0.92rem; }
+        .new-site-alert { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); background: color-mix(in oklab, var(--accent) 12%, var(--panel)); color: var(--text); font-size: 0.92rem; }
         .new-site-alert-icon { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: var(--accent-fg); flex: none; }
         .new-site-alert-text { flex: 1; min-width: 0; }
         .new-site-alert-text strong { font-family: var(--font-mono); font-weight: 500; }
@@ -1722,6 +2244,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                against the cream bg-sunk; a brighter, more saturated teal at
                3px reads unambiguously as teal (same hue as the brand, just
                higher chroma so it survives the narrow band). */
+            background: #3fb6cf;
             background: oklch(72% 0.15 190);
             animation: add-row-slide 1.3s linear infinite;
         }
@@ -1748,7 +2271,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-domain { font-family: var(--font-mono); font-size: 0.88rem; color: var(--text-dim); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .site-domain .host-accent { color: var(--accent); }
         .site-domain:hover { color: var(--accent); }
-        .site-domain mark { background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: 3px; }
+        .site-domain mark { background: rgba(58, 151, 169, 0.28); background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: 3px; }
         .site-type { display: inline-flex; justify-content: center; min-width: 64px; padding: 0.2rem 0.55rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.68rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; user-select: none; transition: filter 120ms; }
         .site-type:hover { filter: brightness(1.15); }
         .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
@@ -1783,7 +2306,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .dot { display: inline-flex; align-items: center; gap: 0.45rem; color: var(--text-dim); text-decoration: none; background: transparent; border: 0; padding: 0; font-family: inherit; font-size: inherit; cursor: default; }
         .dot.link, .dot[role="button"] { cursor: pointer; }
         .dot.link:hover, .dot[role="button"]:hover { color: var(--text); }
-        .dot::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px color-mix(in oklch, var(--accent) 60%, transparent); }
+        .dot::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px rgba(58, 151, 169, 0.6); box-shadow: 0 0 6px color-mix(in oklch, var(--accent) 60%, transparent); }
         .totals { display: inline-flex; align-items: center; gap: 0.5rem; }
         .refresh-btn { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; padding: 0.15rem 0.35rem; font-size: 0.95rem; border-radius: 5px; }
         .refresh-btn:hover { color: var(--text); background: var(--panel-hover); }
@@ -2433,10 +2956,14 @@ display_command_help() {
     local cmd="$1"
     case "$cmd" in
         install)
-            echo "Usage: cove install"
+            echo "Usage: cove install [--yes]"
             echo ""
             echo "Installs and configures Homebrew dependencies like Caddy, MariaDB, and Mailpit."
             echo "It also sets up the required directory structure inside '~/Cove'."
+            echo ""
+            echo "Options:"
+            echo "  --yes, -y, --force   Skip confirmation prompts for scripted installs."
+            echo "                       Auto-enabled when stdin is not a TTY."
             ;;
         enable)
             echo "Usage: cove enable"
@@ -2819,7 +3346,7 @@ main() {
             cove_push "$@"
             ;;
         install)
-            cove_install
+            cove_install "$@"
             ;;
         login)
             check_dependencies
@@ -2836,6 +3363,18 @@ main() {
         reload)
             check_dependencies
             cove_reload
+            ;;
+        post-upgrade)
+            # Internal: cove_upgrade calls this through the freshly-installed
+            # on-disk binary so these component refreshes run with the NEW code.
+            # The upgrade process is still executing the pre-upgrade script in
+            # memory, which may not define (or defines an older version of) these
+            # functions — so anything that must ship the latest bits has to be
+            # invoked via the on-disk binary here. Not part of the public CLI.
+            deploy_whoops
+            create_whoops_bootstrap
+            refresh_all_mu_plugins
+            install_watchdog_service
             ;;
         status)
             check_dependencies
@@ -3007,7 +3546,7 @@ cove_add() {
         echo "🗄️ Creating database: $db_name"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
         echo "Installing WordPress..."
-        admin_pass=$(openssl rand -base64 12)
+        admin_pass=$(cove_random_password 12)
         
         # get_wp_cmd routes wp-cli through `frankenphp php-cli` and PHPRC
         # (exported in main) sets display_errors=0 + error_reporting=6143.
@@ -3038,11 +3577,17 @@ define( 'WP_DEBUG_DISPLAY', false );
 PHP
 
             # 3. Install WordPress
-            $wp_cmd core install --url="$(url_for "$full_hostname")" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email
+            if ! $wp_cmd core install --url="$(url_for "$full_hostname")" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email; then
+                echo "❌ Error: WordPress core install failed."
+                exit 1
+            fi
 
-            # 4. Delete default plugins
+            # 4. Delete default plugins. Cosmetic cleanup — never let it decide
+            # the subshell's exit status (it was the last command, so a benign
+            # "already deleted" non-zero used to trigger the rollback below and
+            # destroy a fully-installed site). Tolerate failure.
             echo "   - Deleting default plugins (Hello Dolly, Akismet)..."
-            $wp_cmd plugin delete hello akismet --quiet
+            $wp_cmd plugin delete hello akismet --quiet || true
         ) 2> >(grep -v -E '^(PHP )?Deprecated:' >&2)
 
         # Check the exit code of the subshell. If it's not 0, something failed.
@@ -3288,6 +3833,13 @@ cove_db_list() {
 cove_delete() {
     source_config
     local site_name="$1"
+    # Reject traversal / metacharacters before the name reaches rm -rf and
+    # DROP DATABASE below — cove delete never validated it, so `../x` escaped
+    # the Sites tree (and the sudo -n rm fallback made that worse).
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
     for protected_name in $PROTECTED_NAMES; do
         if [ "$site_name" == "$protected_name" ]; then
             gum style --foreground red "❌ Error: '$site_name' is a reserved name and cannot be deleted."
@@ -3298,9 +3850,14 @@ cove_delete() {
     local force_delete=false
     local no_reload=false
     for arg in "$@"; do
-        [ "$arg" = "--force" ] && force_delete=true
-        [ "$arg" = "--no-reload" ] && no_reload=true
+        case "$arg" in
+            --force|--yes|-y) force_delete=true ;;
+            --no-reload) no_reload=true ;;
+        esac
     done
+    # Non-interactive callers (dashboard shell_exec, scripted cleanup) have no
+    # TTY; gum confirm aborts there. Auto-promote so the delete doesn't hang.
+    [ -t 0 ] || force_delete=true
 
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir" ]; then
@@ -3327,8 +3884,17 @@ cove_delete() {
 
     echo "🔥 Deleting site: $site_name.localhost"
     if [ -f "$site_dir/public/wp-config.php" ]; then
-        local db_name
-        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        local db_name wp_cmd
+        wp_cmd=$(get_wp_cmd)
+        # Prefer the DB actually named in wp-config.php. Deriving cove_<name>
+        # blindly (as before) would orphan the real database for any site whose
+        # DB_NAME was changed — and could drop an unrelated database that
+        # happened to match the derived name. Fall back to the derived name only
+        # if wp-config can't be read.
+        db_name=$( (cd "$site_dir/public" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        if [ -z "$db_name" ]; then
+            db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        fi
         echo "🗄️ Deleting database: $db_name"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
     fi
@@ -3513,21 +4079,26 @@ cove_directive_list() {
 }
 cove_disable() {
     echo "🛑 Disabling Cove services..."
-    
+
     echo "   - Stopping Caddy/FrankenPHP..."
 
     # Stop services on MacOS
     if [ "$OS" == "macos" ]; then
+        # Unload the watchdog first so it doesn't SIGKILL Caddy mid-shutdown.
+        launchctl unload "$COVE_DIR/com.cove.watchdog.plist" &>/dev/null
         launchctl unload "$COVE_DIR/com.cove.caddy.plist" &>/dev/null
         "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
         echo "   - Stopping MariaDB..."
-        brew services stop mariadb &>/dev/null
+        pkg_service stop mariadb &>/dev/null
         echo "   - Stopping Mailpit..."
         launchctl unload "$COVE_DIR/com.cove.mailpit.plist" &>/dev/null
     fi
 
     # Stop services on Linux
     if [ "$OS" == "linux" ]; then
+        # Stop the watchdog first so it doesn't SIGKILL cove.service as we
+        # bring it down.
+        $SUDO_CMD systemctl stop cove-watchdog.timer &>/dev/null || true
         # v1.10+: FrankenPHP runs as cove.service under systemd. Try that
         # first; fall back to `frankenphp stop` in case a user skipped
         # cove_enable since the upgrade and still has an ad-hoc instance.
@@ -3535,6 +4106,15 @@ cove_disable() {
             || "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
             || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
             || true
+
+        # Also disable the Cove-owned units so they stay down across a reboot —
+        # cove_enable runs `systemctl enable` on these, so stop-only left them
+        # to re-grab ports 80/443 (the reason to disable in the first place) on
+        # the next boot. MariaDB is intentionally left enabled: it's shared
+        # infrastructure that doesn't conflict with another web server, so we
+        # don't surprise users who rely on it outside Cove.
+        $SUDO_CMD systemctl disable cove-watchdog.timer &>/dev/null || true
+        $SUDO_CMD systemctl disable cove.service &>/dev/null || true
 
         # Get the correct MariaDB service name
         local mariadb_service
@@ -3550,13 +4130,13 @@ cove_disable() {
 }
 cove_enable() {
     echo "🚀 Enabling Cove services..."
-    
+
     # Ensure log directory exists
     mkdir -p "$LOGS_DIR"
 
     if [ "$OS" == "macos" ]; then
         echo "   - Starting MariaDB..."
-        brew services start mariadb
+        start_macos_mariadb
 
         local plist_path="$COVE_DIR/com.cove.mailpit.plist"
         local mailpit_bin
@@ -3564,7 +4144,7 @@ cove_enable() {
 
         # Stop and unload any existing service to ensure our custom one is used.
         launchctl unload "$plist_path" &>/dev/null
-        brew services stop mailpit &>/dev/null
+        pkg_service stop mailpit &>/dev/null
 
         echo "   - Generating custom Mailpit service file..."
         cat > "$plist_path" << EOM
@@ -3612,10 +4192,13 @@ EOM
         current_user=$(whoami)
 
         echo "   - Generating custom Mailpit service file..."
-        # Note: Using a temp file approach to avoid issues with heredoc and sudo
-        local temp_service
-        temp_service=$(mktemp)
-        cat > "$temp_service" << EOM
+        # Write the unit file directly to its destination via sudo tee.
+        # Previously we used mktemp + sudo mv, but on Fedora/SELinux mv
+        # preserves the source file's user_tmp_t context from /tmp, and
+        # systemd refuses to load units outside the systemd_unit_file_t
+        # type. Writing fresh into /etc/systemd/system/ picks up that
+        # directory's type-transition rule automatically.
+        $SUDO_CMD tee "$service_path" >/dev/null << EOM
 [Unit]
 Description=Mailpit Service for Cove
 After=network.target
@@ -3628,8 +4211,6 @@ User=$current_user
 [Install]
 WantedBy=multi-user.target
 EOM
-        
-        $SUDO_CMD mv "$temp_service" "$service_path"
         $SUDO_CMD chmod 644 "$service_path"
 
         # --- FrankenPHP / Cove systemd unit ---
@@ -3642,9 +4223,9 @@ EOM
         frankenphp_bin=$(command -v "$CADDY_CMD")
 
         echo "   - Generating Cove FrankenPHP service file..."
-        local temp_cove_service
-        temp_cove_service=$(mktemp)
-        cat > "$temp_cove_service" << EOM
+        # Same sudo-tee pattern as the mailpit unit above; see the note
+        # there for why mktemp + sudo mv doesn't survive SELinux.
+        $SUDO_CMD tee "$cove_service_path" >/dev/null << EOM
 [Unit]
 Description=FrankenPHP for Cove
 After=network.target mariadb.service
@@ -3656,15 +4237,23 @@ ExecStart=$frankenphp_bin run --config $CADDYFILE_PATH --pidfile $COVE_DIR/caddy
 ExecReload=$frankenphp_bin reload --config $CADDYFILE_PATH --address localhost:2019
 Restart=on-failure
 RestartSec=2s
+# FrankenPHP holds ~1 FD per site (listener/cert) plus one per in-flight
+# request. A Cove install with a couple hundred sites idles near the default
+# soft limit and hits EMFILE ("too many open files") under concurrency, which
+# wedges the Go runtime. Give it generous headroom (matches the macOS plist).
+LimitNOFILE=65536
 User=$current_user
 Environment=HOME=/home/$current_user
 Environment=PHPRC=$PHP_INI_FILE
+# ImageMagick installs process-wide signal handlers without SA_ONSTACK; in
+# FrankenPHP's threaded (ZTS) server that trips the Go runtime's "non-Go code
+# set up signal handler without SA_ONSTACK flag" fatal (and the "panic during
+# panic" 100%-CPU wedge). Disabling them lets a fault crash cleanly + restart.
+Environment=MAGICK_SIGNAL_HANDLERS=0
 
 [Install]
 WantedBy=multi-user.target
 EOM
-
-        $SUDO_CMD mv "$temp_cove_service" "$cove_service_path"
         $SUDO_CMD chmod 644 "$cove_service_path"
 
         # Reload systemd, then enable and start both Cove-managed services
@@ -3685,7 +4274,22 @@ EOM
         start_caddy_service
     fi
 
-    if [ $? -eq 0 ]; then
+    # --- Watchdog ---
+    # Installed last so the target service is already up when the first tick
+    # fires. See cove_watchdog_tick() for why this exists.
+    install_watchdog_service
+
+    # Base the "Services are running" banner on Caddy actually answering, not
+    # on the watchdog install's exit code (which is almost always 0 even when a
+    # bad Caddyfile kept FrankenPHP from starting). Poll briefly — the admin
+    # endpoint binds early but not instantly, especially on large installs.
+    local caddy_up=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if is_caddy_running; then caddy_up=true; break; fi
+        sleep 0.3
+    done
+
+    if [ "$caddy_up" = true ]; then
         echo ""
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
             "✅ Services are running" \
@@ -3750,7 +4354,7 @@ install_dependency() {
 
     # 2. Attempt installation with the native package manager.
     if [ "$OS" == "macos" ]; then
-        if brew install "$brew_pkg"; then
+        if "$MAC_BREW" install "$brew_pkg"; then
             installed_successfully=true
         fi
     else # For Linux (apt/dnf)
@@ -3846,6 +4450,26 @@ install_dependency() {
 }
 
 cove_install() {
+    local auto_yes=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y|--force)
+                auto_yes=true
+                shift
+                ;;
+            *)
+                echo "❌ Unknown argument: $1" >&2
+                echo "Usage: cove install [--yes]" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    # Non-interactive callers (CI, installer piping, dashboards) have no TTY;
+    # gum confirm / gum choose abort there. Auto-promote so the install doesn't
+    # hang.
+    [ -t 0 ] || auto_yes=true
+
     echo "🚀 Starting Cove installation..."
 
     # --- WSL/Systemd Check ---
@@ -3864,11 +4488,15 @@ cove_install() {
                 echo ""
                 echo "   Then restart WSL with: wsl --shutdown"
                 echo ""
-                read -p "Do you want to continue anyway? (y/N) " -n 1 -r
-                echo
-                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                    echo "🚫 Installation cancelled."
-                    exit 0
+                if $auto_yes; then
+                    echo "   (--yes set — continuing anyway.)"
+                else
+                    read -p "Do you want to continue anyway? (y/N) " -n 1 -r
+                    echo
+                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                        echo "🚫 Installation cancelled."
+                        exit 0
+                    fi
                 fi
             fi
         fi
@@ -3996,8 +4624,12 @@ cove_install() {
     config_set HTTPS_PORT "$HTTPS_PORT"
 
     # --- Pre-install Checks ---
-    if [ -d "$COVE_DIR" ]; then
-        if ! gum confirm "⚠️ The Cove directory (~/Cove) already exists. Proceeding may overwrite some configurations. Continue?"; then
+    # $COVE_DIR alone isn't a reliable "previous install" marker — config_set
+    # above creates it just to persist HTTP_PORT/HTTPS_PORT. Check for a
+    # directory that only a completed install writes (Adminer), so the prompt
+    # only fires when it's actually meaningful.
+    if [ -d "$ADMINER_DIR" ]; then
+        if ! $auto_yes && ! gum confirm "⚠️ Cove already appears to be installed at ~/Cove. Proceeding may overwrite some configurations. Continue?"; then
             echo "🚫 Installation cancelled."
             exit 0
         fi
@@ -4137,15 +4769,36 @@ INI
     # pick up index.php/head() and CSS/JS changes without a full reinstall.
     deploy_adminer_theme
 
-    echo "✨ Downloading Whoops error handler..."
-    rm -rf "$APP_DIR/whoops" # Remove any old versions first
-    mkdir -p "$APP_DIR/whoops"
-    curl -sL "https://github.com/filp/whoops/archive/refs/tags/2.15.3.tar.gz" | tar -xz -C "$APP_DIR/whoops" --strip-components=1
+    deploy_whoops
+
+    # --- Fedora/RHEL SELinux labeling ---
+    # The upstream FrankenPHP installer tags /usr/bin/frankenphp with the
+    # httpd_exec_t file context. On Fedora/RHEL that triggers an exec-time
+    # domain transition into httpd_t — a confined web-server domain that:
+    #   - can't read files labeled user_home_t (fails to open ~/Cove/Caddyfile
+    #     and ~/.local/share/caddy/pki/.../root.crt with "permission denied")
+    #   - silently RSTs TLS connections under some configs (TCP accepts but
+    #     the TLS ClientHello gets no response)
+    # Neither failure logs an AVC — both are dontaudit'd. Retagging the binary
+    # as bin_t keeps systemd running it in unconfined_service_t, which can
+    # read user files normally. On non-SELinux distros (Debian/Ubuntu)
+    # `semanage` isn't in $PATH and this block is a no-op.
+    if [ "$OS" = "linux" ] && command -v semanage &>/dev/null; then
+        local fp_bin
+        fp_bin=$(command -v "$CADDY_CMD")
+        if [ -n "$fp_bin" ]; then
+            echo "🔐 Relabeling FrankenPHP for SELinux..."
+            $SUDO_CMD semanage fcontext -a -t bin_t "$fp_bin" &>/dev/null \
+                || $SUDO_CMD semanage fcontext -m -t bin_t "$fp_bin" &>/dev/null \
+                || true
+            $SUDO_CMD restorecon "$fp_bin" &>/dev/null || true
+        fi
+    fi
 
     echo "⚙️ Starting services..."
     if [ "$OS" == "macos" ]; then
-        if ! brew services restart mariadb; then
-            gum style --foreground red "❌ Failed to start MariaDB via Homebrew."
+        if ! start_macos_mariadb; then
+            gum style --foreground red "❌ Failed to start MariaDB via ${MAC_BREW}."
             exit 1
         fi
     else # Linux
@@ -4156,7 +4809,14 @@ INI
     fi
 
     # --- Database Configuration ---
-    if [ -f "$CONFIG_FILE" ] && gum confirm "Existing Cove database config found. Use it and skip database setup?"; then
+    # Reuse saved DB creds if present. $CONFIG_FILE always exists at this
+    # point (config_set above wrote HTTP_PORT/HTTPS_PORT), so probe for the
+    # DB keys specifically rather than just the file.
+    local has_db_config=false
+    if [ -f "$CONFIG_FILE" ] && grep -q '^DB_USER=' "$CONFIG_FILE" 2>/dev/null; then
+        has_db_config=true
+    fi
+    if $has_db_config && { $auto_yes || gum confirm "Existing Cove database config found. Use it and skip database setup?"; }; then
         echo "✅ Using existing database configuration."
     else
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Configuring MariaDB"
@@ -4173,7 +4833,7 @@ INI
         echo "   - ✅ MariaDB is ready."
         local db_user="cove_user"
         local db_pass
-        db_pass=$(openssl rand -base64 16)
+        db_pass=$(cove_random_password 16)
         local sql_command="DROP USER IF EXISTS '$db_user'@'localhost'; CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass'; GRANT ALL PRIVILEGES ON *.* TO '$db_user'@'localhost' WITH GRANT OPTION; FLUSH PRIVILEGES;"
         local user_created_successfully=false
 
@@ -4832,6 +5492,14 @@ cove_login() {
         exit 1
     fi
 
+    # Reject traversal / metacharacters before the name builds a path we cd into
+    # and run wp-cli against — otherwise `cove login ../x` targets a WordPress
+    # install outside the Sites tree.
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
     
@@ -4874,30 +5542,16 @@ cove_login() {
         echo "✅ Found admin: '$admin_to_login'."
     fi
 
-    # 3. Attempt to generate the login URL.
+    # 3. Refresh the MU-plugin before generating the URL. Always overwrite
+    # the file so sites created with older Cove versions pick up changes to
+    # the plugin (token format, query-arg name, etc.) without needing a
+    # re-add. The file is small and idempotent to regenerate.
+    inject_mu_plugin "$public_dir"
+
+    # 4. Generate the login URL.
     echo "   Generating login link..."
     local login_url
-    # Suppress stderr on the first try so we can handle the error gracefully.
-    login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" ) 2>/dev/null )
-    local exit_code=$?
-
-    # 4. If the command failed, check for the mu-plugin and retry.
-    if [ $exit_code -ne 0 ]; then
-        echo "   ⚠️ Login command failed. Checking for missing MU-plugin..."
-        local mu_plugin_path="$public_dir/wp-content/mu-plugins/captaincore-helper.php"
-        
-        if [ ! -f "$mu_plugin_path" ]; then
-            # The plugin is missing, so inject it.
-            inject_mu_plugin "$public_dir"
-            
-            echo "   - Retrying login link generation..."
-            # Run the command again, but this time, show errors if it fails.
-            login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" --skip-plugins --skip-themes) )
-        else
-            # The plugin exists, so the failure is for another reason.
-            echo "   - MU-plugin is already present. The issue may be with WP-CLI or the site's database."
-        fi
-    fi
+    login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" --skip-plugins --skip-themes) )
 
     # 5. Display the final URL or an error message.
     if [ -n "$login_url" ]; then
@@ -5552,7 +6206,7 @@ cove_proxy_add() {
     # Interactive mode if arguments not provided
     if [ -z "$name" ]; then
         echo "📝 Adding a new reverse proxy entry..."
-        name=$(gum input --placeholder "Proxy name (e.g., opencode)")
+        name=$(gum input --width 0 --placeholder "Proxy name (e.g., opencode)")
     fi
 
     if [ -z "$name" ]; then
@@ -5577,7 +6231,7 @@ cove_proxy_add() {
     fi
 
     if [ -z "$domain" ]; then
-        domain=$(gum input --placeholder "Domain to listen on (e.g., myhost.tailnet.ts.net)")
+        domain=$(gum input --width 0 --placeholder "Domain to listen on (e.g., myhost.tailnet.ts.net)")
     fi
 
     if [ -z "$domain" ]; then
@@ -5586,7 +6240,7 @@ cove_proxy_add() {
     fi
 
     if [ -z "$target" ]; then
-        target=$(gum input --placeholder "Target to proxy to (e.g., 127.0.0.1:4096)")
+        target=$(gum input --width 0 --placeholder "Target to proxy to (e.g., 127.0.0.1:4096)")
     fi
 
     if [ -z "$target" ]; then
@@ -5771,21 +6425,32 @@ cove_pull() {
         fi
     done
 
-    # Define quiet SSH options to prevent host key warnings
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    # Define quiet SSH options to prevent host key warnings. ControlMaster
+    # shares a single authenticated connection across every ssh call below
+    # so the user enters their password (or unlocks their key) once — the
+    # validate, backup, and cleanup steps all piggyback on the first
+    # connection instead of re-prompting. The socket lives in a per-run
+    # path so parallel `cove pull` invocations don't collide.
+    local ssh_ctl
+    ssh_ctl=$(mktemp -u "${TMPDIR:-/tmp}/cove-ssh-XXXXXXXX")
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
+    # Remove the socket on any exit path (success, failure, Ctrl-C). Any
+    # orphaned master process times out on its own via ControlPersist.
+    # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
+    trap "rm -f '$ssh_ctl'" EXIT
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pulling a remote WordPress site into Cove."
     # --- 1. Gather Remote Info ---
     log_step "Enter remote server details"
     local remote_ssh
-    remote_ssh=$(gum input --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
     if [ -z "$remote_ssh" ]; then log_error "SSH connection cannot be empty."; fi
 
     # Trim the "ssh " prefix if the user includes it.
     remote_ssh="${remote_ssh##ssh }"
 
     local remote_path
-    remote_path=$(gum input --value "public/" --prompt "Path to WordPress Root: ")
+    remote_path=$(gum input --width 0 --value "public/" --prompt "Path to WordPress Root: ")
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
     local remote_path_q
     remote_path_q=$(shell_quote "$remote_path")
@@ -5818,11 +6483,12 @@ cove_pull() {
     local dest_path
     local local_url
     local db_name
+    local reset_db=false
 
     if [ "$destination_choice" == "New Site" ]; then
         local proposed_name
         proposed_name=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//; s/\./-/g')
-        site_name=$(gum input --value "$proposed_name" --prompt "Enter a name for the new local site: ")
+        site_name=$(gum input --width 0 --value "$proposed_name" --prompt "Enter a name for the new local site: ")
         if [ -z "$site_name" ]; then log_error "Site name cannot be empty."; fi
 
         log_step "Creating new placeholder site: ${site_name}.localhost"
@@ -5838,7 +6504,10 @@ cove_pull() {
         
         log_step "Preparing to overwrite existing site: ${site_name}.localhost"
         db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\`;"
+        # Defer the destructive DROP/CREATE until the remote backup is in hand
+        # (below). Dropping here left the local DB gone with no rollback if the
+        # backup step then failed — the pull broke the site worse than a no-op.
+        reset_db=true
     fi
 
     dest_path="$SITES_DIR/$site_name.localhost/public"
@@ -5860,9 +6529,19 @@ cove_pull() {
     fi
     log_success "Backup created: ${backup_url}"
 
+    # Only now that a valid backup exists is it safe to wipe the local DB.
+    if [ "$reset_db" = true ]; then
+        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\`;"
+    fi
+
     log_step "Restoring backup to ${site_name}.localhost..."
     # Execute the migration script directly instead of using a variable with a pipe
     if ! (cd "$dest_path" && curl -sL https://captaincore.io/do | bash -s -- migrate --url="$backup_url" --update-urls); then
+        # Remove the remote backup (full DB dump + wp-config) so a failed
+        # restore doesn't leave it downloadable in the remote web root.
+        local failed_backup_q
+        failed_backup_q=$(shell_quote "$remote_path/${backup_url##*/}")
+        ssh $ssh_opts $remote_ssh "rm -f $failed_backup_q" 2>/dev/null
         log_error "The migration script failed to execute correctly."
     fi
     log_success "Restore complete."
@@ -5923,13 +6602,19 @@ cove_push() {
         gum style --foreground "green" "✅ $1" 
     }
     log_error() {
-        gum style --foreground "red" "❌ ERROR: $1" 
-        >&2
+        gum style --foreground "red" "❌ ERROR: $1" >&2
         exit 1
     }
 
-    # Define quiet SSH options to prevent host key warnings
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    # Define quiet SSH options to prevent host key warnings. ControlMaster
+    # shares a single authenticated connection across every ssh call below
+    # (validate, upload backup, restore, cleanup) so the user enters their
+    # password or unlocks their key once instead of four times.
+    local ssh_ctl
+    ssh_ctl=$(mktemp -u "${TMPDIR:-/tmp}/cove-ssh-XXXXXXXX")
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
+    # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
+    trap "rm -f '$ssh_ctl'" EXIT
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pushing a local Cove site to a remote server."
 
@@ -5955,14 +6640,14 @@ cove_push() {
     # --- 2. Gather Remote Info ---
     log_step "Enter remote server details"
     local remote_ssh
-    remote_ssh=$(gum input --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
     if [ -z "$remote_ssh" ]; then log_error "SSH connection cannot be empty."; fi
 
     # Trim the "ssh " prefix if the user includes it.
     remote_ssh="${remote_ssh##ssh }"
 
     local remote_path
-    remote_path=$(gum input --value "public/" --prompt "Path to Remote WordPress Root: ")
+    remote_path=$(gum input --width 0 --value "public/" --prompt "Path to Remote WordPress Root: ")
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
     local remote_path_q
     remote_path_q=$(shell_quote "$remote_path")
@@ -6012,6 +6697,10 @@ cove_push() {
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
     if ! ssh $ssh_opts $remote_ssh "cd $remote_path_q && curl -sL https://captaincore.io/do | bash -s -- migrate --url=$backup_filename_q --update-urls"; then
+        # Don't leave a full DB dump + wp-config zip sitting in the remote web
+        # root (or locally) after a failed restore — it's directly downloadable.
+        rm -f "$backup_filename"
+        ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q" 2>/dev/null
         log_error "The remote migration script failed to execute correctly."
     fi
     log_success "Remote restore complete."
@@ -6075,10 +6764,15 @@ cove_reload() {
     # reliably when cove_reload is invoked via shell_exec(…&) from PHP.
     trap 'rm -f "$lock_file" 2>/dev/null; trap - EXIT INT TERM' EXIT INT TERM
 
+    # Track the last regenerate's result so a failed Caddy reload (bad
+    # directive, port conflict) surfaces to the caller instead of being
+    # swallowed — cove_reload used to always return 0, so upgrade/CLI callers
+    # couldn't tell the new config never went live.
+    local reload_rc=0
     while :; do
         rm -f "$pending"
         create_gui_file
-        regenerate_caddyfile
+        regenerate_caddyfile; reload_rc=$?
         update_etc_hosts
         [ -f "$pending" ] || break
     done
@@ -6086,6 +6780,11 @@ cove_reload() {
     # Explicit unlock — belt-and-suspenders with the trap.
     rm -f "$lock_file" 2>/dev/null
     trap - EXIT INT TERM
+
+    if [ "$reload_rc" -ne 0 ]; then
+        gum style --foreground red "❌ Caddy reload failed — check $LOGS_DIR/caddy-reload.log for the adapt/reload error." >&2
+    fi
+    return "$reload_rc"
 }
 
 cove_rename() {
@@ -6167,13 +6866,31 @@ cove_rename() {
 
         echo "   - Creating and importing to new database '$new_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db_name" < "$temp_sql_dump"
+        # Gate the destructive DROP below on a verified import + config update.
+        # Previously the import was unchecked, so a failed import (disk full,
+        # packet size) still fell through to dropping the old database — losing
+        # the site's only good copy. On failure here, abort with the old
+        # database and wp-config left intact.
+        if ! mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db_name" < "$temp_sql_dump"; then
+            gum style --foreground red "❌ Error: Failed to import into '$new_db_name'. Aborting; old database left intact."
+            mv "$new_site_dir" "$old_site_dir" # Revert directory rename
+            exit 1
+        fi
 
         echo "   - Updating wp-config.php..."
-        (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet)
+        if ! (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet); then
+            gum style --foreground red "❌ Error: Failed to update wp-config.php. Aborting; old database left intact."
+            mv "$new_site_dir" "$old_site_dir" # Revert directory rename
+            exit 1
+        fi
 
         echo "   - Running search-replace for site URL..."
-        (cd "$new_site_dir/public" && $wp_cmd search-replace "$(url_for "$old_name.localhost")" "$(url_for "$new_name.localhost")" --all-tables --skip-plugins --skip-themes --quiet)
+        # Non-fatal: the data already lives in the new DB and wp-config points
+        # at it, so a search-replace hiccup shouldn't block the rename or strand
+        # the old database — just warn.
+        if ! (cd "$new_site_dir/public" && $wp_cmd search-replace "$(url_for "$old_name.localhost")" "$(url_for "$new_name.localhost")" --all-tables --skip-plugins --skip-themes --quiet); then
+            gum style --foreground yellow "⚠️  search-replace did not complete cleanly; verify the site URL under the new name."
+        fi
 
         echo "   - Dropping old database '$old_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
@@ -6245,7 +6962,10 @@ cove_share() {
         local install_cmd=""
         local install_name=""
         
-        if command -v brew &> /dev/null; then
+        if [ "$OS" == "macos" ] && command -v "$MAC_BREW" &> /dev/null; then
+            install_cmd="$MAC_BREW install cloudflared"
+            install_name=$([ "$MAC_BREW" = "nb" ] && echo "nanobrew" || echo "Homebrew")
+        elif command -v brew &> /dev/null; then
             install_cmd="brew install cloudflared"
             install_name="Homebrew"
         elif command -v apt-get &> /dev/null; then
@@ -6537,10 +7257,13 @@ cove_status() {
 
     # Check MariaDB and Mailpit status on MacOS
     if [ "$OS" == "macos" ]; then
-        if brew services list 2>/dev/null | grep -q "mariadb.*started"; then 
+        if is_mariadb_running; then
             mariadb_status="✅ Running"
         fi
-        if launchctl list 2>/dev/null | grep -q "com.cove.mailpit"; then 
+        # Probe the process, not the launchd label: `launchctl list` shows the
+        # job as long as it's loaded even while it's crash-looping/throttled, so
+        # it reported "Running" for a dead Mailpit. pgrep reflects real liveness.
+        if pgrep -x mailpit &>/dev/null; then
             mailpit_status="✅ Running"
         fi
     fi
@@ -6603,7 +7326,7 @@ cove_tailscale_enable() {
     if [ -z "$hostname" ]; then
         echo "📝 Enter your Tailscale machine hostname"
         echo "   (e.g., mycomputer.tail1234.ts.net)"
-        hostname=$(gum input --placeholder "your-machine.tailnet.ts.net")
+        hostname=$(gum input --width 0 --placeholder "your-machine.tailnet.ts.net")
     fi
 
     if [ -z "$hostname" ]; then
@@ -6760,12 +7483,22 @@ cove_trust() {
 
     # Run the built-in trust installer. Needs sudo on Linux to write to
     # /usr/local/share/ca-certificates and re-run update-ca-certificates.
+    # `frankenphp trust` talks to the Caddy admin API on :2019 to fetch the
+    # current root — so if Caddy isn't up (common right after `cove install`
+    # fails to start the service) the call errors with "connection refused"
+    # and the remainder of the trust work is a no-op. Capture the exit code
+    # so the final success banner only fires when something was actually
+    # installed.
     echo "   - Running frankenphp trust..."
+    local trust_output trust_rc=0
     if [ "$OS" = "linux" ]; then
-        $SUDO_CMD "$CADDY_CMD" trust 2>&1 | grep -vE '^\{|^$' || true
+        trust_output=$($SUDO_CMD "$CADDY_CMD" trust 2>&1)
+        trust_rc=$?
     else
-        "$CADDY_CMD" trust 2>&1 | grep -vE '^\{|^$' || true
+        trust_output=$("$CADDY_CMD" trust 2>&1)
+        trust_rc=$?
     fi
+    echo "$trust_output" | grep -vE '^\{|^$' || true
 
     # Linux-only: Firefox and Chromium ship as snaps on Ubuntu 22+ and
     # store their NSS DBs under ~/snap/... — a path that neither Caddy nor
@@ -6801,9 +7534,23 @@ cove_trust() {
     fi
 
     echo ""
-    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
-        "✅ Local SSL trust installed" \
-        "If a browser was open during this run, restart it to pick up the new CA."
+    if [ "$trust_rc" -eq 0 ]; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Local SSL trust installed" \
+            "If a browser was open during this run, restart it to pick up the new CA."
+    else
+        # Tailor the hint based on what frankenphp actually said — "connection
+        # refused" almost always means Caddy's admin API isn't up yet.
+        if echo "$trust_output" | grep -q "connection refused"; then
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground yellow \
+                "⚠️ Trust install skipped — Cove server isn't running yet" \
+                "Run 'cove enable' then 'cove trust' to finish installing the local root."
+        else
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground yellow \
+                "⚠️ Trust install did not complete" \
+                "Re-run 'cove trust' once Cove is running to try again."
+        fi
+    fi
 }
 
 upgrade_frankenphp() {
@@ -7110,6 +7857,7 @@ cove_upgrade() {
     echo "🎨 Refreshing Cove Adminer theme..."
     deploy_adminer_theme
 
+
     # --- Floor Cove's PHP ini at the current installer default ---
     # Pre-1.10 installers wrote memory_limit=512M (also upload/post=unset).
     # Raise to the 1G floor the fresh installer uses today, but leave any
@@ -7137,7 +7885,12 @@ cove_upgrade() {
         current=$(cove_ini_get "$k" "")
         local current_bytes
         current_bytes=$(mem_to_bytes "$current")
-        if [ -z "$current" ] || [ "$current_bytes" -lt "$floor_bytes" ]; then
+        # -1 means unlimited (valid for memory_limit) — it's above any floor,
+        # not below it. mem_to_bytes("-1") returns -1, which would otherwise
+        # test as < 1G and silently cap a user's unlimited limit at 1G.
+        if [ "$current" = "-1" ]; then
+            echo "   ✓ ${k}: -1 (unlimited)"
+        elif [ -z "$current" ] || [ "$current_bytes" -lt "$floor_bytes" ]; then
             mkdir -p "$(dirname "$PHP_INI_FILE")"
             touch "$PHP_INI_FILE"
             if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
@@ -7155,6 +7908,17 @@ cove_upgrade() {
     if [ "$bumped_any" = true ]; then
         echo "   (cove reload below regenerates the Caddyfile so the web server picks up the new limits.)"
     fi
+
+    # --- Refresh managed components with the new code ---
+    # Whoops (PHP 8.5 compat), its resilient bootstrap, the one-time-login
+    # MU-plugin across all sites, and the watchdog service. These are invoked
+    # through the freshly-installed on-disk binary because the still-running
+    # upgrade process holds the pre-upgrade script — which may not define these
+    # functions (or defines older versions), so a direct call would deploy stale
+    # bits or fail outright. See the 'post-upgrade' case in main.
+    echo ""
+    echo "🧩 Refreshing managed components (Whoops, MU-plugin, watchdog)..."
+    "$install_path" post-upgrade
 
     # --- Reload to pull in any UI updates ---
     # Invoke the on-disk binary so a freshly-upgraded script's new functions are used
