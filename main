@@ -485,24 +485,36 @@ spl_autoload_register(function ($class) {
     }
 });
 
-$whoops = new \Whoops\Run;
+// Whoops is a dev-time convenience (pretty error pages), not essential to
+// serving a request — so it must never be able to take a site down. A bundled
+// Whoops incompatible with the running PHP (e.g. 2.15.3 under PHP 8.5) threw a
+// TypeError from register() here, and because this file is auto_prepend'd to
+// every request it 500-ed every site at once. Catch anything so a failure
+// degrades to "no pretty pages" instead of a site-wide outage; the underlying
+// error still lands in the PHP error log.
+try {
+    $whoops = new \Whoops\Run;
 
-// We want to see all errors *except* for the noisy Deprecated and Notice warnings,
-// which are common with older plugins on modern PHP.
-// E_USER_NOTICE is used by WordPress's _doing_it_wrong() function.
-// E_USER_WARNING is triggered by WP_HTTP (wp_version_check, update checks, API
-// calls) whenever a request to api.wordpress.org or a plugin update endpoint
-// fails — e.g. on first wp-admin load before background crons settle, or on a
-// fresh install without system CA certs. That's a transient runtime condition,
-// not a bug to page on; leave it in the error log and let WordPress recover.
-$whoops->silenceErrorsInPaths(
-    '/.*/', // A regex that matches all file paths
-    E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE | E_USER_WARNING
-);
+    // We want to see all errors *except* for the noisy Deprecated and Notice
+    // warnings, which are common with older plugins on modern PHP.
+    // E_USER_NOTICE is used by WordPress's _doing_it_wrong() function.
+    // E_USER_WARNING is triggered by WP_HTTP (wp_version_check, update checks,
+    // API calls) whenever a request to api.wordpress.org or a plugin update
+    // endpoint fails — e.g. on first wp-admin load before background crons
+    // settle, or on a fresh install without system CA certs. That's a transient
+    // runtime condition, not a bug to page on; leave it in the error log and
+    // let WordPress recover.
+    $whoops->silenceErrorsInPaths(
+        '/.*/', // A regex that matches all file paths
+        E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE | E_USER_WARNING
+    );
 
-// The PrettyPageHandler will now only be triggered for fatal errors.
-$whoops->pushHandler(new \Whoops\Handler\PrettyPageHandler);
-$whoops->register();
+    // The PrettyPageHandler will now only be triggered for fatal errors.
+    $whoops->pushHandler(new \Whoops\Handler\PrettyPageHandler);
+    $whoops->register();
+} catch (\Throwable $e) {
+    error_log('Cove: Whoops failed to initialize, continuing without it: ' . $e->getMessage());
+}
 EOM
 }
 
