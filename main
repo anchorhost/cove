@@ -667,8 +667,12 @@ if (defined('WP_CLI') && WP_CLI) {
         $password = wp_generate_password();
         $token    = substr( sha1( $password ), 0, 7 );
 
-        // Update user meta with the new token
+        // Update user meta with the new token. Stamp the mint time too — the
+        // token validator expires anything without a recent cove_login_token_time
+        // (see captaincore_login_handle_token), so omitting it here made every
+        // `wp user login` / `cove add` link read as already expired.
         update_user_meta( $user->ID, 'cove_login_token', $token );
+        update_user_meta( $user->ID, 'cove_login_token_time', time() );
         // Construct the one-time login URL
         $query_args = [
             'user_id'          => $user->ID,
