@@ -183,6 +183,10 @@ CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
 COVE_VERSION="1.11"
+# Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
+# the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
+# 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
+WHOOPS_VERSION="2.18.0"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -433,6 +437,27 @@ update_wp_site_urls_for_port_change() {
         gum style --foreground yellow "⚠️  $failed_hosts hostname replacement(s) failed."
     fi
     return 0
+}
+
+# Download the pinned Whoops release into $APP_DIR/whoops. Shared by cove
+# install and cove upgrade so both stay on WHOOPS_VERSION — upgrade previously
+# never refreshed Whoops, so upgraders whose FrankenPHP jumped to PHP 8.5 kept
+# an incompatible 2.15.3 and 500-ed every site.
+deploy_whoops() {
+    echo "✨ Downloading Whoops error handler (v$WHOOPS_VERSION)..."
+    local tmp
+    tmp=$(mktemp -d)
+    if curl -sL "https://github.com/filp/whoops/archive/refs/tags/${WHOOPS_VERSION}.tar.gz" | tar -xz -C "$tmp" --strip-components=1 \
+        && [ -f "$tmp/src/Whoops/Run.php" ]; then
+        rm -rf "$APP_DIR/whoops"
+        mkdir -p "$APP_DIR/whoops"
+        cp -R "$tmp"/. "$APP_DIR/whoops/"
+    else
+        echo "   ⚠️  Whoops download failed; leaving the existing copy in place." >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
 }
 
 # --- Whoops Bootstrap Generation ---

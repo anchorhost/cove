@@ -450,10 +450,7 @@ INI
     # pick up index.php/head() and CSS/JS changes without a full reinstall.
     deploy_adminer_theme
 
-    echo "✨ Downloading Whoops error handler..."
-    rm -rf "$APP_DIR/whoops" # Remove any old versions first
-    mkdir -p "$APP_DIR/whoops"
-    curl -sL "https://github.com/filp/whoops/archive/refs/tags/2.15.3.tar.gz" | tar -xz -C "$APP_DIR/whoops" --strip-components=1
+    deploy_whoops
 
     # --- Fedora/RHEL SELinux labeling ---
     # The upstream FrankenPHP installer tags /usr/bin/frankenphp with the

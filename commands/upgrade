@@ -302,6 +302,14 @@ cove_upgrade() {
     echo "🎨 Refreshing Cove Adminer theme..."
     deploy_adminer_theme
 
+    # Refresh Whoops to the pinned version. upgrade_frankenphp above can jump
+    # PHP to a release the bundled Whoops doesn't support (2.15.3 500-ed every
+    # site under PHP 8.5), and nothing else re-downloads it — so upgraders were
+    # left on a stale, incompatible copy.
+    echo ""
+    deploy_whoops
+    create_whoops_bootstrap
+
     # --- Floor Cove's PHP ini at the current installer default ---
     # Pre-1.10 installers wrote memory_limit=512M (also upload/post=unset).
     # Raise to the 1G floor the fresh installer uses today, but leave any
