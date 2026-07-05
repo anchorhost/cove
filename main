@@ -187,6 +187,11 @@ COVE_VERSION="1.11"
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
 WHOOPS_VERSION="2.18.0"
+# Version of the injected one-time-login MU-plugin (captaincore-helper.php).
+# MUST match the `Version:` header in build_mu_plugin's heredoc — refresh_all_mu_plugins
+# compares the two to decide which sites need the plugin re-pushed on upgrade.
+# Bump whenever the mu-plugin code changes so existing sites pick it up.
+MU_PLUGIN_VERSION="0.4.0"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -534,7 +539,7 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.3.0
+ * Version: 0.4.0
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
@@ -727,6 +732,33 @@ heredoc
     mkdir -p "$mu_plugins_dir"
     echo "$build_mu_plugin" > "$mu_plugins_dir/captaincore-helper.php"
     echo "   - ✅ Injected one-time login MU-plugin."
+}
+
+# Re-push the one-time-login MU-plugin to every WordPress site whose deployed
+# copy is out of date. cove login re-injects lazily, but only for sites you log
+# into — this proactively updates the rest, which matters because the plugin
+# carries security-sensitive code (the nopriv login handler) and runtime filters
+# (option_home/siteurl) that are live regardless of whether anyone triggers a
+# login. Gated on the Version: header so unchanged sites aren't rewritten.
+refresh_all_mu_plugins() {
+    echo "🔌 Refreshing one-time-login MU-plugin (v$MU_PLUGIN_VERSION) across sites..."
+    local total=0 updated=0 site public deployed ver
+    for site in "$SITES_DIR"/*.localhost; do
+        [ -d "$site" ] || continue
+        public="$site/public"
+        [ -f "$public/wp-config.php" ] || continue   # WordPress sites only
+        total=$((total + 1))
+        deployed="$public/wp-content/mu-plugins/captaincore-helper.php"
+        ver=""
+        if [ -f "$deployed" ]; then
+            ver=$(grep -m1 -E '^[[:space:]]*\*[[:space:]]*Version:' "$deployed" \
+                | sed -E 's/.*Version:[[:space:]]*//; s/[[:space:]]*$//')
+        fi
+        if [ "$ver" != "$MU_PLUGIN_VERSION" ]; then
+            inject_mu_plugin "$public" >/dev/null && updated=$((updated + 1))
+        fi
+    done
+    echo "   - ✅ MU-plugin current on $total WordPress site(s); updated $updated."
 }
 
 # Write a Cove-branded landing index.php into a plain site's public dir.
@@ -3332,10 +3364,16 @@ main() {
             check_dependencies
             cove_reload
             ;;
-        install-watchdog)
+        post-upgrade)
             # Internal: cove_upgrade calls this through the freshly-installed
-            # on-disk binary so the new install_watchdog_service runs (the
-            # running upgrade process predates it). Not part of the public CLI.
+            # on-disk binary so these component refreshes run with the NEW code.
+            # The upgrade process is still executing the pre-upgrade script in
+            # memory, which may not define (or defines an older version of) these
+            # functions — so anything that must ship the latest bits has to be
+            # invoked via the on-disk binary here. Not part of the public CLI.
+            deploy_whoops
+            create_whoops_bootstrap
+            refresh_all_mu_plugins
             install_watchdog_service
             ;;
         status)

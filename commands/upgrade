@@ -302,13 +302,6 @@ cove_upgrade() {
     echo "🎨 Refreshing Cove Adminer theme..."
     deploy_adminer_theme
 
-    # Refresh Whoops to the pinned version. upgrade_frankenphp above can jump
-    # PHP to a release the bundled Whoops doesn't support (2.15.3 500-ed every
-    # site under PHP 8.5), and nothing else re-downloads it — so upgraders were
-    # left on a stale, incompatible copy.
-    echo ""
-    deploy_whoops
-    create_whoops_bootstrap
 
     # --- Floor Cove's PHP ini at the current installer default ---
     # Pre-1.10 installers wrote memory_limit=512M (also upload/post=unset).
@@ -361,15 +354,16 @@ cove_upgrade() {
         echo "   (cove reload below regenerates the Caddyfile so the web server picks up the new limits.)"
     fi
 
-    # --- Refresh service units ---
-    # cove_enable is the only other caller; upgraders never run it, so without
-    # this a pre-1.11 install would get the new cove.sh but no watchdog (and no
-    # refresh of any future unit change). Invoke the on-disk binary so the
-    # freshly-upgraded install_watchdog_service runs — the still-running upgrade
-    # process holds the old script, which may not define it. Idempotent.
+    # --- Refresh managed components with the new code ---
+    # Whoops (PHP 8.5 compat), its resilient bootstrap, the one-time-login
+    # MU-plugin across all sites, and the watchdog service. These are invoked
+    # through the freshly-installed on-disk binary because the still-running
+    # upgrade process holds the pre-upgrade script — which may not define these
+    # functions (or defines older versions), so a direct call would deploy stale
+    # bits or fail outright. See the 'post-upgrade' case in main.
     echo ""
-    echo "🐕 Installing/refreshing the FrankenPHP watchdog service..."
-    "$install_path" install-watchdog
+    echo "🧩 Refreshing managed components (Whoops, MU-plugin, watchdog)..."
+    "$install_path" post-upgrade
 
     # --- Reload to pull in any UI updates ---
     # Invoke the on-disk binary so a freshly-upgraded script's new functions are used
