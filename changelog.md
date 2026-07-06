@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### 🔒 Security & Bug Fixes
+
+* **Whoops No Longer Promotes `E_WARNING` to a Full-Screen Crash Page:** The Whoops bootstrap's silence mask covered notices, deprecations, and `E_USER_WARNING`, but not plain `E_WARNING` — so a harmless warning like PHP's "Cannot modify header information - headers already sent" (core's own `Content-Type` header colliding with a plugin that echoed output early, as LearnDash's setup wizard does) was converted into a fatal `ErrorException` and rendered as a full-screen crash, even with `WP_DEBUG_DISPLAY` off. `E_WARNING` is now silenced alongside the other non-fatal levels, so the Whoops page is reserved for actual fatals and uncaught exceptions. Existing sites pick up the regenerated bootstrap via `cove upgrade` (or a one-time `cove post-upgrade`). Reported in [#5](https://github.com/anchorhost/cove/issues/5).
+
 ## [1.11] - 2026-07-05
 
 ### ✨ New Features
