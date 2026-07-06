@@ -182,7 +182,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.11"
+COVE_VERSION="1.11.1"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -500,18 +500,21 @@ spl_autoload_register(function ($class) {
 try {
     $whoops = new \Whoops\Run;
 
-    // We want to see all errors *except* for the noisy Deprecated and Notice
-    // warnings, which are common with older plugins on modern PHP.
+    // Only fatal errors and uncaught exceptions should get the full-screen
+    // Whoops page. Everything non-fatal is silenced:
     // E_USER_NOTICE is used by WordPress's _doing_it_wrong() function.
     // E_USER_WARNING is triggered by WP_HTTP (wp_version_check, update checks,
     // API calls) whenever a request to api.wordpress.org or a plugin update
-    // endpoint fails — e.g. on first wp-admin load before background crons
-    // settle, or on a fresh install without system CA certs. That's a transient
-    // runtime condition, not a bug to page on; leave it in the error log and
-    // let WordPress recover.
+    // endpoint fails — a transient runtime condition, not a bug to page on.
+    // E_WARNING covers PHP's "Cannot modify header information - headers
+    // already sent", which fires whenever a plugin echoes output before core
+    // sends its Content-Type header — harmless and silent on a normal host.
+    // Note: Whoops swallows silenced errors entirely (its error handler
+    // returns true, so PHP's own log_errors handling never runs) — these
+    // levels do NOT reach debug.log.
     $whoops->silenceErrorsInPaths(
         '/.*/', // A regex that matches all file paths
-        E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE | E_USER_WARNING
+        E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE | E_WARNING | E_USER_WARNING
     );
 
     // The PrettyPageHandler will now only be triggered for fatal errors.

@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.11.1] - 2026-07-05
 
 ### 🔒 Security & Bug Fixes
 
