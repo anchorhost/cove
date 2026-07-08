@@ -3,10 +3,11 @@ cove_add() {
     local site_name="$1"
     local site_type="wordpress"
     local no_reload_flag=false
+    local wp_version=""
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [--plain]"
+        echo "Usage: cove add <name> [--plain] [--wp-version=<version>]"
         exit 1
     fi
 
@@ -30,7 +31,15 @@ cove_add() {
         if [ "$arg" == "--no-reload" ]; then
             no_reload_flag=true
         fi
+        if [[ "$arg" == --wp-version=* ]]; then
+            wp_version="${arg#*=}"
+        fi
     done
+
+    if [ -n "$wp_version" ] && ! [[ "$wp_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        gum style --foreground red "❌ Error: Invalid WordPress version '$wp_version'." "Use a numeric version like 6.4 or 6.4.3."
+        exit 1
+    fi
 
     for protected_name in $PROTECTED_NAMES; do
         if [ "$site_name" == "$protected_name" ]; then
@@ -63,7 +72,10 @@ cove_add() {
         source_config
         local db_name
         db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
-        
+
+        if [ -n "$wp_version" ]; then
+            echo "📌 Targeting WordPress $wp_version"
+        fi
         echo "🗄️ Creating database: $db_name"
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
         echo "Installing WordPress..."
@@ -85,7 +97,9 @@ cove_add() {
             cd "$site_dir/public" || exit 1
 
             # 1. Download WordPress with a higher memory limit
-            if ! $wp_cmd core download --quiet; then
+            local version_arg=""
+            [ -n "$wp_version" ] && version_arg="--version=$wp_version"
+            if ! $wp_cmd core download --quiet $version_arg; then
                 echo "❌ Error: Failed to download WordPress core. This might be a network issue or a permissions problem."
                 exit 1 # Exit the subshell with an error
             fi

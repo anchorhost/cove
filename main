@@ -2173,7 +2173,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'add_site':
             if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
                 $type_flag = ($input['is_plain'] ?? false) ? '--plain' : '';
-                $command = sprintf('HOME=%s %s add %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag);
+                $version_flag = '';
+                if (!empty($input['wp_version']) && preg_match('/^\d+\.\d+(\.\d+)?$/', $input['wp_version'])) {
+                    $version_flag = ' --wp-version=' . escapeshellarg($input['wp_version']);
+                }
+                $command = sprintf('HOME=%s %s add %s %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $type_flag, $version_flag);
                 // Remember we're adding so the post-exec block below can
                 // measure the new site's size and fold it into the cache.
                 $add_site_target = $site_name;
@@ -2647,6 +2651,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .add-row input[type="text"]:focus { outline: 0; border-color: var(--accent); }
         .add-row .plain-toggle { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--text-dim); font-size: 0.85rem; cursor: pointer; }
         .add-row .plain-toggle input { accent-color: var(--accent); }
+        .add-row input.wp-version { min-width: 0; width: 170px; flex: none; }
 
         /* Site list — one grid on the <ul>, rows inherit its columns via
            subgrid so type/modified/size/actions align vertically across rows
@@ -2919,6 +2924,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         <input type="checkbox" x-model="newSite.isPlain" :disabled="newSite.isLoading">
                         plain (no WordPress)
                     </label>
+                    <input type="text" class="wp-version" x-show="!newSite.isPlain" x-model="newSite.wpVersion" placeholder="WP version (e.g. 6.4.3)" pattern="\d+\.\d+(\.\d+)?" title="Numeric version like 6.4 or 6.4.3" :disabled="newSite.isLoading || newSite.isPlain">
                     <button class="pill primary" type="submit" :disabled="!newSite.name || newSite.isLoading">
                         <span class="btn-spinner" x-show="newSite.isLoading" aria-hidden="true" style="display: none;"></span>
                         <span x-text="newSite.isLoading ? 'creating…' : 'create'"></span>
@@ -3142,7 +3148,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 rename: { open: false, site: null, value: '', busy: false },
                 logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
                 _initialised: false,
-                newSite: { name: '', isPlain: false, isLoading: false },
+                newSite: { name: '', isPlain: false, wpVersion: '', isLoading: false },
                 snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
                 // Deletes are staged for a short undo window before anything is
                 // sent to the backend. One batch at a time; staging more sites
@@ -3710,8 +3716,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.newSite.isLoading = true;
                     const name = this.newSite.name;
                     const isPlain = this.newSite.isPlain;
+                    const wpVersion = this.newSite.isPlain ? '' : this.newSite.wpVersion.trim();
 
-                    const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain });
+                    const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: wpVersion || undefined });
                     if (add.success) {
                         // Optimistic insert: we already know every field the row
                         // template uses. No auto-refresh — the Caddy reload that
@@ -3733,6 +3740,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         });
                         this.showSnack('Site created.');
                         this.newSite.name = '';
+                        this.newSite.wpVersion = '';
                         this.adding = false;
                         this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
 
@@ -4053,7 +4061,7 @@ display_command_help() {
             echo "  --totals       Calculates and displays the size of each site's public directory."
             ;;
         add)
-            echo "Usage: cove add <name> [--plain]"
+            echo "Usage: cove add <name> [--plain] [--wp-version=<version>]"
             echo ""
             echo "Creates a new local site accessible at 'https://<name>.localhost'."
             echo ""
@@ -4061,7 +4069,8 @@ display_command_help() {
             echo "  <name>         The name for the new site. Becomes the subdomain."
             echo ""
             echo "Flags:"
-            echo "  --plain        Creates a new static HTML site without a database."
+            echo "  --plain                Creates a new static HTML site without a database."
+            echo "  --wp-version=<version> Download a specific WordPress version (e.g. 6.4.3)."
             ;;
         delete)
             echo "Usage: cove delete <name> [--force]"
