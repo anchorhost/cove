@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### 🔒 Security & Bug Fixes
+
+* **`cove upgrade` Now Self-Locates via `$0` Instead of PATH:** The upgrade flow resolved its install path with `command -v cove`, which finds whatever `cove` happens to sit in PATH rather than the copy actually running. When cove runs through a shell alias or an absolute path, those can differ — a stale v1.8 binary left in `/opt/homebrew/bin` answered a v1.11 upgrade's `post-upgrade` call with "Unknown command" (skipping the Whoops/MU-plugin/watchdog refresh) and ran `reload` through three-versions-old dashboard and Caddyfile generators. The running script's own `$0` is now authoritative, with PATH lookup kept only as a fallback.
+
 ## [1.11.1] - 2026-07-05
 
 ### 🔒 Security & Bug Fixes
