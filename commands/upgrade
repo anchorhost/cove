@@ -113,8 +113,17 @@ cove_upgrade() {
     local temp_script="/tmp/cove.sh.latest"
     local install_path
 
-    # Find the real path of the currently running script
-    install_path=$(command -v cove)
+    # Find the real path of the currently running script. $0 is authoritative:
+    # when cove runs via a shell alias or absolute path, `command -v cove`
+    # finds whatever happens to sit in PATH — possibly a different, older
+    # copy. (A stale v1.8 in /opt/homebrew/bin once answered a v1.11
+    # upgrade's post-upgrade/reload calls: "Unknown command 'post-upgrade'",
+    # plus a reload through three-versions-old generators.) PATH lookup is
+    # only the fallback when $0 is unusable.
+    install_path="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")"
+    if [ ! -f "$install_path" ]; then
+        install_path=$(command -v cove)
+    fi
     if [ -z "$install_path" ]; then
         install_path="/usr/local/bin/cove" # Fallback to default
     fi
