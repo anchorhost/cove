@@ -2377,6 +2377,25 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-list > .empty, .site-list > .loading { grid-column: 1 / -1; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
         .empty-hint { margin-top: 0.35rem; font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-faint); }
         .empty-hint code { background: var(--panel-hover); padding: 0.1rem 0.4rem; border-radius: 5px; }
+        .empty-art { display: block; width: 104px; height: 68px; margin: 0 auto 1rem; }
+        .empty-art .art-line { stroke: var(--text-dim); stroke-width: 2; fill: none; }
+        .empty-art .art-fill { fill: var(--accent); opacity: 0.14; stroke: none; }
+        .empty-art .art-wave { stroke: var(--accent); stroke-width: 2; fill: none; opacity: 0.55; }
+
+        /* Column headers — subgrid row mirroring .site-row's columns. */
+        .site-head { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); }
+        .site-head-btn, .site-head-label { background: transparent; border: 0; padding: 0; font-family: var(--font-mono); font-size: 0.66rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); text-align: left; }
+        .site-head-btn { cursor: pointer; border-radius: 4px; }
+        .site-head-btn:hover { color: var(--text); }
+        .site-head-btn.active { color: var(--text-dim); }
+        .site-head-label { justify-self: center; }
+        .site-head-right { justify-self: end; text-align: right; }
+        .sort-arrow { display: inline-block; min-width: 1em; text-align: right; }
+
+        /* Bulk delete — appears in the filter row when a filter narrows the list. */
+        .bulk-delete-btn { background: transparent; border: 1px solid var(--panel-border); color: var(--text-dim); cursor: pointer; font-family: var(--font-mono); font-size: 0.76rem; padding: 0.18rem 0.65rem; border-radius: var(--radius-pill); white-space: nowrap; transition: color 120ms, border-color 120ms, background 120ms; }
+        .bulk-delete-btn:hover { color: var(--danger); border-color: var(--danger); }
+        .bulk-delete-btn.armed { color: white; background: var(--danger); border-color: var(--danger); }
 
         /* Footer */
         .card-foot { display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1.5rem; border-top: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.78rem; gap: 1rem; flex-wrap: wrap; }
@@ -2408,8 +2427,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         /* Centered via auto margins + fit-content width, NOT transform — Alpine
            writes transform inline during x-transition, which would wipe out a
            translateX(-50%) centering and slide the snackbar in from the edge. */
-        .snackbar { position: fixed; bottom: 1.5rem; left: 0; right: 0; margin-inline: auto; width: max-content; max-width: 90vw; background: var(--text); color: var(--bg); padding: 0.7rem 1.15rem; border-radius: 10px; font-size: 0.88rem; z-index: 200; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+        .snackbar { position: fixed; bottom: 1.5rem; left: 0; right: 0; margin-inline: auto; width: max-content; max-width: 90vw; display: flex; align-items: center; gap: 0.9rem; background: var(--text); color: var(--bg); padding: 0.7rem 1.15rem; border-radius: 10px; font-size: 0.88rem; z-index: 200; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
         .snackbar.error { background: var(--danger); color: white; }
+        .snackbar-action { background: transparent; border: 0; padding: 0; color: inherit; font: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+        .snackbar-action:hover { opacity: 0.8; }
 
         /* Responsive */
         @media (max-width: 620px) {
@@ -2418,7 +2439,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             .card-actions { width: 100%; justify-content: flex-end; }
             .site-list { grid-template-columns: 1fr auto auto; column-gap: 0.6rem; }
             .site-row { padding: 0.7rem 1rem; }
-            .site-size, .site-modified { display: none; }
+            .site-size, .site-modified, .head-size, .head-modified { display: none; }
             .site-actions { opacity: 1; }
             .add-row { padding: 0.8rem 1rem; }
             .card-foot { padding: 0.75rem 1rem; }
@@ -2457,7 +2478,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <header class="card-head">
                 <h1 class="card-title">Sites</h1>
                 <div class="card-actions">
-                    <button class="pill" @click="cycleSort()" :title="'Sort by — click to cycle'" x-text="'sort: ' + sort"></button>
                     <a class="pill" href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Adminer">
                         <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5v-9"/><path d="M3 8c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5"/></svg>
                         db
@@ -2506,6 +2526,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     @keydown.escape.prevent="filter = ''; $event.target.blur()"
                     aria-label="Filter sites"
                 >
+                <button
+                    type="button"
+                    class="bulk-delete-btn"
+                    :class="{ armed: bulkArmed }"
+                    x-show="(filter || typeFilter) && filteredSites.length > 0 && filteredSites.length < sites.length"
+                    @click="bulkDelete()"
+                    :title="'Delete every site matching the current filter'"
+                    x-text="bulkArmed ? ('sure? delete ' + filteredSites.length) : ('delete ' + filteredSites.length + ' shown')"
+                    style="display: none;"></button>
                 <span class="filter-kbd" x-show="!filter && !typeFilter" aria-hidden="true">/</span>
                 <button class="filter-clear" x-show="filter || typeFilter" @click="clearAllFilters(); $refs.filterInput.focus()" aria-label="Clear filter" title="Clear all (Esc)">×</button>
             </div>
@@ -2525,6 +2554,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </div>
 
             <ul class="site-list">
+                <li class="site-head" x-show="!isLoading && filteredSites.length > 0">
+                    <button type="button" class="site-head-btn" :class="{ active: sort === 'name' }" @click="setSort('name')" title="Sort by name">name<span class="sort-arrow" x-text="sortArrow('name')"></span></button>
+                    <span class="site-head-label">type</span>
+                    <button type="button" class="site-head-btn site-head-right head-modified" :class="{ active: sort === 'modified' }" @click="setSort('modified')" title="Sort by last modified">modified<span class="sort-arrow" x-text="sortArrow('modified')"></span></button>
+                    <button type="button" class="site-head-btn site-head-right head-size" :class="{ active: sort === 'size' }" @click="setSort('size')" title="Sort by disk size">size<span class="sort-arrow" x-text="sortArrow('size')"></span></button>
+                    <span aria-hidden="true"></span>
+                </li>
                 <template x-for="site in filteredSites" :key="site.name">
                     <li class="site-row" @click="openSite(site)">
                         <a class="site-domain" :href="site.domain" target="_blank" rel="noopener" @click.stop x-html="highlightedDomain(site.domain, filter)"></a>
@@ -2548,13 +2584,31 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </template>
                 <template x-if="!isLoading && sites.length === 0">
                     <li class="empty">
-                        <div>No sites yet.</div>
+                        <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path class="art-fill" d="M52 12 L68 38 H52 Z"/>
+                            <path class="art-line" d="M52 10 v30"/>
+                            <path class="art-line" d="M52 14 L67 37 H52 Z"/>
+                            <path class="art-line" d="M49 20 L39 37 H49 Z"/>
+                            <path class="art-line" d="M36 42 h32 l-6 9 H42 Z"/>
+                            <path class="art-wave" d="M8 56 Q 15 52, 22 56 T 36 56 T 50 56 T 64 56 T 78 56 T 92 56"/>
+                            <path class="art-wave" d="M20 62 Q 27 58, 34 62 T 48 62 T 62 62 T 76 62" opacity="0.35"/>
+                        </svg>
+                        <div>No sites in the cove yet.</div>
                         <div class="empty-hint">Click <em>+ add site</em>, or run <code>cove add myblog</code>.</div>
                     </li>
                 </template>
                 <template x-if="!isLoading && sites.length > 0 && filteredSites.length === 0">
                     <li class="empty">
-                        <div>No matches for <code x-text="filter"></code>.</div>
+                        <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path class="art-line" d="M52 44 v-14 q0 -6 6 -6 h4"/>
+                            <path class="art-line" d="M62 18 h8 q3 0 3 3 v3 h-11 q-3 0 -3 -3 v-3 Z"/>
+                            <path class="art-line" d="M73 21 l7 -4 v11 l-7 -4"/>
+                            <path class="art-fill" d="M46 44 h12 v8 H46 Z"/>
+                            <path class="art-line" d="M46 52 v-8 h12 v8"/>
+                            <path class="art-wave" d="M8 56 Q 15 52, 22 56 T 36 56 T 50 56 T 64 56 T 78 56 T 92 56"/>
+                            <path class="art-wave" d="M20 62 Q 27 58, 34 62 T 48 62 T 62 62 T 76 62" opacity="0.35"/>
+                        </svg>
+                        <div>Nothing surfaced for <code x-text="filter || typeFilterLabel"></code>.</div>
                         <div class="empty-hint">Press Esc to clear.</div>
                     </li>
                 </template>
@@ -2596,7 +2650,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         </div>
     </div>
 
-    <div x-show="snackbar.visible" x-transition.opacity.duration.200ms class="snackbar" :class="{ error: snackbar.isError }" x-text="snackbar.message" style="display: none;"></div>
+    <div x-show="snackbar.visible" x-transition.opacity.duration.200ms class="snackbar" :class="{ error: snackbar.isError }" style="display: none;">
+        <span x-text="snackbar.message"></span>
+        <!-- !! matters: x-show/@click expressions that RESULT in a function get
+             auto-invoked by Alpine, so a bare `snackbar.action` here would run
+             the undo handler on every render. -->
+        <button type="button" class="snackbar-action" x-show="!!snackbar.action" @click="if (snackbar.action) snackbar.action()" x-text="snackbar.actionLabel" style="display: none;"></button>
+    </div>
 
     <script>
         const PORT_SUFFIX = '<?= $__cove_port_suffix ?>';
@@ -2613,10 +2673,16 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 isRefreshingSizes: false,
                 filter: '',
                 typeFilter: null, // null | 'WordPress' | 'Plain' — set via the row type pills, cleared via the chip × or overall filter clear
-                sort: 'name',
-                sortModes: ['name', 'size', 'modified'],
+                sort: ['name', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'name',
+                sortDir: ['asc', 'desc'].includes(localStorage.getItem('sortDir')) ? localStorage.getItem('sortDir') : 'asc',
                 newSite: { name: '', isPlain: false, isLoading: false },
-                snackbar: { visible: false, message: '', isError: false, timer: null },
+                snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
+                // Deletes are staged for a short undo window before anything is
+                // sent to the backend. One batch at a time; staging more sites
+                // merges into it and restarts the window.
+                pendingDelete: null, // { sites: [...], timer }
+                bulkArmed: false,
+                bulkArmTimer: null,
                 // Persistent dismissible banners for newly-created sites — the
                 // snackbar only lives ~3.5s, not long enough to reach for the
                 // admin login after spinning up a fresh install.
@@ -2643,12 +2709,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             s.name.toLowerCase().includes(q) ||
                             (s.type || '').toLowerCase().includes(q));
                     }
+                    const dir = this.sortDir === 'asc' ? 1 : -1;
                     if (this.sort === 'size') {
-                        base.sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0));
+                        base.sort((a, b) => dir * ((a.size_bytes || 0) - (b.size_bytes || 0)));
                     } else if (this.sort === 'modified') {
-                        base.sort((a, b) => (b.modified_at || 0) - (a.modified_at || 0));
+                        base.sort((a, b) => dir * ((a.modified_at || 0) - (b.modified_at || 0)));
                     } else {
-                        base.sort((a, b) => a.name.localeCompare(b.name));
+                        base.sort((a, b) => dir * a.name.localeCompare(b.name));
                     }
                     return base;
                 },
@@ -2671,6 +2738,28 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 init() {
                     this.applyTheme();
                     this.$watch('theme', () => { this.applyTheme(); localStorage.setItem('theme', this.theme); });
+
+                    // An armed bulk-delete is scoped to the current result set —
+                    // disarm if the filter changes underneath it.
+                    this.$watch('filter', () => { this.bulkArmed = false; });
+                    this.$watch('typeFilter', () => { this.bulkArmed = false; });
+
+                    // If the tab closes during an undo window, flush the staged
+                    // deletes with keepalive requests so they aren't lost. No
+                    // reload_server here: the next reload from any source
+                    // regenerates from disk and prunes via tombstones.
+                    window.addEventListener('pagehide', () => {
+                        if (!this.pendingDelete) return;
+                        for (const s of this.pendingDelete.sites) {
+                            fetch('api.php', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ action: 'delete_site', site_name: s.name }),
+                                keepalive: true
+                            }).catch(() => {});
+                        }
+                        this.pendingDelete = null;
+                    });
 
                     // `/` focuses the filter (GitHub-style). Ignored when typing
                     // in a form field or holding a modifier key.
@@ -2766,9 +2855,23 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
                 },
 
-                cycleSort() {
-                    const i = this.sortModes.indexOf(this.sort);
-                    this.sort = this.sortModes[(i + 1) % this.sortModes.length];
+                setSort(key) {
+                    // Click the active header to flip direction; a new key
+                    // starts at its natural default (a→z for name, biggest /
+                    // most recent first for size and modified).
+                    if (this.sort === key) {
+                        this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
+                    } else {
+                        this.sort = key;
+                        this.sortDir = key === 'name' ? 'asc' : 'desc';
+                    }
+                    localStorage.setItem('sort', this.sort);
+                    localStorage.setItem('sortDir', this.sortDir);
+                },
+
+                sortArrow(key) {
+                    if (this.sort !== key) return '';
+                    return this.sortDir === 'asc' ? '↑' : '↓';
                 },
 
                 openSite(site) {
@@ -2778,10 +2881,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     window.open(site.domain, '_blank', 'noopener');
                 },
 
-                showSnack(msg, isError = false) {
+                showSnack(msg, isError = false, opts = {}) {
                     if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
-                    this.snackbar = { visible: true, message: msg, isError, timer: null };
-                    this.snackbar.timer = setTimeout(() => { this.snackbar.visible = false; }, 3500);
+                    this.snackbar = {
+                        visible: true, message: msg, isError, timer: null,
+                        action: opts.action || null,
+                        actionLabel: opts.actionLabel || ''
+                    };
+                    this.snackbar.timer = setTimeout(() => { this.snackbar.visible = false; }, opts.duration || 3500);
                 },
 
                 async apiPost(action, payload = {}, opts = {}) {
@@ -2896,18 +3003,70 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.alerts = this.alerts.filter(a => a.id !== id);
                 },
 
-                async deleteSite(name) {
-                    if (!confirm(`Delete ${name}? This removes its files and database.`)) return;
+                deleteSite(name) {
+                    const site = this.sites.find(s => s.name === name);
+                    if (!site) return;
+                    this.stageDeletes([site]);
+                },
 
-                    // Optimistic: pull from the local list immediately so the UI feels
-                    // instant, and enqueue the backend work. processDeleteQueue below
-                    // drains the queue single-file so concurrent deletes don't race on
-                    // shared state (Caddyfile regeneration, /etc/hosts edits).
-                    const idx = this.sites.findIndex(s => s.name === name);
-                    if (idx === -1) return;
-                    this.sites.splice(idx, 1);
-                    this.deleteQueue.push(name);
+                bulkDelete() {
+                    // Two-step inline confirm: first click arms the button for a
+                    // few seconds, second click stages every filtered site. The
+                    // undo snackbar is the safety net after that.
+                    if (!this.bulkArmed) {
+                        this.bulkArmed = true;
+                        this.bulkArmTimer = setTimeout(() => { this.bulkArmed = false; }, 3500);
+                        return;
+                    }
+                    clearTimeout(this.bulkArmTimer);
+                    this.bulkArmed = false;
+                    this.stageDeletes([...this.filteredSites]);
+                },
+
+                stageDeletes(sitesToDelete) {
+                    // Pull the rows from the list immediately (the UI feels
+                    // instant) but hold the backend work for an undo window.
+                    // Nothing is deleted server-side until the window passes.
+                    if (this.pendingDelete) clearTimeout(this.pendingDelete.timer);
+                    const staged = this.pendingDelete ? this.pendingDelete.sites : [];
+                    for (const site of sitesToDelete) {
+                        const idx = this.sites.findIndex(s => s.name === site.name);
+                        if (idx !== -1) { this.sites.splice(idx, 1); staged.push(site); }
+                    }
+                    if (!staged.length) { this.pendingDelete = null; return; }
+                    this.pendingDelete = {
+                        sites: staged,
+                        timer: setTimeout(() => this.commitPendingDeletes(), 5000)
+                    };
+                    const label = staged.length === 1
+                        ? 'Deleted ' + staged[0].name + '.'
+                        : 'Deleted ' + staged.length + ' sites.';
+                    this.showSnack(label, false, {
+                        actionLabel: 'undo',
+                        action: () => this.undoPendingDeletes(),
+                        duration: 5000
+                    });
+                },
+
+                commitPendingDeletes() {
+                    if (!this.pendingDelete) return;
+                    const names = this.pendingDelete.sites.map(s => s.name);
+                    this.pendingDelete = null;
+                    // processDeleteQueue drains the queue single-file so
+                    // concurrent deletes don't race on shared state (Caddyfile
+                    // regeneration, /etc/hosts edits).
+                    this.deleteQueue.push(...names);
                     this.processDeleteQueue();
+                },
+
+                undoPendingDeletes() {
+                    if (!this.pendingDelete) return;
+                    clearTimeout(this.pendingDelete.timer);
+                    // filteredSites re-sorts on render, so push order is fine.
+                    this.sites.push(...this.pendingDelete.sites);
+                    this.pendingDelete = null;
+                    if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
+                    this.snackbar.visible = false;
                 },
 
                 async processDeleteQueue() {
@@ -2926,7 +3085,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                                 const target = this.deleteQueue.shift();
                                 const del = await this.apiPostRetry('delete_site', { site_name: target });
                                 if (del.success) {
-                                    this.showSnack('Site deleted.');
+                                    // Don't stomp a newer batch's undo snackbar
+                                    // with a routine confirmation.
+                                    if (!this.pendingDelete) this.showSnack('Site deleted.');
                                 } else {
                                     anyFailed = true; // apiPost already surfaced the error
                                 }
