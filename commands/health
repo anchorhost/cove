@@ -39,15 +39,17 @@ cove_health() {
     if [ "$OS" = "macos" ]; then
         local last_exit
         last_exit=$(launchctl list 2>/dev/null | awk '$3=="com.cove.caddy"{print $2}')
+        # Informational only (no warn++): launchd keeps showing the last
+        # non-zero exit until the next clean restart, so this lingers long
+        # after recovery. The crash section above owns severity (with recency).
         if [ -n "$last_exit" ] && [ "$last_exit" != "0" ]; then
             if [ "$last_exit" = "-11" ]; then
-                echo "  ⚠️  last exit -11 (SIGSEGV) — previous instance segfaulted"
+                echo "  ℹ️  last exit -11 (SIGSEGV) — a prior instance segfaulted (persists until next clean restart)"
             elif [ "$last_exit" = "-6" ]; then
-                echo "  ⚠️  last exit -6 (SIGABRT) — previous instance hit a Go fatal (PHP segfault turned abort)"
+                echo "  ℹ️  last exit -6 (SIGABRT) — a prior instance hit a Go fatal (PHP segfault turned abort)"
             else
-                echo "  ⚠️  last exit $last_exit — previous instance died abnormally"
+                echo "  ℹ️  last exit $last_exit — a prior instance died abnormally"
             fi
-            warn=$((warn+1))
         fi
     fi
 
@@ -86,14 +88,26 @@ cove_health() {
         if [ "$total" -eq 0 ]; then
             echo "  ✅ none"
         else
+            # Severity by recency. A real crash loop produces a crash every few
+            # minutes, so a report in the last 5 min = actively looping
+            # (critical). Older reports are history to note (warning) — notably
+            # the single birth-crash that spawned a now-healthy process ages out
+            # of the window within minutes. (A fixed window beats -newer on the
+            # pidfile: macOS finalizes the crash report a second or two after the
+            # crash, so the birth-crash report often lands just after the
+            # respawned pidfile and would false-positive as "active".)
+            local active5; active5=$(find "$dr" -name 'frankenphp-*.ips' -mmin -5 2>/dev/null | grep -c .)
             local nice_ts; nice_ts=$(echo "$newest" | sed -E 's/^[0-9]{8}([0-9]{2})([0-9]{2})([0-9]{2})$/\1:\2:\3/')
-            echo "  ⚠️  $total hard crash(es); most recent $nice_ts"
+            if [ "$active5" -gt 0 ]; then
+                echo "  ❌ $total in 24h ($active5 in last 5 min — ACTIVELY CRASHING); most recent $nice_ts"
+                crit=$((crit+1))
+            else
+                echo "  ⚠️  $total in 24h; most recent $nice_ts (none in last 5 min — appears resolved)"
+                warn=$((warn+1))
+            fi
             [ "$oc_n"    -gt 0 ] && echo "     • $oc_n OPcache shared-memory (see OPcache section below)"
             [ "$im_n"    -gt 0 ] && echo "     • $im_n Imagick signal-handler (GD-editor MU-plugin should prevent — verify it's active)"
             [ "$other_n" -gt 0 ] && echo "     • $other_n other (bystander thread; usually the same OPcache instability)"
-            # Many crashes is critical; a stray one is a warning. But if the
-            # newest is well in the past, downgrade — it's history, not active.
-            if [ "$total" -ge 5 ]; then crit=$((crit+1)); else warn=$((warn+1)); fi
         fi
     fi
 
