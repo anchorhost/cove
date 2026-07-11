@@ -80,6 +80,19 @@ cove_delete() {
     fi
     echo "✅ Directory deleted."
 
+    # A reload already in flight snapshotted the Sites listing while this
+    # site still existed. When that stale Caddyfile applies, Caddy re-creates
+    # the site's logs/ skeleton — which resurrects the site in the dashboard.
+    # Leave a tombstone so cove_reload prunes the skeleton, and flag the
+    # in-flight holder to re-run against the post-delete Sites listing.
+    mkdir -p "$COVE_DIR/cache/delete-tombstones"
+    touch "$COVE_DIR/cache/delete-tombstones/$site_name.localhost"
+    local reload_holder
+    reload_holder=$(cat "$COVE_DIR/.reload.lock" 2>/dev/null)
+    if [ -n "$reload_holder" ] && kill -0 "$reload_holder" 2>/dev/null; then
+        touch "$COVE_DIR/.reload.pending" 2>/dev/null || true
+    fi
+
     # --- Delete Custom Caddy Directives ---
     local custom_conf_file="$CUSTOM_CADDY_DIR/$site_name.localhost"
     if [ -f "$custom_conf_file" ]; then

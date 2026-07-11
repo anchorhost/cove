@@ -55,6 +55,7 @@ cove_reload() {
     local reload_rc=0
     while :; do
         rm -f "$pending"
+        prune_delete_tombstones
         create_gui_file
         regenerate_caddyfile; reload_rc=$?
         update_etc_hosts

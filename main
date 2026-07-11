@@ -1015,7 +1015,17 @@ update_etc_hosts() {
     if [ -d "$SITES_DIR" ]; then
         for site_path in "$SITES_DIR"/*; do
             if [ -d "$site_path" ]; then
-                required_hosts+=("$(basename "$site_path")")
+                local host_site_name
+                host_site_name=$(basename "$site_path")
+
+                # Same skip as regenerate_caddyfile: a dir with no public/
+                # and no custom directive isn't a servable site (e.g. the
+                # logs/-only skeleton left by a reload racing a delete) —
+                # adding its hosts entry back would undo the delete's cleanup.
+                if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$host_site_name" ]; then
+                    continue
+                fi
+                required_hosts+=("$host_site_name")
 
                 # Check for additional mappings
                 if [ -f "$site_path/mappings" ]; then
@@ -1482,6 +1492,26 @@ EOM
 }
 
 # Function to regenerate the Caddyfile
+# Remove leftover skeletons of deleted sites. A Caddy reload that races a
+# `cove delete` re-applies a config snapshot that still names the deleted
+# site, and Caddy's log directive re-creates <site>/logs/ at apply time.
+# cove_delete leaves a tombstone naming each deleted site so the next reload
+# can prune that skeleton. A dir that regained a public/ tree was re-created
+# by the user — leave it alone and just drop the tombstone.
+prune_delete_tombstones() {
+    local tombstone_dir="$COVE_DIR/cache/delete-tombstones"
+    [ -d "$tombstone_dir" ] || return 0
+    local ts ts_site
+    for ts in "$tombstone_dir"/*; do
+        [ -e "$ts" ] || continue
+        ts_site="$SITES_DIR/$(basename "$ts")"
+        if [ -d "$ts_site" ] && [ ! -d "$ts_site/public" ]; then
+            rm -rf "$ts_site"
+        fi
+        rm -f "$ts"
+    done
+}
+
 regenerate_caddyfile() {
     echo "🔄 Regenerating Caddyfile..."
     if ! command -v mailpit &> /dev/null; then
@@ -1563,7 +1593,15 @@ EOM
             if [ -d "$site_path" ]; then
                 local site_name
                 site_name=$(basename "$site_path")
-                
+
+                # Skip dirs that aren't servable sites: no public/ docroot and
+                # no custom directive. Notably the logs/-only skeleton Caddy
+                # re-creates when a reload races a delete — emitting a block
+                # for it would resurrect the deleted site on every reload.
+                if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$site_name" ]; then
+                    continue
+                fi
+
                 # Build the list of domains
                 local site_domains="$site_name"
                 
@@ -1692,7 +1730,12 @@ EOM
                     site_name=$(basename "$site_path")
                     local site_base_name
                     site_base_name=$(echo "$site_name" | sed 's/\.localhost$//')
-                    
+
+                    # Same skip as the main site loop: not a servable site.
+                    if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$site_name" ]; then
+                        continue
+                    fi
+
                     # Check if this site has a simple reverse_proxy directive
                     local directive_file="$CUSTOM_CADDY_DIR/$site_name"
                     local direct_proxy_target=""
@@ -1927,6 +1970,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // recreated. The dashboard batches one reload after the whole
                 // delete queue drains, so skip per-item reloads here.
                 $command = sprintf('HOME=%s %s delete %s --force --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
+                $delete_site_target = $site_name;
             } else { $response['message'] = 'Invalid site name provided for deletion.'; }
             break;
         case 'get_login_link':
@@ -2027,6 +2071,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // taken" tells the user exactly what to do next.
             $err_text = implode("\n", $output);
             $msg = 'An error occurred.';
+            if (isset($delete_site_target) && stripos($err_text, 'not found') !== false) {
+                // Idempotent delete: the UI retries deletes whose response was
+                // dropped mid-reload — a retry that finds the site already
+                // gone is a success, not an error.
+                echo json_encode(['success' => true, 'message' => 'Site already deleted.']);
+                exit;
+            }
             if (isset($add_site_target)) {
                 $msg = 'Could not create site.';
                 if (stripos($err_text, 'already exists') !== false) {
@@ -2733,19 +2784,42 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.snackbar.timer = setTimeout(() => { this.snackbar.visible = false; }, 3500);
                 },
 
-                async apiPost(action, payload = {}) {
+                async apiPost(action, payload = {}, opts = {}) {
+                    const { timeoutMs = 0, quiet = false } = opts;
+                    const ctrl = timeoutMs ? new AbortController() : null;
+                    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
                     try {
                         const res = await fetch('api.php', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ action, ...payload })
+                            body: JSON.stringify({ action, ...payload }),
+                            ...(ctrl ? { signal: ctrl.signal } : {})
                         }).then(r => r.json());
-                        if (!res.success) this.showSnack(res.message || 'An error occurred.', true);
+                        if (!res.success && !quiet) this.showSnack(res.message || 'An error occurred.', true);
                         return res;
                     } catch (e) {
-                        this.showSnack('Network error.', true);
-                        return { success: false };
+                        // transport marks network-level failures (connection
+                        // dropped, timeout) as distinct from server-reported
+                        // errors — only these are worth retrying.
+                        if (!quiet) this.showSnack('Network error.', true);
+                        return { success: false, transport: true };
+                    } finally {
+                        if (timer) clearTimeout(timer);
                     }
+                },
+
+                async apiPostRetry(action, payload = {}, attempts = 3, timeoutMs = 30000) {
+                    // The Caddy/FrankenPHP reload the dashboard triggers after
+                    // add/delete can momentarily drop or hang requests to the
+                    // dashboard itself. Retry transport failures a few times so
+                    // an action that lands mid-reload isn't silently lost.
+                    let res;
+                    for (let i = 1; i <= attempts; i++) {
+                        res = await this.apiPost(action, payload, { timeoutMs, quiet: i < attempts });
+                        if (res.success || !res.transport) return res;
+                        if (i < attempts) await new Promise(r => setTimeout(r, 3000));
+                    }
+                    return res;
                 },
 
                 async getSites() {
@@ -2850,7 +2924,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         while (this.deleteQueue.length > 0) {
                             while (this.deleteQueue.length > 0) {
                                 const target = this.deleteQueue.shift();
-                                const del = await this.apiPost('delete_site', { site_name: target });
+                                const del = await this.apiPostRetry('delete_site', { site_name: target });
                                 if (del.success) {
                                     this.showSnack('Site deleted.');
                                 } else {
@@ -2864,7 +2938,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             // command (shell_exec '...&') and returns instantly.
                             // Two unsynchronized frankenphp reload calls otherwise
                             // deadlock Caddy's admin server (10s shutdown timeout).
-                            await this.apiPost('reload_server');
+                            await this.apiPostRetry('reload_server', {}, 3, 10000);
                         }
                     } finally {
                         this.isProcessingQueue = false;
