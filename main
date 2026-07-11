@@ -3224,6 +3224,7 @@ show_general_help() {
     echo "  enable           Starts the Caddy, MariaDB, and Mailpit background services."
     echo "  disable          Stops all background services managed by Cove."
     echo "  status           Check the status of all background services."
+    echo "  health           Diagnose crashes, OPcache pressure, and on-disk hygiene."
     echo "  trust            Install Cove's local CA into browser + system trust stores."
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
@@ -3278,6 +3279,15 @@ display_command_help() {
             echo "Usage: cove status"
             echo ""
             echo "Checks the status of all background services."
+            ;;
+        health)
+            echo "Usage: cove health"
+            echo ""
+            echo "Read-only diagnostic. Reports service liveness, the FrankenPHP"
+            echo "process state and last exit code, recent hard segfaults"
+            echo "(classified as OPcache vs Imagick vs other), live OPcache"
+            echo "pressure, and on-disk hygiene (zombie site dirs, oversized"
+            echo "logs). Recommends fixes but changes nothing."
             ;;
         trust)
             echo "Usage: cove trust"
@@ -3678,6 +3688,10 @@ main() {
         status)
             check_dependencies
             cove_status
+            ;;
+        health)
+            check_dependencies
+            cove_health
             ;;
         trust)
             check_dependencies

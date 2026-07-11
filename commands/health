@@ -1,0 +1,223 @@
+cove_health() {
+    # Read-only diagnostic. Aggregates the signals you'd otherwise gather by
+    # hand after a crash: service liveness, FrankenPHP process health + last
+    # exit code, recent hard segfaults (classified), live OPcache pressure, and
+    # on-disk hygiene. Never mutates anything — it only recommends fixes.
+    local warn=0 crit=0
+    echo ""
+    gum style --bold "🩺 Cove health check"
+    echo ""
+
+    # --- Services -----------------------------------------------------------
+    local caddy_up=false
+    is_caddy_running && caddy_up=true
+    echo "Services"
+    if $caddy_up; then echo "  ✅ Caddy (FrankenPHP) running"; else echo "  ❌ Caddy not responding on :2019"; crit=$((crit+1)); fi
+    if [ "$OS" = "macos" ]; then
+        if is_mariadb_running; then echo "  ✅ MariaDB running"; else echo "  ❌ MariaDB stopped"; crit=$((crit+1)); fi
+        if pgrep -x mailpit &>/dev/null; then echo "  ✅ Mailpit running"; else echo "  ⚠️  Mailpit stopped"; warn=$((warn+1)); fi
+    else
+        local mdb; mdb=$(get_mariadb_service_name)
+        if systemctl is-active --quiet "$mdb" 2>/dev/null; then echo "  ✅ MariaDB running"; else echo "  ❌ MariaDB stopped"; crit=$((crit+1)); fi
+        if systemctl is-active --quiet mailpit 2>/dev/null; then echo "  ✅ Mailpit running"; else echo "  ⚠️  Mailpit stopped"; warn=$((warn+1)); fi
+    fi
+
+    # --- FrankenPHP process + last exit code --------------------------------
+    echo ""
+    echo "FrankenPHP process"
+    local fpid=""
+    [ -f "$COVE_DIR/caddy.pid" ] && fpid=$(cat "$COVE_DIR/caddy.pid" 2>/dev/null)
+    if [ -n "$fpid" ] && kill -0 "$fpid" 2>/dev/null; then
+        # Uptime via ps etime (portable enough for display).
+        local up; up=$(ps -o etime= -p "$fpid" 2>/dev/null | tr -d ' ')
+        echo "  ✅ pid $fpid up ${up:-?}"
+    else
+        echo "  ⚠️  no live FrankenPHP pid on file"; warn=$((warn+1))
+    fi
+    # launchd's last-exit status is the crash tell: a negative value is the
+    # signal that killed the previous instance (-11 = SIGSEGV). macOS only.
+    if [ "$OS" = "macos" ]; then
+        local last_exit
+        last_exit=$(launchctl list 2>/dev/null | awk '$3=="com.cove.caddy"{print $2}')
+        if [ -n "$last_exit" ] && [ "$last_exit" != "0" ]; then
+            if [ "$last_exit" = "-11" ]; then
+                echo "  ⚠️  last exit -11 (SIGSEGV) — previous instance segfaulted"
+            elif [ "$last_exit" = "-6" ]; then
+                echo "  ⚠️  last exit -6 (SIGABRT) — previous instance hit a Go fatal (PHP segfault turned abort)"
+            else
+                echo "  ⚠️  last exit $last_exit — previous instance died abnormally"
+            fi
+            warn=$((warn+1))
+        fi
+    fi
+
+    # --- Recent hard crashes (macOS DiagnosticReports) ----------------------
+    # Each .ips is one hard segfault. Classify by the culprit frames: the
+    # OPcache-SHM path (this box's common cause) vs Imagick's signal-handler
+    # bug vs anything else. grep the raw report — no JSON parser dependency.
+    if [ "$OS" = "macos" ]; then
+        echo ""
+        echo "Hard crashes (last 24h)"
+        local dr="$HOME/Library/Logs/DiagnosticReports"
+        local oc_n=0 im_n=0 other_n=0 total=0 newest=""
+        if [ -d "$dr" ]; then
+            # -mtime -1 = within 24h. Null-safe loop.
+            while IFS= read -r rpt; do
+                [ -n "$rpt" ] || continue
+                total=$((total+1))
+                # Classify by culprit frames. OPcache SHM family is broad: the
+                # crash can land in compile, persist, optimize, interned-string,
+                # or shared-alloc frames — all the same root (arena corruption).
+                # "other" is usually the same instability caught on a bystander
+                # thread (e.g. a long-poll parked in sleep), not a compile frame.
+                if grep -qE "cache_script_in_shared_memory|zend_persist|zend_accel|zend_optimize_script|zend_analyze_call|zend_shared_alloc|interned_string|lex_scan|zend_hash_func" "$rpt" 2>/dev/null; then
+                    oc_n=$((oc_n+1))
+                elif grep -qiE "MagickWand|Imagick|Magick" "$rpt" 2>/dev/null; then
+                    im_n=$((im_n+1))
+                else
+                    other_n=$((other_n+1))
+                fi
+                # Track the true newest (find is unordered). Filename is
+                # frankenphp-YYYY-MM-DD-HHMMSS.ips → strip prefix, drop dashes.
+                local key; key=$(basename "$rpt" .ips | sed -E 's/^frankenphp-//; s/-//g')
+                [ "$key" \> "$newest" ] && newest="$key"
+            done < <(find "$dr" -name 'frankenphp-*.ips' -mtime -1 2>/dev/null)
+        fi
+        if [ "$total" -eq 0 ]; then
+            echo "  ✅ none"
+        else
+            local nice_ts; nice_ts=$(echo "$newest" | sed -E 's/^[0-9]{8}([0-9]{2})([0-9]{2})([0-9]{2})$/\1:\2:\3/')
+            echo "  ⚠️  $total hard crash(es); most recent $nice_ts"
+            [ "$oc_n"    -gt 0 ] && echo "     • $oc_n OPcache shared-memory (see OPcache section below)"
+            [ "$im_n"    -gt 0 ] && echo "     • $im_n Imagick signal-handler (GD-editor MU-plugin should prevent — verify it's active)"
+            [ "$other_n" -gt 0 ] && echo "     • $other_n other (bystander thread; usually the same OPcache instability)"
+            # Many crashes is critical; a stray one is a warning. But if the
+            # newest is well in the past, downgrade — it's history, not active.
+            if [ "$total" -ge 5 ]; then crit=$((crit+1)); else warn=$((warn+1)); fi
+        fi
+    fi
+
+    # --- Live OPcache pressure ----------------------------------------------
+    # The SHM is per-process, so we must ask the RUNNING server, not a fresh
+    # php-cli (which would report an empty cache). Drop a probe into the
+    # dashboard's own docroot ($GUI_DIR, served at cove.localhost), curl it,
+    # remove it. Contained to Cove's dir — never touches a user's site.
+    echo ""
+    echo "OPcache pressure"
+    if ! $caddy_up; then
+        echo "  ⏭️  skipped (Caddy not running)"
+    else
+        local probe="_cove_health_oc_$$.php"
+        cat > "$GUI_DIR/$probe" 2>/dev/null <<'PHP'
+<?php
+header('Content-Type: text/plain');
+if (!function_exists('opcache_get_status')) { echo "noopcache\n"; exit; }
+$s = @opcache_get_status(false); $c = @opcache_get_configuration();
+if (!$s || !$c) { echo "disabled\n"; exit; }
+$st = $s['opcache_statistics']; $is = $s['interned_strings_usage'];
+$int_total = $is['used_memory'] + $is['free_memory'];
+printf("hit_rate=%.1f\n", $st['opcache_hit_rate']);
+printf("cached=%d\n", $st['num_cached_scripts']);
+printf("maxfiles=%d\n", $c['directives']['opcache.max_accelerated_files']);
+printf("interned_used_pct=%.0f\n", $int_total ? 100*$is['used_memory']/$int_total : 0);
+printf("interned_mb=%.0f\n", $int_total/1048576);
+printf("oom_restarts=%d\n", $st['oom_restarts']);
+printf("hash_restarts=%d\n", $st['hash_restarts']);
+printf("optimizer=%d\n", $c['directives']['opcache.optimization_level']);
+PHP
+        # Retry: a probe landing during a config reload hangs (the swap pauses
+        # serving on a large box), which would otherwise look like a failure.
+        local out="" attempt
+        for attempt in 1 2 3; do
+            out=$(curl -sk --max-time 12 "https://cove.localhost:${HTTPS_PORT}/$probe" 2>/dev/null)
+            [ -n "$out" ] && break
+            sleep 2
+        done
+        rm -f "$GUI_DIR/$probe" 2>/dev/null
+        if [ -z "$out" ] || echo "$out" | grep -q "noopcache\|disabled"; then
+            echo "  ⚠️  could not read OPcache status (${out:-no response; server may be mid-reload})"; warn=$((warn+1))
+        else
+            local hit cached maxf ipct imb oom hashr opt
+            hit=$(echo "$out"   | sed -n 's/^hit_rate=//p')
+            cached=$(echo "$out"| sed -n 's/^cached=//p')
+            maxf=$(echo "$out"  | sed -n 's/^maxfiles=//p')
+            ipct=$(echo "$out"  | sed -n 's/^interned_used_pct=//p')
+            imb=$(echo "$out"   | sed -n 's/^interned_mb=//p')
+            oom=$(echo "$out"   | sed -n 's/^oom_restarts=//p')
+            hashr=$(echo "$out" | sed -n 's/^hash_restarts=//p')
+            opt=$(echo "$out"   | sed -n 's/^optimizer=//p')
+            echo "  interned buffer ${ipct}% full (${imb} MB) · cached ${cached}/${maxf} · hit ${hit}%"
+            echo "  restarts: ${oom} OOM, ${hashr} max-files"
+            local pressure=false
+            [ "${ipct:-0}" -ge 85 ] 2>/dev/null && pressure=true
+            [ "${oom:-0}" -gt 0 ] 2>/dev/null && pressure=true
+            [ "${hashr:-0}" -gt 0 ] 2>/dev/null && pressure=true
+            # cached within 10% of the cap = about to hash_restart
+            if [ -n "$cached" ] && [ -n "$maxf" ] && [ "$maxf" -gt 0 ] 2>/dev/null; then
+                [ $((cached*100/maxf)) -ge 90 ] 2>/dev/null && pressure=true
+            fi
+            if $pressure; then
+                echo "  ⚠️  OPcache under pressure — SHM restarts under ZTS can segfault FrankenPHP."
+                echo "     Raise limits in $PHP_INI_FILE, then fully restart FrankenPHP:"
+                echo "       opcache.memory_consumption = 768"
+                echo "       opcache.interned_strings_buffer = 128"
+                echo "       opcache.max_accelerated_files = 200000"
+                if [ "$OS" = "macos" ]; then
+                    echo "     Restart: launchctl kickstart -k gui/\$(id -u)/com.cove.caddy"
+                else
+                    echo "     Restart: cove disable && cove enable"
+                fi
+                warn=$((warn+1))
+            else
+                echo "  ✅ within healthy limits"
+            fi
+            [ "${opt:-1}" != "0" ] && echo "  ℹ️  optimizer on (0x$(printf '%X' "${opt:-0}")); level 0 is recommended for dev (validate_timestamps recompiles constantly)"
+        fi
+    fi
+
+    # --- On-disk hygiene ----------------------------------------------------
+    echo ""
+    echo "Hygiene"
+    # Zombie skeletons: a Sites/ dir with no public/ and no custom directive —
+    # the leftover a reload-racing-delete used to create (see delete/reload fix).
+    local zombies=0 zlist=""
+    if [ -d "$SITES_DIR" ]; then
+        local sp bn
+        for sp in "$SITES_DIR"/*; do
+            [ -d "$sp" ] || continue
+            bn=$(basename "$sp")
+            if [ ! -d "$sp/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$bn" ]; then
+                zombies=$((zombies+1)); zlist="$zlist $bn"
+            fi
+        done
+    fi
+    if [ "$zombies" -gt 0 ]; then
+        echo "  ⚠️  $zombies zombie site dir(s):$zlist"
+        echo "     Clear with: cove reload   (prunes public/-less skeletons)"
+        warn=$((warn+1))
+    else
+        echo "  ✅ no zombie site directories"
+    fi
+    # Oversized logs (the process log grows on every restart).
+    local biglog=0 lf sz
+    for lf in "$LOGS_DIR/caddy-process.log" "$LOGS_DIR/errors.log"; do
+        [ -f "$lf" ] || continue
+        sz=$(stat -f%z "$lf" 2>/dev/null || stat -c%s "$lf" 2>/dev/null || echo 0)
+        if [ "$sz" -gt 52428800 ]; then
+            echo "  ⚠️  $(basename "$lf") is $((sz/1048576)) MB"
+            biglog=$((biglog+1))
+        fi
+    done
+    [ "$biglog" -eq 0 ] && echo "  ✅ logs within size limits"
+
+    # --- Verdict ------------------------------------------------------------
+    echo ""
+    if [ "$crit" -gt 0 ]; then
+        gum style --foreground red "❌ $crit critical, $warn warning(s) — see above."
+    elif [ "$warn" -gt 0 ]; then
+        gum style --foreground yellow "⚠️  $warn warning(s) — see above."
+    else
+        gum style --foreground green "✅ All healthy."
+    fi
+    echo ""
+}
