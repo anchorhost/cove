@@ -1562,6 +1562,26 @@ ${port_directives}    frankenphp {
         php_ini memory_limit $(cove_ini_get memory_limit 1G)
         php_ini upload_max_filesize $(cove_ini_get upload_max_filesize 1G)
         php_ini post_max_size $(cove_ini_get post_max_size 1G)
+        # OPcache sizing. FrankenPHP embeds a THREAD-SAFE (ZTS) PHP, so every
+        # site on the box shares ONE OPcache arena across all worker threads.
+        # PHP's stock limits (128M / 8M interned / 10000 files) are sized for a
+        # single small FPM pool and are wildly undersized here: one Cove box
+        # routinely holds 100+ WordPress sites (hundreds of thousands of PHP
+        # files, tens of thousands in a single large site). When the arena or
+        # the interned-strings buffer fills, OPcache does a blocking SHM
+        # *restart* — and under ZTS a restart racing concurrent compiles
+        # corrupts shared memory, segfaulting PHP inside cache_script_in_
+        # shared_memory (lex/persist/optimize). FrankenPHP's Go runtime then
+        # turns that SIGSEGV into a whole-process abort (the "non-Go code set
+        # up signal handler without SA_ONSTACK" fatal), which reads as random
+        # server crashes while editing a heavy plugin. Right-size the arena so
+        # a restart is rare, and disable the optimizer: with validate_timestamps
+        # on (dev), files recompile constantly so the optimizer buys almost
+        # nothing, and its SSA/DFA/call-graph passes were a recurring crash site.
+        php_ini opcache.memory_consumption $(cove_ini_get opcache.memory_consumption 512)
+        php_ini opcache.interned_strings_buffer $(cove_ini_get opcache.interned_strings_buffer 64)
+        php_ini opcache.max_accelerated_files $(cove_ini_get opcache.max_accelerated_files 100000)
+        php_ini opcache.optimization_level $(cove_ini_get opcache.optimization_level 0)
         # User-owned session dir. Linux apt's php.ini points sessions at
         # /var/lib/php-zts/session (owned by the frankenphp user); since
         # Cove runs FrankenPHP as the invoking user, that path is
