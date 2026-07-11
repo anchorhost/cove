@@ -1177,6 +1177,23 @@ fi
 
 ts=\$(date '+%Y-%m-%dT%H:%M:%S%z')
 
+# A cove reload is applying a new Caddyfile. With hundreds of sites the
+# config swap holds HTTPS requests longer than fail_threshold ticks, and
+# killing mid-swap trades a ~45s pause for a multi-minute cold start (TLS
+# re-provisioning for every site). Hold fire while the reload lock is
+# fresh — age-capped so a stale lock can't blind the watchdog forever.
+# State is left untouched: a server still wedged after the reload ends
+# must accumulate a full fresh streak before a kill.
+reload_lock="$COVE_DIR/.reload.lock"
+if [ -f "\$reload_lock" ]; then
+    lock_mtime=\$(stat -f%m "\$reload_lock" 2>/dev/null || stat -c%Y "\$reload_lock" 2>/dev/null || echo 0)
+    lock_age=\$(( \$(date +%s) - lock_mtime ))
+    if [ "\$lock_age" -ge 0 ] && [ "\$lock_age" -lt 300 ]; then
+        echo "[\$ts] watchdog: pid=\$pid probe failed during active reload (lock \${lock_age}s old); holding fire" >> "\$log_file"
+        exit 0
+    fi
+fi
+
 # Probe failed. A new pid, or one that has never been healthy, is still
 # starting up (or its config is broken) — do NOT kill it, or we just restart
 # the slow startup forever. Only intervene if it stays stuck far past any
