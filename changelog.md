@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### ✨ New Features
+
+* **Sortable Column Headers on the Dashboard:** The site list now has a proper header row (name / type / modified / size). Click a header to sort by that column, click again to flip direction; the choice persists across visits. Replaces the old "sort:" pill that cycled blindly through modes — and finally labels the modified and size columns.
+* **Undo-Style Deletes Instead of a Confirm Dialog:** Deleting a site from the dashboard no longer throws a blocking browser `confirm()`. The row disappears immediately and a snackbar offers *undo* for five seconds; only after the window passes does the backend delete run. Deleting more sites during the window merges them into one batch ("Deleted 3 sites — undo"). Closing the tab mid-window flushes the staged deletes with keepalive requests so nothing is silently lost.
+* **Bulk Delete for Filtered Sites:** When a filter narrows the list, a "delete N shown" button appears in the filter row. First click arms it ("sure? delete N"), second click stages every matching site through the same undo window and serialized delete queue. Ideal for clearing out batches of throwaway `poc-*` / test sites in one pass.
+* **Cove-Themed Empty States:** The "no sites yet" and "no filter matches" states now carry small SVG illustrations (a sailboat in the cove, a periscope scanning the waves) that follow the light/dark theme.
+
 ### 🔒 Security & Bug Fixes
 
 * **Dashboard Deletes No Longer Race the Background Reload (Second Delete "Not Deleting" / Sites Resurrecting):** Deleting a site in the dashboard fires a background `cove reload`, and a second delete issued while that reload was still in flight could fail two ways. First, the reload's Caddyfile snapshot still named the just-deleted site, so when the stale config applied, Caddy's log directive re-created the site's `logs/` skeleton — resurrecting the "deleted" site in the dashboard (and re-adding its `/etc/hosts` entry). Second, a delete request landing exactly in the FrankenPHP config-swap window could hang and never execute at all. Now: `cove delete` leaves a tombstone and flags an in-flight reload to re-run against the post-delete Sites listing; `cove reload` prunes tombstoned skeletons; the Caddyfile and `/etc/hosts` generators skip directories that aren't servable sites (no `public/` and no custom directive); the dashboard retries deletes whose response was dropped mid-reload; and the delete API is idempotent, so a retry that finds the site already gone reports success.
