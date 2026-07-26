@@ -182,7 +182,7 @@ ADMINER_DIR="$APP_DIR/adminer"
 CUSTOM_CADDY_DIR="$APP_DIR/directives"
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.11.1"
+COVE_VERSION="1.12"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -191,7 +191,7 @@ WHOOPS_VERSION="2.18.0"
 # MUST match the `Version:` header in build_mu_plugin's heredoc — refresh_all_mu_plugins
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
-MU_PLUGIN_VERSION="0.4.0"
+MU_PLUGIN_VERSION="0.5.0"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -314,6 +314,23 @@ port_has_conflict() {
     port_is_free "$1" && return 1
     port_is_own "$1" && return 1
     return 0
+}
+
+# True when there's no TTY to prompt on — scripted callers, CI, an AI agent
+# driving the CLI, the dashboard's shell_exec, systemd. Every interactive
+# prompt in Cove should be reachable via flags; this is the switch that picks
+# the flag-only path.
+is_noninteractive() { [ ! -t 0 ]; }
+
+# Bail out of an unavoidable prompt with a message that names the flag to pass
+# instead of letting gum abort with the opaque "could not open a new TTY".
+# $1 = what was being asked for, $2 = the flag(s) that supply it.
+require_interactive() {
+    local what="$1" hint="$2"
+    is_noninteractive || return 0
+    gum style --foreground red "❌ $what requires an interactive terminal." >&2
+    echo "   Running headless? Pass $hint" >&2
+    exit 1
 }
 
 # Interactive prompt that asks for HTTP and HTTPS ports, validates each, and
@@ -542,7 +559,7 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.4.0
+ * Version: 0.5.0
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
@@ -729,6 +746,30 @@ function cove_maybe_override_site_url( $value ) {
 }
 add_filter( 'option_home', 'cove_maybe_override_site_url' );
 add_filter( 'option_siteurl', 'cove_maybe_override_site_url' );
+
+/**
+ * Force the GD image editor instead of Imagick.
+ *
+ * FrankenPHP embeds a ZTS PHP (built by static-php-cli) with the imagick
+ * extension baked in. The first time any request constructs an Imagick
+ * object, ImageMagick's MagickWandGenesis() installs its own SIGSEGV /
+ * SIGBUS / SIGABRT handlers WITHOUT the SA_ONSTACK flag. Go — FrankenPHP's
+ * runtime — owns SIGSEGV for goroutine stack-growth guard pages, so the
+ * very next stack-growth signal trips "fatal error: non-Go code set up
+ * signal handler without SA_ONSTACK flag" and the whole server aborts. On
+ * WordPress every thumbnail/resize/upload instantiates Imagick (it's the
+ * default editor when available), so an image-heavy site under load crashes
+ * FrankenPHP repeatedly. Never instantiating Imagick avoids the handler
+ * install entirely; GD covers every core WordPress image need. A site that
+ * truly needs Imagick (and accepts the crash risk) can opt out with
+ * add_filter( 'cove_force_gd_editor', '__return_false' ).
+ */
+add_filter( 'wp_image_editors', function ( $editors ) {
+	if ( ! apply_filters( 'cove_force_gd_editor', true ) ) {
+		return $editors;
+	}
+	return array( 'WP_Image_Editor_GD' );
+}, 999 );
 heredoc
 
     local mu_plugins_dir="$public_dir/wp-content/mu-plugins"
@@ -787,7 +828,7 @@ $display_dir = ($home && str_starts_with($dir, $home)) ? '~' . substr($dir, strl
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title><?= htmlspecialchars($host) ?></title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%238bb382'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%2358b293'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -871,7 +912,7 @@ footer a:hover { color: var(--text); }
     <g clip-path="url(#c)">
       <rect width="64" height="64" fill="#f6f1e8"/>
       <rect y="32" width="64" height="32" fill="#3a97a9"/>
-      <path d="M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z" fill="#8bb382"/>
+      <path d="M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z" fill="#58b293"/>
       <line x1="2" y1="32" x2="62" y2="32" stroke="#1c4c58" stroke-width="2.5" fill="none"/>
       <g stroke="#1c4c58" stroke-width="2.6" fill="none">
         <path d="M 10 42 Q 18 38, 26 42 T 42 42 T 56 42"/>
@@ -991,7 +1032,17 @@ update_etc_hosts() {
     if [ -d "$SITES_DIR" ]; then
         for site_path in "$SITES_DIR"/*; do
             if [ -d "$site_path" ]; then
-                required_hosts+=("$(basename "$site_path")")
+                local host_site_name
+                host_site_name=$(basename "$site_path")
+
+                # Same skip as regenerate_caddyfile: a dir with no public/
+                # and no custom directive isn't a servable site (e.g. the
+                # logs/-only skeleton left by a reload racing a delete) —
+                # adding its hosts entry back would undo the delete's cleanup.
+                if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$host_site_name" ]; then
+                    continue
+                fi
+                required_hosts+=("$host_site_name")
 
                 # Check for additional mappings
                 if [ -f "$site_path/mappings" ]; then
@@ -1143,6 +1194,23 @@ fi
 
 ts=\$(date '+%Y-%m-%dT%H:%M:%S%z')
 
+# A cove reload is applying a new Caddyfile. With hundreds of sites the
+# config swap holds HTTPS requests longer than fail_threshold ticks, and
+# killing mid-swap trades a ~45s pause for a multi-minute cold start (TLS
+# re-provisioning for every site). Hold fire while the reload lock is
+# fresh — age-capped so a stale lock can't blind the watchdog forever.
+# State is left untouched: a server still wedged after the reload ends
+# must accumulate a full fresh streak before a kill.
+reload_lock="$COVE_DIR/.reload.lock"
+if [ -f "\$reload_lock" ]; then
+    lock_mtime=\$(stat -f%m "\$reload_lock" 2>/dev/null || stat -c%Y "\$reload_lock" 2>/dev/null || echo 0)
+    lock_age=\$(( \$(date +%s) - lock_mtime ))
+    if [ "\$lock_age" -ge 0 ] && [ "\$lock_age" -lt 300 ]; then
+        echo "[\$ts] watchdog: pid=\$pid probe failed during active reload (lock \${lock_age}s old); holding fire" >> "\$log_file"
+        exit 0
+    fi
+fi
+
 # Probe failed. A new pid, or one that has never been healthy, is still
 # starting up (or its config is broken) — do NOT kill it, or we just restart
 # the slow startup forever. Only intervene if it stays stuck far past any
@@ -1271,6 +1339,169 @@ EOM
         $SUDO_CMD systemctl daemon-reload
         $SUDO_CMD systemctl enable cove-watchdog.timer &>/dev/null
         $SUDO_CMD systemctl restart cove-watchdog.timer
+    fi
+}
+
+# Write a standalone mailpit runner to $COVE_DIR so launchd/systemd can invoke
+# it without depending on the cove binary. The wrapper's job is to *own* the
+# SMTP/HTTP ports cleanly: kill any orphaned mailpit that would make us fail
+# to bind, cap the log so a past thrash doesn't fill the disk, then exec.
+#
+# Failure mode this prevents: an orphaned mailpit (manual start, brew services
+# leftover, or a previous job that outlived unload) holds :1025/:8025; the
+# service-managed instance fails with "address already in use" and exits;
+# KeepAlive/Restart=always respawns forever (observed: 51k restarts over ~10
+# days and a 28MB log of nothing but bind errors).
+write_mailpit_run_script() {
+    local script_path="$COVE_DIR/mailpit-run.sh"
+    local mailpit_bin
+    mailpit_bin=$(command -v mailpit)
+    mkdir -p "$COVE_DIR" "$LOGS_DIR"
+    cat > "$script_path" << EOM
+#!/bin/bash
+# Auto-generated by install_mailpit_service. See write_mailpit_run_script() in main.
+mailpit_bin="$mailpit_bin"
+db_path="$COVE_DIR/mailpit.db"
+log_file="$LOGS_DIR/mailpit.log"
+log_cap_bytes=52428800    # 50MB — a restart storm must not fill the disk
+
+mkdir -p "$LOGS_DIR"
+
+# Cap the log. A bind-failure restart storm used to push this into the tens of
+# MBs with nothing useful but "address already in use" lines. Keep the most
+# recent 1MB so a real error still has context.
+if [ -f "\$log_file" ]; then
+    lsize=\$(stat -f%z "\$log_file" 2>/dev/null || stat -c%s "\$log_file" 2>/dev/null || echo 0)
+    if [ "\$lsize" -gt "\$log_cap_bytes" ]; then
+        tail -c 1048576 "\$log_file" > "\$log_file.tmp" 2>/dev/null \\
+            && mv "\$log_file.tmp" "\$log_file" 2>/dev/null
+    fi
+fi
+
+# Clear the path. We're about to exec mailpit as the sole owner of :1025/:8025;
+# any leftover is fair game. pgrep -x matches the basename only (never this
+# bash wrapper), so we won't kill ourselves.
+if command -v pgrep >/dev/null 2>&1; then
+    orphans=\$(pgrep -x mailpit 2>/dev/null || true)
+    if [ -n "\$orphans" ]; then
+        # Intentional word-split: one signal for the whole set.
+        # shellcheck disable=SC2086
+        kill \$orphans 2>/dev/null || true
+        sleep 0.4
+        # shellcheck disable=SC2086
+        kill -KILL \$orphans 2>/dev/null || true
+        # Brief settle so the kernel releases the sockets before we bind.
+        sleep 0.2
+    fi
+fi
+
+if [ ! -x "\$mailpit_bin" ]; then
+    echo "mailpit-run: binary not found or not executable: \$mailpit_bin" >&2
+    exit 127
+fi
+
+exec "\$mailpit_bin" --database "\$db_path"
+EOM
+    chmod +x "$script_path"
+    echo "$script_path"
+}
+
+# (Re)install the Mailpit service unit + runner. Shared by cove_enable and
+# post-upgrade so upgraders pick up the orphan-clearing wrapper without a
+# manual re-enable. Idempotent.
+install_mailpit_service() {
+    if ! command -v mailpit &>/dev/null; then
+        echo "   ⚠️  mailpit not installed; skipping mailpit service." >&2
+        return 0
+    fi
+
+    local run_script
+    run_script=$(write_mailpit_run_script)
+    mkdir -p "$LOGS_DIR"
+
+    if [ "$OS" == "macos" ]; then
+        local plist_path="$COVE_DIR/com.cove.mailpit.plist"
+
+        # Stop any brew/nanobrew mailpit and unload our prior job so we own
+        # the ports. The runner also kills orphans at start; this is the
+        # enable-time pass so load doesn't race a leftover.
+        launchctl unload "$plist_path" &>/dev/null || true
+        pkg_service stop mailpit &>/dev/null || true
+        if command -v pgrep >/dev/null 2>&1; then
+            local orphans
+            orphans=$(pgrep -x mailpit 2>/dev/null || true)
+            if [ -n "$orphans" ]; then
+                # shellcheck disable=SC2086
+                kill $orphans 2>/dev/null || true
+                sleep 0.3
+                # shellcheck disable=SC2086
+                kill -KILL $orphans 2>/dev/null || true
+            fi
+        fi
+
+        echo "   - Generating Mailpit service file..."
+        cat > "$plist_path" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>KeepAlive</key>
+        <true/>
+        <!-- Default throttle is 10s; stretch it so a real port conflict
+             (something non-mailpit on :1025) can't spam-restart forever.
+             The runner clears mailpit orphans, so normal restarts are fast. -->
+        <key>ThrottleInterval</key>
+        <integer>30</integer>
+        <key>Label</key>
+        <string>com.cove.mailpit</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>/bin/bash</string>
+                <string>$run_script</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>$LOGS_DIR/mailpit.log</string>
+        <key>StandardOutPath</key>
+        <string>$LOGS_DIR/mailpit.log</string>
+</dict>
+</plist>
+EOM
+        launchctl load "$plist_path"
+        launchctl start com.cove.mailpit
+    fi
+
+    if [ "$OS" == "linux" ]; then
+        local service_path="/etc/systemd/system/mailpit.service"
+        local current_user
+        current_user=$(whoami)
+
+        echo "   - Generating Mailpit service file..."
+        # Write the unit file directly via sudo tee (SELinux-safe; see the
+        # note in cove_enable's original mailpit unit for why mktemp+mv fails).
+        $SUDO_CMD tee "$service_path" >/dev/null << EOM
+[Unit]
+Description=Mailpit Service for Cove
+After=network.target
+
+[Service]
+# Wrapper clears orphaned mailpit processes before bind (see
+# write_mailpit_run_script) so a leftover can't thrash Restart=.
+ExecStart=/bin/bash $run_script
+# on-failure (not always): a clean stop stays down. RestartSec backs off
+# enough that a real port conflict doesn't spin the journal.
+Restart=on-failure
+RestartSec=5s
+User=$current_user
+
+[Install]
+WantedBy=multi-user.target
+EOM
+        $SUDO_CMD chmod 644 "$service_path"
+        $SUDO_CMD systemctl daemon-reload
+        $SUDO_CMD systemctl enable mailpit &>/dev/null
+        $SUDO_CMD systemctl restart mailpit
     fi
 }
 
@@ -1458,6 +1689,26 @@ EOM
 }
 
 # Function to regenerate the Caddyfile
+# Remove leftover skeletons of deleted sites. A Caddy reload that races a
+# `cove delete` re-applies a config snapshot that still names the deleted
+# site, and Caddy's log directive re-creates <site>/logs/ at apply time.
+# cove_delete leaves a tombstone naming each deleted site so the next reload
+# can prune that skeleton. A dir that regained a public/ tree was re-created
+# by the user — leave it alone and just drop the tombstone.
+prune_delete_tombstones() {
+    local tombstone_dir="$COVE_DIR/cache/delete-tombstones"
+    [ -d "$tombstone_dir" ] || return 0
+    local ts ts_site
+    for ts in "$tombstone_dir"/*; do
+        [ -e "$ts" ] || continue
+        ts_site="$SITES_DIR/$(basename "$ts")"
+        if [ -d "$ts_site" ] && [ ! -d "$ts_site/public" ]; then
+            rm -rf "$ts_site"
+        fi
+        rm -f "$ts"
+    done
+}
+
 regenerate_caddyfile() {
     echo "🔄 Regenerating Caddyfile..."
     if ! command -v mailpit &> /dev/null; then
@@ -1491,6 +1742,26 @@ ${port_directives}    frankenphp {
         php_ini memory_limit $(cove_ini_get memory_limit 1G)
         php_ini upload_max_filesize $(cove_ini_get upload_max_filesize 1G)
         php_ini post_max_size $(cove_ini_get post_max_size 1G)
+        # OPcache sizing. FrankenPHP embeds a THREAD-SAFE (ZTS) PHP, so every
+        # site on the box shares ONE OPcache arena across all worker threads.
+        # PHP's stock limits (128M / 8M interned / 10000 files) are sized for a
+        # single small FPM pool and are wildly undersized here: one Cove box
+        # routinely holds 100+ WordPress sites (hundreds of thousands of PHP
+        # files, tens of thousands in a single large site). When the arena or
+        # the interned-strings buffer fills, OPcache does a blocking SHM
+        # *restart* — and under ZTS a restart racing concurrent compiles
+        # corrupts shared memory, segfaulting PHP inside cache_script_in_
+        # shared_memory (lex/persist/optimize). FrankenPHP's Go runtime then
+        # turns that SIGSEGV into a whole-process abort (the "non-Go code set
+        # up signal handler without SA_ONSTACK" fatal), which reads as random
+        # server crashes while editing a heavy plugin. Right-size the arena so
+        # a restart is rare, and disable the optimizer: with validate_timestamps
+        # on (dev), files recompile constantly so the optimizer buys almost
+        # nothing, and its SSA/DFA/call-graph passes were a recurring crash site.
+        php_ini opcache.memory_consumption $(cove_ini_get opcache.memory_consumption 512)
+        php_ini opcache.interned_strings_buffer $(cove_ini_get opcache.interned_strings_buffer 64)
+        php_ini opcache.max_accelerated_files $(cove_ini_get opcache.max_accelerated_files 100000)
+        php_ini opcache.optimization_level $(cove_ini_get opcache.optimization_level 0)
         # User-owned session dir. Linux apt's php.ini points sessions at
         # /var/lib/php-zts/session (owned by the frankenphp user); since
         # Cove runs FrankenPHP as the invoking user, that path is
@@ -1539,7 +1810,15 @@ EOM
             if [ -d "$site_path" ]; then
                 local site_name
                 site_name=$(basename "$site_path")
-                
+
+                # Skip dirs that aren't servable sites: no public/ docroot and
+                # no custom directive. Notably the logs/-only skeleton Caddy
+                # re-creates when a reload races a delete — emitting a block
+                # for it would resurrect the deleted site on every reload.
+                if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$site_name" ]; then
+                    continue
+                fi
+
                 # Build the list of domains
                 local site_domains="$site_name"
                 
@@ -1668,7 +1947,12 @@ EOM
                     site_name=$(basename "$site_path")
                     local site_base_name
                     site_base_name=$(echo "$site_name" | sed 's/\.localhost$//')
-                    
+
+                    # Same skip as the main site loop: not a servable site.
+                    if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$site_name" ]; then
+                        continue
+                    fi
+
                     # Check if this site has a simple reverse_proxy directive
                     local directive_file="$CUSTOM_CADDY_DIR/$site_name"
                     local direct_proxy_target=""
@@ -1842,6 +2126,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'full_path' => $site_path,
                         'size_bytes' => isset($size_cache[$item]) ? (int) $size_cache[$item] : null,
                         'modified_at' => $mtime ?: null,
+                        // Mirrors cove_add's `echo "cove_$name" | tr -c '[:alnum:]_' '_'`,
+                        // so the UI can deep-link Adminer straight at this site's schema.
+                        'db_name' => preg_replace('/[^a-zA-Z0-9_]/', '_', 'cove_' . str_replace('.localhost', '', $item)),
                     ];
                 }
             }
@@ -1903,8 +2190,86 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // recreated. The dashboard batches one reload after the whole
                 // delete queue drains, so skip per-item reloads here.
                 $command = sprintf('HOME=%s %s delete %s --force --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name));
+                $delete_site_target = $site_name;
             } else { $response['message'] = 'Invalid site name provided for deletion.'; }
             break;
+        case 'rename_site':
+            // Same charset gate as add/delete on BOTH names: escapeshellarg stops
+            // shell injection, but cove_rename builds filesystem paths and a
+            // database name from these, so `../` must never get that far.
+            $new_name = $input['new_name'] ?? '';
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            if (empty($new_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $new_name)) {
+                $response['message'] = 'Invalid new name. Use letters, numbers and hyphens only.';
+                break;
+            }
+            if ($new_name === $site_name) {
+                $response['message'] = 'That is already the site name.';
+                break;
+            }
+            // Idempotent retry. Renaming regenerates the Caddyfile and reloads
+            // the very Caddy serving this dashboard, so the response can be
+            // dropped mid-reload and the UI retries. By then the rename has
+            // already happened, and a naive retry fails with "site not found" —
+            // reporting an error for work that actually succeeded. Source gone
+            // plus destination present is exactly that case.
+            $src_exists = is_dir($sitedir . '/' . $site_name . '.localhost');
+            $dst_exists = is_dir($sitedir . '/' . $new_name . '.localhost');
+            if (!$src_exists && $dst_exists) {
+                echo json_encode(['success' => true, 'message' => 'Renamed to ' . $new_name . '.localhost.', 'new_name' => $new_name]);
+                exit;
+            }
+            if ($dst_exists) {
+                $response['message'] = 'A site named ' . $new_name . ' already exists.';
+                break;
+            }
+            $command = sprintf('HOME=%s %s rename %s %s 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), escapeshellarg($new_name));
+            $rename_site_target = $new_name;
+            break;
+        case 'reveal_site':
+            // Opens the site directory in the desktop file manager. Only ever
+            // hands the resolved path to the opener, never the raw name.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            $reveal_path = $sitedir . '/' . $site_name . '.localhost';
+            if (!is_dir($reveal_path)) {
+                $response['message'] = 'Site directory not found.';
+                break;
+            }
+            $opener = (PHP_OS_FAMILY === 'Darwin') ? 'open' : 'xdg-open';
+            // Detached: a file manager that stays in the foreground would hold
+            // the request open until the user closed it.
+            exec(sprintf('%s %s > /dev/null 2>&1 &', $opener, escapeshellarg($reveal_path)));
+            echo json_encode(['success' => true, 'message' => 'Opened ' . $site_name . '.localhost in the file manager.']);
+            exit;
+        case 'site_log':
+            // Read-only tail of the site's own Caddy log. Never shells out —
+            // there is no reason to involve a shell to read a known file.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            $log_dir = $sitedir . '/' . $site_name . '.localhost/logs';
+            $log_file = $log_dir . '/caddy.log';
+            if (!is_file($log_file)) {
+                echo json_encode(['success' => true, 'log' => '', 'message' => 'No log yet for this site.']);
+                exit;
+            }
+            // Tail the last 64KB rather than reading the whole file: these grow
+            // without bound and the UI only ever shows the recent end.
+            $max = 64 * 1024;
+            $size = filesize($log_file);
+            $fh = fopen($log_file, 'r');
+            if ($size > $max) { fseek($fh, $size - $max); fgets($fh); }
+            $log = stream_get_contents($fh);
+            fclose($fh);
+            echo json_encode(['success' => true, 'log' => $log, 'truncated' => $size > $max]);
+            exit;
         case 'get_login_link':
             $response = ['success' => false, 'message' => 'An unknown error occurred.'];
             if (!empty($site_name)) {
@@ -1977,6 +2342,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exec($command, $output, $return_code);
         if ($return_code === 0) {
             $response = ['success' => true, 'message' => 'Operation completed successfully.'];
+            if (isset($rename_site_target)) {
+                $response['message'] = 'Renamed to ' . $rename_site_target . '.localhost.';
+                $response['new_name'] = $rename_site_target;
+            }
             // For add_site: measure the new site's footprint inline and fold
             // it into the size cache so the UI shows "4.0 KB" (or whatever)
             // immediately instead of "—" until the next refresh_sizes pass.
@@ -2003,6 +2372,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // taken" tells the user exactly what to do next.
             $err_text = implode("\n", $output);
             $msg = 'An error occurred.';
+            if (isset($delete_site_target) && stripos($err_text, 'not found') !== false) {
+                // Idempotent delete: the UI retries deletes whose response was
+                // dropped mid-reload — a retry that finds the site already
+                // gone is a success, not an error.
+                echo json_encode(['success' => true, 'message' => 'Site already deleted.']);
+                exit;
+            }
+            if (isset($rename_site_target)) {
+                $msg = 'Could not rename site.';
+                if (stripos($err_text, 'already exists') !== false) {
+                    $msg = 'That name is already taken.';
+                } elseif (stripos($err_text, 'reserved name') !== false) {
+                    $msg = 'That name is reserved. Pick another.';
+                }
+            }
             if (isset($add_site_target)) {
                 $msg = 'Could not create site.';
                 if (stripos($err_text, 'already exists') !== false) {
@@ -2056,7 +2440,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             } catch (e) {}
         })();
     </script>
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%238bb382'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%2358b293'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -2167,7 +2551,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .logo-mark { width: 34px; height: 34px; display: block; flex-shrink: 0; }
         .logo-mark .disc    { fill: var(--mark-disc, #f6f1e8); fill: var(--mark-disc, oklch(96% 0.015 85)); }
         .logo-mark .water   { fill: var(--mark-water, #3a97a9); fill: var(--mark-water, oklch(62% 0.11 190)); }
-        .logo-mark .land    { fill: var(--mark-land, #8bb382); fill: var(--mark-land, oklch(72% 0.10 150)); }
+        .logo-mark .land    { fill: var(--mark-land, #58b293); fill: var(--mark-land, oklch(70% 0.10 168)); }
         .logo-mark .horizon { stroke: var(--mark-horizon, #1c4c58); stroke: var(--mark-horizon, oklch(35% 0.08 190)); fill: none; }
         .logo-mark .wave    { stroke: var(--mark-wave, #1c4c58); stroke: var(--mark-wave, oklch(35% 0.08 190)); fill: none; }
         .logo-mark .ring    { stroke: var(--mark-ring, #1c4c58); stroke: var(--mark-ring, oklch(35% 0.08 190)); fill: none; stroke-width: 3; }
@@ -2175,7 +2559,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --mark-disc:    #2b2925;
             --mark-disc:    oklch(22% 0.01 85);
             --mark-land:    #6a9d70;
-            --mark-land:    oklch(64% 0.09 150);
+            --mark-land:    oklch(64% 0.09 168);
             --mark-ring:    rgba(237, 238, 233, 0.72);
             --mark-ring:    color-mix(in oklab, var(--text) 72%, transparent);
             --mark-horizon: rgba(237, 238, 233, 0.72);
@@ -2302,6 +2686,74 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-list > .empty, .site-list > .loading { grid-column: 1 / -1; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
         .empty-hint { margin-top: 0.35rem; font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-faint); }
         .empty-hint code { background: var(--panel-hover); padding: 0.1rem 0.4rem; border-radius: 5px; }
+        .empty-art { display: block; width: 104px; height: 68px; margin: 0 auto 1rem; }
+        .empty-art .art-line { stroke: var(--text-dim); stroke-width: 2; fill: none; }
+        .empty-art .art-fill { fill: var(--accent); opacity: 0.14; stroke: none; }
+        .empty-art .art-wave { stroke: var(--accent); stroke-width: 2; fill: none; opacity: 0.55; }
+
+        /* Column headers — subgrid row mirroring .site-row's columns. */
+        .site-head { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); }
+        .site-head-btn, .site-head-label { background: transparent; border: 0; padding: 0; font-family: var(--font-mono); font-size: 0.66rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); text-align: left; }
+        .site-head-btn { cursor: pointer; border-radius: 4px; }
+        .site-head-btn:hover { color: var(--text); }
+        .site-head-btn.active { color: var(--text-dim); }
+        .site-head-label { justify-self: center; }
+        .site-head-right { justify-self: end; text-align: right; }
+        .sort-arrow { display: inline-block; min-width: 1em; text-align: right; }
+
+        /* Bulk delete — appears in the filter row when a filter narrows the list. */
+        .bulk-delete-btn { background: transparent; border: 1px solid var(--panel-border); color: var(--text-dim); cursor: pointer; font-family: var(--font-mono); font-size: 0.76rem; padding: 0.18rem 0.65rem; border-radius: var(--radius-pill); white-space: nowrap; transition: color 120ms, border-color 120ms, background 120ms; }
+        .bulk-delete-btn:hover { color: var(--danger); border-color: var(--danger); }
+        .bulk-delete-btn.armed { color: white; background: var(--danger); border-color: var(--danger); }
+
+        /* Service dots in the top bar. They used to live only in the footer,
+           which on an install with hundreds of sites sits ~14,000px down the
+           page — the most glanceable status was the least reachable thing. */
+        .nav-services { display: flex; align-items: center; gap: 0.85rem; margin-left: auto; margin-right: 0.85rem; font-family: var(--font-mono); font-size: 0.74rem; }
+
+        /* Keyboard selection. Distinct from :hover so the two can coexist. */
+        .site-row.is-selected { background: var(--panel-hover); box-shadow: inset 2px 0 0 var(--accent); }
+        .site-row.is-selected .site-actions { opacity: 1; }
+        /* Transient: only while this row's context menu is open. Deliberately
+           separate from .is-selected — a mouse action shouldn't leave keyboard
+           selection behind, which read as a highlight stuck on the last row. */
+        .site-row.has-menu { background: var(--panel-hover); }
+        .site-row.has-menu .site-actions { opacity: 1; }
+
+        /* Pinned sites float to the top of the list. */
+        .site-row.is-pinned .site-domain::before { content: '●'; color: var(--accent); font-size: 0.62rem; margin-right: 0.4rem; vertical-align: middle; opacity: 0.9; }
+
+        /* Row overflow trigger. Always rendered (not hover-gated) so the row's
+           actions are reachable by touch — Cove is explicitly used from phones
+           over Tailscale, where :hover never fires and the old text links were
+           therefore unreachable. */
+        .row-menu-btn { background: transparent; border: 0; color: var(--text-faint); cursor: pointer; font-size: 1rem; line-height: 1; padding: 0.15rem 0.4rem; border-radius: 6px; }
+        .row-menu-btn:hover, .row-menu-btn.active { color: var(--text); background: var(--panel-hover); }
+
+        /* Context menu — shared by right-click and the ⋯ button. */
+        .ctx-menu { position: fixed; z-index: 300; min-width: 190px; padding: 0.3rem; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; box-shadow: 0 12px 34px rgba(0,0,0,0.28); font-size: 0.85rem; }
+        .ctx-title { padding: 0.35rem 0.6rem 0.45rem; font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); border-bottom: 1px solid var(--panel-border); margin-bottom: 0.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ctx-item { display: flex; align-items: center; justify-content: space-between; gap: 1rem; width: 100%; background: transparent; border: 0; text-align: left; padding: 0.42rem 0.6rem; border-radius: 6px; color: var(--text); cursor: pointer; font: inherit; }
+        .ctx-item:hover { background: var(--panel-hover); }
+        .ctx-item.danger { color: var(--danger); }
+        .ctx-item .ctx-key { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .ctx-sep { height: 1px; background: var(--panel-border); margin: 0.25rem 0; }
+
+        /* Command palette. With 274 sites the list is not navigable by
+           scrolling, so search is the real navigation and deserves to be one
+           keystroke away. */
+        .palette-backdrop { position: fixed; inset: 0; z-index: 400; background: rgba(0,0,0,0.45); display: flex; align-items: flex-start; justify-content: center; padding: 12vh 1rem 1rem; }
+        .palette { width: 100%; max-width: 560px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px; box-shadow: 0 24px 60px rgba(0,0,0,0.4); overflow: hidden; display: flex; flex-direction: column; max-height: 70vh; }
+        .palette-input { width: 100%; background: transparent; border: 0; border-bottom: 1px solid var(--panel-border); padding: 0.95rem 1.1rem; color: var(--text); font-family: var(--font-mono); font-size: 0.95rem; outline: none; }
+        .palette-input::placeholder { color: var(--text-faint); }
+        .palette-list { list-style: none; margin: 0; padding: 0.35rem; overflow-y: auto; flex: 1; }
+        .palette-item { display: flex; align-items: center; gap: 0.7rem; padding: 0.5rem 0.75rem; border-radius: 8px; cursor: pointer; }
+        .palette-item.active { background: var(--panel-hover); }
+        .palette-item .pi-name { flex: 1; font-family: var(--font-mono); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .palette-item .pi-meta { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
+        .palette-item .pi-kind { font-family: var(--font-mono); font-size: 0.62rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint); border: 1px solid var(--panel-border); border-radius: var(--radius-pill); padding: 0.05rem 0.4rem; }
+        .palette-empty { padding: 1.4rem; text-align: center; color: var(--text-dim); font-size: 0.87rem; }
+        .palette-hint { display: flex; gap: 1rem; flex-wrap: wrap; padding: 0.5rem 0.9rem; border-top: 1px solid var(--panel-border); font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
 
         /* Footer */
         .card-foot { display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1.5rem; border-top: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.78rem; gap: 1rem; flex-wrap: wrap; }
@@ -2329,12 +2781,24 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .db-cred-value { color: var(--text); word-break: break-all; background: transparent; padding: 0; }
         .modal .modal-foot { margin-top: 1rem; display: flex; justify-content: space-between; align-items: center; color: var(--text-faint); font-family: var(--font-mono); font-size: 0.75rem; }
 
+        /* Wider variant for log output, which is unreadable at 540px. */
+        .modal-wide { max-width: min(900px, 92vw); width: 900px; }
+        .modal-title-dim { font-family: var(--font-mono); font-style: normal; font-size: 0.9rem; color: var(--text-faint); }
+        .modal-input { width: 100%; background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.6rem 0.8rem; color: var(--text); font-family: var(--font-mono); font-size: 0.9rem; outline: none; }
+        .modal-input:focus { border-color: var(--accent); }
+        .modal-input:disabled { opacity: 0.6; }
+        .modal-hint { margin-top: 0.4rem; min-height: 1.1em; font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-faint); }
+        .modal-actions { margin-top: 1.1rem; display: flex; justify-content: flex-end; gap: 0.6rem; }
+        .log-pane { max-height: 55vh; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 0.76rem !important; line-height: 1.5; }
+
         /* Snackbar */
         /* Centered via auto margins + fit-content width, NOT transform — Alpine
            writes transform inline during x-transition, which would wipe out a
            translateX(-50%) centering and slide the snackbar in from the edge. */
-        .snackbar { position: fixed; bottom: 1.5rem; left: 0; right: 0; margin-inline: auto; width: max-content; max-width: 90vw; background: var(--text); color: var(--bg); padding: 0.7rem 1.15rem; border-radius: 10px; font-size: 0.88rem; z-index: 200; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+        .snackbar { position: fixed; bottom: 1.5rem; left: 0; right: 0; margin-inline: auto; width: max-content; max-width: 90vw; display: flex; align-items: center; gap: 0.9rem; background: var(--text); color: var(--bg); padding: 0.7rem 1.15rem; border-radius: 10px; font-size: 0.88rem; z-index: 200; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
         .snackbar.error { background: var(--danger); color: white; }
+        .snackbar-action { background: transparent; border: 0; padding: 0; color: inherit; font: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+        .snackbar-action:hover { opacity: 0.8; }
 
         /* Responsive */
         @media (max-width: 620px) {
@@ -2343,7 +2807,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             .card-actions { width: 100%; justify-content: flex-end; }
             .site-list { grid-template-columns: 1fr auto auto; column-gap: 0.6rem; }
             .site-row { padding: 0.7rem 1rem; }
-            .site-size, .site-modified { display: none; }
+            .site-size, .site-modified, .head-size, .head-modified { display: none; }
             .site-actions { opacity: 1; }
             .add-row { padding: 0.8rem 1rem; }
             .card-foot { padding: 0.75rem 1rem; }
@@ -2372,6 +2836,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </svg>
                 <span>Cove</span>
             </a>
+            <div class="nav-services services">
+                <span class="dot" title="Caddy is serving this page — it's running">caddy</span>
+                <button type="button" class="dot link" @click="showDbModal = true" title="Database credentials">mariadb</button>
+                <a class="dot link" :href="mailpitUrl" target="_blank" rel="noopener" title="Open Mailpit">mailpit</a>
+            </div>
             <button class="theme-btn" @click="toggleTheme()" :title="theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'" aria-label="Toggle theme">
                 <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5a5.75 5.75 0 1 0 6.7 6.7Z"/></svg>
                 <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.8M8 12.7v1.8M2.6 2.6l1.3 1.3M12.1 12.1l1.3 1.3M1.5 8h1.8M12.7 8h1.8M2.6 13.4l1.3-1.3M12.1 3.9l1.3-1.3"/></svg>
@@ -2382,7 +2851,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <header class="card-head">
                 <h1 class="card-title">Sites</h1>
                 <div class="card-actions">
-                    <button class="pill" @click="cycleSort()" :title="'Sort by — click to cycle'" x-text="'sort: ' + sort"></button>
                     <a class="pill" href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Adminer">
                         <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5v-9"/><path d="M3 8c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5"/></svg>
                         db
@@ -2431,6 +2899,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     @keydown.escape.prevent="filter = ''; $event.target.blur()"
                     aria-label="Filter sites"
                 >
+                <button
+                    type="button"
+                    class="bulk-delete-btn"
+                    :class="{ armed: bulkArmed }"
+                    x-show="(filter || typeFilter) && filteredSites.length > 0 && filteredSites.length < sites.length"
+                    @click="bulkDelete()"
+                    :title="'Delete every site matching the current filter'"
+                    x-text="bulkArmed ? ('sure? delete ' + filteredSites.length) : ('delete ' + filteredSites.length + ' shown')"
+                    style="display: none;"></button>
                 <span class="filter-kbd" x-show="!filter && !typeFilter" aria-hidden="true">/</span>
                 <button class="filter-clear" x-show="filter || typeFilter" @click="clearAllFilters(); $refs.filterInput.focus()" aria-label="Clear filter" title="Clear all (Esc)">×</button>
             </div>
@@ -2450,8 +2927,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </div>
 
             <ul class="site-list">
+                <li class="site-head" x-show="!isLoading && filteredSites.length > 0">
+                    <button type="button" class="site-head-btn" :class="{ active: sort === 'name' }" @click="setSort('name')" title="Sort by name">name<span class="sort-arrow" x-text="sortArrow('name')"></span></button>
+                    <span class="site-head-label">type</span>
+                    <button type="button" class="site-head-btn site-head-right head-modified" :class="{ active: sort === 'modified' }" @click="setSort('modified')" title="Sort by last modified">modified<span class="sort-arrow" x-text="sortArrow('modified')"></span></button>
+                    <button type="button" class="site-head-btn site-head-right head-size" :class="{ active: sort === 'size' }" @click="setSort('size')" title="Sort by disk size">size<span class="sort-arrow" x-text="sortArrow('size')"></span></button>
+                    <span aria-hidden="true"></span>
+                </li>
                 <template x-for="site in filteredSites" :key="site.name">
-                    <li class="site-row" @click="openSite(site)">
+                    <li class="site-row" :class="{ 'is-selected': selectedName === site.name, 'has-menu': ctxMenu.open && ctxMenu.site && ctxMenu.site.name === site.name, 'is-pinned': isPinned(site.name) }" @click="openSite(site)" @contextmenu.prevent="openRowMenu(site, $event)">
                         <a class="site-domain" :href="site.domain" target="_blank" rel="noopener" @click.stop x-html="highlightedDomain(site.domain, filter)"></a>
                         <span class="site-type" :class="site.type === 'WordPress' ? 'wp' : 'static'" @click.stop="typeFilter = site.type" :title="'Filter to ' + (site.type === 'WordPress' ? 'WordPress' : 'static') + ' sites'" x-text="site.type === 'WordPress' ? 'WP' : 'STATIC'"></span>
                         <span class="site-modified" x-text="formatRelative(site.modified_at)" :title="site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : ''"></span>
@@ -2463,8 +2947,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                                     <span class="btn-spinner" aria-hidden="true"></span>
                                 </button>
                             </template>
-                            <button class="site-action-btn" @click.stop="copyPath(site.full_path)" title="Copy site path to clipboard">path</button>
-                            <button class="site-action-btn danger" @click.stop="deleteSite(site.name)" :title="'Delete ' + site.name">delete</button>
+                            <!-- Always rendered, unlike the hover-only links: this is the
+                                 only way the row's actions are reachable on touch. -->
+                            <button class="row-menu-btn" :class="{ active: ctxMenu.open && ctxMenu.site && ctxMenu.site.name === site.name }" @click.stop="openRowMenu(site, $event)" :aria-label="'Actions for ' + site.name" title="Actions">⋯</button>
                         </div>
                     </li>
                 </template>
@@ -2473,24 +2958,37 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </template>
                 <template x-if="!isLoading && sites.length === 0">
                     <li class="empty">
-                        <div>No sites yet.</div>
+                        <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path class="art-fill" d="M52 12 L68 38 H52 Z"/>
+                            <path class="art-line" d="M52 10 v30"/>
+                            <path class="art-line" d="M52 14 L67 37 H52 Z"/>
+                            <path class="art-line" d="M49 20 L39 37 H49 Z"/>
+                            <path class="art-line" d="M36 42 h32 l-6 9 H42 Z"/>
+                            <path class="art-wave" d="M8 56 Q 15 52, 22 56 T 36 56 T 50 56 T 64 56 T 78 56 T 92 56"/>
+                            <path class="art-wave" d="M20 62 Q 27 58, 34 62 T 48 62 T 62 62 T 76 62" opacity="0.35"/>
+                        </svg>
+                        <div>No sites in the cove yet.</div>
                         <div class="empty-hint">Click <em>+ add site</em>, or run <code>cove add myblog</code>.</div>
                     </li>
                 </template>
                 <template x-if="!isLoading && sites.length > 0 && filteredSites.length === 0">
                     <li class="empty">
-                        <div>No matches for <code x-text="filter"></code>.</div>
+                        <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path class="art-line" d="M52 44 v-14 q0 -6 6 -6 h4"/>
+                            <path class="art-line" d="M62 18 h8 q3 0 3 3 v3 h-11 q-3 0 -3 -3 v-3 Z"/>
+                            <path class="art-line" d="M73 21 l7 -4 v11 l-7 -4"/>
+                            <path class="art-fill" d="M46 44 h12 v8 H46 Z"/>
+                            <path class="art-line" d="M46 52 v-8 h12 v8"/>
+                            <path class="art-wave" d="M8 56 Q 15 52, 22 56 T 36 56 T 50 56 T 64 56 T 78 56 T 92 56"/>
+                            <path class="art-wave" d="M20 62 Q 27 58, 34 62 T 48 62 T 62 62 T 76 62" opacity="0.35"/>
+                        </svg>
+                        <div>Nothing surfaced for <code x-text="filter || typeFilterLabel"></code>.</div>
                         <div class="empty-hint">Press Esc to clear.</div>
                     </li>
                 </template>
             </ul>
 
             <footer class="card-foot">
-                <div class="services">
-                    <span class="dot" title="Caddy is serving this page — it's running">caddy</span>
-                    <button type="button" class="dot link" @click="showDbModal = true" title="Database credentials">mariadb</button>
-                    <a class="dot link" :href="mailpitUrl" target="_blank" rel="noopener" title="Open Mailpit">mailpit</a>
-                </div>
                 <div class="totals">
                     <span x-text="siteCountLabel"></span>
                     <span x-show="totalBytes > 0" x-text="'· ' + formatSize(totalBytes)"></span>
@@ -2521,11 +3019,105 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         </div>
     </div>
 
-    <div x-show="snackbar.visible" x-transition.opacity.duration.200ms class="snackbar" :class="{ error: snackbar.isError }" x-text="snackbar.message" style="display: none;"></div>
+    <!-- Rename -->
+    <div x-show="rename.open" x-transition.opacity class="modal-backdrop" @click.self="rename.open = false" @keydown.escape.window="rename.open = false" style="display: none;">
+        <div class="modal">
+            <h3>Rename site</h3>
+            <p class="modal-sub">Renames the directory, the database, and the local URL. Any bookmark to the old address stops working.</p>
+            <form @submit.prevent="submitRename()">
+                <input class="modal-input" type="text" x-model="rename.value" x-ref="renameInput" spellcheck="false" autocomplete="off"
+                    placeholder="new-name" :disabled="rename.busy" @keydown.escape.prevent="rename.open = false">
+                <div class="modal-hint"><span x-text="rename.value ? rename.value + '.localhost' : '\u00a0'"></span></div>
+                <div class="modal-actions">
+                    <button type="button" class="pill" @click="rename.open = false" :disabled="rename.busy">cancel</button>
+                    <button type="submit" class="pill primary" :disabled="rename.busy || !rename.value" x-text="rename.busy ? 'renaming…' : 'rename'"></button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Site log -->
+    <div x-show="logView.open" x-transition.opacity class="modal-backdrop" @click.self="logView.open = false" @keydown.escape.window="logView.open = false" style="display: none;">
+        <div class="modal modal-wide">
+            <h3>Log <span class="modal-title-dim" x-text="logView.site"></span></h3>
+            <p class="modal-sub" x-show="logView.truncated">Showing the most recent 64KB.</p>
+            <pre class="log-pane" x-ref="logPane" x-text="logDisplay"></pre>
+            <div class="modal-actions">
+                <button type="button" class="pill" @click="logView.raw = !logView.raw" x-text="logView.raw ? 'formatted' : 'raw'"></button>
+                <button type="button" class="pill" @click="viewLog({ name: logView.site }, true)" :disabled="logView.busy">refresh</button>
+                <button type="button" class="pill primary" @click="logView.open = false">close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Context menu: one component driven by both right-click on a row and the
+         row's ⋯ button, so the two affordances can never drift apart. -->
+    <div x-show="ctxMenu.open" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.outside="closeRowMenu()" x-transition.opacity.duration.100ms style="display: none;">
+        <template x-if="ctxMenu.site">
+            <div>
+                <div class="ctx-title" x-text="ctxMenu.site.domain.replace('https://','')"></div>
+                <button class="ctx-item" @click="openSite(ctxMenu.site); closeRowMenu()"><span>Open site</span><span class="ctx-key">↵</span></button>
+                <template x-if="ctxMenu.site.type === 'WordPress'">
+                    <button class="ctx-item" @click="getLoginLink(ctxMenu.site.name); closeRowMenu()"><span>Log in to admin</span><span class="ctx-key">⌘↵</span></button>
+                </template>
+                <div class="ctx-sep"></div>
+                <button class="ctx-item" @click="promptRename(ctxMenu.site); closeRowMenu()"><span>Rename…</span></button>
+                <button class="ctx-item" @click="revealSite(ctxMenu.site.name); closeRowMenu()"><span x-text="revealLabel"></span></button>
+                <template x-if="ctxMenu.site.type === 'WordPress'">
+                    <button class="ctx-item" @click="openSiteDb(ctxMenu.site); closeRowMenu()"><span>Open database</span></button>
+                </template>
+                <button class="ctx-item" @click="viewLog(ctxMenu.site); closeRowMenu()"><span>View log</span></button>
+                <div class="ctx-sep"></div>
+                <button class="ctx-item" @click="copyPath(ctxMenu.site.full_path); closeRowMenu()"><span>Copy path</span></button>
+                <button class="ctx-item" @click="togglePin(ctxMenu.site.name); closeRowMenu()"><span x-text="isPinned(ctxMenu.site.name) ? 'Unpin from top' : 'Pin to top'"></span></button>
+                <div class="ctx-sep"></div>
+                <button class="ctx-item danger" @click="deleteSite(ctxMenu.site.name); closeRowMenu()"><span>Delete site</span><span class="ctx-key">⌘⌫</span></button>
+            </div>
+        </template>
+    </div>
+
+    <!-- Command palette. Primary navigation once the list is longer than a
+         screen, which on a real install it always is. -->
+    <div x-show="palette.open" class="palette-backdrop" @click.self="closePalette()" x-transition.opacity.duration.120ms style="display: none;">
+        <div class="palette">
+            <input class="palette-input" type="text" x-model="palette.query" x-ref="paletteInput"
+                placeholder="Search sites, or type a command…" spellcheck="false" autocomplete="off"
+                @keydown.arrow-down.prevent="paletteMove(1)"
+                @keydown.arrow-up.prevent="paletteMove(-1)"
+                @keydown.enter.prevent="paletteRun($event)"
+                @keydown.escape.prevent="closePalette()"
+                aria-label="Command palette">
+            <ul class="palette-list" x-ref="paletteList">
+                <template x-for="(item, i) in paletteResults" :key="item.key">
+                    <li class="palette-item" :class="{ active: i === palette.index }" @click="paletteRunItem(item)" @mouseenter="palette.index = i">
+                        <span class="pi-kind" x-text="item.kind"></span>
+                        <span class="pi-name" x-text="item.label"></span>
+                        <span class="pi-meta" x-text="item.meta"></span>
+                    </li>
+                </template>
+                <template x-if="paletteResults.length === 0">
+                    <li class="palette-empty">No matches.</li>
+                </template>
+            </ul>
+            <div class="palette-hint">
+                <span>↑↓ navigate</span><span>↵ open</span><span>⌘↵ log in</span><span>esc close</span>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="snackbar.visible" x-transition.opacity.duration.200ms class="snackbar" :class="{ error: snackbar.isError }" style="display: none;">
+        <span x-text="snackbar.message"></span>
+        <!-- !! matters: x-show/@click expressions that RESULT in a function get
+             auto-invoked by Alpine, so a bare `snackbar.action` here would run
+             the undo handler on every render. -->
+        <button type="button" class="snackbar-action" x-show="!!snackbar.action" @click="if (snackbar.action) snackbar.action()" x-text="snackbar.actionLabel" style="display: none;"></button>
+    </div>
 
     <script>
         const PORT_SUFFIX = '<?= $__cove_port_suffix ?>';
         const SITES_DIR = 'SITES_DIR_PLACEHOLDER';
+        // Adminer needs the username to deep-link straight into a site's schema.
+        const DB_USER = '<?= htmlspecialchars($config_data['DB_USER'] ?? '', ENT_QUOTES) ?>';
 
         document.addEventListener('alpine:init', () => {
             Alpine.data('dashboard', () => ({
@@ -2538,10 +3130,26 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 isRefreshingSizes: false,
                 filter: '',
                 typeFilter: null, // null | 'WordPress' | 'Plain' — set via the row type pills, cleared via the chip × or overall filter clear
-                sort: 'name',
-                sortModes: ['name', 'size', 'modified'],
+                // Default to most-recently-modified rather than alphabetical: on an
+                // install with hundreds of sites, "what was I just working on" is a
+                // far better landing state than "what starts with A".
+                sort: ['name', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'modified',
+                sortDir: ['asc', 'desc'].includes(localStorage.getItem('sortDir')) ? localStorage.getItem('sortDir') : 'desc',
+                pinned: (() => { try { return JSON.parse(localStorage.getItem('pinned')) || []; } catch (e) { return []; } })(),
+                selectedName: null,
+                ctxMenu: { open: false, site: null, x: 0, y: 0 },
+                palette: { open: false, query: '', index: 0 },
+                rename: { open: false, site: null, value: '', busy: false },
+                logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
+                _initialised: false,
                 newSite: { name: '', isPlain: false, isLoading: false },
-                snackbar: { visible: false, message: '', isError: false, timer: null },
+                snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
+                // Deletes are staged for a short undo window before anything is
+                // sent to the backend. One batch at a time; staging more sites
+                // merges into it and restarts the window.
+                pendingDelete: null, // { sites: [...], timer }
+                bulkArmed: false,
+                bulkArmTimer: null,
                 // Persistent dismissible banners for newly-created sites — the
                 // snackbar only lives ~3.5s, not long enough to reach for the
                 // admin login after spinning up a fresh install.
@@ -2568,12 +3176,18 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             s.name.toLowerCase().includes(q) ||
                             (s.type || '').toLowerCase().includes(q));
                     }
+                    const dir = this.sortDir === 'asc' ? 1 : -1;
                     if (this.sort === 'size') {
-                        base.sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0));
+                        base.sort((a, b) => dir * ((a.size_bytes || 0) - (b.size_bytes || 0)));
                     } else if (this.sort === 'modified') {
-                        base.sort((a, b) => (b.modified_at || 0) - (a.modified_at || 0));
+                        base.sort((a, b) => dir * ((a.modified_at || 0) - (b.modified_at || 0)));
                     } else {
-                        base.sort((a, b) => a.name.localeCompare(b.name));
+                        base.sort((a, b) => dir * a.name.localeCompare(b.name));
+                    }
+                    // Pinned sites float above the chosen sort rather than replacing
+                    // it: out of hundreds of sites only a handful are ever active.
+                    if (this.pinned.length) {
+                        base.sort((a, b) => (this.pinned.includes(b.name) ? 1 : 0) - (this.pinned.includes(a.name) ? 1 : 0));
                     }
                     return base;
                 },
@@ -2594,19 +3208,95 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 },
 
                 init() {
+                    if (this._initialised) return;
+                    this._initialised = true;
+
                     this.applyTheme();
                     this.$watch('theme', () => { this.applyTheme(); localStorage.setItem('theme', this.theme); });
+
+                    // An armed bulk-delete is scoped to the current result set —
+                    // disarm if the filter changes underneath it.
+                    this.$watch('filter', () => { this.bulkArmed = false; });
+                    this.$watch('typeFilter', () => { this.bulkArmed = false; });
+
+                    // If the tab closes during an undo window, flush the staged
+                    // deletes with keepalive requests so they aren't lost. No
+                    // reload_server here: the next reload from any source
+                    // regenerates from disk and prunes via tombstones.
+                    window.addEventListener('pagehide', () => {
+                        if (!this.pendingDelete) return;
+                        for (const s of this.pendingDelete.sites) {
+                            fetch('api.php', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ action: 'delete_site', site_name: s.name }),
+                                keepalive: true
+                            }).catch(() => {});
+                        }
+                        this.pendingDelete = null;
+                    });
 
                     // `/` focuses the filter (GitHub-style). Ignored when typing
                     // in a form field or holding a modifier key.
                     window.addEventListener('keydown', (e) => {
-                        if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
                         const el = document.activeElement;
                         const tag = el && el.tagName;
-                        if (tag === 'INPUT' || tag === 'TEXTAREA' || (el && el.isContentEditable)) return;
-                        e.preventDefault();
-                        this.$refs.filterInput && this.$refs.filterInput.focus();
+                        const typing = tag === 'INPUT' || tag === 'TEXTAREA' || (el && el.isContentEditable);
+
+                        // Cmd/Ctrl+K opens the palette from anywhere, including
+                        // from inside the filter box — it's the one shortcut that
+                        // should never be swallowed by a focused field.
+                        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+                            e.preventDefault();
+                            this.palette.open ? this.closePalette() : this.openPalette();
+                            return;
+                        }
+                        if (this.palette.open) return; // palette owns its own keys
+
+                        // Arrows work while filtering (type to narrow, arrow to pick).
+                        // j/k only outside a text field, or they'd eat typed letters.
+                        const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
+                        const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
+                        if ((isDown || isUp) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                            e.preventDefault();
+                            this.moveSelection(isDown ? 1 : -1);
+                            return;
+                        }
+
+                        if (e.key === 'Enter' && this.selectedName && !this.adding) {
+                            const site = this.selectedSite();
+                            if (!site) return;
+                            e.preventDefault();
+                            if ((e.metaKey || e.ctrlKey) && site.type === 'WordPress') {
+                                this.getLoginLink(site.name);
+                            } else {
+                                this.openSite(site);
+                            }
+                            return;
+                        }
+
+                        if ((e.metaKey || e.ctrlKey) && (e.key === 'Backspace' || e.key === 'Delete') && this.selectedName) {
+                            e.preventDefault();
+                            this.deleteSite(this.selectedName);
+                            return;
+                        }
+
+                        if (e.key === 'Escape') {
+                            if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                            if (this.selectedName && !typing) { this.selectedName = null; return; }
+                        }
+
+                        if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                            if (typing) return;
+                            e.preventDefault();
+                            this.$refs.filterInput && this.$refs.filterInput.focus();
+                        }
                     });
+
+                    // A scroll or resize would leave the menu floating away from
+                    // the row it belongs to, so dismiss rather than reposition.
+                    window.addEventListener('scroll', () => { if (this.ctxMenu.open) this.closeRowMenu(); }, { passive: true });
+                    window.addEventListener('resize', () => { if (this.ctxMenu.open) this.closeRowMenu(); });
 
                     this.getSites().then(() => {
                         // If the size cache is empty (fresh install or just deleted),
@@ -2691,9 +3381,252 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
                 },
 
-                cycleSort() {
-                    const i = this.sortModes.indexOf(this.sort);
-                    this.sort = this.sortModes[(i + 1) % this.sortModes.length];
+                // --- Command palette -------------------------------------------
+                // Results mix matching sites with global commands. Sites are ranked
+                // by match position so a prefix hit beats a mid-string one.
+                get paletteResults() {
+                    const q = this.palette.query.trim().toLowerCase();
+                    const out = [];
+                    const commands = [
+                        { key: 'cmd:add',     kind: 'cmd', label: 'Add site',            meta: '',  run: () => { this.closePalette(); this.toggleAdd(); } },
+                        { key: 'cmd:reload',  kind: 'cmd', label: 'Reload server',       meta: '',  run: () => { this.closePalette(); this.reloadServer(); } },
+                        { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
+                        { key: 'cmd:db',      kind: 'cmd', label: 'Open database',       meta: '',  run: () => { this.closePalette(); window.open('https://db.cove.localhost' + PORT_SUFFIX, '_blank', 'noopener'); } },
+                        { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: '',  run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
+                        { key: 'cmd:creds',   kind: 'cmd', label: 'Database credentials',meta: '',  run: () => { this.closePalette(); this.showDbModal = true; } },
+                        { key: 'cmd:theme',   kind: 'cmd', label: 'Toggle theme',        meta: '',  run: () => { this.closePalette(); this.toggleTheme(); } },
+                    ];
+                    let sites = this.sites;
+                    if (q) {
+                        sites = sites
+                            .map(s => ({ s, i: s.name.toLowerCase().indexOf(q) }))
+                            .filter(x => x.i !== -1)
+                            .sort((a, b) => a.i - b.i || a.s.name.localeCompare(b.s.name))
+                            .map(x => x.s);
+                    } else {
+                        // No query: show pinned first, then whatever the list is
+                        // sorted by, capped so the palette stays a menu not a dump.
+                        sites = this.filteredSites;
+                    }
+                    for (const site of sites.slice(0, 40)) {
+                        out.push({
+                            key: 'site:' + site.name,
+                            kind: site.type === 'WordPress' ? 'wp' : 'static',
+                            label: site.name + '.localhost',
+                            meta: this.formatSize(site.size_bytes),
+                            site,
+                            run: () => { this.closePalette(); this.openSite(site); }
+                        });
+                    }
+                    for (const c of commands) {
+                        if (!q || c.label.toLowerCase().includes(q)) out.push(c);
+                    }
+                    return out;
+                },
+
+                async reloadServer() {
+                    this.showSnack('Reloading server…');
+                    const res = await this.apiPostRetry('reload_server', {}, 3, 10000);
+                    if (res.success) this.showSnack('Server reloaded.');
+                },
+
+                // --- Row actions -----------------------------------------------
+                // macOS says "Finder"; everywhere else the file manager has no
+                // one name, so stay generic rather than lie about it.
+                get revealLabel() {
+                    return navigator.platform && navigator.platform.startsWith('Mac')
+                        ? 'Reveal in Finder' : 'Open folder';
+                },
+
+                promptRename(site) {
+                    this.rename = { open: true, site, value: site.name, busy: false };
+                    this.$nextTick(() => {
+                        const el = this.$refs.renameInput;
+                        if (el) { el.focus(); el.select(); }
+                    });
+                },
+
+                async submitRename() {
+                    const site = this.rename.site;
+                    const next = (this.rename.value || '').trim();
+                    if (!site || !next || next === site.name) { this.rename.open = false; return; }
+                    if (!/^[a-zA-Z0-9-]+$/.test(next)) {
+                        this.showSnack('Use letters, numbers and hyphens only.', true);
+                        return;
+                    }
+                    this.rename.busy = true;
+                    // Renaming rewrites the Caddyfile, so the response can land
+                    // mid-reload exactly like a delete does — same retry policy.
+                    const res = await this.apiPostRetry('rename_site', { site_name: site.name, new_name: next });
+                    this.rename.busy = false;
+                    if (!res.success) return;   // apiPost surfaced the reason
+                    this.rename.open = false;
+                    // Carry over UI state that is keyed by name, or a pinned site
+                    // would silently unpin itself on rename.
+                    if (this.isPinned(site.name)) {
+                        this.pinned = this.pinned.map(n => (n === site.name ? next : n));
+                        localStorage.setItem('pinned', JSON.stringify(this.pinned));
+                    }
+                    if (this.selectedName === site.name) this.selectedName = next;
+                    this.showSnack(res.message || 'Renamed.');
+                    await this.getSites();
+                },
+
+                async revealSite(name) {
+                    const res = await this.apiPost('reveal_site', { site_name: name });
+                    if (res.success) this.showSnack(res.message || 'Opened in the file manager.');
+                },
+
+                openSiteDb(site) {
+                    // Adminer takes the schema in the query string, so this lands
+                    // on the site's own tables instead of the server root.
+                    const url = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) +
+                                '&db=' + encodeURIComponent(site.db_name || ('cove_' + site.name).replace(/[^a-zA-Z0-9_]/g, '_'));
+                    window.open(url, '_blank', 'noopener');
+                },
+
+                // Caddy writes one JSON object per line, which is unreadable as a
+                // wall of text. Fold each request down to the fields you'd
+                // actually scan for — time, status, method, path, duration —
+                // and leave anything that isn't a request line untouched.
+                get logDisplay() {
+                    if (this.logView.busy) return 'Loading…';
+                    const raw = this.logView.text || '';
+                    if (!raw) return 'No log entries yet.';
+                    if (this.logView.raw) return raw;
+                    const out = [];
+                    for (const line of raw.split('\n')) {
+                        const t = line.trim();
+                        if (!t) continue;
+                        if (t[0] !== '{') { out.push(t); continue; }
+                        let o;
+                        try { o = JSON.parse(t); } catch (e) { out.push(t); continue; }
+                        const req = o.request || {};
+                        if (!req.method) { out.push(o.msg ? (o.level || '') + ' ' + o.msg : t); continue; }
+                        const time = o.ts ? new Date(o.ts * 1000).toLocaleTimeString() : '';
+                        const status = o.status !== undefined ? String(o.status) : '';
+                        const dur = typeof o.duration === 'number' ? (o.duration * 1000).toFixed(0) + 'ms' : '';
+                        out.push([
+                            time,
+                            status.padEnd(3),
+                            (req.method || '').padEnd(6),
+                            req.uri || '',
+                            dur
+                        ].filter(Boolean).join('  '));
+                    }
+                    return out.join('\n') || 'No log entries yet.';
+                },
+
+                async viewLog(site, refresh = false) {
+                    this.logView = { open: true, site: site.name, text: refresh ? this.logView.text : '', truncated: false, busy: true };
+                    const res = await this.apiPost('site_log', { site_name: site.name });
+                    this.logView.busy = false;
+                    if (!res.success) { this.logView.open = false; return; }
+                    this.logView.text = res.log || '';
+                    this.logView.truncated = !!res.truncated;
+                    // Logs are read tail-first; jump to the newest lines.
+                    this.$nextTick(() => {
+                        const el = this.$refs.logPane;
+                        if (el) el.scrollTop = el.scrollHeight;
+                    });
+                },
+
+                openPalette() {
+                    this.palette.open = true;
+                    this.palette.query = '';
+                    this.palette.index = 0;
+                    this.closeRowMenu();
+                    this.$nextTick(() => this.$refs.paletteInput && this.$refs.paletteInput.focus());
+                },
+
+                closePalette() { this.palette.open = false; },
+
+                paletteMove(delta) {
+                    const n = this.paletteResults.length;
+                    if (!n) return;
+                    this.palette.index = (this.palette.index + delta + n) % n;
+                    this.$nextTick(() => {
+                        const list = this.$refs.paletteList;
+                        if (!list) return;
+                        const el = list.children[this.palette.index];
+                        if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+                    });
+                },
+
+                paletteRun(event) {
+                    const item = this.paletteResults[this.palette.index];
+                    if (!item) return;
+                    // Cmd/Ctrl+Enter logs into a WordPress site instead of opening it.
+                    if (event && (event.metaKey || event.ctrlKey) && item.site && item.site.type === 'WordPress') {
+                        this.closePalette();
+                        this.getLoginLink(item.site.name);
+                        return;
+                    }
+                    item.run();
+                },
+
+                paletteRunItem(item) { item.run(); },
+
+                // --- Row context menu ------------------------------------------
+                openRowMenu(site, event) {
+                    // Clamp into the viewport so a right-click near the right or
+                    // bottom edge doesn't push the menu off-screen.
+                    const w = 200, h = 230;
+                    const x = Math.min(event.clientX, window.innerWidth - w - 8);
+                    const y = Math.min(event.clientY, window.innerHeight - h - 8);
+                    this.ctxMenu = { open: true, site, x: Math.max(8, x), y: Math.max(8, y) };
+                },
+
+                closeRowMenu() { this.ctxMenu.open = false; },
+
+                // --- Pinning ---------------------------------------------------
+                isPinned(name) { return this.pinned.includes(name); },
+
+                togglePin(name) {
+                    if (this.isPinned(name)) {
+                        this.pinned = this.pinned.filter(n => n !== name);
+                    } else {
+                        this.pinned = [...this.pinned, name];
+                    }
+                    localStorage.setItem('pinned', JSON.stringify(this.pinned));
+                },
+
+                // --- Keyboard list navigation ----------------------------------
+                moveSelection(delta) {
+                    const list = this.filteredSites;
+                    if (!list.length) return;
+                    const cur = list.findIndex(s => s.name === this.selectedName);
+                    let next = cur === -1 ? (delta > 0 ? 0 : list.length - 1) : cur + delta;
+                    next = Math.max(0, Math.min(list.length - 1, next));
+                    this.selectedName = list[next].name;
+                    this.$nextTick(() => {
+                        const rows = document.querySelectorAll('.site-row');
+                        const el = rows[next];
+                        if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+                    });
+                },
+
+                selectedSite() {
+                    return this.filteredSites.find(s => s.name === this.selectedName) || null;
+                },
+
+                setSort(key) {
+                    // Click the active header to flip direction; a new key
+                    // starts at its natural default (a→z for name, biggest /
+                    // most recent first for size and modified).
+                    if (this.sort === key) {
+                        this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
+                    } else {
+                        this.sort = key;
+                        this.sortDir = key === 'name' ? 'asc' : 'desc';
+                    }
+                    localStorage.setItem('sort', this.sort);
+                    localStorage.setItem('sortDir', this.sortDir);
+                },
+
+                sortArrow(key) {
+                    if (this.sort !== key) return '';
+                    return this.sortDir === 'asc' ? '↑' : '↓';
                 },
 
                 openSite(site) {
@@ -2703,25 +3636,52 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     window.open(site.domain, '_blank', 'noopener');
                 },
 
-                showSnack(msg, isError = false) {
+                showSnack(msg, isError = false, opts = {}) {
                     if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
-                    this.snackbar = { visible: true, message: msg, isError, timer: null };
-                    this.snackbar.timer = setTimeout(() => { this.snackbar.visible = false; }, 3500);
+                    this.snackbar = {
+                        visible: true, message: msg, isError, timer: null,
+                        action: opts.action || null,
+                        actionLabel: opts.actionLabel || ''
+                    };
+                    this.snackbar.timer = setTimeout(() => { this.snackbar.visible = false; }, opts.duration || 3500);
                 },
 
-                async apiPost(action, payload = {}) {
+                async apiPost(action, payload = {}, opts = {}) {
+                    const { timeoutMs = 0, quiet = false } = opts;
+                    const ctrl = timeoutMs ? new AbortController() : null;
+                    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
                     try {
                         const res = await fetch('api.php', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ action, ...payload })
+                            body: JSON.stringify({ action, ...payload }),
+                            ...(ctrl ? { signal: ctrl.signal } : {})
                         }).then(r => r.json());
-                        if (!res.success) this.showSnack(res.message || 'An error occurred.', true);
+                        if (!res.success && !quiet) this.showSnack(res.message || 'An error occurred.', true);
                         return res;
                     } catch (e) {
-                        this.showSnack('Network error.', true);
-                        return { success: false };
+                        // transport marks network-level failures (connection
+                        // dropped, timeout) as distinct from server-reported
+                        // errors — only these are worth retrying.
+                        if (!quiet) this.showSnack('Network error.', true);
+                        return { success: false, transport: true };
+                    } finally {
+                        if (timer) clearTimeout(timer);
                     }
+                },
+
+                async apiPostRetry(action, payload = {}, attempts = 3, timeoutMs = 30000) {
+                    // The Caddy/FrankenPHP reload the dashboard triggers after
+                    // add/delete can momentarily drop or hang requests to the
+                    // dashboard itself. Retry transport failures a few times so
+                    // an action that lands mid-reload isn't silently lost.
+                    let res;
+                    for (let i = 1; i <= attempts; i++) {
+                        res = await this.apiPost(action, payload, { timeoutMs, quiet: i < attempts });
+                        if (res.success || !res.transport) return res;
+                        if (i < attempts) await new Promise(r => setTimeout(r, 3000));
+                    }
+                    return res;
                 },
 
                 async getSites() {
@@ -2729,7 +3689,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     try {
                         const r = await fetch('api.php?action=list_sites');
                         const data = await r.json();
-                        this.sites = data.map(s => ({ ...s, isLoggingIn: false }));
+                        // Sites staged for deletion are still on disk (nothing
+                        // is sent to the backend until the undo window closes),
+                        // so a refresh landing mid-window would re-add the rows
+                        // the user just deleted — and undo would then push a
+                        // second copy, duplicating the :key and breaking x-for.
+                        const staged = new Set(this.pendingDelete ? this.pendingDelete.sites.map(s => s.name) : []);
+                        this.sites = data
+                            .map(s => ({ ...s, isLoggingIn: false }))
+                            .filter(s => !staged.has(s.name));
                     } catch (e) {
                         this.showSnack('Could not fetch sites.', true);
                     } finally {
@@ -2798,18 +3766,70 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.alerts = this.alerts.filter(a => a.id !== id);
                 },
 
-                async deleteSite(name) {
-                    if (!confirm(`Delete ${name}? This removes its files and database.`)) return;
+                deleteSite(name) {
+                    const site = this.sites.find(s => s.name === name);
+                    if (!site) return;
+                    this.stageDeletes([site]);
+                },
 
-                    // Optimistic: pull from the local list immediately so the UI feels
-                    // instant, and enqueue the backend work. processDeleteQueue below
-                    // drains the queue single-file so concurrent deletes don't race on
-                    // shared state (Caddyfile regeneration, /etc/hosts edits).
-                    const idx = this.sites.findIndex(s => s.name === name);
-                    if (idx === -1) return;
-                    this.sites.splice(idx, 1);
-                    this.deleteQueue.push(name);
+                bulkDelete() {
+                    // Two-step inline confirm: first click arms the button for a
+                    // few seconds, second click stages every filtered site. The
+                    // undo snackbar is the safety net after that.
+                    if (!this.bulkArmed) {
+                        this.bulkArmed = true;
+                        this.bulkArmTimer = setTimeout(() => { this.bulkArmed = false; }, 3500);
+                        return;
+                    }
+                    clearTimeout(this.bulkArmTimer);
+                    this.bulkArmed = false;
+                    this.stageDeletes([...this.filteredSites]);
+                },
+
+                stageDeletes(sitesToDelete) {
+                    // Pull the rows from the list immediately (the UI feels
+                    // instant) but hold the backend work for an undo window.
+                    // Nothing is deleted server-side until the window passes.
+                    if (this.pendingDelete) clearTimeout(this.pendingDelete.timer);
+                    const staged = this.pendingDelete ? this.pendingDelete.sites : [];
+                    for (const site of sitesToDelete) {
+                        const idx = this.sites.findIndex(s => s.name === site.name);
+                        if (idx !== -1) { this.sites.splice(idx, 1); staged.push(site); }
+                    }
+                    if (!staged.length) { this.pendingDelete = null; return; }
+                    this.pendingDelete = {
+                        sites: staged,
+                        timer: setTimeout(() => this.commitPendingDeletes(), 5000)
+                    };
+                    const label = staged.length === 1
+                        ? 'Deleted ' + staged[0].name + '.'
+                        : 'Deleted ' + staged.length + ' sites.';
+                    this.showSnack(label, false, {
+                        actionLabel: 'undo',
+                        action: () => this.undoPendingDeletes(),
+                        duration: 5000
+                    });
+                },
+
+                commitPendingDeletes() {
+                    if (!this.pendingDelete) return;
+                    const names = this.pendingDelete.sites.map(s => s.name);
+                    this.pendingDelete = null;
+                    // processDeleteQueue drains the queue single-file so
+                    // concurrent deletes don't race on shared state (Caddyfile
+                    // regeneration, /etc/hosts edits).
+                    this.deleteQueue.push(...names);
                     this.processDeleteQueue();
+                },
+
+                undoPendingDeletes() {
+                    if (!this.pendingDelete) return;
+                    clearTimeout(this.pendingDelete.timer);
+                    // filteredSites re-sorts on render, so push order is fine.
+                    this.sites.push(...this.pendingDelete.sites);
+                    this.pendingDelete = null;
+                    if (this.snackbar.timer) clearTimeout(this.snackbar.timer);
+                    this.snackbar.visible = false;
                 },
 
                 async processDeleteQueue() {
@@ -2826,9 +3846,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         while (this.deleteQueue.length > 0) {
                             while (this.deleteQueue.length > 0) {
                                 const target = this.deleteQueue.shift();
-                                const del = await this.apiPost('delete_site', { site_name: target });
+                                const del = await this.apiPostRetry('delete_site', { site_name: target });
                                 if (del.success) {
-                                    this.showSnack('Site deleted.');
+                                    // Don't stomp a newer batch's undo snackbar
+                                    // with a routine confirmation.
+                                    if (!this.pendingDelete) this.showSnack('Site deleted.');
                                 } else {
                                     anyFailed = true; // apiPost already surfaced the error
                                 }
@@ -2840,7 +3862,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             // command (shell_exec '...&') and returns instantly.
                             // Two unsynchronized frankenphp reload calls otherwise
                             // deadlock Caddy's admin server (10s shutdown timeout).
-                            await this.apiPost('reload_server');
+                            await this.apiPostRetry('reload_server', {}, 3, 10000);
                         }
                     } finally {
                         this.isProcessingQueue = false;
@@ -2928,6 +3950,8 @@ show_general_help() {
     echo "  enable           Starts the Caddy, MariaDB, and Mailpit background services."
     echo "  disable          Stops all background services managed by Cove."
     echo "  status           Check the status of all background services."
+    echo "  health           Diagnose crashes, OPcache pressure, and on-disk hygiene."
+    echo "  transfer         Inspect the backup/restore engine used by pull and push."
     echo "  trust            Install Cove's local CA into browser + system trust stores."
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
@@ -2959,7 +3983,8 @@ display_command_help() {
     local cmd="$1"
     case "$cmd" in
         install)
-            echo "Usage: cove install [--yes]"
+            echo "Usage: cove install [--yes] [--http PORT] [--https PORT]"
+            echo "                    [--db-root-user USER] [--db-root-pass PASS]"
             echo ""
             echo "Installs and configures Homebrew dependencies like Caddy, MariaDB, and Mailpit."
             echo "It also sets up the required directory structure inside '~/Cove'."
@@ -2967,6 +3992,12 @@ display_command_help() {
             echo "Options:"
             echo "  --yes, -y, --force   Skip confirmation prompts for scripted installs."
             echo "                       Auto-enabled when stdin is not a TTY."
+            echo "  --http PORT          Set the HTTP port outright, skipping the port menus."
+            echo "  --https PORT         Set the HTTPS port outright, skipping the port menus."
+            echo "                       Without these, a scripted install keeps the configured"
+            echo "                       ports and reports (rather than prompts on) a conflict."
+            echo "  --db-root-user USER  MariaDB root user, used only if automatic database setup"
+            echo "  --db-root-pass PASS  fails. Without them that fallback needs a terminal."
             ;;
         enable)
             echo "Usage: cove enable"
@@ -2982,6 +4013,29 @@ display_command_help() {
             echo "Usage: cove status"
             echo ""
             echo "Checks the status of all background services."
+            ;;
+        health)
+            echo "Usage: cove health"
+            echo ""
+            echo "Read-only diagnostic. Reports service liveness, the FrankenPHP"
+            echo "process state and last exit code, recent hard segfaults"
+            echo "(classified as OPcache vs Imagick vs other), live OPcache"
+            echo "pressure, and on-disk hygiene (zombie site dirs, oversized"
+            echo "logs). Recommends fixes but changes nothing."
+            ;;
+        transfer)
+            echo "Usage: cove transfer probe [site]"
+            echo ""
+            echo "Reports which tools the backup/restore engine behind 'cove pull' and"
+            echo "'cove push' will use here. Cove implements backup and restore itself"
+            echo "rather than fetching an external script, and degrades gracefully:"
+            echo "archiving prefers zip, then tar, then PHP; the database is dumped and"
+            echo "imported with mysqldump/mysql when present and through WordPress's own"
+            echo "\$wpdb when not. Since the target is always a WordPress install, PHP is"
+            echo "guaranteed — so a host with none of zip, unzip, tar, or a MySQL client"
+            echo "still transfers, just more slowly. Missing tools are installed when the"
+            echo "host allows it, and a remote with no WP-CLI gets wp-cli.phar sideloaded"
+            echo "over SSH."
             ;;
         trust)
             echo "Usage: cove trust"
@@ -3044,7 +4098,13 @@ display_command_help() {
             echo "  list                Lists all custom directives for all managed sites."
             echo ""
             echo "Flags:"
+            echo "  --rules \"...\"       Directives as a string, instead of opening the editor."
+            echo "  --file <path>       Read directives from a file instead of the editor."
             echo "  --force             Skip confirmation prompt (delete only)."
+            echo ""
+            echo "Without --rules/--file, add/update opens an editor on a TTY and otherwise"
+            echo "reads from stdin, so this also works:"
+            echo "  cat rules.conf | cove directive add mysite"
             ;;
         proxy)
             echo "Usage: cove proxy <subcommand>"
@@ -3196,13 +4256,17 @@ display_command_help() {
             echo "  cove log beckon -f    Follow beckon site logs in real-time"
             ;;
         share)
-            echo "Usage: cove share [site]"
+            echo "Usage: cove share [site] [--yes]"
             echo ""
             echo "Creates a temporary public tunnel to share a local site with anyone on the internet."
             echo "Powered by Cloudflare Quick Tunnels (cloudflared installed on-demand)."
             echo ""
             echo "Arguments:"
             echo "  [site]    The site name (optional). If omitted, prompts for selection."
+            echo ""
+            echo "Flags:"
+            echo "  --yes, -y Install cloudflared without asking, if it's missing."
+            echo "            Assumed when stdin is not a TTY."
             echo ""
             echo "Examples:"
             echo "  cove share           Interactive site selection"
@@ -3231,25 +4295,48 @@ display_command_help() {
             echo "  <name>         The name of the site."
             ;;
         pull)
-            echo "Usage: cove pull [--proxy-uploads]"
+            echo "Usage: cove pull [--ssh \"user@host -p 22\"] [--path public/] [--site <name>]"
+            echo "                 [--proxy-uploads] [--yes]"
             echo ""
-            echo "Pulls a remote WordPress site into Cove via an interactive TUI."
-            echo "This command will guide you through providing SSH and path details for the remote site,"
-            echo "then it will create a backup, pull it down, and configure it to run locally."
-            echo "You can choose to create a new site or overwrite an existing one."
+            echo "Pulls a remote WordPress site into Cove. Creates a backup on the remote,"
+            echo "pulls it down, and configures it to run locally."
+            echo ""
+            echo "Prompts for anything you don't pass as a flag. Pass all of them and it"
+            echo "runs unattended — no TTY required."
             echo ""
             echo "Flags:"
+            echo "  --ssh <conn>     Remote SSH connection, e.g. \"user@host.com -p 2222\"."
+            echo "  --path <path>    Remote WordPress root. Defaults to 'public/'."
+            echo "  --site <name>    Destination site. An existing site is OVERWRITTEN;"
+            echo "                   an unused name is created."
+            echo "  --yes, -y        Skip the overwrite confirmation. Required (instead of the"
+            echo "                   prompt) when overwriting an existing site headlessly."
             echo "  --proxy-uploads  Excludes the 'wp-content/uploads' directory from the backup and"
             echo "                   configures the local site to proxy media requests to the live URL."
             echo "                   This saves significant time and disk space for large sites."
+            echo ""
+            echo "Example:"
+            echo "  cove pull --ssh \"dev@example.com -p 22\" --site myblog --yes"
             ;;
         push)
-            echo "Usage: cove push"
+            echo "Usage: cove push [--site <name>] [--ssh \"user@host -p 22\"] [--path public/] [--yes]"
             echo ""
-            echo "Pushes a local Cove site to a remote server via an interactive TUI."
-            echo "This command will guide you through selecting a local site, providing SSH and path"
-            echo "details for the remote site, then it will create a local backup, upload it, and"
-            echo "run a migration script on the remote server to overwrite its contents."
+            echo "Pushes a local Cove site to a remote server. Creates a local backup, uploads"
+            echo "it, and runs a migration on the remote to OVERWRITE its files and database."
+            echo ""
+            echo "Prompts for anything you don't pass as a flag. Pass all of them and it"
+            echo "runs unattended — no TTY required."
+            echo ""
+            echo "Flags:"
+            echo "  --site <name>    Local WordPress site to push."
+            echo "  --ssh <conn>     Remote SSH connection, e.g. \"user@host.com -p 2222\"."
+            echo "  --path <path>    Remote WordPress root. Defaults to 'public/'."
+            echo "  --yes, -y        Confirm the overwrite. Unlike other commands this is never"
+            echo "                   assumed when headless — push destroys a live remote site,"
+            echo "                   so it must always be stated explicitly."
+            echo ""
+            echo "Example:"
+            echo "  cove push --site myblog --ssh \"dev@example.com -p 22\" --yes"
             ;;
         reload)
             echo "Usage: cove reload"
@@ -3378,10 +4465,21 @@ main() {
             create_whoops_bootstrap
             refresh_all_mu_plugins
             install_watchdog_service
+            # Orphan-clearing mailpit runner + throttled KeepAlive. Safe to
+            # re-run: rewrites the unit and restarts mailpit once.
+            install_mailpit_service
             ;;
         status)
             check_dependencies
             cove_status
+            ;;
+        health)
+            check_dependencies
+            cove_health
+            ;;
+        transfer)
+            check_dependencies
+            cove_transfer "$@"
             ;;
         trust)
             check_dependencies
@@ -3915,6 +5013,19 @@ cove_delete() {
     fi
     echo "✅ Directory deleted."
 
+    # A reload already in flight snapshotted the Sites listing while this
+    # site still existed. When that stale Caddyfile applies, Caddy re-creates
+    # the site's logs/ skeleton — which resurrects the site in the dashboard.
+    # Leave a tombstone so cove_reload prunes the skeleton, and flag the
+    # in-flight holder to re-run against the post-delete Sites listing.
+    mkdir -p "$COVE_DIR/cache/delete-tombstones"
+    touch "$COVE_DIR/cache/delete-tombstones/$site_name.localhost"
+    local reload_holder
+    reload_holder=$(cat "$COVE_DIR/.reload.lock" 2>/dev/null)
+    if [ -n "$reload_holder" ] && kill -0 "$reload_holder" 2>/dev/null; then
+        touch "$COVE_DIR/.reload.pending" 2>/dev/null || true
+    fi
+
     # --- Delete Custom Caddy Directives ---
     local custom_conf_file="$CUSTOM_CADDY_DIR/$site_name.localhost"
     if [ -f "$custom_conf_file" ]; then
@@ -3964,11 +5075,39 @@ cove_delete() {
     echo "✅ Site '$site_name.localhost' has been removed."
 }
 cove_directive_add_or_update() {
-    local site_name="$1"
+    local site_name=""
+    local arg_rules=""
+    local arg_file=""
+    local have_rules=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rules) arg_rules="$2"; have_rules=true; shift 2 ;;
+            --rules=*) arg_rules="${1#*=}"; have_rules=true; shift ;;
+            --file) arg_file="$2"; shift 2 ;;
+            --file=*) arg_file="${1#*=}"; shift ;;
+            -h|--help) display_command_help directive; exit 0 ;;
+            -*)
+                gum style --foreground red "❌ Unknown option: $1"
+                echo "Usage: cove directive <add|update> <name> [--rules \"...\" | --file <path>]"
+                exit 1
+                ;;
+            *) [ -z "$site_name" ] && site_name="$1"; shift ;;
+        esac
+    done
+
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: Please provide a site name."
-        echo "Usage: cove directive <add|update> <name>"
+        echo "Usage: cove directive <add|update> <name> [--rules \"...\" | --file <path>]"
         exit 1
+    fi
+
+    if [ -n "$arg_file" ]; then
+        if [ ! -f "$arg_file" ]; then
+            gum style --foreground red "❌ Error: File not found: $arg_file"
+            exit 1
+        fi
+        arg_rules=$(cat "$arg_file")
+        have_rules=true
     fi
     
     local site_hostname="${site_name}.localhost"
@@ -3986,8 +5125,11 @@ cove_directive_add_or_update() {
     fi
     
     local custom_rules
-    # If stdin is a terminal (interactive), use gum. Otherwise, read from pipe.
-    if [ -t 0 ]; then
+    # --rules/--file win outright; otherwise a TTY gets the editor and a pipe
+    # gets read from stdin (the path `cove pull --proxy-uploads` uses).
+    if $have_rules; then
+        custom_rules="$arg_rules"
+    elif [ -t 0 ]; then
         if [ -f "$custom_conf_file" ]; then
             echo "📝 Editing custom Caddy directives for $site_hostname..."
         else
@@ -4095,6 +5237,10 @@ cove_disable() {
         pkg_service stop mariadb &>/dev/null
         echo "   - Stopping Mailpit..."
         launchctl unload "$COVE_DIR/com.cove.mailpit.plist" &>/dev/null
+        # Reap any leftover mailpit so it can't hold :1025/:8025 after unload
+        # and thrash KeepAlive on the next enable (see install_mailpit_service).
+        # -x matches basename only — never a random path containing "mailpit".
+        pkill -x mailpit &>/dev/null || true
     fi
 
     # Stop services on Linux
@@ -4127,6 +5273,9 @@ cove_disable() {
         $SUDO_CMD systemctl stop "$mariadb_service" &>/dev/null
         echo "   - Stopping Mailpit..."
         $SUDO_CMD systemctl stop mailpit &>/dev/null
+        # Same orphan reap as macOS: a manual or leftover mailpit would hold
+        # the ports and fight the next enable's Restart=on-failure loop.
+        pkill -x mailpit &>/dev/null || true
     fi
     
     echo "✅ Services stopped."
@@ -4141,42 +5290,10 @@ cove_enable() {
         echo "   - Starting MariaDB..."
         start_macos_mariadb
 
-        local plist_path="$COVE_DIR/com.cove.mailpit.plist"
-        local mailpit_bin
-        mailpit_bin=$(command -v mailpit)
-
-        # Stop and unload any existing service to ensure our custom one is used.
-        launchctl unload "$plist_path" &>/dev/null
-        pkg_service stop mailpit &>/dev/null
-
-        echo "   - Generating custom Mailpit service file..."
-        cat > "$plist_path" << EOM
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-        <key>KeepAlive</key>
-        <true/>
-        <key>Label</key>
-        <string>com.cove.mailpit</string>
-        <key>ProgramArguments</key>
-        <array>
-                <string>$mailpit_bin</string>
-                <string>--database</string>
-                <string>$COVE_DIR/mailpit.db</string>
-        </array>
-        <key>RunAtLoad</key>
-        <true/>
-        <key>StandardErrorPath</key>
-        <string>$LOGS_DIR/mailpit.log</string>
-        <key>StandardOutPath</key>
-        <string>$LOGS_DIR/mailpit.log</string>
-</dict>
-</plist>
-EOM
-        # Load and start the new service.
-        launchctl load "$plist_path"
-        launchctl start com.cove.mailpit
+        # Mailpit: runner + launchd unit (clears orphaned mailpit that would
+        # otherwise thrash KeepAlive on a bind failure). Shared helper so
+        # post-upgrade can refresh it without a full re-enable.
+        install_mailpit_service
     fi
     
     if [ "$OS" == "linux" ]; then
@@ -4187,34 +5304,12 @@ EOM
         echo "   - Starting MariaDB ($mariadb_service)..."
         $SUDO_CMD systemctl enable "$mariadb_service" &>/dev/null
         $SUDO_CMD systemctl restart "$mariadb_service"
-        
-        local service_path="/etc/systemd/system/mailpit.service"
-        local mailpit_bin
-        mailpit_bin=$(command -v mailpit)
+
+        # Mailpit unit + orphan-clearing runner (see install_mailpit_service).
+        install_mailpit_service
+
         local current_user
         current_user=$(whoami)
-
-        echo "   - Generating custom Mailpit service file..."
-        # Write the unit file directly to its destination via sudo tee.
-        # Previously we used mktemp + sudo mv, but on Fedora/SELinux mv
-        # preserves the source file's user_tmp_t context from /tmp, and
-        # systemd refuses to load units outside the systemd_unit_file_t
-        # type. Writing fresh into /etc/systemd/system/ picks up that
-        # directory's type-transition rule automatically.
-        $SUDO_CMD tee "$service_path" >/dev/null << EOM
-[Unit]
-Description=Mailpit Service for Cove
-After=network.target
-
-[Service]
-ExecStart=$mailpit_bin --database $COVE_DIR/mailpit.db
-Restart=always
-User=$current_user
-
-[Install]
-WantedBy=multi-user.target
-EOM
-        $SUDO_CMD chmod 644 "$service_path"
 
         # --- FrankenPHP / Cove systemd unit ---
         # Mirrors the mailpit pattern so the stack survives a reboot. The
@@ -4226,8 +5321,8 @@ EOM
         frankenphp_bin=$(command -v "$CADDY_CMD")
 
         echo "   - Generating Cove FrankenPHP service file..."
-        # Same sudo-tee pattern as the mailpit unit above; see the note
-        # there for why mktemp + sudo mv doesn't survive SELinux.
+        # Same sudo-tee pattern as the mailpit unit (in install_mailpit_service);
+        # see the note there for why mktemp + sudo mv doesn't survive SELinux.
         $SUDO_CMD tee "$cove_service_path" >/dev/null << EOM
 [Unit]
 Description=FrankenPHP for Cove
@@ -4259,10 +5354,9 @@ WantedBy=multi-user.target
 EOM
         $SUDO_CMD chmod 644 "$cove_service_path"
 
-        # Reload systemd, then enable and start both Cove-managed services
+        # Reload systemd, then enable and start the Cove FrankenPHP unit.
+        # Mailpit was already enabled/restarted by install_mailpit_service.
         $SUDO_CMD systemctl daemon-reload
-        $SUDO_CMD systemctl enable mailpit &>/dev/null
-        $SUDO_CMD systemctl restart mailpit
         $SUDO_CMD systemctl enable cove.service &>/dev/null
         # Stop any ad-hoc frankenphp started by a pre-1.10 cove_enable so
         # systemctl can take ownership of the listening sockets cleanly.
@@ -4320,6 +5414,263 @@ EOM
         gum style --foreground red "❌ Caddy server failed to start. Check $LOGS_DIR/caddy-process.log for errors."
     fi
 }
+cove_health() {
+    # Read-only diagnostic. Aggregates the signals you'd otherwise gather by
+    # hand after a crash: service liveness, FrankenPHP process health + last
+    # exit code, recent hard segfaults (classified), live OPcache pressure, and
+    # on-disk hygiene. Never mutates anything — it only recommends fixes.
+    local warn=0 crit=0
+    echo ""
+    gum style --bold "🩺 Cove health check"
+    echo ""
+
+    # --- Services -----------------------------------------------------------
+    local caddy_up=false
+    is_caddy_running && caddy_up=true
+    echo "Services"
+    if $caddy_up; then echo "  ✅ Caddy (FrankenPHP) running"; else echo "  ❌ Caddy not responding on :2019"; crit=$((crit+1)); fi
+    if [ "$OS" = "macos" ]; then
+        if is_mariadb_running; then echo "  ✅ MariaDB running"; else echo "  ❌ MariaDB stopped"; crit=$((crit+1)); fi
+        if pgrep -x mailpit &>/dev/null; then echo "  ✅ Mailpit running"; else echo "  ⚠️  Mailpit stopped"; warn=$((warn+1)); fi
+        # launchd's restart counter is the thrash tell: a healthy long-lived
+        # mailpit sits at runs≈1–a few; an orphan-port fight climbs into the
+        # tens of thousands (observed 51k). Surface it before the log fills.
+        local mp_runs
+        mp_runs=$(launchctl print "gui/$(id -u)/com.cove.mailpit" 2>/dev/null | awk '/^[[:space:]]*runs =/{print $3; exit}')
+        if [ -n "$mp_runs" ] && [ "$mp_runs" -gt 20 ] 2>/dev/null; then
+            echo "  ⚠️  Mailpit launchd has restarted $mp_runs times (orphan holding :1025/:8025?)"
+            echo "     Fix: cove enable   (reinstalls the orphan-clearing mailpit runner)"
+            warn=$((warn+1))
+        fi
+    else
+        local mdb; mdb=$(get_mariadb_service_name)
+        if systemctl is-active --quiet "$mdb" 2>/dev/null; then echo "  ✅ MariaDB running"; else echo "  ❌ MariaDB stopped"; crit=$((crit+1)); fi
+        if systemctl is-active --quiet mailpit 2>/dev/null; then echo "  ✅ Mailpit running"; else echo "  ⚠️  Mailpit stopped"; warn=$((warn+1)); fi
+    fi
+
+    # --- FrankenPHP process + last exit code --------------------------------
+    echo ""
+    echo "FrankenPHP process"
+    local fpid=""
+    [ -f "$COVE_DIR/caddy.pid" ] && fpid=$(cat "$COVE_DIR/caddy.pid" 2>/dev/null)
+    if [ -n "$fpid" ] && kill -0 "$fpid" 2>/dev/null; then
+        # Uptime via ps etime (portable enough for display).
+        local up; up=$(ps -o etime= -p "$fpid" 2>/dev/null | tr -d ' ')
+        echo "  ✅ pid $fpid up ${up:-?}"
+    else
+        echo "  ⚠️  no live FrankenPHP pid on file"; warn=$((warn+1))
+    fi
+    # launchd's last-exit status is the crash tell: a negative value is the
+    # signal that killed the previous instance (-11 = SIGSEGV). macOS only.
+    if [ "$OS" = "macos" ]; then
+        local last_exit
+        last_exit=$(launchctl list 2>/dev/null | awk '$3=="com.cove.caddy"{print $2}')
+        # Informational only (no warn++): launchd keeps showing the last
+        # non-zero exit until the next clean restart, so this lingers long
+        # after recovery. The crash section above owns severity (with recency).
+        if [ -n "$last_exit" ] && [ "$last_exit" != "0" ]; then
+            if [ "$last_exit" = "-11" ]; then
+                echo "  ℹ️  last exit -11 (SIGSEGV) — a prior instance segfaulted (persists until next clean restart)"
+            elif [ "$last_exit" = "-6" ]; then
+                echo "  ℹ️  last exit -6 (SIGABRT) — a prior instance hit a Go fatal (PHP segfault turned abort)"
+            elif [ "$last_exit" = "-9" ]; then
+                # SIGKILL is what Cove's own watchdog sends, so this is usually
+                # a deliberate restart of a wedged server — not a crash. Say so
+                # rather than implying something went wrong unexplained.
+                echo "  ℹ️  last exit -9 (SIGKILL) — a prior instance was killed, typically the watchdog restarting a wedged server"
+            else
+                echo "  ℹ️  last exit $last_exit — a prior instance died abnormally"
+            fi
+        fi
+    fi
+
+    # --- Recent hard crashes (macOS DiagnosticReports) ----------------------
+    # Each .ips is one hard segfault. Classify by the culprit frames: the
+    # OPcache-SHM path (this box's common cause) vs Imagick's signal-handler
+    # bug vs anything else. grep the raw report — no JSON parser dependency.
+    if [ "$OS" = "macos" ]; then
+        echo ""
+        echo "Hard crashes (last 24h)"
+        local dr="$HOME/Library/Logs/DiagnosticReports"
+        local oc_n=0 im_n=0 other_n=0 total=0 newest=""
+        if [ -d "$dr" ]; then
+            # -mtime -1 = within 24h. Null-safe loop.
+            while IFS= read -r rpt; do
+                [ -n "$rpt" ] || continue
+                total=$((total+1))
+                # Classify by culprit frames. OPcache SHM family is broad: the
+                # crash can land in compile, persist, optimize, interned-string,
+                # or shared-alloc frames — all the same root (arena corruption).
+                # "other" is usually the same instability caught on a bystander
+                # thread (e.g. a long-poll parked in sleep), not a compile frame.
+                if grep -qE "cache_script_in_shared_memory|zend_persist|zend_accel|zend_optimize_script|zend_analyze_call|zend_shared_alloc|interned_string|lex_scan|zend_hash_func" "$rpt" 2>/dev/null; then
+                    oc_n=$((oc_n+1))
+                elif grep -qiE "MagickWand|Imagick|Magick" "$rpt" 2>/dev/null; then
+                    im_n=$((im_n+1))
+                else
+                    other_n=$((other_n+1))
+                fi
+                # Track the true newest (find is unordered). Filename is
+                # frankenphp-YYYY-MM-DD-HHMMSS.ips → strip prefix, drop dashes.
+                local key; key=$(basename "$rpt" .ips | sed -E 's/^frankenphp-//; s/-//g')
+                [ "$key" \> "$newest" ] && newest="$key"
+            done < <(find "$dr" -name 'frankenphp-*.ips' -mtime -1 2>/dev/null)
+        fi
+        if [ "$total" -eq 0 ]; then
+            echo "  ✅ none"
+        else
+            # Severity by recency. A real crash loop produces a crash every few
+            # minutes, so a report in the last 5 min = actively looping
+            # (critical). Older reports are history to note (warning) — notably
+            # the single birth-crash that spawned a now-healthy process ages out
+            # of the window within minutes. (A fixed window beats -newer on the
+            # pidfile: macOS finalizes the crash report a second or two after the
+            # crash, so the birth-crash report often lands just after the
+            # respawned pidfile and would false-positive as "active".)
+            local active5; active5=$(find "$dr" -name 'frankenphp-*.ips' -mmin -5 2>/dev/null | grep -c .)
+            local nice_ts; nice_ts=$(echo "$newest" | sed -E 's/^[0-9]{8}([0-9]{2})([0-9]{2})([0-9]{2})$/\1:\2:\3/')
+            if [ "$active5" -gt 0 ]; then
+                echo "  ❌ $total in 24h ($active5 in last 5 min — ACTIVELY CRASHING); most recent $nice_ts"
+                crit=$((crit+1))
+            else
+                echo "  ⚠️  $total in 24h; most recent $nice_ts (none in last 5 min — appears resolved)"
+                warn=$((warn+1))
+            fi
+            [ "$oc_n"    -gt 0 ] && echo "     • $oc_n OPcache shared-memory (see OPcache section below)"
+            [ "$im_n"    -gt 0 ] && echo "     • $im_n Imagick signal-handler (GD-editor MU-plugin should prevent — verify it's active)"
+            [ "$other_n" -gt 0 ] && echo "     • $other_n other (bystander thread; usually the same OPcache instability)"
+        fi
+    fi
+
+    # --- Live OPcache pressure ----------------------------------------------
+    # The SHM is per-process, so we must ask the RUNNING server, not a fresh
+    # php-cli (which would report an empty cache). Drop a probe into the
+    # dashboard's own docroot ($GUI_DIR, served at cove.localhost), curl it,
+    # remove it. Contained to Cove's dir — never touches a user's site.
+    echo ""
+    echo "OPcache pressure"
+    if ! $caddy_up; then
+        echo "  ⏭️  skipped (Caddy not running)"
+    else
+        local probe="_cove_health_oc_$$.php"
+        cat > "$GUI_DIR/$probe" 2>/dev/null <<'PHP'
+<?php
+header('Content-Type: text/plain');
+if (!function_exists('opcache_get_status')) { echo "noopcache\n"; exit; }
+$s = @opcache_get_status(false); $c = @opcache_get_configuration();
+if (!$s || !$c) { echo "disabled\n"; exit; }
+$st = $s['opcache_statistics']; $is = $s['interned_strings_usage'];
+$int_total = $is['used_memory'] + $is['free_memory'];
+printf("hit_rate=%.1f\n", $st['opcache_hit_rate']);
+printf("cached=%d\n", $st['num_cached_scripts']);
+printf("maxfiles=%d\n", $c['directives']['opcache.max_accelerated_files']);
+printf("interned_used_pct=%.0f\n", $int_total ? 100*$is['used_memory']/$int_total : 0);
+printf("interned_mb=%.0f\n", $int_total/1048576);
+printf("oom_restarts=%d\n", $st['oom_restarts']);
+printf("hash_restarts=%d\n", $st['hash_restarts']);
+printf("optimizer=%d\n", $c['directives']['opcache.optimization_level']);
+PHP
+        # Retry: a probe landing during a config reload hangs (the swap pauses
+        # serving on a large box), which would otherwise look like a failure.
+        local out="" attempt
+        for attempt in 1 2 3; do
+            out=$(curl -sk --max-time 12 "https://cove.localhost:${HTTPS_PORT}/$probe" 2>/dev/null)
+            [ -n "$out" ] && break
+            sleep 2
+        done
+        rm -f "$GUI_DIR/$probe" 2>/dev/null
+        if [ -z "$out" ] || echo "$out" | grep -q "noopcache\|disabled"; then
+            echo "  ⚠️  could not read OPcache status (${out:-no response; server may be mid-reload})"; warn=$((warn+1))
+        else
+            local hit cached maxf ipct imb oom hashr opt
+            hit=$(echo "$out"   | sed -n 's/^hit_rate=//p')
+            cached=$(echo "$out"| sed -n 's/^cached=//p')
+            maxf=$(echo "$out"  | sed -n 's/^maxfiles=//p')
+            ipct=$(echo "$out"  | sed -n 's/^interned_used_pct=//p')
+            imb=$(echo "$out"   | sed -n 's/^interned_mb=//p')
+            oom=$(echo "$out"   | sed -n 's/^oom_restarts=//p')
+            hashr=$(echo "$out" | sed -n 's/^hash_restarts=//p')
+            opt=$(echo "$out"   | sed -n 's/^optimizer=//p')
+            echo "  interned buffer ${ipct}% full (${imb} MB) · cached ${cached}/${maxf} · hit ${hit}%"
+            echo "  restarts: ${oom} OOM, ${hashr} max-files"
+            local pressure=false
+            [ "${ipct:-0}" -ge 85 ] 2>/dev/null && pressure=true
+            [ "${oom:-0}" -gt 0 ] 2>/dev/null && pressure=true
+            [ "${hashr:-0}" -gt 0 ] 2>/dev/null && pressure=true
+            # cached within 10% of the cap = about to hash_restart
+            if [ -n "$cached" ] && [ -n "$maxf" ] && [ "$maxf" -gt 0 ] 2>/dev/null; then
+                [ $((cached*100/maxf)) -ge 90 ] 2>/dev/null && pressure=true
+            fi
+            if $pressure; then
+                echo "  ⚠️  OPcache under pressure — SHM restarts under ZTS can segfault FrankenPHP."
+                echo "     Raise limits in $PHP_INI_FILE, then fully restart FrankenPHP:"
+                echo "       opcache.memory_consumption = 768"
+                echo "       opcache.interned_strings_buffer = 128"
+                echo "       opcache.max_accelerated_files = 200000"
+                if [ "$OS" = "macos" ]; then
+                    echo "     Restart: launchctl kickstart -k gui/\$(id -u)/com.cove.caddy"
+                else
+                    echo "     Restart: cove disable && cove enable"
+                fi
+                warn=$((warn+1))
+            else
+                echo "  ✅ within healthy limits"
+            fi
+            [ "${opt:-1}" != "0" ] && echo "  ℹ️  optimizer on (0x$(printf '%X' "${opt:-0}")); level 0 is recommended for dev (validate_timestamps recompiles constantly)"
+        fi
+    fi
+
+    # --- On-disk hygiene ----------------------------------------------------
+    echo ""
+    echo "Hygiene"
+    # Zombie skeletons: a Sites/ dir with no public/ and no custom directive —
+    # the leftover a reload-racing-delete used to create (see delete/reload fix).
+    local zombies=0 zlist=""
+    if [ -d "$SITES_DIR" ]; then
+        local sp bn
+        for sp in "$SITES_DIR"/*; do
+            [ -d "$sp" ] || continue
+            bn=$(basename "$sp")
+            if [ ! -d "$sp/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$bn" ]; then
+                zombies=$((zombies+1)); zlist="$zlist $bn"
+            fi
+        done
+    fi
+    if [ "$zombies" -gt 0 ]; then
+        echo "  ⚠️  $zombies zombie site dir(s):$zlist"
+        echo "     Clear with: cove reload   (prunes public/-less skeletons)"
+        warn=$((warn+1))
+    else
+        echo "  ✅ no zombie site directories"
+    fi
+    # Oversized logs (the process log grows on every restart; mailpit.log
+    # balloons under a bind-failure KeepAlive thrash).
+    local biglog=0 lf sz
+    for lf in "$LOGS_DIR/caddy-process.log" "$LOGS_DIR/errors.log" "$LOGS_DIR/mailpit.log"; do
+        [ -f "$lf" ] || continue
+        sz=$(stat -f%z "$lf" 2>/dev/null || stat -c%s "$lf" 2>/dev/null || echo 0)
+        if [ "$sz" -gt 52428800 ]; then
+            echo "  ⚠️  $(basename "$lf") is $((sz/1048576)) MB"
+            if [ "$(basename "$lf")" = "mailpit.log" ]; then
+                echo "     (bind-failure thrash? reinstall with: cove enable)"
+            fi
+            biglog=$((biglog+1))
+        fi
+    done
+    [ "$biglog" -eq 0 ] && echo "  ✅ logs within size limits"
+
+    # --- Verdict ------------------------------------------------------------
+    echo ""
+    if [ "$crit" -gt 0 ]; then
+        gum style --foreground red "❌ $crit critical, $warn warning(s) — see above."
+    elif [ "$warn" -gt 0 ]; then
+        gum style --foreground yellow "⚠️  $warn warning(s) — see above."
+    else
+        gum style --foreground green "✅ All healthy."
+    fi
+    echo ""
+}
+
 # A robust function to check, validate, and install a given dependency.
 install_dependency() {
     local cmd_name="$1"      # The command to check for (e.g., "gum")
@@ -4454,19 +5805,52 @@ install_dependency() {
 
 cove_install() {
     local auto_yes=false
+    local explicit_http=""
+    local explicit_https=""
+    local db_root_user=""
+    local db_root_pass=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --yes|-y|--force)
                 auto_yes=true
                 shift
                 ;;
+            --http) explicit_http="$2"; shift 2 ;;
+            --http=*) explicit_http="${1#*=}"; shift ;;
+            --https) explicit_https="$2"; shift 2 ;;
+            --https=*) explicit_https="${1#*=}"; shift ;;
+            --db-root-user) db_root_user="$2"; shift 2 ;;
+            --db-root-user=*) db_root_user="${1#*=}"; shift ;;
+            --db-root-pass) db_root_pass="$2"; shift 2 ;;
+            --db-root-pass=*) db_root_pass="${1#*=}"; shift ;;
+            -h|--help)
+                display_command_help install
+                exit 0
+                ;;
             *)
                 echo "❌ Unknown argument: $1" >&2
-                echo "Usage: cove install [--yes]" >&2
+                echo "Usage: cove install [--yes] [--http PORT] [--https PORT] [--db-root-user USER] [--db-root-pass PASS]" >&2
                 exit 1
                 ;;
         esac
     done
+
+    # Explicit ports bypass both interactive port menus below entirely.
+    if [ -n "$explicit_http" ] || [ -n "$explicit_https" ]; then
+        local want_http="${explicit_http:-$HTTP_PORT}"
+        local want_https="${explicit_https:-$HTTPS_PORT}"
+        if [[ ! "$want_http" =~ ^[0-9]+$ ]] || [ "$want_http" -lt 1 ] || [ "$want_http" -gt 65535 ]; then
+            echo "❌ Invalid HTTP port: $want_http" >&2; exit 1
+        fi
+        if [[ ! "$want_https" =~ ^[0-9]+$ ]] || [ "$want_https" -lt 1 ] || [ "$want_https" -gt 65535 ]; then
+            echo "❌ Invalid HTTPS port: $want_https" >&2; exit 1
+        fi
+        if [ "$want_http" = "$want_https" ]; then
+            echo "❌ HTTP and HTTPS ports must differ." >&2; exit 1
+        fi
+        HTTP_PORT="$want_http"
+        HTTPS_PORT="$want_https"
+    fi
 
     # Non-interactive callers (CI, installer piping, dashboards) have no TTY;
     # gum confirm / gum choose abort there. Auto-promote so the install doesn't
@@ -4527,8 +5911,16 @@ cove_install() {
     local original_https="$HTTPS_PORT"
     local port_choice_made=false
 
+    # Both menus below are gum choose, which aborts without a TTY. --yes (set
+    # automatically when headless) and explicit --http/--https both mean "don't
+    # ask" — keep whatever ports are configured and move on.
+    local ports_decided=false
+    if $auto_yes || [ -n "$explicit_http" ] || [ -n "$explicit_https" ]; then
+        ports_decided=true
+    fi
+
     # --- Reconfigure path ---
-    if [ "$HTTP_PORT" != "80" ] || [ "$HTTPS_PORT" != "443" ]; then
+    if ! $ports_decided && { [ "$HTTP_PORT" != "80" ] || [ "$HTTPS_PORT" != "443" ]; }; then
         echo ""
         gum style --foreground "212" \
             "Cove is currently configured for custom ports: ${HTTP_PORT} / ${HTTPS_PORT}"
@@ -4581,6 +5973,17 @@ cove_install() {
             echo "   Port ${HTTPS_PORT} is in use by: ${app:-another process}"
         fi
         echo ""
+
+        # Headless (or --yes / explicit ports): report the conflict and carry
+        # on with the requested ports rather than stalling on a menu. The
+        # caller picked these deliberately, and re-running with
+        # --http/--https is the way to change them.
+        if $ports_decided; then
+            echo "   Proceeding with ${HTTP_PORT}/${HTTPS_PORT} anyway."
+            echo "   Re-run with --http PORT --https PORT to choose different ports."
+            echo ""
+        else
+
         echo "Cove needs an HTTP and HTTPS port. How would you like to proceed?"
         echo ""
 
@@ -4613,6 +6016,7 @@ cove_install() {
                 exit 1
                 ;;
         esac
+        fi
         port_choice_made=true
     fi
 
@@ -4846,10 +6250,13 @@ INI
             user_created_successfully=true
         else
             echo "   - ⚠️ Automatic setup failed. Falling back to manual credential entry..."
-            local root_user
-            root_user=$(gum input --value "root" --prompt "MariaDB Root Username: ")
-            local root_pass
-            root_pass=$(gum input --password --placeholder "Password for '$root_user'")
+            local root_user="$db_root_user"
+            local root_pass="$db_root_pass"
+            if [ -z "$root_user" ]; then
+                require_interactive "MariaDB root credentials (automatic setup failed)" "--db-root-user USER --db-root-pass PASS"
+                root_user=$(gum input --value "root" --prompt "MariaDB Root Username: ")
+                root_pass=$(gum input --password --placeholder "Password for '$root_user'")
+            fi
 
             if echo "$sql_command" | mysql -u "$root_user" -p"$root_pass"; then
                 echo "   - ✅ Manual database user creation successful."
@@ -6206,8 +7613,11 @@ cove_proxy_add() {
     # callers (dashboard, CI) can overwrite safely.
     [ -t 0 ] || force=true
 
-    # Interactive mode if arguments not provided
+    # Interactive mode if arguments not provided. All three values are
+    # positional, so a headless caller supplies them on the command line
+    # rather than hitting a prompt it can't answer.
     if [ -z "$name" ]; then
+        require_interactive "The proxy name" "it positionally: cove proxy add <name> <domain> <target>"
         echo "📝 Adding a new reverse proxy entry..."
         name=$(gum input --width 0 --placeholder "Proxy name (e.g., opencode)")
     fi
@@ -6234,6 +7644,7 @@ cove_proxy_add() {
     fi
 
     if [ -z "$domain" ]; then
+        require_interactive "The proxy domain" "it positionally: cove proxy add <name> <domain> <target>"
         domain=$(gum input --width 0 --placeholder "Domain to listen on (e.g., myhost.tailnet.ts.net)")
     fi
 
@@ -6243,6 +7654,7 @@ cove_proxy_add() {
     fi
 
     if [ -z "$target" ]; then
+        require_interactive "The proxy target" "it positionally: cove proxy add <name> <domain> <target>"
         target=$(gum input --width 0 --placeholder "Target to proxy to (e.g., 127.0.0.1:4096)")
     fi
 
@@ -6329,6 +7741,7 @@ cove_proxy_delete() {
             exit 0
         fi
 
+        require_interactive "Choosing a proxy to delete" "the proxy name as an argument: cove proxy delete <name>"
         echo "🗑️ Select a proxy to delete:"
         name=$(ls "$PROXY_DIR" | gum choose)
 
@@ -6406,6 +7819,12 @@ cove_proxy() {
 }
 
 cove_pull() {
+    # Sourced up front, not just before the post-migration step. Anything below
+    # that touches DB_USER / DB_PASSWORD needs it, and an unset DB_USER turns
+    # `mysql -u "$DB_USER" -p"$DB_PASSWORD"` into a bare `-p` that stops and
+    # prompts "Enter password:" — which hangs a headless pull outright.
+    source_config
+
     # --- UI/Logging Functions ---
     log_step() { 
         echo ""
@@ -6420,13 +7839,40 @@ cove_pull() {
     }
 
     # --- Argument Parsing ---
+    # Every prompt below has a flag equivalent so the whole pull can run
+    # headless (CI, scripts, an AI agent). Omit a flag and you get the prompt
+    # for it — but only when there's a TTY to prompt on.
     local proxy_uploads=false
-    for arg in "$@"; do
-        if [ "$arg" == "--proxy-uploads" ]; then
-            proxy_uploads=true
-            break
-        fi
+    local arg_ssh=""
+    local arg_path=""
+    local arg_site=""
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --proxy-uploads) proxy_uploads=true; shift ;;
+            --force|--yes|-y) force=true; shift ;;
+            --ssh)  arg_ssh="$2";  shift 2 ;;
+            --ssh=*)  arg_ssh="${1#*=}";  shift ;;
+            --path) arg_path="$2"; shift 2 ;;
+            --path=*) arg_path="${1#*=}"; shift ;;
+            --site) arg_site="$2"; shift 2 ;;
+            --site=*) arg_site="${1#*=}"; shift ;;
+            -h|--help) display_command_help pull; exit 0 ;;
+            *)
+                gum style --foreground red "❌ Unknown option: $1" >&2
+                echo "Usage: cove pull [--ssh \"user@host -p 22\"] [--path public/] [--site <name>] [--proxy-uploads] [--yes]" >&2
+                exit 1
+                ;;
+        esac
     done
+
+    # Headless, the destination can't be prompted for later — so catch a
+    # missing --site now rather than after a full SSH round-trip to the
+    # remote. (Interactively the picker runs after validation on purpose: it
+    # proposes a site name derived from the remote URL.)
+    if is_noninteractive && [ -z "$arg_site" ]; then
+        require_interactive "Choosing a destination site" "--site <name> (an existing site is overwritten, a new name is created)"
+    fi
 
     # Define quiet SSH options to prevent host key warnings. ControlMaster
     # shares a single authenticated connection across every ssh call below
@@ -6442,111 +7888,185 @@ cove_pull() {
     # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
     trap "rm -f '$ssh_ctl'" EXIT
 
+    # Bulk archive transfers deliberately bypass the multiplexed socket above.
+    # Sharing one channel with the control commands throttled a 30MB upload to
+    # ~16KB/s against a real gateway and then stalled outright, while the same
+    # file moved in 15s on its own connection. Key auth makes the extra
+    # connection free; with a password you are asked once more.
+    local ssh_bulk_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
+
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pulling a remote WordPress site into Cove."
     # --- 1. Gather Remote Info ---
-    log_step "Enter remote server details"
-    local remote_ssh
-    remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    local remote_ssh="$arg_ssh"
+    if [ -z "$remote_ssh" ]; then
+        require_interactive "The SSH connection" "--ssh \"user@host -p 2222\""
+        log_step "Enter remote server details"
+        remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    fi
     if [ -z "$remote_ssh" ]; then log_error "SSH connection cannot be empty."; fi
 
     # Trim the "ssh " prefix if the user includes it.
     remote_ssh="${remote_ssh##ssh }"
 
-    local remote_path
-    remote_path=$(gum input --width 0 --value "public/" --prompt "Path to WordPress Root: ")
+    # The remote root defaults to public/ — the same value the prompt
+    # pre-fills — so --path is only needed for non-standard layouts.
+    local remote_path="$arg_path"
+    if [ -z "$remote_path" ]; then
+        if is_noninteractive; then
+            remote_path="public/"
+        else
+            remote_path=$(gum input --width 0 --value "public/" --prompt "Path to WordPress Root: ")
+        fi
+    fi
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
     local remote_path_q
     remote_path_q=$(shell_quote "$remote_path")
 
     # --- 2. Validate Remote Site ---
+    # One probe round-trip answers both questions at once: is there a usable
+    # WordPress here, and which tools does this host actually have? The answer
+    # decides whether we need to sideload WP-CLI before doing any real work.
     log_step "Validating remote WordPress site..."
+    local wp_cli_flag=""
+    wp_cli_flag=$(transfer_ensure_remote_wp_cli "$ssh_opts" "$remote_ssh" "$remote_path")
+    local remote_probe
+    remote_probe=$(transfer_remote "$ssh_opts" "$remote_ssh" probe "$remote_path" $wp_cli_flag 2>/dev/null)
     local remote_url
-    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path_q && wp option get home 2>/dev/null")
+    remote_url=$(echo "$remote_probe" | sed -n 's/^home=//p')
     domain=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//')
-    
+
     if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
+        if echo "$remote_probe" | grep -q '^wp_cli=missing'; then
+            log_error "No WP-CLI on the remote and the sideload failed. Install WP-CLI there, or check that PHP is available."
+        fi
         log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
     fi
     log_success "Found WordPress site: $remote_url"
+    # Worth surfacing: a host on the PHP tier works, just more slowly.
+    local remote_arch remote_db
+    remote_arch=$(echo "$remote_probe" | sed -n 's/^archiver=//p')
+    remote_db=$(echo "$remote_probe" | sed -n 's/^db_dump=//p')
+    if [ "$remote_arch" = "php" ] || [ "$remote_arch" = "phar" ] || [ "$remote_db" = "php" ]; then
+        log_success "Remote lacks some CLI tools; using the PHP fallback (archiver=$remote_arch, db=$remote_db)."
+    fi
 
     # --- 3. Choose Destination ---
-    log_step "Choose a destination for the pulled site"
-    
-    local wp_sites=()
-    for site_dir in "$SITES_DIR"/*.localhost; do
-        if [ -f "$site_dir/public/wp-config.php" ]; then
-            wp_sites+=("$(basename "$site_dir" .localhost)")
-        fi
-    done
-    
-    local destination_choice
-    destination_choice=$(gum choose "New Site" "${wp_sites[@]}")
-
     local site_name
     local dest_path
     local local_url
-    local db_name
-    local reset_db=false
+    local is_new_site=false
 
-    if [ "$destination_choice" == "New Site" ]; then
-        local proposed_name
-        proposed_name=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//; s/\./-/g')
-        site_name=$(gum input --width 0 --value "$proposed_name" --prompt "Enter a name for the new local site: ")
-        if [ -z "$site_name" ]; then log_error "Site name cannot be empty."; fi
-
-        log_step "Creating new placeholder site: ${site_name}.localhost"
-        "$COVE_CMD" add "$site_name"
-        if [ $? -ne 0 ]; then log_error "Failed to create placeholder site. Does it already exist?"; fi
-        
-    else
-        site_name="$destination_choice"
-        if ! gum confirm "Are you sure you want to overwrite '${site_name}'? All its files and database content will be replaced."; then
-            echo "🚫 Pull cancelled."
-            exit 0
+    if [ -n "$arg_site" ]; then
+        # --site covers both destinations: an existing site is overwritten,
+        # an unused name is created. Which one it is follows from whether the
+        # directory exists, so the caller doesn't need a second flag.
+        site_name="${arg_site%.localhost}"
+        if ! validate_site_name "$site_name"; then
+            log_error "Invalid site name '$site_name'."
         fi
-        
+        [ -d "$SITES_DIR/$site_name.localhost" ] || is_new_site=true
+    else
+        require_interactive "Choosing a destination site" "--site <name> (an existing site is overwritten, a new name is created)"
+        log_step "Choose a destination for the pulled site"
+
+        local wp_sites=()
+        for site_dir in "$SITES_DIR"/*.localhost; do
+            if [ -f "$site_dir/public/wp-config.php" ]; then
+                wp_sites+=("$(basename "$site_dir" .localhost)")
+            fi
+        done
+
+        local destination_choice
+        destination_choice=$(gum choose "New Site" "${wp_sites[@]}")
+        if [ -z "$destination_choice" ]; then log_error "No destination selected."; fi
+
+        if [ "$destination_choice" == "New Site" ]; then
+            is_new_site=true
+            local proposed_name
+            proposed_name=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//; s/\./-/g')
+            site_name=$(gum input --width 0 --value "$proposed_name" --prompt "Enter a name for the new local site: ")
+            if [ -z "$site_name" ]; then log_error "Site name cannot be empty."; fi
+        else
+            site_name="$destination_choice"
+        fi
+    fi
+
+    if $is_new_site; then
+        log_step "Creating new placeholder site: ${site_name}.localhost"
+        if ! "$COVE_CMD" add "$site_name"; then
+            log_error "Failed to create placeholder site. Does it already exist?"
+        fi
+    else
+        # Overwriting destroys the local site's files and database, so it needs
+        # an explicit yes: the confirm interactively, --yes when headless.
+        if ! $force; then
+            require_interactive "Overwriting the existing site '${site_name}'" "--yes to confirm the overwrite"
+            if ! gum confirm "Are you sure you want to overwrite '${site_name}'? All its files and database content will be replaced."; then
+                echo "🚫 Pull cancelled."
+                exit 0
+            fi
+        fi
+
         log_step "Preparing to overwrite existing site: ${site_name}.localhost"
-        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
-        # Defer the destructive DROP/CREATE until the remote backup is in hand
-        # (below). Dropping here left the local DB gone with no rollback if the
-        # backup step then failed — the pull broke the site worse than a no-op.
-        reset_db=true
+        # The database is reset by `do migrate` itself (wp db reset + import),
+        # so nothing destructive happens here — the local site stays intact and
+        # servable right up until the restore actually succeeds.
     fi
 
     dest_path="$SITES_DIR/$site_name.localhost/public"
     local_url="$(url_for "$site_name.localhost")"
 
     # --- 4. Perform Migration ---
+    # Backup on the remote, stream it down over the SSH connection we already
+    # hold, restore locally. Nothing is fetched over HTTP at any point, which is
+    # what makes this work against hosts whose WordPress URL isn't publicly
+    # reachable (staging behind auth, private networks, a sandbox whose `home`
+    # still points at a provisioning template).
     log_step "Generating backup for ${remote_url}..."
-    local backup_extra_args=""
+    local -a backup_args=()
     if [ "$proxy_uploads" = true ]; then
         log_success "Uploads will be excluded from the backup and proxied instead."
-        backup_extra_args="--exclude=\"wp-content/uploads\""
+        backup_args+=(--exclude=wp-content/uploads)
     fi
 
-    local backup_url
-    backup_url=$(ssh $ssh_opts $remote_ssh "curl -sL https://captaincore.io/do | bash -s -- backup $remote_path_q --quiet $backup_extra_args")
-
-    if [[ -z "$backup_url" || ! "$backup_url" == *.zip ]]; then
-        log_error "Failed to generate backup or received an invalid backup URL."
+    local remote_archive
+    remote_archive=$(transfer_remote "$ssh_opts" "$remote_ssh" backup "$remote_path" \
+        ${backup_args[@]+"${backup_args[@]}"} $wp_cli_flag)
+    if [ -z "$remote_archive" ]; then
+        log_error "Failed to generate a backup on the remote."
     fi
-    log_success "Backup created: ${backup_url}"
+    log_success "Backup created: ${remote_archive}"
 
-    # Only now that a valid backup exists is it safe to wipe the local DB.
-    if [ "$reset_db" = true ]; then
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\`;"
+    # The remote archive is removed on every exit path below, so a failed pull
+    # never leaves a full database dump sitting on the remote filesystem.
+    local remote_archive_q
+    remote_archive_q=$(shell_quote "$remote_archive")
+
+    log_step "Downloading backup over SSH..."
+    # Keep the remote's own filename: the extension is what tells the restore
+    # whether it is unpacking a zip or a tar.gz, and the remote may well have
+    # picked a different archiver than this machine would have.
+    local dl_dir
+    dl_dir=$(mktemp -d "${TMPDIR:-/tmp}/cove-pull-XXXXXX") || log_error "mktemp failed."
+    local local_archive="$dl_dir/$(basename "$remote_archive")"
+    if ! ssh $ssh_bulk_opts $remote_ssh "cat $remote_archive_q" > "$local_archive"; then
+        rm -rf "$dl_dir"
+        ssh $ssh_opts $remote_ssh "rm -f $remote_archive_q" 2>/dev/null
+        log_error "Failed to download the backup over SSH."
     fi
+    log_success "Downloaded ($(du -h "$local_archive" 2>/dev/null | cut -f1 | tr -d ' '))."
 
+    # NOTE: there is deliberately no DROP DATABASE here. The restore resets the
+    # database itself, immediately before importing. Wiping it up front instead
+    # BROKE the overwrite path: the destination has to still be a working
+    # WordPress for the restore to read its current URL and rewrite links.
     log_step "Restoring backup to ${site_name}.localhost..."
-    # Execute the migration script directly instead of using a variable with a pipe
-    if ! (cd "$dest_path" && curl -sL https://captaincore.io/do | bash -s -- migrate --url="$backup_url" --update-urls); then
-        # Remove the remote backup (full DB dump + wp-config) so a failed
-        # restore doesn't leave it downloadable in the remote web root.
-        local failed_backup_q
-        failed_backup_q=$(shell_quote "$remote_path/${backup_url##*/}")
-        ssh $ssh_opts $remote_ssh "rm -f $failed_backup_q" 2>/dev/null
-        log_error "The migration script failed to execute correctly."
+    if ! transfer_local restore "$dest_path" "$local_archive" --url-to="$local_url"; then
+        rm -rf "$dl_dir"
+        ssh $ssh_opts $remote_ssh "rm -f $remote_archive_q" 2>/dev/null
+        log_error "The restore failed."
     fi
+    rm -rf "$dl_dir"
     log_success "Restore complete."
 
     # --- 5. Post-Migration Configuration ---
@@ -6584,10 +8104,7 @@ EOM
 
     # --- 7. Cleanup ---
     log_step "Cleaning up remote backup file..."
-    local filename="${backup_url##*/}"
-    local remote_backup_q
-    remote_backup_q=$(shell_quote "$remote_path/$filename")
-    ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q" 2>/dev/null
+    ssh $ssh_opts $remote_ssh "rm -f $remote_archive_q" 2>/dev/null
     log_success "Cleanup complete."
  
     # --- 8. Finalize ---
@@ -6609,6 +8126,32 @@ cove_push() {
         exit 1
     }
 
+    # --- Argument Parsing ---
+    # Flag equivalents for every prompt below, so a push can run headless
+    # (CI, scripts, an AI agent). Omit a flag and you get its prompt — but
+    # only when there's a TTY to prompt on.
+    local arg_site=""
+    local arg_ssh=""
+    local arg_path=""
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|--yes|-y) force=true; shift ;;
+            --site) arg_site="$2"; shift 2 ;;
+            --site=*) arg_site="${1#*=}"; shift ;;
+            --ssh)  arg_ssh="$2";  shift 2 ;;
+            --ssh=*)  arg_ssh="${1#*=}";  shift ;;
+            --path) arg_path="$2"; shift 2 ;;
+            --path=*) arg_path="${1#*=}"; shift ;;
+            -h|--help) display_command_help push; exit 0 ;;
+            *)
+                gum style --foreground red "❌ Unknown option: $1" >&2
+                echo "Usage: cove push [--site <name>] [--ssh \"user@host -p 22\"] [--path public/] [--yes]" >&2
+                exit 1
+                ;;
+        esac
+    done
+
     # Define quiet SSH options to prevent host key warnings. ControlMaster
     # shares a single authenticated connection across every ssh call below
     # (validate, upload backup, restore, cleanup) so the user enters their
@@ -6619,99 +8162,152 @@ cove_push() {
     # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
     trap "rm -f '$ssh_ctl'" EXIT
 
+    # Bulk archive transfers deliberately bypass the multiplexed socket above.
+    # Sharing one channel with the control commands throttled a 30MB upload to
+    # ~16KB/s against a real gateway and then stalled outright, while the same
+    # file moved in 15s on its own connection. Key auth makes the extra
+    # connection free; with a password you are asked once more.
+    local ssh_bulk_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
+
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pushing a local Cove site to a remote server."
 
     # --- 1. Choose Local Site ---
-    log_step "Choose a local site to push"
-    local wp_sites=()
-    for site_dir in "$SITES_DIR"/*.localhost; do
-        if [ -f "$site_dir/public/wp-config.php" ]; then
-            wp_sites+=("$(basename "$site_dir" .localhost)")
-        fi
-    done
+    local site_name="${arg_site%.localhost}"
+    if [ -z "$site_name" ]; then
+        require_interactive "Choosing a local site to push" "--site <name>"
+        log_step "Choose a local site to push"
+        local wp_sites=()
+        for site_dir in "$SITES_DIR"/*.localhost; do
+            if [ -f "$site_dir/public/wp-config.php" ]; then
+                wp_sites+=("$(basename "$site_dir" .localhost)")
+            fi
+        done
 
-    if [ ${#wp_sites[@]} -eq 0 ]; then
-        log_error "No local WordPress sites found to push."
+        if [ ${#wp_sites[@]} -eq 0 ]; then
+            log_error "No local WordPress sites found to push."
+        fi
+
+        site_name=$(gum choose "${wp_sites[@]}")
+        if [ -z "$site_name" ]; then log_error "No site selected."; fi
+    else
+        # A name supplied by flag skipped the picker, which only ever listed
+        # real WordPress sites — so validate what the picker would have guaranteed.
+        if ! validate_site_name "$site_name"; then
+            log_error "Invalid site name '$site_name'."
+        fi
+        if [ ! -f "$SITES_DIR/$site_name.localhost/public/wp-config.php" ]; then
+            log_error "No local WordPress site named '$site_name' (looked for $SITES_DIR/$site_name.localhost/public/wp-config.php)."
+        fi
     fi
 
-    local site_name
-    site_name=$(gum choose "${wp_sites[@]}")
-    if [ -z "$site_name" ]; then log_error "No site selected."; fi
-
     local local_path="$SITES_DIR/$site_name.localhost/public"
-    
+
     # --- 2. Gather Remote Info ---
-    log_step "Enter remote server details"
-    local remote_ssh
-    remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    local remote_ssh="$arg_ssh"
+    if [ -z "$remote_ssh" ]; then
+        require_interactive "The SSH connection" "--ssh \"user@host -p 2222\""
+        log_step "Enter remote server details"
+        remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    fi
     if [ -z "$remote_ssh" ]; then log_error "SSH connection cannot be empty."; fi
 
     # Trim the "ssh " prefix if the user includes it.
     remote_ssh="${remote_ssh##ssh }"
 
-    local remote_path
-    remote_path=$(gum input --width 0 --value "public/" --prompt "Path to Remote WordPress Root: ")
+    # Defaults to public/ — the same value the prompt pre-fills.
+    local remote_path="$arg_path"
+    if [ -z "$remote_path" ]; then
+        if is_noninteractive; then
+            remote_path="public/"
+        else
+            remote_path=$(gum input --width 0 --value "public/" --prompt "Path to Remote WordPress Root: ")
+        fi
+    fi
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
     local remote_path_q
     remote_path_q=$(shell_quote "$remote_path")
 
     # --- 3. Validate Remote Site ---
+    # A single probe confirms there's a usable WordPress there and reports the
+    # host's tooling, so a remote without WP-CLI gets the phar sideloaded before
+    # we spend time building a backup that couldn't be restored anyway.
     log_step "Validating remote WordPress site..."
+    local wp_cli_flag=""
+    wp_cli_flag=$(transfer_ensure_remote_wp_cli "$ssh_opts" "$remote_ssh" "$remote_path")
+    local remote_probe
+    remote_probe=$(transfer_remote "$ssh_opts" "$remote_ssh" probe "$remote_path" $wp_cli_flag 2>/dev/null)
     local remote_url
-    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path_q && wp option get home 2>/dev/null")
-    
+    remote_url=$(echo "$remote_probe" | sed -n 's/^home=//p')
+
     if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
+        if echo "$remote_probe" | grep -q '^wp_cli=missing'; then
+            log_error "No WP-CLI on the remote and the sideload failed. Install WP-CLI there, or check that PHP is available."
+        fi
         log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
     fi
     log_success "Found remote site to overwrite: $remote_url"
+    local remote_ext remote_db
+    remote_ext=$(echo "$remote_probe" | sed -n 's/^extractor=//p')
+    remote_db=$(echo "$remote_probe" | sed -n 's/^db_load=//p')
+    if [ "$remote_ext" = "php" ] || [ "$remote_ext" = "phar" ] || [ "$remote_db" = "php" ]; then
+        log_success "Remote lacks some CLI tools; using the PHP fallback (extractor=$remote_ext, db=$remote_db)."
+    fi
 
     # --- 4. Confirmation ---
-    if ! gum confirm "🚨 Are you sure you want to push '${site_name}' to '${remote_url}'? This will completely overwrite the remote site's files and database."; then
-        echo "🚫 Push cancelled."
-        exit 0
+    # Deliberately NOT auto-promoted on a missing TTY the way `cove delete` is.
+    # Delete is driven by the dashboard and only destroys a local throwaway;
+    # push overwrites a live remote site's files AND database. A headless
+    # caller has to say --yes out loud.
+    if ! $force; then
+        require_interactive "Overwriting the remote site at '${remote_url}'" "--yes to confirm the push"
+        if ! gum confirm "🚨 Are you sure you want to push '${site_name}' to '${remote_url}'? This will completely overwrite the remote site's files and database."; then
+            echo "🚫 Push cancelled."
+            exit 0
+        fi
     fi
 
     # --- 5. Perform Local Backup ---
     log_step "Generating local backup for ${site_name}..."
-    local backup_filename
-    backup_filename=$( (cd "$local_path" && curl -sL https://captaincore.io/do | bash -s -- backup . --quiet --format=filename) )
-    
-    if [[ ! -f "$backup_filename" || ! "$backup_filename" == *".zip" ]]; then
-        log_error "Failed to generate local backup. The captaincore script might have failed."
+    local backup_path
+    backup_path=$(transfer_local backup "$local_path")
+    if [ -z "$backup_path" ] || [ ! -f "$backup_path" ]; then
+        log_error "Failed to generate the local backup."
     fi
-    
-    size=$(ls -lh "$backup_filename" | awk '{print $5}')
-    log_success "Local backup created: ${backup_filename} ($size)"
+    local size
+    size=$(du -h "$backup_path" 2>/dev/null | cut -f1 | tr -d ' ')
+    log_success "Local backup created: $(basename "$backup_path") ($size)"
 
-    local backup_filename_q
-    backup_filename_q=$(shell_quote "$backup_filename")
-    local remote_backup_q
-    remote_backup_q=$(shell_quote "$remote_path/$backup_filename")
+    # Upload to a temp path outside the web root. The old flow dropped the
+    # archive into the remote's WordPress directory, where a full database dump
+    # plus wp-config sat publicly downloadable until cleanup ran — and stayed
+    # there for good if the restore died in between.
+    local remote_tmp="/tmp/cove-push-$$-$(basename "$backup_path")"
+    local remote_tmp_q
+    remote_tmp_q=$(shell_quote "$remote_tmp")
 
     # --- 6. Upload Backup ---
     log_step "Uploading backup to remote server..."
-    if ! cat "$backup_filename" | ssh $ssh_opts $remote_ssh "cat > $remote_backup_q"; then
-        # Clean up local backup on failure
-        rm -f "$backup_filename"
+    if ! ssh $ssh_bulk_opts $remote_ssh "cat > $remote_tmp_q" < "$backup_path"; then
+        rm -f "$backup_path"
+        ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
         log_error "Failed to upload backup."
     fi
     log_success "Upload complete."
 
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
-    if ! ssh $ssh_opts $remote_ssh "cd $remote_path_q && curl -sL https://captaincore.io/do | bash -s -- migrate --url=$backup_filename_q --update-urls"; then
-        # Don't leave a full DB dump + wp-config zip sitting in the remote web
-        # root (or locally) after a failed restore — it's directly downloadable.
-        rm -f "$backup_filename"
-        ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q" 2>/dev/null
-        log_error "The remote migration script failed to execute correctly."
+    if ! transfer_remote "$ssh_opts" "$remote_ssh" restore "$remote_path" "$remote_tmp" \
+            --url-to="$remote_url" $wp_cli_flag; then
+        rm -f "$backup_path"
+        ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
+        log_error "The remote restore failed."
     fi
     log_success "Remote restore complete."
 
     # --- 8. Cleanup ---
     log_step "Cleaning up backup files..."
-    rm -f "$backup_filename"
-    ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q"
+    rm -f "$backup_path"
+    ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
     log_success "Cleanup complete."
 
     # --- 9. Finalize ---
@@ -6774,6 +8370,7 @@ cove_reload() {
     local reload_rc=0
     while :; do
         rm -f "$pending"
+        prune_delete_tombstones
         create_gui_file
         regenerate_caddyfile; reload_rc=$?
         update_etc_hosts
@@ -6919,10 +8516,24 @@ cove_rename() {
 SHARE_PROXY_PORT=19876
 
 cove_share() {
-    local site_name="$1"
-    
+    local site_name=""
+    local auto_yes=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y|--force) auto_yes=true; shift ;;
+            -h|--help) display_command_help share; exit 0 ;;
+            -*)
+                gum style --foreground red "Error: Unknown option: $1" >&2
+                echo "Usage: cove share [<name>] [--yes]" >&2
+                exit 1
+                ;;
+            *) [ -z "$site_name" ] && site_name="$1"; shift ;;
+        esac
+    done
+
     # --- 1. Validate Site ---
     if [ -z "$site_name" ]; then
+        require_interactive "Choosing a site to share" "the site name as an argument: cove share <name>"
         # Interactive mode: let user select a site
         local all_sites=()
         for site_dir in "$SITES_DIR"/*.localhost; do
@@ -6982,7 +8593,18 @@ cove_share() {
         fi
         
         if [ -n "$install_cmd" ]; then
-            if gum confirm "Install cloudflared via ${install_name}?"; then
+            # --yes (or no TTY to ask on) installs without prompting; the
+            # alternative is aborting a share for want of a keystroke.
+            if $auto_yes || ! [ -t 0 ]; then
+                echo "Installing cloudflared via ${install_name}..."
+                eval "$install_cmd"
+                if ! command -v cloudflared &> /dev/null; then
+                    gum style --foreground red "Error: Failed to install cloudflared."
+                    exit 1
+                fi
+                echo "cloudflared installed successfully."
+                echo ""
+            elif gum confirm "Install cloudflared via ${install_name}?"; then
                 echo "Installing cloudflared..."
                 eval "$install_cmd"
                 if ! command -v cloudflared &> /dev/null; then
@@ -7460,6 +9082,603 @@ cove_tailscale() {
     esac
 }
 
+# --- Site Transfer (backup / restore) ---
+#
+# Cove's own implementation of the two operations `cove pull` and `cove push`
+# need. It replaces piping https://captaincore.io/do into bash on both the
+# local machine and the user's remote server: that fetched 7300+ lines to use
+# roughly 490 of them, tied Cove's behaviour to a script released separately
+# (a mismatch there once made `cove pull` wipe a database it then refused to
+# restore into), and required the remote to be online to captaincore.io.
+#
+# The helper below is emitted as one self-contained script and run identically
+# on both ends — locally with bash, remotely by piping it into `bash -s --`
+# over the SSH connection pull/push already hold open. Same code both sides
+# means one archive contract rather than two implementations agreeing by luck.
+#
+# Everything moves over SSH, so no HTTP download happens at any point. That is
+# what retires the old failure mode where the backup URL was built from the
+# remote's own `home` option and therefore only resolved when the remote's
+# WordPress URL was publicly reachable.
+
+COVE_WP_CLI_PHAR_URL="https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar"
+
+# Emit the transfer helper. Quoted heredoc: this text is shipped verbatim and
+# must not expand anything on Cove's side.
+transfer_helper_source() {
+cat << 'COVE_TRANSFER_HELPER'
+#!/bin/bash
+# cove-transfer — self-contained WordPress backup/restore.
+# Generated by Cove. Runs on the local machine and on remote hosts alike.
+#
+# Subcommands:
+#   probe   <site_dir>                     report tool capabilities as key=value
+#   backup  <site_dir> [--exclude=GLOB]... create an archive, print its path
+#   restore <site_dir> <archive> [--url-to=URL]
+#
+# Design note: every capability degrades rather than failing. Archiving prefers
+# zip, falls back to tar, and finally to PHP itself; the database is dumped and
+# imported through the native client when present and through WordPress's own
+# $wpdb when it isn't. Because the target is always a WordPress install, PHP is
+# guaranteed to exist — which makes the PHP tier a true universal fallback and
+# means a bare host needs no package installs at all.
+
+set -uo pipefail
+
+WP=""            # resolved WP-CLI invocation (may include php + phar + --allow-root)
+ARCHIVER=""      # zip | tar | php
+EXTRACTOR=""     # unzip | tar | php
+DB_DUMP=""       # native | php
+DB_LOAD=""       # native | php
+WP_CLI_PHAR=""   # optional sideloaded phar path (--wp-cli=)
+
+log()  { [ "${QUIET:-false}" = true ] || echo "$@" >&2; }
+die()  { echo "cove-transfer: $*" >&2; exit 1; }
+
+# --- package install (tier 3) -------------------------------------------------
+# Only attempted when we're already root or hold passwordless sudo; a tool that
+# stops to ask for a password would hang the non-interactive SSH session that
+# invoked us. Failure here is never fatal — the PHP tier still covers us.
+pkg_install() {
+    local pkg="$1" sudo_cmd=""
+    if [ "$(id -u)" != "0" ]; then
+        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo_cmd="sudo -n"
+        else
+            return 1
+        fi
+    fi
+    if   command -v apt-get >/dev/null 2>&1; then $sudo_cmd apt-get install -y -qq "$pkg" >/dev/null 2>&1
+    elif command -v dnf     >/dev/null 2>&1; then $sudo_cmd dnf install -y -q "$pkg"      >/dev/null 2>&1
+    elif command -v yum     >/dev/null 2>&1; then $sudo_cmd yum install -y -q "$pkg"      >/dev/null 2>&1
+    elif command -v apk     >/dev/null 2>&1; then $sudo_cmd apk add --no-cache "$pkg"     >/dev/null 2>&1
+    elif command -v zypper  >/dev/null 2>&1; then $sudo_cmd zypper -q install -y "$pkg"   >/dev/null 2>&1
+    elif command -v brew    >/dev/null 2>&1; then brew install "$pkg"                     >/dev/null 2>&1
+    else return 1
+    fi
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- WP-CLI -------------------------------------------------------------------
+# Order: an explicitly sideloaded phar, then wp/wp-cli on PATH, then a phar
+# already sitting in the usual spots. --allow-root is appended when running as
+# root, which is the norm inside containers and trips WP-CLI by default.
+resolve_wp() {
+    local root_flag=""
+    [ "$(id -u)" = "0" ] && root_flag=" --allow-root"
+
+    if [ -n "$WP_CLI_PHAR" ] && [ -f "$WP_CLI_PHAR" ]; then
+        have php || die "PHP not found; cannot run the sideloaded WP-CLI."
+        WP="php $WP_CLI_PHAR$root_flag"; return 0
+    fi
+    local c
+    for c in wp wp-cli; do
+        if have "$c"; then WP="$c$root_flag"; return 0; fi
+    done
+    for c in "$HOME/wp-cli.phar" /usr/local/bin/wp-cli.phar ./wp-cli.phar; do
+        if [ -f "$c" ] && have php; then WP="php $c$root_flag"; return 0; fi
+    done
+    return 1
+}
+
+# --- capability detection -----------------------------------------------------
+# php_has <extension|class> — asks PHP directly rather than guessing from the
+# distro, since ZipArchive in particular is a separate package on many hosts.
+php_has_zip()  { have php && php -r 'exit(class_exists("ZipArchive")?0:1);' 2>/dev/null; }
+php_has_phar() { have php && php -r 'exit(class_exists("PharData")?0:1);' 2>/dev/null; }
+
+resolve_archiver() {
+    if have zip; then ARCHIVER=zip; return 0; fi
+    if have tar; then ARCHIVER=tar; return 0; fi
+    pkg_install zip && have zip && { ARCHIVER=zip; return 0; }
+    if php_has_zip;  then ARCHIVER=php;  return 0; fi
+    if php_has_phar; then ARCHIVER=phar; return 0; fi
+    return 1
+}
+
+resolve_extractor() {
+    local archive="${1:-}"
+    case "$archive" in
+        *.tar.gz|*.tgz)
+            have tar && { EXTRACTOR=tar; return 0; }
+            pkg_install tar && have tar && { EXTRACTOR=tar; return 0; }
+            php_has_phar && { EXTRACTOR=phar; return 0; }
+            return 1 ;;
+    esac
+    if have unzip; then EXTRACTOR=unzip; return 0; fi
+    pkg_install unzip && have unzip && { EXTRACTOR=unzip; return 0; }
+    if php_has_zip; then EXTRACTOR=php; return 0; fi
+    return 1
+}
+
+# The native path goes through WP-CLI, which shells out to mysqldump/mysql (or
+# the mariadb-named equivalents). When those are absent we drive $wpdb instead,
+# which always works because WordPress itself has a live database connection.
+resolve_db() {
+    if have mysqldump || have mariadb-dump; then DB_DUMP=native; else DB_DUMP=php; fi
+    if have mysql     || have mariadb;      then DB_LOAD=native; else DB_LOAD=php; fi
+    if [ "$DB_DUMP" = php ] || [ "$DB_LOAD" = php ]; then
+        # One cheap attempt to get the real client; harmless if it fails.
+        for p in default-mysql-client mariadb-client mysql-client; do
+            pkg_install "$p" && break
+        done
+        have mysqldump || have mariadb-dump && DB_DUMP=native
+        have mysql     || have mariadb      && DB_LOAD=native
+    fi
+}
+
+# --- PHP helpers --------------------------------------------------------------
+# Written to temp files rather than piped: stdin is already carrying this very
+# script when we run over SSH, so it isn't available to hand to `wp eval-file -`.
+php_dump_script() {
+cat << 'PHPDUMP'
+<?php
+// Dump every table to $args[0] as portable SQL. Used when no mysqldump exists.
+global $wpdb;
+$out = $args[0];
+$fh  = fopen( $out, 'w' );
+if ( ! $fh ) { WP_CLI::error( 'Cannot write ' . $out ); }
+fwrite( $fh, "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n" );
+$tables = $wpdb->get_col( 'SHOW TABLES' );
+foreach ( $tables as $table ) {
+    $create = $wpdb->get_row( "SHOW CREATE TABLE `$table`", ARRAY_N );
+    fwrite( $fh, "\nDROP TABLE IF EXISTS `$table`;\n" . $create[1] . ";\n" );
+    $offset = 0;
+    $limit  = 500;
+    while ( true ) {
+        $rows = $wpdb->get_results( "SELECT * FROM `$table` LIMIT $limit OFFSET $offset", ARRAY_A );
+        if ( empty( $rows ) ) { break; }
+        foreach ( $rows as $row ) {
+            $vals = array();
+            foreach ( $row as $v ) {
+                if ( is_null( $v ) ) {
+                    $vals[] = 'NULL';
+                } elseif ( ! mb_check_encoding( $v, 'UTF-8' ) ) {
+                    // Binary column: hex literals survive a round trip that
+                    // quoting would corrupt.
+                    $vals[] = '0x' . bin2hex( $v );
+                } else {
+                    $vals[] = "'" . esc_sql( $v ) . "'";
+                }
+            }
+            // One statement per line so the importer can split on newlines.
+            fwrite( $fh, "INSERT INTO `$table` VALUES (" . implode( ',', $vals ) . ");\n" );
+        }
+        $offset += $limit;
+    }
+}
+fwrite( $fh, "SET FOREIGN_KEY_CHECKS=1;\n" );
+fclose( $fh );
+WP_CLI::success( 'Database exported.' );
+PHPDUMP
+}
+
+php_load_script() {
+cat << 'PHPLOAD'
+<?php
+// Import SQL from $args[0] using $wpdb. Used when no mysql client exists.
+// Splits on statement boundaries with a small state machine rather than a
+// naive explode(';'): post content very often contains ";\n" inside a string
+// literal, and splitting there would corrupt the import.
+global $wpdb;
+$file = $args[0];
+$fh   = fopen( $file, 'r' );
+if ( ! $fh ) { WP_CLI::error( 'Cannot read ' . $file ); }
+
+$wpdb->query( 'SET FOREIGN_KEY_CHECKS=0' );
+$buffer = '';
+$in_str = false;
+$quote  = '';
+$esc    = false;
+$count  = 0;
+
+$run = function ( $sql ) use ( $wpdb, &$count ) {
+    $sql = trim( $sql );
+    if ( $sql === '' ) { return; }
+    $wpdb->query( $sql );
+    $count++;
+};
+
+while ( ( $chunk = fgets( $fh ) ) !== false ) {
+    $len = strlen( $chunk );
+    for ( $i = 0; $i < $len; $i++ ) {
+        $ch      = $chunk[ $i ];
+        $buffer .= $ch;
+        if ( $esc ) { $esc = false; continue; }
+        if ( $ch === '\\' ) { $esc = true; continue; }
+        if ( $in_str ) {
+            if ( $ch === $quote ) { $in_str = false; }
+            continue;
+        }
+        if ( $ch === "'" || $ch === '"' ) { $in_str = true; $quote = $ch; continue; }
+        if ( $ch === ';' ) {
+            $run( substr( $buffer, 0, -1 ) );
+            $buffer = '';
+        }
+    }
+}
+$run( $buffer );
+fclose( $fh );
+$wpdb->query( 'SET FOREIGN_KEY_CHECKS=1' );
+WP_CLI::success( "Imported {$count} statements." );
+PHPLOAD
+}
+
+php_archive_script() {
+cat << 'PHPZIP'
+<?php
+// $args: 0=mode(create|extract) 1=archive 2=dir 3..=excludes (create only)
+$mode    = $args[0];
+$archive = $args[1];
+$dir     = rtrim( $args[2], '/' );
+
+if ( 'extract' === $mode ) {
+    $zip = new ZipArchive();
+    if ( true !== $zip->open( $archive ) ) { WP_CLI::error( 'Cannot open archive.' ); }
+    $zip->extractTo( $dir );
+    $zip->close();
+    WP_CLI::success( 'Extracted.' );
+    return;
+}
+
+$excludes = array_slice( $args, 3 );
+$zip      = new ZipArchive();
+if ( true !== $zip->open( $archive, ZipArchive::CREATE | ZipArchive::OVERWRITE ) ) {
+    WP_CLI::error( 'Cannot create archive.' );
+}
+$base = basename( $dir );
+$it   = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator( $dir, FilesystemIterator::SKIP_DOTS ),
+    RecursiveIteratorIterator::SELF_FIRST
+);
+foreach ( $it as $path ) {
+    $real = $path->getPathname();
+    $rel  = $base . '/' . ltrim( substr( $real, strlen( $dir ) ), '/' );
+    foreach ( $excludes as $pattern ) {
+        if ( fnmatch( $base . '/' . $pattern, $rel ) || fnmatch( $pattern, $rel ) ) { continue 2; }
+    }
+    if ( $path->isDir() ) { $zip->addEmptyDir( $rel ); } else { $zip->addFile( $real, $rel ); }
+}
+$zip->close();
+WP_CLI::success( 'Archived.' );
+PHPZIP
+}
+
+# Run a PHP snippet through WP-CLI against $1 (site dir); remaining args are
+# passed to the script as $args.
+wp_eval() {
+    local site_dir="$1" script="$2"; shift 2
+    local tmp_php
+    tmp_php=$(mktemp "${TMPDIR:-/tmp}/cove-php-XXXXXX.php") || die "mktemp failed"
+    "$script" > "$tmp_php"
+    local rc=0
+    $WP eval-file "$tmp_php" "$@" --path="$site_dir" --skip-plugins --skip-themes >&2 || rc=$?
+    rm -f "$tmp_php"
+    return $rc
+}
+
+# --- subcommands --------------------------------------------------------------
+cmd_probe() {
+    local site_dir="$1"
+    resolve_wp || { echo "wp_cli=missing"; exit 0; }
+    resolve_archiver || true
+    resolve_extractor "" || true
+    resolve_db
+    echo "wp_cli=${WP}"
+    echo "archiver=${ARCHIVER:-none}"
+    echo "extractor=${EXTRACTOR:-none}"
+    echo "db_dump=${DB_DUMP}"
+    echo "db_load=${DB_LOAD}"
+    echo "zip=$(have zip && echo y || echo n)"
+    echo "unzip=$(have unzip && echo y || echo n)"
+    echo "tar=$(have tar && echo y || echo n)"
+    echo "mysqldump=$( { have mysqldump || have mariadb-dump; } && echo y || echo n)"
+    echo "mysql=$( { have mysql || have mariadb; } && echo y || echo n)"
+    echo "php=$(have php && echo y || echo n)"
+    if [ -n "$site_dir" ] && [ -d "$site_dir" ]; then
+        echo "home=$($WP option get home --path="$site_dir" --skip-plugins --skip-themes 2>/dev/null)"
+    fi
+}
+
+cmd_backup() {
+    local site_dir="$1"; shift
+    local -a excludes=()
+    local a
+    for a in "$@"; do
+        case "$a" in --exclude=*) excludes+=("${a#--exclude=}") ;; esac
+    done
+
+    [ -d "$site_dir" ] || die "Site directory not found: $site_dir"
+    resolve_wp       || die "WP-CLI not found and no PHP to run a phar with."
+    resolve_archiver || die "No way to create an archive (need zip, tar, or PHP zip/phar support)."
+    resolve_db
+
+    site_dir=$(cd "$site_dir" && pwd -P)
+    local parent base
+    parent=$(dirname "$site_dir")
+    base=$(basename "$site_dir")
+
+    # Named like the old _do output so operators recognise the artefact.
+    local stamp rand ext archive
+    stamp=$(date +%Y-%m-%d)
+    rand=$( (head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n') 2>/dev/null || echo "$$$(date +%s)" )
+    rand=$(echo "$rand" | cut -c1-7)
+    case "$ARCHIVER" in tar) ext="tar.gz" ;; *) ext="zip" ;; esac
+    archive="$parent/${stamp}_${rand}.${ext}"
+
+    # The dump lands inside the site dir so it travels in the archive, exactly
+    # where restore expects to find it.
+    log "Exporting database..."
+    local dump="$site_dir/db_export.sql"
+    if [ "$DB_DUMP" = native ]; then
+        $WP db export "$dump" --path="$site_dir" --add-drop-table \
+            --default-character-set=utf8mb4 --skip-plugins --skip-themes >&2 \
+            || die "Database export failed."
+    else
+        log "  (no mysqldump — exporting through WordPress)"
+        wp_eval "$site_dir" php_dump_script "$dump" || die "Database export failed."
+    fi
+
+    log "Creating archive (${ARCHIVER})..."
+    ( cd "$parent" || exit 1
+      case "$ARCHIVER" in
+        zip)
+            local -a zargs=(-rq "$archive" "$base")
+            for a in ${excludes[@]+"${excludes[@]}"}; do zargs+=(-x "$base/$a" "$base/$a/*"); done
+            zip "${zargs[@]}" ;;
+        tar)
+            local -a targs=()
+            for a in ${excludes[@]+"${excludes[@]}"}; do targs+=(--exclude="$base/$a"); done
+            tar -czf "$archive" ${targs[@]+"${targs[@]}"} "$base" ;;
+        php|phar)
+            local -a pargs=(create "$archive" "$site_dir")
+            for a in ${excludes[@]+"${excludes[@]}"}; do pargs+=("$a"); done
+            wp_eval "$site_dir" php_archive_script "${pargs[@]}" ;;
+      esac ) || { rm -f "$dump"; die "Archive creation failed."; }
+
+    rm -f "$dump"
+    [ -f "$archive" ] || die "Archive was not created."
+    echo "$archive"
+}
+
+cmd_restore() {
+    local site_dir="$1" archive="$2"; shift 2
+    local url_to=""
+    local a
+    for a in "$@"; do
+        case "$a" in --url-to=*) url_to="${a#--url-to=}" ;; esac
+    done
+
+    [ -d "$site_dir" ] || die "Site directory not found: $site_dir"
+    [ -f "$archive" ]  || die "Archive not found: $archive"
+    resolve_wp || die "WP-CLI not found and no PHP to run a phar with."
+    resolve_extractor "$archive" || die "No way to extract the archive (need unzip, tar, or PHP zip support)."
+    resolve_db
+
+    site_dir=$(cd "$site_dir" && pwd -P)
+    archive=$(cd "$(dirname "$archive")" && pwd -P)/$(basename "$archive")
+
+    # Defence in depth around the one destructive step in this engine (the
+    # rm -rf below). `cove pull` always targets a Cove-managed site directory,
+    # and `cove push` probes the remote first and refuses anything that isn't a
+    # live WordPress install — so a stray --path cannot reach the wipe today.
+    # But this helper is a standalone script piped over SSH, so any future
+    # caller that skips that probe would otherwise hand rm -rf whatever it was
+    # given. Refuse the obviously catastrophic targets outright, and require
+    # the destination to actually look like WordPress.
+    case "$site_dir" in
+        /|/usr|/etc|/var|/var/www|/home|/root|/Users|/opt|/srv|/tmp|"$HOME")
+            die "Refusing to restore over $site_dir." ;;
+    esac
+    if [ ! -f "$site_dir/wp-config.php" ] && [ ! -f "$site_dir/wp-load.php" ] && [ ! -d "$site_dir/wp-includes" ]; then
+        die "Refusing to restore over $site_dir: it does not look like a WordPress install."
+    fi
+
+    local work
+    work=$(mktemp -d "${TMPDIR:-/tmp}/cove-restore-XXXXXX") || die "mktemp failed"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$work'" EXIT
+
+    log "Extracting archive (${EXTRACTOR})..."
+    case "$EXTRACTOR" in
+        unzip) unzip -qo "$archive" -d "$work" ;;
+        tar)   tar -xzf "$archive" -C "$work" ;;
+        php|phar) wp_eval "$site_dir" php_archive_script extract "$archive" "$work" ;;
+    esac || die "Extraction failed."
+
+    # Archives carry a single top-level directory (the site folder). Descend
+    # into it when present so both shapes restore identically.
+    local src="$work"
+    local entries
+    entries=$(find "$work" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+    if [ "$entries" = "1" ]; then
+        local only
+        only=$(find "$work" -mindepth 1 -maxdepth 1)
+        [ -d "$only" ] && src="$only"
+    fi
+
+    local sql
+    sql=$(find "$src" -maxdepth 1 -name '*.sql' | head -1)
+    [ -n "$sql" ] || die "No .sql file found in the archive."
+
+    # Preserve the destination's own wp-config.php: its credentials are the
+    # ones that work here. Shipping the source's would point the restored site
+    # at a database that does not exist on this machine.
+    local keep_config=""
+    if [ -f "$site_dir/wp-config.php" ]; then
+        keep_config="$work/wp-config.php.keep"
+        cp "$site_dir/wp-config.php" "$keep_config"
+    fi
+
+    log "Replacing files..."
+    # Clear the destination except wp-config.php, then move the new tree in.
+    find "$site_dir" -mindepth 1 -maxdepth 1 ! -name 'wp-config.php' -exec rm -rf {} + 2>/dev/null
+    ( cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name 'wp-config.php' \
+        -exec cp -R {} "$site_dir/" \; ) || die "Copying files failed."
+    if [ -n "$keep_config" ]; then
+        cp "$keep_config" "$site_dir/wp-config.php"
+    fi
+    rm -f "$site_dir"/*.sql
+
+    log "Importing database..."
+    if [ "$DB_LOAD" = native ]; then
+        $WP db reset --yes --path="$site_dir" --skip-plugins --skip-themes >&2 \
+            || die "Database reset failed."
+        $WP db import "$sql" --path="$site_dir" --skip-plugins --skip-themes >&2 \
+            || die "Database import failed."
+    else
+        log "  (no mysql client — importing through WordPress)"
+        # The dump's DROP TABLE statements make a separate reset unnecessary,
+        # which matters here because `wp db reset` also needs the native client.
+        wp_eval "$site_dir" php_load_script "$sql" || die "Database import failed."
+    fi
+
+    if [ -n "$url_to" ]; then
+        local url_from
+        url_from=$($WP option get home --path="$site_dir" --skip-plugins --skip-themes 2>/dev/null)
+        if [ -n "$url_from" ] && [ "$url_from" != "$url_to" ]; then
+            log "Rewriting URLs: $url_from -> $url_to"
+            $WP search-replace "$url_from" "$url_to" --all-tables --skip-columns=guid \
+                --path="$site_dir" --skip-plugins --skip-themes --quiet >&2 \
+                || log "  (URL rewrite reported errors)"
+            # search-replace covers serialized data but not a home/siteurl that
+            # differed in scheme only; set them outright to be certain.
+            $WP option update home "$url_to" --path="$site_dir" --skip-plugins --skip-themes >&2 2>/dev/null
+            $WP option update siteurl "$url_to" --path="$site_dir" --skip-plugins --skip-themes >&2 2>/dev/null
+        fi
+    fi
+
+    $WP cache flush --path="$site_dir" --skip-plugins --skip-themes >&2 2>/dev/null
+    log "Restore complete."
+}
+
+# --- entry --------------------------------------------------------------------
+QUIET=false
+SUB="${1:-}"; shift 2>/dev/null || true
+ARGS=()
+for a in "$@"; do
+    case "$a" in
+        --quiet)    QUIET=true ;;
+        --wp-cli=*) WP_CLI_PHAR="${a#--wp-cli=}" ;;
+        *)          ARGS+=("$a") ;;
+    esac
+done
+set -- ${ARGS+"${ARGS[@]}"}
+
+case "$SUB" in
+    probe)   cmd_probe   "${1:-}" ;;
+    backup)  [ $# -ge 1 ] || die "usage: backup <site_dir> [--exclude=GLOB]..."; cmd_backup  "$@" ;;
+    restore) [ $# -ge 2 ] || die "usage: restore <site_dir> <archive> [--url-to=URL]"; cmd_restore "$@" ;;
+    *)       die "unknown subcommand: ${SUB:-<none>}" ;;
+esac
+COVE_TRANSFER_HELPER
+}
+
+# --- Cove-side plumbing -------------------------------------------------------
+
+# Run the helper on this machine.
+transfer_local() {
+    transfer_helper_source | bash -s -- "$@"
+}
+
+# Run the helper on the remote, piping it in over the SSH connection pull/push
+# already hold open. Nothing is written to the remote filesystem, so there is
+# no installer to clean up and no trace left if the run dies partway.
+# $1 = ssh option string (unquoted on purpose), $2 = connection, rest = args.
+transfer_remote() {
+    local opts="$1" conn="$2"; shift 2
+    # shellcheck disable=SC2086
+    transfer_helper_source | ssh $opts $conn "bash -s -- $(transfer_quote_args "$@")"
+}
+
+# Quote helper arguments for the single remote shell string.
+transfer_quote_args() {
+    local out="" a
+    for a in "$@"; do
+        out="$out $(shell_quote "$a")"
+    done
+    echo "$out"
+}
+
+# Cache wp-cli.phar locally so it can be sideloaded to a remote that has no
+# WP-CLI at all (tier 4). The phar is architecture-independent, which is why
+# it is the one binary worth pushing rather than trying to package-install.
+transfer_wp_cli_phar() {
+    local cache_dir="$COVE_DIR/cache"
+    local phar="$cache_dir/wp-cli.phar"
+    mkdir -p "$cache_dir"
+    if [ ! -s "$phar" ]; then
+        curl -sL "$COVE_WP_CLI_PHAR_URL" -o "$phar" || return 1
+        [ -s "$phar" ] || { rm -f "$phar"; return 1; }
+    fi
+    echo "$phar"
+}
+
+# Ensure the remote can run WP-CLI, sideloading the phar when it can't.
+# Echoes a "--wp-cli=<path>" flag to append (empty when the remote is fine).
+# $1 = ssh opts, $2 = connection, $3 = remote site dir.
+transfer_ensure_remote_wp_cli() {
+    local opts="$1" conn="$2" site_dir="$3"
+    local probe
+    probe=$(transfer_remote "$opts" "$conn" probe "$site_dir" 2>/dev/null)
+    if ! echo "$probe" | grep -q '^wp_cli=missing'; then
+        echo ""
+        return 0
+    fi
+    echo "   - Remote has no WP-CLI; sideloading wp-cli.phar over SSH..." >&2
+    local phar
+    phar=$(transfer_wp_cli_phar) || { echo "" ; return 0; }
+    local remote_phar="/tmp/cove-wp-cli.phar"
+    # shellcheck disable=SC2086
+    if ! ssh $opts $conn "cat > $remote_phar" < "$phar"; then
+        echo ""
+        return 0
+    fi
+    echo "--wp-cli=$remote_phar"
+}
+
+# `cove transfer probe [site]` — surface the capability ladder for debugging a
+# host that pull/push struggles with.
+cove_transfer() {
+    local sub="${1:-}"; shift 2>/dev/null || true
+    case "$sub" in
+        probe)
+            local target="${1:-}"
+            if [ -n "$target" ] && [[ "$target" != /* ]]; then
+                target="$SITES_DIR/${target%.localhost}.localhost/public"
+            fi
+            echo "🔎 Transfer capabilities (local)"
+            transfer_local probe "$target"
+            ;;
+        *)
+            echo "Usage: cove transfer probe [site]"
+            echo ""
+            echo "Reports which tools the backup/restore engine will use here."
+            ;;
+    esac
+}
+
 cove_trust() {
     echo "🔐 Installing Cove's local root certificate..."
 
@@ -7671,8 +9890,17 @@ cove_upgrade() {
     local temp_script="/tmp/cove.sh.latest"
     local install_path
 
-    # Find the real path of the currently running script
-    install_path=$(command -v cove)
+    # Find the real path of the currently running script. $0 is authoritative:
+    # when cove runs via a shell alias or absolute path, `command -v cove`
+    # finds whatever happens to sit in PATH — possibly a different, older
+    # copy. (A stale v1.8 in /opt/homebrew/bin once answered a v1.11
+    # upgrade's post-upgrade/reload calls: "Unknown command 'post-upgrade'",
+    # plus a reload through three-versions-old generators.) PATH lookup is
+    # only the fallback when $0 is unusable.
+    install_path="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")"
+    if [ ! -f "$install_path" ]; then
+        install_path=$(command -v cove)
+    fi
     if [ -z "$install_path" ]; then
         install_path="/usr/local/bin/cove" # Fallback to default
     fi
