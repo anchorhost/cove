@@ -45,8 +45,11 @@ cove_proxy_add() {
     # callers (dashboard, CI) can overwrite safely.
     [ -t 0 ] || force=true
 
-    # Interactive mode if arguments not provided
+    # Interactive mode if arguments not provided. All three values are
+    # positional, so a headless caller supplies them on the command line
+    # rather than hitting a prompt it can't answer.
     if [ -z "$name" ]; then
+        require_interactive "The proxy name" "it positionally: cove proxy add <name> <domain> <target>"
         echo "📝 Adding a new reverse proxy entry..."
         name=$(gum input --width 0 --placeholder "Proxy name (e.g., opencode)")
     fi
@@ -73,6 +76,7 @@ cove_proxy_add() {
     fi
 
     if [ -z "$domain" ]; then
+        require_interactive "The proxy domain" "it positionally: cove proxy add <name> <domain> <target>"
         domain=$(gum input --width 0 --placeholder "Domain to listen on (e.g., myhost.tailnet.ts.net)")
     fi
 
@@ -82,6 +86,7 @@ cove_proxy_add() {
     fi
 
     if [ -z "$target" ]; then
+        require_interactive "The proxy target" "it positionally: cove proxy add <name> <domain> <target>"
         target=$(gum input --width 0 --placeholder "Target to proxy to (e.g., 127.0.0.1:4096)")
     fi
 
@@ -168,6 +173,7 @@ cove_proxy_delete() {
             exit 0
         fi
 
+        require_interactive "Choosing a proxy to delete" "the proxy name as an argument: cove proxy delete <name>"
         echo "🗑️ Select a proxy to delete:"
         name=$(ls "$PROXY_DIR" | gum choose)
 

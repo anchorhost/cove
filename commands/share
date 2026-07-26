@@ -5,10 +5,24 @@
 SHARE_PROXY_PORT=19876
 
 cove_share() {
-    local site_name="$1"
-    
+    local site_name=""
+    local auto_yes=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y|--force) auto_yes=true; shift ;;
+            -h|--help) display_command_help share; exit 0 ;;
+            -*)
+                gum style --foreground red "Error: Unknown option: $1" >&2
+                echo "Usage: cove share [<name>] [--yes]" >&2
+                exit 1
+                ;;
+            *) [ -z "$site_name" ] && site_name="$1"; shift ;;
+        esac
+    done
+
     # --- 1. Validate Site ---
     if [ -z "$site_name" ]; then
+        require_interactive "Choosing a site to share" "the site name as an argument: cove share <name>"
         # Interactive mode: let user select a site
         local all_sites=()
         for site_dir in "$SITES_DIR"/*.localhost; do
@@ -68,7 +82,18 @@ cove_share() {
         fi
         
         if [ -n "$install_cmd" ]; then
-            if gum confirm "Install cloudflared via ${install_name}?"; then
+            # --yes (or no TTY to ask on) installs without prompting; the
+            # alternative is aborting a share for want of a keystroke.
+            if $auto_yes || ! [ -t 0 ]; then
+                echo "Installing cloudflared via ${install_name}..."
+                eval "$install_cmd"
+                if ! command -v cloudflared &> /dev/null; then
+                    gum style --foreground red "Error: Failed to install cloudflared."
+                    exit 1
+                fi
+                echo "cloudflared installed successfully."
+                echo ""
+            elif gum confirm "Install cloudflared via ${install_name}?"; then
                 echo "Installing cloudflared..."
                 eval "$install_cmd"
                 if ! command -v cloudflared &> /dev/null; then

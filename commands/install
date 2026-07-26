@@ -132,19 +132,52 @@ install_dependency() {
 
 cove_install() {
     local auto_yes=false
+    local explicit_http=""
+    local explicit_https=""
+    local db_root_user=""
+    local db_root_pass=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --yes|-y|--force)
                 auto_yes=true
                 shift
                 ;;
+            --http) explicit_http="$2"; shift 2 ;;
+            --http=*) explicit_http="${1#*=}"; shift ;;
+            --https) explicit_https="$2"; shift 2 ;;
+            --https=*) explicit_https="${1#*=}"; shift ;;
+            --db-root-user) db_root_user="$2"; shift 2 ;;
+            --db-root-user=*) db_root_user="${1#*=}"; shift ;;
+            --db-root-pass) db_root_pass="$2"; shift 2 ;;
+            --db-root-pass=*) db_root_pass="${1#*=}"; shift ;;
+            -h|--help)
+                display_command_help install
+                exit 0
+                ;;
             *)
                 echo "❌ Unknown argument: $1" >&2
-                echo "Usage: cove install [--yes]" >&2
+                echo "Usage: cove install [--yes] [--http PORT] [--https PORT] [--db-root-user USER] [--db-root-pass PASS]" >&2
                 exit 1
                 ;;
         esac
     done
+
+    # Explicit ports bypass both interactive port menus below entirely.
+    if [ -n "$explicit_http" ] || [ -n "$explicit_https" ]; then
+        local want_http="${explicit_http:-$HTTP_PORT}"
+        local want_https="${explicit_https:-$HTTPS_PORT}"
+        if [[ ! "$want_http" =~ ^[0-9]+$ ]] || [ "$want_http" -lt 1 ] || [ "$want_http" -gt 65535 ]; then
+            echo "❌ Invalid HTTP port: $want_http" >&2; exit 1
+        fi
+        if [[ ! "$want_https" =~ ^[0-9]+$ ]] || [ "$want_https" -lt 1 ] || [ "$want_https" -gt 65535 ]; then
+            echo "❌ Invalid HTTPS port: $want_https" >&2; exit 1
+        fi
+        if [ "$want_http" = "$want_https" ]; then
+            echo "❌ HTTP and HTTPS ports must differ." >&2; exit 1
+        fi
+        HTTP_PORT="$want_http"
+        HTTPS_PORT="$want_https"
+    fi
 
     # Non-interactive callers (CI, installer piping, dashboards) have no TTY;
     # gum confirm / gum choose abort there. Auto-promote so the install doesn't
@@ -205,8 +238,16 @@ cove_install() {
     local original_https="$HTTPS_PORT"
     local port_choice_made=false
 
+    # Both menus below are gum choose, which aborts without a TTY. --yes (set
+    # automatically when headless) and explicit --http/--https both mean "don't
+    # ask" — keep whatever ports are configured and move on.
+    local ports_decided=false
+    if $auto_yes || [ -n "$explicit_http" ] || [ -n "$explicit_https" ]; then
+        ports_decided=true
+    fi
+
     # --- Reconfigure path ---
-    if [ "$HTTP_PORT" != "80" ] || [ "$HTTPS_PORT" != "443" ]; then
+    if ! $ports_decided && { [ "$HTTP_PORT" != "80" ] || [ "$HTTPS_PORT" != "443" ]; }; then
         echo ""
         gum style --foreground "212" \
             "Cove is currently configured for custom ports: ${HTTP_PORT} / ${HTTPS_PORT}"
@@ -259,6 +300,17 @@ cove_install() {
             echo "   Port ${HTTPS_PORT} is in use by: ${app:-another process}"
         fi
         echo ""
+
+        # Headless (or --yes / explicit ports): report the conflict and carry
+        # on with the requested ports rather than stalling on a menu. The
+        # caller picked these deliberately, and re-running with
+        # --http/--https is the way to change them.
+        if $ports_decided; then
+            echo "   Proceeding with ${HTTP_PORT}/${HTTPS_PORT} anyway."
+            echo "   Re-run with --http PORT --https PORT to choose different ports."
+            echo ""
+        else
+
         echo "Cove needs an HTTP and HTTPS port. How would you like to proceed?"
         echo ""
 
@@ -291,6 +343,7 @@ cove_install() {
                 exit 1
                 ;;
         esac
+        fi
         port_choice_made=true
     fi
 
@@ -524,10 +577,13 @@ INI
             user_created_successfully=true
         else
             echo "   - ⚠️ Automatic setup failed. Falling back to manual credential entry..."
-            local root_user
-            root_user=$(gum input --value "root" --prompt "MariaDB Root Username: ")
-            local root_pass
-            root_pass=$(gum input --password --placeholder "Password for '$root_user'")
+            local root_user="$db_root_user"
+            local root_pass="$db_root_pass"
+            if [ -z "$root_user" ]; then
+                require_interactive "MariaDB root credentials (automatic setup failed)" "--db-root-user USER --db-root-pass PASS"
+                root_user=$(gum input --value "root" --prompt "MariaDB Root Username: ")
+                root_pass=$(gum input --password --placeholder "Password for '$root_user'")
+            fi
 
             if echo "$sql_command" | mysql -u "$root_user" -p"$root_pass"; then
                 echo "   - ✅ Manual database user creation successful."

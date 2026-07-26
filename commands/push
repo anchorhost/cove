@@ -12,6 +12,32 @@ cove_push() {
         exit 1
     }
 
+    # --- Argument Parsing ---
+    # Flag equivalents for every prompt below, so a push can run headless
+    # (CI, scripts, an AI agent). Omit a flag and you get its prompt — but
+    # only when there's a TTY to prompt on.
+    local arg_site=""
+    local arg_ssh=""
+    local arg_path=""
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|--yes|-y) force=true; shift ;;
+            --site) arg_site="$2"; shift 2 ;;
+            --site=*) arg_site="${1#*=}"; shift ;;
+            --ssh)  arg_ssh="$2";  shift 2 ;;
+            --ssh=*)  arg_ssh="${1#*=}";  shift ;;
+            --path) arg_path="$2"; shift 2 ;;
+            --path=*) arg_path="${1#*=}"; shift ;;
+            -h|--help) display_command_help push; exit 0 ;;
+            *)
+                gum style --foreground red "❌ Unknown option: $1" >&2
+                echo "Usage: cove push [--site <name>] [--ssh \"user@host -p 22\"] [--path public/] [--yes]" >&2
+                exit 1
+                ;;
+        esac
+    done
+
     # Define quiet SSH options to prevent host key warnings. ControlMaster
     # shares a single authenticated connection across every ssh call below
     # (validate, upload backup, restore, cleanup) so the user enters their
@@ -25,35 +51,57 @@ cove_push() {
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pushing a local Cove site to a remote server."
 
     # --- 1. Choose Local Site ---
-    log_step "Choose a local site to push"
-    local wp_sites=()
-    for site_dir in "$SITES_DIR"/*.localhost; do
-        if [ -f "$site_dir/public/wp-config.php" ]; then
-            wp_sites+=("$(basename "$site_dir" .localhost)")
-        fi
-    done
+    local site_name="${arg_site%.localhost}"
+    if [ -z "$site_name" ]; then
+        require_interactive "Choosing a local site to push" "--site <name>"
+        log_step "Choose a local site to push"
+        local wp_sites=()
+        for site_dir in "$SITES_DIR"/*.localhost; do
+            if [ -f "$site_dir/public/wp-config.php" ]; then
+                wp_sites+=("$(basename "$site_dir" .localhost)")
+            fi
+        done
 
-    if [ ${#wp_sites[@]} -eq 0 ]; then
-        log_error "No local WordPress sites found to push."
+        if [ ${#wp_sites[@]} -eq 0 ]; then
+            log_error "No local WordPress sites found to push."
+        fi
+
+        site_name=$(gum choose "${wp_sites[@]}")
+        if [ -z "$site_name" ]; then log_error "No site selected."; fi
+    else
+        # A name supplied by flag skipped the picker, which only ever listed
+        # real WordPress sites — so validate what the picker would have guaranteed.
+        if ! validate_site_name "$site_name"; then
+            log_error "Invalid site name '$site_name'."
+        fi
+        if [ ! -f "$SITES_DIR/$site_name.localhost/public/wp-config.php" ]; then
+            log_error "No local WordPress site named '$site_name' (looked for $SITES_DIR/$site_name.localhost/public/wp-config.php)."
+        fi
     fi
 
-    local site_name
-    site_name=$(gum choose "${wp_sites[@]}")
-    if [ -z "$site_name" ]; then log_error "No site selected."; fi
-
     local local_path="$SITES_DIR/$site_name.localhost/public"
-    
+
     # --- 2. Gather Remote Info ---
-    log_step "Enter remote server details"
-    local remote_ssh
-    remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    local remote_ssh="$arg_ssh"
+    if [ -z "$remote_ssh" ]; then
+        require_interactive "The SSH connection" "--ssh \"user@host -p 2222\""
+        log_step "Enter remote server details"
+        remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    fi
     if [ -z "$remote_ssh" ]; then log_error "SSH connection cannot be empty."; fi
 
     # Trim the "ssh " prefix if the user includes it.
     remote_ssh="${remote_ssh##ssh }"
 
-    local remote_path
-    remote_path=$(gum input --width 0 --value "public/" --prompt "Path to Remote WordPress Root: ")
+    # Defaults to public/ — the same value the prompt pre-fills.
+    local remote_path="$arg_path"
+    if [ -z "$remote_path" ]; then
+        if is_noninteractive; then
+            remote_path="public/"
+        else
+            remote_path=$(gum input --width 0 --value "public/" --prompt "Path to Remote WordPress Root: ")
+        fi
+    fi
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
     local remote_path_q
     remote_path_q=$(shell_quote "$remote_path")
@@ -69,21 +117,35 @@ cove_push() {
     log_success "Found remote site to overwrite: $remote_url"
 
     # --- 4. Confirmation ---
-    if ! gum confirm "🚨 Are you sure you want to push '${site_name}' to '${remote_url}'? This will completely overwrite the remote site's files and database."; then
-        echo "🚫 Push cancelled."
-        exit 0
+    # Deliberately NOT auto-promoted on a missing TTY the way `cove delete` is.
+    # Delete is driven by the dashboard and only destroys a local throwaway;
+    # push overwrites a live remote site's files AND database. A headless
+    # caller has to say --yes out loud.
+    if ! $force; then
+        require_interactive "Overwriting the remote site at '${remote_url}'" "--yes to confirm the push"
+        if ! gum confirm "🚨 Are you sure you want to push '${site_name}' to '${remote_url}'? This will completely overwrite the remote site's files and database."; then
+            echo "🚫 Push cancelled."
+            exit 0
+        fi
     fi
 
     # --- 5. Perform Local Backup ---
     log_step "Generating local backup for ${site_name}..."
     local backup_filename
     backup_filename=$( (cd "$local_path" && curl -sL https://captaincore.io/do | bash -s -- backup . --quiet --format=filename) )
-    
-    if [[ ! -f "$backup_filename" || ! "$backup_filename" == *".zip" ]]; then
+
+    # The cd above is scoped to the subshell, so the zip lands in $local_path
+    # while we're still wherever the user invoked cove from. Every local
+    # reference below therefore has to be absolute — resolving the bare
+    # filename against the caller's cwd meant `cove push` only worked when run
+    # from inside the site's own public/ directory and failed everywhere else.
+    local backup_path="$local_path/$backup_filename"
+
+    if [[ -z "$backup_filename" || ! -f "$backup_path" || ! "$backup_filename" == *".zip" ]]; then
         log_error "Failed to generate local backup. The captaincore script might have failed."
     fi
-    
-    size=$(ls -lh "$backup_filename" | awk '{print $5}')
+
+    size=$(ls -lh "$backup_path" | awk '{print $5}')
     log_success "Local backup created: ${backup_filename} ($size)"
 
     local backup_filename_q
@@ -93,9 +155,9 @@ cove_push() {
 
     # --- 6. Upload Backup ---
     log_step "Uploading backup to remote server..."
-    if ! cat "$backup_filename" | ssh $ssh_opts $remote_ssh "cat > $remote_backup_q"; then
+    if ! cat "$backup_path" | ssh $ssh_opts $remote_ssh "cat > $remote_backup_q"; then
         # Clean up local backup on failure
-        rm -f "$backup_filename"
+        rm -f "$backup_path"
         log_error "Failed to upload backup."
     fi
     log_success "Upload complete."
@@ -105,7 +167,7 @@ cove_push() {
     if ! ssh $ssh_opts $remote_ssh "cd $remote_path_q && curl -sL https://captaincore.io/do | bash -s -- migrate --url=$backup_filename_q --update-urls"; then
         # Don't leave a full DB dump + wp-config zip sitting in the remote web
         # root (or locally) after a failed restore — it's directly downloadable.
-        rm -f "$backup_filename"
+        rm -f "$backup_path"
         ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q" 2>/dev/null
         log_error "The remote migration script failed to execute correctly."
     fi
@@ -113,7 +175,7 @@ cove_push() {
 
     # --- 8. Cleanup ---
     log_step "Cleaning up backup files..."
-    rm -f "$backup_filename"
+    rm -f "$backup_path"
     ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q"
     log_success "Cleanup complete."
 

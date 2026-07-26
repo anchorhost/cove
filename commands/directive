@@ -1,9 +1,37 @@
 cove_directive_add_or_update() {
-    local site_name="$1"
+    local site_name=""
+    local arg_rules=""
+    local arg_file=""
+    local have_rules=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rules) arg_rules="$2"; have_rules=true; shift 2 ;;
+            --rules=*) arg_rules="${1#*=}"; have_rules=true; shift ;;
+            --file) arg_file="$2"; shift 2 ;;
+            --file=*) arg_file="${1#*=}"; shift ;;
+            -h|--help) display_command_help directive; exit 0 ;;
+            -*)
+                gum style --foreground red "❌ Unknown option: $1"
+                echo "Usage: cove directive <add|update> <name> [--rules \"...\" | --file <path>]"
+                exit 1
+                ;;
+            *) [ -z "$site_name" ] && site_name="$1"; shift ;;
+        esac
+    done
+
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: Please provide a site name."
-        echo "Usage: cove directive <add|update> <name>"
+        echo "Usage: cove directive <add|update> <name> [--rules \"...\" | --file <path>]"
         exit 1
+    fi
+
+    if [ -n "$arg_file" ]; then
+        if [ ! -f "$arg_file" ]; then
+            gum style --foreground red "❌ Error: File not found: $arg_file"
+            exit 1
+        fi
+        arg_rules=$(cat "$arg_file")
+        have_rules=true
     fi
     
     local site_hostname="${site_name}.localhost"
@@ -21,8 +49,11 @@ cove_directive_add_or_update() {
     fi
     
     local custom_rules
-    # If stdin is a terminal (interactive), use gum. Otherwise, read from pipe.
-    if [ -t 0 ]; then
+    # --rules/--file win outright; otherwise a TTY gets the editor and a pipe
+    # gets read from stdin (the path `cove pull --proxy-uploads` uses).
+    if $have_rules; then
+        custom_rules="$arg_rules"
+    elif [ -t 0 ]; then
         if [ -f "$custom_conf_file" ]; then
             echo "📝 Editing custom Caddy directives for $site_hostname..."
         else

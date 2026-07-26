@@ -1,4 +1,10 @@
 cove_pull() {
+    # Sourced up front, not just before the post-migration step. Anything below
+    # that touches DB_USER / DB_PASSWORD needs it, and an unset DB_USER turns
+    # `mysql -u "$DB_USER" -p"$DB_PASSWORD"` into a bare `-p` that stops and
+    # prompts "Enter password:" — which hangs a headless pull outright.
+    source_config
+
     # --- UI/Logging Functions ---
     log_step() { 
         echo ""
@@ -13,13 +19,40 @@ cove_pull() {
     }
 
     # --- Argument Parsing ---
+    # Every prompt below has a flag equivalent so the whole pull can run
+    # headless (CI, scripts, an AI agent). Omit a flag and you get the prompt
+    # for it — but only when there's a TTY to prompt on.
     local proxy_uploads=false
-    for arg in "$@"; do
-        if [ "$arg" == "--proxy-uploads" ]; then
-            proxy_uploads=true
-            break
-        fi
+    local arg_ssh=""
+    local arg_path=""
+    local arg_site=""
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --proxy-uploads) proxy_uploads=true; shift ;;
+            --force|--yes|-y) force=true; shift ;;
+            --ssh)  arg_ssh="$2";  shift 2 ;;
+            --ssh=*)  arg_ssh="${1#*=}";  shift ;;
+            --path) arg_path="$2"; shift 2 ;;
+            --path=*) arg_path="${1#*=}"; shift ;;
+            --site) arg_site="$2"; shift 2 ;;
+            --site=*) arg_site="${1#*=}"; shift ;;
+            -h|--help) display_command_help pull; exit 0 ;;
+            *)
+                gum style --foreground red "❌ Unknown option: $1" >&2
+                echo "Usage: cove pull [--ssh \"user@host -p 22\"] [--path public/] [--site <name>] [--proxy-uploads] [--yes]" >&2
+                exit 1
+                ;;
+        esac
     done
+
+    # Headless, the destination can't be prompted for later — so catch a
+    # missing --site now rather than after a full SSH round-trip to the
+    # remote. (Interactively the picker runs after validation on purpose: it
+    # proposes a site name derived from the remote URL.)
+    if is_noninteractive && [ -z "$arg_site" ]; then
+        require_interactive "Choosing a destination site" "--site <name> (an existing site is overwritten, a new name is created)"
+    fi
 
     # Define quiet SSH options to prevent host key warnings. ControlMaster
     # shares a single authenticated connection across every ssh call below
@@ -37,16 +70,27 @@ cove_pull() {
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pulling a remote WordPress site into Cove."
     # --- 1. Gather Remote Info ---
-    log_step "Enter remote server details"
-    local remote_ssh
-    remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    local remote_ssh="$arg_ssh"
+    if [ -z "$remote_ssh" ]; then
+        require_interactive "The SSH connection" "--ssh \"user@host -p 2222\""
+        log_step "Enter remote server details"
+        remote_ssh=$(gum input --width 0 --placeholder "user@host.com -p 2222" --prompt "SSH Connection: ")
+    fi
     if [ -z "$remote_ssh" ]; then log_error "SSH connection cannot be empty."; fi
 
     # Trim the "ssh " prefix if the user includes it.
     remote_ssh="${remote_ssh##ssh }"
 
-    local remote_path
-    remote_path=$(gum input --width 0 --value "public/" --prompt "Path to WordPress Root: ")
+    # The remote root defaults to public/ — the same value the prompt
+    # pre-fills — so --path is only needed for non-standard layouts.
+    local remote_path="$arg_path"
+    if [ -z "$remote_path" ]; then
+        if is_noninteractive; then
+            remote_path="public/"
+        else
+            remote_path=$(gum input --width 0 --value "public/" --prompt "Path to WordPress Root: ")
+        fi
+    fi
     if [ -z "$remote_path" ]; then log_error "Remote path cannot be empty."; fi
     local remote_path_q
     remote_path_q=$(shell_quote "$remote_path")
@@ -63,47 +107,66 @@ cove_pull() {
     log_success "Found WordPress site: $remote_url"
 
     # --- 3. Choose Destination ---
-    log_step "Choose a destination for the pulled site"
-    
-    local wp_sites=()
-    for site_dir in "$SITES_DIR"/*.localhost; do
-        if [ -f "$site_dir/public/wp-config.php" ]; then
-            wp_sites+=("$(basename "$site_dir" .localhost)")
-        fi
-    done
-    
-    local destination_choice
-    destination_choice=$(gum choose "New Site" "${wp_sites[@]}")
-
     local site_name
     local dest_path
     local local_url
-    local db_name
-    local reset_db=false
+    local is_new_site=false
 
-    if [ "$destination_choice" == "New Site" ]; then
-        local proposed_name
-        proposed_name=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//; s/\./-/g')
-        site_name=$(gum input --width 0 --value "$proposed_name" --prompt "Enter a name for the new local site: ")
-        if [ -z "$site_name" ]; then log_error "Site name cannot be empty."; fi
-
-        log_step "Creating new placeholder site: ${site_name}.localhost"
-        "$COVE_CMD" add "$site_name"
-        if [ $? -ne 0 ]; then log_error "Failed to create placeholder site. Does it already exist?"; fi
-        
-    else
-        site_name="$destination_choice"
-        if ! gum confirm "Are you sure you want to overwrite '${site_name}'? All its files and database content will be replaced."; then
-            echo "🚫 Pull cancelled."
-            exit 0
+    if [ -n "$arg_site" ]; then
+        # --site covers both destinations: an existing site is overwritten,
+        # an unused name is created. Which one it is follows from whether the
+        # directory exists, so the caller doesn't need a second flag.
+        site_name="${arg_site%.localhost}"
+        if ! validate_site_name "$site_name"; then
+            log_error "Invalid site name '$site_name'."
         fi
-        
+        [ -d "$SITES_DIR/$site_name.localhost" ] || is_new_site=true
+    else
+        require_interactive "Choosing a destination site" "--site <name> (an existing site is overwritten, a new name is created)"
+        log_step "Choose a destination for the pulled site"
+
+        local wp_sites=()
+        for site_dir in "$SITES_DIR"/*.localhost; do
+            if [ -f "$site_dir/public/wp-config.php" ]; then
+                wp_sites+=("$(basename "$site_dir" .localhost)")
+            fi
+        done
+
+        local destination_choice
+        destination_choice=$(gum choose "New Site" "${wp_sites[@]}")
+        if [ -z "$destination_choice" ]; then log_error "No destination selected."; fi
+
+        if [ "$destination_choice" == "New Site" ]; then
+            is_new_site=true
+            local proposed_name
+            proposed_name=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//; s/\./-/g')
+            site_name=$(gum input --width 0 --value "$proposed_name" --prompt "Enter a name for the new local site: ")
+            if [ -z "$site_name" ]; then log_error "Site name cannot be empty."; fi
+        else
+            site_name="$destination_choice"
+        fi
+    fi
+
+    if $is_new_site; then
+        log_step "Creating new placeholder site: ${site_name}.localhost"
+        if ! "$COVE_CMD" add "$site_name"; then
+            log_error "Failed to create placeholder site. Does it already exist?"
+        fi
+    else
+        # Overwriting destroys the local site's files and database, so it needs
+        # an explicit yes: the confirm interactively, --yes when headless.
+        if ! $force; then
+            require_interactive "Overwriting the existing site '${site_name}'" "--yes to confirm the overwrite"
+            if ! gum confirm "Are you sure you want to overwrite '${site_name}'? All its files and database content will be replaced."; then
+                echo "🚫 Pull cancelled."
+                exit 0
+            fi
+        fi
+
         log_step "Preparing to overwrite existing site: ${site_name}.localhost"
-        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
-        # Defer the destructive DROP/CREATE until the remote backup is in hand
-        # (below). Dropping here left the local DB gone with no rollback if the
-        # backup step then failed — the pull broke the site worse than a no-op.
-        reset_db=true
+        # The database is reset by `do migrate` itself (wp db reset + import),
+        # so nothing destructive happens here — the local site stays intact and
+        # servable right up until the restore actually succeeds.
     fi
 
     dest_path="$SITES_DIR/$site_name.localhost/public"
@@ -125,19 +188,49 @@ cove_pull() {
     fi
     log_success "Backup created: ${backup_url}"
 
-    # Only now that a valid backup exists is it safe to wipe the local DB.
-    if [ "$reset_db" = true ]; then
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\`;"
+    # NOTE: there is deliberately no DROP DATABASE here. `do migrate` runs
+    # `wp db reset --yes` immediately before `wp db import`, so the clean slate
+    # is already guaranteed at the right moment. Wiping the DB up front instead
+    # BROKE the overwrite path: migrate's preflight refuses to run unless the
+    # destination is an installed WordPress (`wp option get home` must return a
+    # URL), and an emptied database fails that check with "WordPress not found
+    # in current directory" — leaving the site with no tables at all.
+
+    local backup_filename="${backup_url##*/}"
+
+    # The URL `do backup` hands back is built from the REMOTE's own home option
+    # (home_url + filename), so it only resolves when the remote's WordPress URL
+    # is publicly reachable AND maps to the directory holding the backup. That's
+    # false more often than you'd expect: a sandbox with a stale home option, a
+    # staging site behind basic auth or an IP allowlist, anything on a private
+    # network. We already hold an authenticated SSH connection to that exact
+    # file, so fall back to streaming it down rather than failing the pull.
+    #
+    # Landing it in $dest_path is what makes this work seamlessly: migrate_site
+    # looks for basename(--url) in its working directory and skips the download
+    # when the file is already sitting there.
+    if ! curl -sfI --max-time 20 "$backup_url" >/dev/null 2>&1; then
+        log_step "Backup URL isn't publicly reachable — fetching over SSH instead..."
+        local remote_backup_src
+        remote_backup_src=$(shell_quote "$remote_path/$backup_filename")
+        if ! ssh $ssh_opts $remote_ssh "cat $remote_backup_src" > "$dest_path/$backup_filename"; then
+            rm -f "$dest_path/$backup_filename"
+            ssh $ssh_opts $remote_ssh "rm -f $remote_backup_src" 2>/dev/null
+            log_error "Could not retrieve the backup over HTTP or SSH."
+        fi
+        log_success "Backup retrieved over SSH ($(du -h "$dest_path/$backup_filename" 2>/dev/null | cut -f1))."
     fi
 
     log_step "Restoring backup to ${site_name}.localhost..."
     # Execute the migration script directly instead of using a variable with a pipe
     if ! (cd "$dest_path" && curl -sL https://captaincore.io/do | bash -s -- migrate --url="$backup_url" --update-urls); then
         # Remove the remote backup (full DB dump + wp-config) so a failed
-        # restore doesn't leave it downloadable in the remote web root.
+        # restore doesn't leave it downloadable in the remote web root. Also
+        # clear an SSH-fetched copy if migrate didn't consume it.
         local failed_backup_q
-        failed_backup_q=$(shell_quote "$remote_path/${backup_url##*/}")
+        failed_backup_q=$(shell_quote "$remote_path/$backup_filename")
         ssh $ssh_opts $remote_ssh "rm -f $failed_backup_q" 2>/dev/null
+        rm -f "$dest_path/$backup_filename"
         log_error "The migration script failed to execute correctly."
     fi
     log_success "Restore complete."

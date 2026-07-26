@@ -316,6 +316,23 @@ port_has_conflict() {
     return 0
 }
 
+# True when there's no TTY to prompt on — scripted callers, CI, an AI agent
+# driving the CLI, the dashboard's shell_exec, systemd. Every interactive
+# prompt in Cove should be reachable via flags; this is the switch that picks
+# the flag-only path.
+is_noninteractive() { [ ! -t 0 ]; }
+
+# Bail out of an unavoidable prompt with a message that names the flag to pass
+# instead of letting gum abort with the opaque "could not open a new TTY".
+# $1 = what was being asked for, $2 = the flag(s) that supply it.
+require_interactive() {
+    local what="$1" hint="$2"
+    is_noninteractive || return 0
+    gum style --foreground red "❌ $what requires an interactive terminal." >&2
+    echo "   Running headless? Pass $hint" >&2
+    exit 1
+}
+
 # Interactive prompt that asks for HTTP and HTTPS ports, validates each, and
 # re-prompts until both are free. Sets HTTP_PORT / HTTPS_PORT globals on
 # success. Called by the install and `cove ports` flows.
@@ -3427,7 +3444,8 @@ display_command_help() {
     local cmd="$1"
     case "$cmd" in
         install)
-            echo "Usage: cove install [--yes]"
+            echo "Usage: cove install [--yes] [--http PORT] [--https PORT]"
+            echo "                    [--db-root-user USER] [--db-root-pass PASS]"
             echo ""
             echo "Installs and configures Homebrew dependencies like Caddy, MariaDB, and Mailpit."
             echo "It also sets up the required directory structure inside '~/Cove'."
@@ -3435,6 +3453,12 @@ display_command_help() {
             echo "Options:"
             echo "  --yes, -y, --force   Skip confirmation prompts for scripted installs."
             echo "                       Auto-enabled when stdin is not a TTY."
+            echo "  --http PORT          Set the HTTP port outright, skipping the port menus."
+            echo "  --https PORT         Set the HTTPS port outright, skipping the port menus."
+            echo "                       Without these, a scripted install keeps the configured"
+            echo "                       ports and reports (rather than prompts on) a conflict."
+            echo "  --db-root-user USER  MariaDB root user, used only if automatic database setup"
+            echo "  --db-root-pass PASS  fails. Without them that fallback needs a terminal."
             ;;
         enable)
             echo "Usage: cove enable"
@@ -3521,7 +3545,13 @@ display_command_help() {
             echo "  list                Lists all custom directives for all managed sites."
             echo ""
             echo "Flags:"
+            echo "  --rules \"...\"       Directives as a string, instead of opening the editor."
+            echo "  --file <path>       Read directives from a file instead of the editor."
             echo "  --force             Skip confirmation prompt (delete only)."
+            echo ""
+            echo "Without --rules/--file, add/update opens an editor on a TTY and otherwise"
+            echo "reads from stdin, so this also works:"
+            echo "  cat rules.conf | cove directive add mysite"
             ;;
         proxy)
             echo "Usage: cove proxy <subcommand>"
@@ -3673,13 +3703,17 @@ display_command_help() {
             echo "  cove log beckon -f    Follow beckon site logs in real-time"
             ;;
         share)
-            echo "Usage: cove share [site]"
+            echo "Usage: cove share [site] [--yes]"
             echo ""
             echo "Creates a temporary public tunnel to share a local site with anyone on the internet."
             echo "Powered by Cloudflare Quick Tunnels (cloudflared installed on-demand)."
             echo ""
             echo "Arguments:"
             echo "  [site]    The site name (optional). If omitted, prompts for selection."
+            echo ""
+            echo "Flags:"
+            echo "  --yes, -y Install cloudflared without asking, if it's missing."
+            echo "            Assumed when stdin is not a TTY."
             echo ""
             echo "Examples:"
             echo "  cove share           Interactive site selection"
@@ -3708,25 +3742,48 @@ display_command_help() {
             echo "  <name>         The name of the site."
             ;;
         pull)
-            echo "Usage: cove pull [--proxy-uploads]"
+            echo "Usage: cove pull [--ssh \"user@host -p 22\"] [--path public/] [--site <name>]"
+            echo "                 [--proxy-uploads] [--yes]"
             echo ""
-            echo "Pulls a remote WordPress site into Cove via an interactive TUI."
-            echo "This command will guide you through providing SSH and path details for the remote site,"
-            echo "then it will create a backup, pull it down, and configure it to run locally."
-            echo "You can choose to create a new site or overwrite an existing one."
+            echo "Pulls a remote WordPress site into Cove. Creates a backup on the remote,"
+            echo "pulls it down, and configures it to run locally."
+            echo ""
+            echo "Prompts for anything you don't pass as a flag. Pass all of them and it"
+            echo "runs unattended — no TTY required."
             echo ""
             echo "Flags:"
+            echo "  --ssh <conn>     Remote SSH connection, e.g. \"user@host.com -p 2222\"."
+            echo "  --path <path>    Remote WordPress root. Defaults to 'public/'."
+            echo "  --site <name>    Destination site. An existing site is OVERWRITTEN;"
+            echo "                   an unused name is created."
+            echo "  --yes, -y        Skip the overwrite confirmation. Required (instead of the"
+            echo "                   prompt) when overwriting an existing site headlessly."
             echo "  --proxy-uploads  Excludes the 'wp-content/uploads' directory from the backup and"
             echo "                   configures the local site to proxy media requests to the live URL."
             echo "                   This saves significant time and disk space for large sites."
+            echo ""
+            echo "Example:"
+            echo "  cove pull --ssh \"dev@example.com -p 22\" --site myblog --yes"
             ;;
         push)
-            echo "Usage: cove push"
+            echo "Usage: cove push [--site <name>] [--ssh \"user@host -p 22\"] [--path public/] [--yes]"
             echo ""
-            echo "Pushes a local Cove site to a remote server via an interactive TUI."
-            echo "This command will guide you through selecting a local site, providing SSH and path"
-            echo "details for the remote site, then it will create a local backup, upload it, and"
-            echo "run a migration script on the remote server to overwrite its contents."
+            echo "Pushes a local Cove site to a remote server. Creates a local backup, uploads"
+            echo "it, and runs a migration on the remote to OVERWRITE its files and database."
+            echo ""
+            echo "Prompts for anything you don't pass as a flag. Pass all of them and it"
+            echo "runs unattended — no TTY required."
+            echo ""
+            echo "Flags:"
+            echo "  --site <name>    Local WordPress site to push."
+            echo "  --ssh <conn>     Remote SSH connection, e.g. \"user@host.com -p 2222\"."
+            echo "  --path <path>    Remote WordPress root. Defaults to 'public/'."
+            echo "  --yes, -y        Confirm the overwrite. Unlike other commands this is never"
+            echo "                   assumed when headless — push destroys a live remote site,"
+            echo "                   so it must always be stated explicitly."
+            echo ""
+            echo "Example:"
+            echo "  cove push --site myblog --ssh \"dev@example.com -p 22\" --yes"
             ;;
         reload)
             echo "Usage: cove reload"
