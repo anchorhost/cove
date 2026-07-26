@@ -3134,7 +3134,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     try {
                         const r = await fetch('api.php?action=list_sites');
                         const data = await r.json();
-                        this.sites = data.map(s => ({ ...s, isLoggingIn: false }));
+                        // Sites staged for deletion are still on disk (nothing
+                        // is sent to the backend until the undo window closes),
+                        // so a refresh landing mid-window would re-add the rows
+                        // the user just deleted — and undo would then push a
+                        // second copy, duplicating the :key and breaking x-for.
+                        const staged = new Set(this.pendingDelete ? this.pendingDelete.sites.map(s => s.name) : []);
+                        this.sites = data
+                            .map(s => ({ ...s, isLoggingIn: false }))
+                            .filter(s => !staged.has(s.name));
                     } catch (e) {
                         this.showSnack('Could not fetch sites.', true);
                     } finally {
