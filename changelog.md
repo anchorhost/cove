@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [1.12] - 2026-07-26
+
+The dashboard grows up: a `⌘K` command palette, right-click and `⋯` row menus, keyboard navigation, and pinned sites, so an install with hundreds of sites stays navigable. `cove pull` and `cove push` now run on Cove's own backup/restore engine over SSH instead of fetching an external script — which also means they work against hosts missing `zip`, `unzip`, `wget`, or a MySQL client. Every interactive prompt gained a flag equivalent so scripts and AI agents never stall on a question they can't answer, a new `cove health` diagnoses crashes and OPcache pressure, and a run of stability fixes clears the OPcache and Imagick segfaults that had been restarting FrankenPHP under load.
 
 ### ✨ New Features
 
