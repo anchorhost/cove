@@ -2622,6 +2622,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         /* Keyboard selection. Distinct from :hover so the two can coexist. */
         .site-row.is-selected { background: var(--panel-hover); box-shadow: inset 2px 0 0 var(--accent); }
         .site-row.is-selected .site-actions { opacity: 1; }
+        /* Transient: only while this row's context menu is open. Deliberately
+           separate from .is-selected — a mouse action shouldn't leave keyboard
+           selection behind, which read as a highlight stuck on the last row. */
+        .site-row.has-menu { background: var(--panel-hover); }
+        .site-row.has-menu .site-actions { opacity: 1; }
 
         /* Pinned sites float to the top of the list. */
         .site-row.is-pinned .site-domain::before { content: '●'; color: var(--accent); font-size: 0.62rem; margin-right: 0.4rem; vertical-align: middle; opacity: 0.9; }
@@ -2828,7 +2833,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     <span aria-hidden="true"></span>
                 </li>
                 <template x-for="site in filteredSites" :key="site.name">
-                    <li class="site-row" :class="{ 'is-selected': selectedName === site.name, 'is-pinned': isPinned(site.name) }" @click="openSite(site)" @contextmenu.prevent="openRowMenu(site, $event)">
+                    <li class="site-row" :class="{ 'is-selected': selectedName === site.name, 'has-menu': ctxMenu.open && ctxMenu.site && ctxMenu.site.name === site.name, 'is-pinned': isPinned(site.name) }" @click="openSite(site)" @contextmenu.prevent="openRowMenu(site, $event)">
                         <a class="site-domain" :href="site.domain" target="_blank" rel="noopener" @click.stop x-html="highlightedDomain(site.domain, filter)"></a>
                         <span class="site-type" :class="site.type === 'WordPress' ? 'wp' : 'static'" @click.stop="typeFilter = site.type" :title="'Filter to ' + (site.type === 'WordPress' ? 'WordPress' : 'static') + ' sites'" x-text="site.type === 'WordPress' ? 'WP' : 'STATIC'"></span>
                         <span class="site-modified" x-text="formatRelative(site.modified_at)" :title="site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : ''"></span>
@@ -3324,7 +3329,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     const x = Math.min(event.clientX, window.innerWidth - w - 8);
                     const y = Math.min(event.clientY, window.innerHeight - h - 8);
                     this.ctxMenu = { open: true, site, x: Math.max(8, x), y: Math.max(8, y) };
-                    this.selectedName = site.name;
                 },
 
                 closeRowMenu() { this.ctxMenu.open = false; },
