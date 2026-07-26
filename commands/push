@@ -48,6 +48,13 @@ cove_push() {
     # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
     trap "rm -f '$ssh_ctl'" EXIT
 
+    # Bulk archive transfers deliberately bypass the multiplexed socket above.
+    # Sharing one channel with the control commands throttled a 30MB upload to
+    # ~16KB/s against a real gateway and then stalled outright, while the same
+    # file moved in 15s on its own connection. Key auth makes the extra
+    # connection free; with a password you are asked once more.
+    local ssh_bulk_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
+
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pushing a local Cove site to a remote server."
 
     # --- 1. Choose Local Site ---
@@ -107,14 +114,30 @@ cove_push() {
     remote_path_q=$(shell_quote "$remote_path")
 
     # --- 3. Validate Remote Site ---
+    # A single probe confirms there's a usable WordPress there and reports the
+    # host's tooling, so a remote without WP-CLI gets the phar sideloaded before
+    # we spend time building a backup that couldn't be restored anyway.
     log_step "Validating remote WordPress site..."
+    local wp_cli_flag=""
+    wp_cli_flag=$(transfer_ensure_remote_wp_cli "$ssh_opts" "$remote_ssh" "$remote_path")
+    local remote_probe
+    remote_probe=$(transfer_remote "$ssh_opts" "$remote_ssh" probe "$remote_path" $wp_cli_flag 2>/dev/null)
     local remote_url
-    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path_q && wp option get home 2>/dev/null")
-    
+    remote_url=$(echo "$remote_probe" | sed -n 's/^home=//p')
+
     if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
+        if echo "$remote_probe" | grep -q '^wp_cli=missing'; then
+            log_error "No WP-CLI on the remote and the sideload failed. Install WP-CLI there, or check that PHP is available."
+        fi
         log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
     fi
     log_success "Found remote site to overwrite: $remote_url"
+    local remote_ext remote_db
+    remote_ext=$(echo "$remote_probe" | sed -n 's/^extractor=//p')
+    remote_db=$(echo "$remote_probe" | sed -n 's/^db_load=//p')
+    if [ "$remote_ext" = "php" ] || [ "$remote_ext" = "phar" ] || [ "$remote_db" = "php" ]; then
+        log_success "Remote lacks some CLI tools; using the PHP fallback (extractor=$remote_ext, db=$remote_db)."
+    fi
 
     # --- 4. Confirmation ---
     # Deliberately NOT auto-promoted on a missing TTY the way `cove delete` is.
@@ -131,52 +154,46 @@ cove_push() {
 
     # --- 5. Perform Local Backup ---
     log_step "Generating local backup for ${site_name}..."
-    local backup_filename
-    backup_filename=$( (cd "$local_path" && curl -sL https://captaincore.io/do | bash -s -- backup . --quiet --format=filename) )
-
-    # The cd above is scoped to the subshell, so the zip lands in $local_path
-    # while we're still wherever the user invoked cove from. Every local
-    # reference below therefore has to be absolute — resolving the bare
-    # filename against the caller's cwd meant `cove push` only worked when run
-    # from inside the site's own public/ directory and failed everywhere else.
-    local backup_path="$local_path/$backup_filename"
-
-    if [[ -z "$backup_filename" || ! -f "$backup_path" || ! "$backup_filename" == *".zip" ]]; then
-        log_error "Failed to generate local backup. The captaincore script might have failed."
+    local backup_path
+    backup_path=$(transfer_local backup "$local_path")
+    if [ -z "$backup_path" ] || [ ! -f "$backup_path" ]; then
+        log_error "Failed to generate the local backup."
     fi
+    local size
+    size=$(du -h "$backup_path" 2>/dev/null | cut -f1 | tr -d ' ')
+    log_success "Local backup created: $(basename "$backup_path") ($size)"
 
-    size=$(ls -lh "$backup_path" | awk '{print $5}')
-    log_success "Local backup created: ${backup_filename} ($size)"
-
-    local backup_filename_q
-    backup_filename_q=$(shell_quote "$backup_filename")
-    local remote_backup_q
-    remote_backup_q=$(shell_quote "$remote_path/$backup_filename")
+    # Upload to a temp path outside the web root. The old flow dropped the
+    # archive into the remote's WordPress directory, where a full database dump
+    # plus wp-config sat publicly downloadable until cleanup ran — and stayed
+    # there for good if the restore died in between.
+    local remote_tmp="/tmp/cove-push-$$-$(basename "$backup_path")"
+    local remote_tmp_q
+    remote_tmp_q=$(shell_quote "$remote_tmp")
 
     # --- 6. Upload Backup ---
     log_step "Uploading backup to remote server..."
-    if ! cat "$backup_path" | ssh $ssh_opts $remote_ssh "cat > $remote_backup_q"; then
-        # Clean up local backup on failure
+    if ! ssh $ssh_bulk_opts $remote_ssh "cat > $remote_tmp_q" < "$backup_path"; then
         rm -f "$backup_path"
+        ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
         log_error "Failed to upload backup."
     fi
     log_success "Upload complete."
 
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
-    if ! ssh $ssh_opts $remote_ssh "cd $remote_path_q && curl -sL https://captaincore.io/do | bash -s -- migrate --url=$backup_filename_q --update-urls"; then
-        # Don't leave a full DB dump + wp-config zip sitting in the remote web
-        # root (or locally) after a failed restore — it's directly downloadable.
+    if ! transfer_remote "$ssh_opts" "$remote_ssh" restore "$remote_path" "$remote_tmp" \
+            --url-to="$remote_url" $wp_cli_flag; then
         rm -f "$backup_path"
-        ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q" 2>/dev/null
-        log_error "The remote migration script failed to execute correctly."
+        ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
+        log_error "The remote restore failed."
     fi
     log_success "Remote restore complete."
 
     # --- 8. Cleanup ---
     log_step "Cleaning up backup files..."
     rm -f "$backup_path"
-    ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q"
+    ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
     log_success "Cleanup complete."
 
     # --- 9. Finalize ---

@@ -3413,6 +3413,7 @@ show_general_help() {
     echo "  disable          Stops all background services managed by Cove."
     echo "  status           Check the status of all background services."
     echo "  health           Diagnose crashes, OPcache pressure, and on-disk hygiene."
+    echo "  transfer         Inspect the backup/restore engine used by pull and push."
     echo "  trust            Install Cove's local CA into browser + system trust stores."
     echo "  list             Lists all sites currently managed by Cove."
     echo "  add              Creates a new WordPress or plain static site."
@@ -3483,6 +3484,20 @@ display_command_help() {
             echo "(classified as OPcache vs Imagick vs other), live OPcache"
             echo "pressure, and on-disk hygiene (zombie site dirs, oversized"
             echo "logs). Recommends fixes but changes nothing."
+            ;;
+        transfer)
+            echo "Usage: cove transfer probe [site]"
+            echo ""
+            echo "Reports which tools the backup/restore engine behind 'cove pull' and"
+            echo "'cove push' will use here. Cove implements backup and restore itself"
+            echo "rather than fetching an external script, and degrades gracefully:"
+            echo "archiving prefers zip, then tar, then PHP; the database is dumped and"
+            echo "imported with mysqldump/mysql when present and through WordPress's own"
+            echo "\$wpdb when not. Since the target is always a WordPress install, PHP is"
+            echo "guaranteed — so a host with none of zip, unzip, tar, or a MySQL client"
+            echo "still transfers, just more slowly. Missing tools are installed when the"
+            echo "host allows it, and a remote with no WP-CLI gets wp-cli.phar sideloaded"
+            echo "over SSH."
             ;;
         trust)
             echo "Usage: cove trust"
@@ -3923,6 +3938,10 @@ main() {
         health)
             check_dependencies
             cove_health
+            ;;
+        transfer)
+            check_dependencies
+            cove_transfer "$@"
             ;;
         trust)
             check_dependencies

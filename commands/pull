@@ -68,6 +68,13 @@ cove_pull() {
     # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
     trap "rm -f '$ssh_ctl'" EXIT
 
+    # Bulk archive transfers deliberately bypass the multiplexed socket above.
+    # Sharing one channel with the control commands throttled a 30MB upload to
+    # ~16KB/s against a real gateway and then stalled outright, while the same
+    # file moved in 15s on its own connection. Key auth makes the extra
+    # connection free; with a password you are asked once more.
+    local ssh_bulk_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
+
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pulling a remote WordPress site into Cove."
     # --- 1. Gather Remote Info ---
     local remote_ssh="$arg_ssh"
@@ -96,15 +103,32 @@ cove_pull() {
     remote_path_q=$(shell_quote "$remote_path")
 
     # --- 2. Validate Remote Site ---
+    # One probe round-trip answers both questions at once: is there a usable
+    # WordPress here, and which tools does this host actually have? The answer
+    # decides whether we need to sideload WP-CLI before doing any real work.
     log_step "Validating remote WordPress site..."
+    local wp_cli_flag=""
+    wp_cli_flag=$(transfer_ensure_remote_wp_cli "$ssh_opts" "$remote_ssh" "$remote_path")
+    local remote_probe
+    remote_probe=$(transfer_remote "$ssh_opts" "$remote_ssh" probe "$remote_path" $wp_cli_flag 2>/dev/null)
     local remote_url
-    remote_url=$(ssh $ssh_opts $remote_ssh "cd $remote_path_q && wp option get home 2>/dev/null")
+    remote_url=$(echo "$remote_probe" | sed -n 's/^home=//p')
     domain=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//')
-    
+
     if [ -z "$remote_url" ] || [[ ! "$remote_url" == http* ]]; then
+        if echo "$remote_probe" | grep -q '^wp_cli=missing'; then
+            log_error "No WP-CLI on the remote and the sideload failed. Install WP-CLI there, or check that PHP is available."
+        fi
         log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
     fi
     log_success "Found WordPress site: $remote_url"
+    # Worth surfacing: a host on the PHP tier works, just more slowly.
+    local remote_arch remote_db
+    remote_arch=$(echo "$remote_probe" | sed -n 's/^archiver=//p')
+    remote_db=$(echo "$remote_probe" | sed -n 's/^db_dump=//p')
+    if [ "$remote_arch" = "php" ] || [ "$remote_arch" = "phar" ] || [ "$remote_db" = "php" ]; then
+        log_success "Remote lacks some CLI tools; using the PHP fallback (archiver=$remote_arch, db=$remote_db)."
+    fi
 
     # --- 3. Choose Destination ---
     local site_name
@@ -173,66 +197,56 @@ cove_pull() {
     local_url="$(url_for "$site_name.localhost")"
 
     # --- 4. Perform Migration ---
+    # Backup on the remote, stream it down over the SSH connection we already
+    # hold, restore locally. Nothing is fetched over HTTP at any point, which is
+    # what makes this work against hosts whose WordPress URL isn't publicly
+    # reachable (staging behind auth, private networks, a sandbox whose `home`
+    # still points at a provisioning template).
     log_step "Generating backup for ${remote_url}..."
-    local backup_extra_args=""
+    local -a backup_args=()
     if [ "$proxy_uploads" = true ]; then
         log_success "Uploads will be excluded from the backup and proxied instead."
-        backup_extra_args="--exclude=\"wp-content/uploads\""
+        backup_args+=(--exclude=wp-content/uploads)
     fi
 
-    local backup_url
-    backup_url=$(ssh $ssh_opts $remote_ssh "curl -sL https://captaincore.io/do | bash -s -- backup $remote_path_q --quiet $backup_extra_args")
-
-    if [[ -z "$backup_url" || ! "$backup_url" == *.zip ]]; then
-        log_error "Failed to generate backup or received an invalid backup URL."
+    local remote_archive
+    remote_archive=$(transfer_remote "$ssh_opts" "$remote_ssh" backup "$remote_path" \
+        ${backup_args[@]+"${backup_args[@]}"} $wp_cli_flag)
+    if [ -z "$remote_archive" ]; then
+        log_error "Failed to generate a backup on the remote."
     fi
-    log_success "Backup created: ${backup_url}"
+    log_success "Backup created: ${remote_archive}"
 
-    # NOTE: there is deliberately no DROP DATABASE here. `do migrate` runs
-    # `wp db reset --yes` immediately before `wp db import`, so the clean slate
-    # is already guaranteed at the right moment. Wiping the DB up front instead
-    # BROKE the overwrite path: migrate's preflight refuses to run unless the
-    # destination is an installed WordPress (`wp option get home` must return a
-    # URL), and an emptied database fails that check with "WordPress not found
-    # in current directory" — leaving the site with no tables at all.
+    # The remote archive is removed on every exit path below, so a failed pull
+    # never leaves a full database dump sitting on the remote filesystem.
+    local remote_archive_q
+    remote_archive_q=$(shell_quote "$remote_archive")
 
-    local backup_filename="${backup_url##*/}"
-
-    # The URL `do backup` hands back is built from the REMOTE's own home option
-    # (home_url + filename), so it only resolves when the remote's WordPress URL
-    # is publicly reachable AND maps to the directory holding the backup. That's
-    # false more often than you'd expect: a sandbox with a stale home option, a
-    # staging site behind basic auth or an IP allowlist, anything on a private
-    # network. We already hold an authenticated SSH connection to that exact
-    # file, so fall back to streaming it down rather than failing the pull.
-    #
-    # Landing it in $dest_path is what makes this work seamlessly: migrate_site
-    # looks for basename(--url) in its working directory and skips the download
-    # when the file is already sitting there.
-    if ! curl -sfI --max-time 20 "$backup_url" >/dev/null 2>&1; then
-        log_step "Backup URL isn't publicly reachable — fetching over SSH instead..."
-        local remote_backup_src
-        remote_backup_src=$(shell_quote "$remote_path/$backup_filename")
-        if ! ssh $ssh_opts $remote_ssh "cat $remote_backup_src" > "$dest_path/$backup_filename"; then
-            rm -f "$dest_path/$backup_filename"
-            ssh $ssh_opts $remote_ssh "rm -f $remote_backup_src" 2>/dev/null
-            log_error "Could not retrieve the backup over HTTP or SSH."
-        fi
-        log_success "Backup retrieved over SSH ($(du -h "$dest_path/$backup_filename" 2>/dev/null | cut -f1))."
+    log_step "Downloading backup over SSH..."
+    # Keep the remote's own filename: the extension is what tells the restore
+    # whether it is unpacking a zip or a tar.gz, and the remote may well have
+    # picked a different archiver than this machine would have.
+    local dl_dir
+    dl_dir=$(mktemp -d "${TMPDIR:-/tmp}/cove-pull-XXXXXX") || log_error "mktemp failed."
+    local local_archive="$dl_dir/$(basename "$remote_archive")"
+    if ! ssh $ssh_bulk_opts $remote_ssh "cat $remote_archive_q" > "$local_archive"; then
+        rm -rf "$dl_dir"
+        ssh $ssh_opts $remote_ssh "rm -f $remote_archive_q" 2>/dev/null
+        log_error "Failed to download the backup over SSH."
     fi
+    log_success "Downloaded ($(du -h "$local_archive" 2>/dev/null | cut -f1 | tr -d ' '))."
 
+    # NOTE: there is deliberately no DROP DATABASE here. The restore resets the
+    # database itself, immediately before importing. Wiping it up front instead
+    # BROKE the overwrite path: the destination has to still be a working
+    # WordPress for the restore to read its current URL and rewrite links.
     log_step "Restoring backup to ${site_name}.localhost..."
-    # Execute the migration script directly instead of using a variable with a pipe
-    if ! (cd "$dest_path" && curl -sL https://captaincore.io/do | bash -s -- migrate --url="$backup_url" --update-urls); then
-        # Remove the remote backup (full DB dump + wp-config) so a failed
-        # restore doesn't leave it downloadable in the remote web root. Also
-        # clear an SSH-fetched copy if migrate didn't consume it.
-        local failed_backup_q
-        failed_backup_q=$(shell_quote "$remote_path/$backup_filename")
-        ssh $ssh_opts $remote_ssh "rm -f $failed_backup_q" 2>/dev/null
-        rm -f "$dest_path/$backup_filename"
-        log_error "The migration script failed to execute correctly."
+    if ! transfer_local restore "$dest_path" "$local_archive" --url-to="$local_url"; then
+        rm -rf "$dl_dir"
+        ssh $ssh_opts $remote_ssh "rm -f $remote_archive_q" 2>/dev/null
+        log_error "The restore failed."
     fi
+    rm -rf "$dl_dir"
     log_success "Restore complete."
 
     # --- 5. Post-Migration Configuration ---
@@ -270,10 +284,7 @@ EOM
 
     # --- 7. Cleanup ---
     log_step "Cleaning up remote backup file..."
-    local filename="${backup_url##*/}"
-    local remote_backup_q
-    remote_backup_q=$(shell_quote "$remote_path/$filename")
-    ssh $ssh_opts $remote_ssh "rm -f $remote_backup_q" 2>/dev/null
+    ssh $ssh_opts $remote_ssh "rm -f $remote_archive_q" 2>/dev/null
     log_success "Cleanup complete."
  
     # --- 8. Finalize ---
