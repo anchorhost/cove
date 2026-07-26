@@ -13,6 +13,10 @@ cove_disable() {
         pkg_service stop mariadb &>/dev/null
         echo "   - Stopping Mailpit..."
         launchctl unload "$COVE_DIR/com.cove.mailpit.plist" &>/dev/null
+        # Reap any leftover mailpit so it can't hold :1025/:8025 after unload
+        # and thrash KeepAlive on the next enable (see install_mailpit_service).
+        # -x matches basename only — never a random path containing "mailpit".
+        pkill -x mailpit &>/dev/null || true
     fi
 
     # Stop services on Linux
@@ -45,6 +49,9 @@ cove_disable() {
         $SUDO_CMD systemctl stop "$mariadb_service" &>/dev/null
         echo "   - Stopping Mailpit..."
         $SUDO_CMD systemctl stop mailpit &>/dev/null
+        # Same orphan reap as macOS: a manual or leftover mailpit would hold
+        # the ports and fight the next enable's Restart=on-failure loop.
+        pkill -x mailpit &>/dev/null || true
     fi
     
     echo "✅ Services stopped."

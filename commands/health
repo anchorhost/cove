@@ -16,6 +16,16 @@ cove_health() {
     if [ "$OS" = "macos" ]; then
         if is_mariadb_running; then echo "  ✅ MariaDB running"; else echo "  ❌ MariaDB stopped"; crit=$((crit+1)); fi
         if pgrep -x mailpit &>/dev/null; then echo "  ✅ Mailpit running"; else echo "  ⚠️  Mailpit stopped"; warn=$((warn+1)); fi
+        # launchd's restart counter is the thrash tell: a healthy long-lived
+        # mailpit sits at runs≈1–a few; an orphan-port fight climbs into the
+        # tens of thousands (observed 51k). Surface it before the log fills.
+        local mp_runs
+        mp_runs=$(launchctl print "gui/$(id -u)/com.cove.mailpit" 2>/dev/null | awk '/^[[:space:]]*runs =/{print $3; exit}')
+        if [ -n "$mp_runs" ] && [ "$mp_runs" -gt 20 ] 2>/dev/null; then
+            echo "  ⚠️  Mailpit launchd has restarted $mp_runs times (orphan holding :1025/:8025?)"
+            echo "     Fix: cove enable   (reinstalls the orphan-clearing mailpit runner)"
+            warn=$((warn+1))
+        fi
     else
         local mdb; mdb=$(get_mariadb_service_name)
         if systemctl is-active --quiet "$mdb" 2>/dev/null; then echo "  ✅ MariaDB running"; else echo "  ❌ MariaDB stopped"; crit=$((crit+1)); fi
@@ -212,13 +222,17 @@ PHP
     else
         echo "  ✅ no zombie site directories"
     fi
-    # Oversized logs (the process log grows on every restart).
+    # Oversized logs (the process log grows on every restart; mailpit.log
+    # balloons under a bind-failure KeepAlive thrash).
     local biglog=0 lf sz
-    for lf in "$LOGS_DIR/caddy-process.log" "$LOGS_DIR/errors.log"; do
+    for lf in "$LOGS_DIR/caddy-process.log" "$LOGS_DIR/errors.log" "$LOGS_DIR/mailpit.log"; do
         [ -f "$lf" ] || continue
         sz=$(stat -f%z "$lf" 2>/dev/null || stat -c%s "$lf" 2>/dev/null || echo 0)
         if [ "$sz" -gt 52428800 ]; then
             echo "  ⚠️  $(basename "$lf") is $((sz/1048576)) MB"
+            if [ "$(basename "$lf")" = "mailpit.log" ]; then
+                echo "     (bind-failure thrash? reinstall with: cove enable)"
+            fi
             biglog=$((biglog+1))
         fi
     done
