@@ -2126,6 +2126,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'full_path' => $site_path,
                         'size_bytes' => isset($size_cache[$item]) ? (int) $size_cache[$item] : null,
                         'modified_at' => $mtime ?: null,
+                        // Mirrors cove_add's `echo "cove_$name" | tr -c '[:alnum:]_' '_'`,
+                        // so the UI can deep-link Adminer straight at this site's schema.
+                        'db_name' => preg_replace('/[^a-zA-Z0-9_]/', '_', 'cove_' . str_replace('.localhost', '', $item)),
                     ];
                 }
             }
@@ -2190,6 +2193,83 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $delete_site_target = $site_name;
             } else { $response['message'] = 'Invalid site name provided for deletion.'; }
             break;
+        case 'rename_site':
+            // Same charset gate as add/delete on BOTH names: escapeshellarg stops
+            // shell injection, but cove_rename builds filesystem paths and a
+            // database name from these, so `../` must never get that far.
+            $new_name = $input['new_name'] ?? '';
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            if (empty($new_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $new_name)) {
+                $response['message'] = 'Invalid new name. Use letters, numbers and hyphens only.';
+                break;
+            }
+            if ($new_name === $site_name) {
+                $response['message'] = 'That is already the site name.';
+                break;
+            }
+            // Idempotent retry. Renaming regenerates the Caddyfile and reloads
+            // the very Caddy serving this dashboard, so the response can be
+            // dropped mid-reload and the UI retries. By then the rename has
+            // already happened, and a naive retry fails with "site not found" —
+            // reporting an error for work that actually succeeded. Source gone
+            // plus destination present is exactly that case.
+            $src_exists = is_dir($sitedir . '/' . $site_name . '.localhost');
+            $dst_exists = is_dir($sitedir . '/' . $new_name . '.localhost');
+            if (!$src_exists && $dst_exists) {
+                echo json_encode(['success' => true, 'message' => 'Renamed to ' . $new_name . '.localhost.', 'new_name' => $new_name]);
+                exit;
+            }
+            if ($dst_exists) {
+                $response['message'] = 'A site named ' . $new_name . ' already exists.';
+                break;
+            }
+            $command = sprintf('HOME=%s %s rename %s %s 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), escapeshellarg($new_name));
+            $rename_site_target = $new_name;
+            break;
+        case 'reveal_site':
+            // Opens the site directory in the desktop file manager. Only ever
+            // hands the resolved path to the opener, never the raw name.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            $reveal_path = $sitedir . '/' . $site_name . '.localhost';
+            if (!is_dir($reveal_path)) {
+                $response['message'] = 'Site directory not found.';
+                break;
+            }
+            $opener = (PHP_OS_FAMILY === 'Darwin') ? 'open' : 'xdg-open';
+            // Detached: a file manager that stays in the foreground would hold
+            // the request open until the user closed it.
+            exec(sprintf('%s %s > /dev/null 2>&1 &', $opener, escapeshellarg($reveal_path)));
+            echo json_encode(['success' => true, 'message' => 'Opened ' . $site_name . '.localhost in the file manager.']);
+            exit;
+        case 'site_log':
+            // Read-only tail of the site's own Caddy log. Never shells out —
+            // there is no reason to involve a shell to read a known file.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            $log_dir = $sitedir . '/' . $site_name . '.localhost/logs';
+            $log_file = $log_dir . '/caddy.log';
+            if (!is_file($log_file)) {
+                echo json_encode(['success' => true, 'log' => '', 'message' => 'No log yet for this site.']);
+                exit;
+            }
+            // Tail the last 64KB rather than reading the whole file: these grow
+            // without bound and the UI only ever shows the recent end.
+            $max = 64 * 1024;
+            $size = filesize($log_file);
+            $fh = fopen($log_file, 'r');
+            if ($size > $max) { fseek($fh, $size - $max); fgets($fh); }
+            $log = stream_get_contents($fh);
+            fclose($fh);
+            echo json_encode(['success' => true, 'log' => $log, 'truncated' => $size > $max]);
+            exit;
         case 'get_login_link':
             $response = ['success' => false, 'message' => 'An unknown error occurred.'];
             if (!empty($site_name)) {
@@ -2262,6 +2342,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exec($command, $output, $return_code);
         if ($return_code === 0) {
             $response = ['success' => true, 'message' => 'Operation completed successfully.'];
+            if (isset($rename_site_target)) {
+                $response['message'] = 'Renamed to ' . $rename_site_target . '.localhost.';
+                $response['new_name'] = $rename_site_target;
+            }
             // For add_site: measure the new site's footprint inline and fold
             // it into the size cache so the UI shows "4.0 KB" (or whatever)
             // immediately instead of "—" until the next refresh_sizes pass.
@@ -2294,6 +2378,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // gone is a success, not an error.
                 echo json_encode(['success' => true, 'message' => 'Site already deleted.']);
                 exit;
+            }
+            if (isset($rename_site_target)) {
+                $msg = 'Could not rename site.';
+                if (stripos($err_text, 'already exists') !== false) {
+                    $msg = 'That name is already taken.';
+                } elseif (stripos($err_text, 'reserved name') !== false) {
+                    $msg = 'That name is reserved. Pick another.';
+                }
             }
             if (isset($add_site_target)) {
                 $msg = 'Could not create site.';
@@ -2689,6 +2781,16 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .db-cred-value { color: var(--text); word-break: break-all; background: transparent; padding: 0; }
         .modal .modal-foot { margin-top: 1rem; display: flex; justify-content: space-between; align-items: center; color: var(--text-faint); font-family: var(--font-mono); font-size: 0.75rem; }
 
+        /* Wider variant for log output, which is unreadable at 540px. */
+        .modal-wide { max-width: min(900px, 92vw); width: 900px; }
+        .modal-title-dim { font-family: var(--font-mono); font-style: normal; font-size: 0.9rem; color: var(--text-faint); }
+        .modal-input { width: 100%; background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.6rem 0.8rem; color: var(--text); font-family: var(--font-mono); font-size: 0.9rem; outline: none; }
+        .modal-input:focus { border-color: var(--accent); }
+        .modal-input:disabled { opacity: 0.6; }
+        .modal-hint { margin-top: 0.4rem; min-height: 1.1em; font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-faint); }
+        .modal-actions { margin-top: 1.1rem; display: flex; justify-content: flex-end; gap: 0.6rem; }
+        .log-pane { max-height: 55vh; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 0.76rem !important; line-height: 1.5; }
+
         /* Snackbar */
         /* Centered via auto margins + fit-content width, NOT transform — Alpine
            writes transform inline during x-transition, which would wipe out a
@@ -2917,6 +3019,37 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         </div>
     </div>
 
+    <!-- Rename -->
+    <div x-show="rename.open" x-transition.opacity class="modal-backdrop" @click.self="rename.open = false" @keydown.escape.window="rename.open = false" style="display: none;">
+        <div class="modal">
+            <h3>Rename site</h3>
+            <p class="modal-sub">Renames the directory, the database, and the local URL. Any bookmark to the old address stops working.</p>
+            <form @submit.prevent="submitRename()">
+                <input class="modal-input" type="text" x-model="rename.value" x-ref="renameInput" spellcheck="false" autocomplete="off"
+                    placeholder="new-name" :disabled="rename.busy" @keydown.escape.prevent="rename.open = false">
+                <div class="modal-hint"><span x-text="rename.value ? rename.value + '.localhost' : '\u00a0'"></span></div>
+                <div class="modal-actions">
+                    <button type="button" class="pill" @click="rename.open = false" :disabled="rename.busy">cancel</button>
+                    <button type="submit" class="pill primary" :disabled="rename.busy || !rename.value" x-text="rename.busy ? 'renaming…' : 'rename'"></button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Site log -->
+    <div x-show="logView.open" x-transition.opacity class="modal-backdrop" @click.self="logView.open = false" @keydown.escape.window="logView.open = false" style="display: none;">
+        <div class="modal modal-wide">
+            <h3>Log <span class="modal-title-dim" x-text="logView.site"></span></h3>
+            <p class="modal-sub" x-show="logView.truncated">Showing the most recent 64KB.</p>
+            <pre class="log-pane" x-ref="logPane" x-text="logDisplay"></pre>
+            <div class="modal-actions">
+                <button type="button" class="pill" @click="logView.raw = !logView.raw" x-text="logView.raw ? 'formatted' : 'raw'"></button>
+                <button type="button" class="pill" @click="viewLog({ name: logView.site }, true)" :disabled="logView.busy">refresh</button>
+                <button type="button" class="pill primary" @click="logView.open = false">close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Context menu: one component driven by both right-click on a row and the
          row's ⋯ button, so the two affordances can never drift apart. -->
     <div x-show="ctxMenu.open" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.outside="closeRowMenu()" x-transition.opacity.duration.100ms style="display: none;">
@@ -2927,6 +3060,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 <template x-if="ctxMenu.site.type === 'WordPress'">
                     <button class="ctx-item" @click="getLoginLink(ctxMenu.site.name); closeRowMenu()"><span>Log in to admin</span><span class="ctx-key">⌘↵</span></button>
                 </template>
+                <div class="ctx-sep"></div>
+                <button class="ctx-item" @click="promptRename(ctxMenu.site); closeRowMenu()"><span>Rename…</span></button>
+                <button class="ctx-item" @click="revealSite(ctxMenu.site.name); closeRowMenu()"><span x-text="revealLabel"></span></button>
+                <template x-if="ctxMenu.site.type === 'WordPress'">
+                    <button class="ctx-item" @click="openSiteDb(ctxMenu.site); closeRowMenu()"><span>Open database</span></button>
+                </template>
+                <button class="ctx-item" @click="viewLog(ctxMenu.site); closeRowMenu()"><span>View log</span></button>
+                <div class="ctx-sep"></div>
                 <button class="ctx-item" @click="copyPath(ctxMenu.site.full_path); closeRowMenu()"><span>Copy path</span></button>
                 <button class="ctx-item" @click="togglePin(ctxMenu.site.name); closeRowMenu()"><span x-text="isPinned(ctxMenu.site.name) ? 'Unpin from top' : 'Pin to top'"></span></button>
                 <div class="ctx-sep"></div>
@@ -2975,6 +3116,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <script>
         const PORT_SUFFIX = '<?= $__cove_port_suffix ?>';
         const SITES_DIR = 'SITES_DIR_PLACEHOLDER';
+        // Adminer needs the username to deep-link straight into a site's schema.
+        const DB_USER = '<?= htmlspecialchars($config_data['DB_USER'] ?? '', ENT_QUOTES) ?>';
 
         document.addEventListener('alpine:init', () => {
             Alpine.data('dashboard', () => ({
@@ -2996,6 +3139,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 selectedName: null,
                 ctxMenu: { open: false, site: null, x: 0, y: 0 },
                 palette: { open: false, query: '', index: 0 },
+                rename: { open: false, site: null, value: '', busy: false },
+                logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
                 _initialised: false,
                 newSite: { name: '', isPlain: false, isLoading: false },
                 snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
@@ -3283,6 +3428,107 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.showSnack('Reloading server…');
                     const res = await this.apiPostRetry('reload_server', {}, 3, 10000);
                     if (res.success) this.showSnack('Server reloaded.');
+                },
+
+                // --- Row actions -----------------------------------------------
+                // macOS says "Finder"; everywhere else the file manager has no
+                // one name, so stay generic rather than lie about it.
+                get revealLabel() {
+                    return navigator.platform && navigator.platform.startsWith('Mac')
+                        ? 'Reveal in Finder' : 'Open folder';
+                },
+
+                promptRename(site) {
+                    this.rename = { open: true, site, value: site.name, busy: false };
+                    this.$nextTick(() => {
+                        const el = this.$refs.renameInput;
+                        if (el) { el.focus(); el.select(); }
+                    });
+                },
+
+                async submitRename() {
+                    const site = this.rename.site;
+                    const next = (this.rename.value || '').trim();
+                    if (!site || !next || next === site.name) { this.rename.open = false; return; }
+                    if (!/^[a-zA-Z0-9-]+$/.test(next)) {
+                        this.showSnack('Use letters, numbers and hyphens only.', true);
+                        return;
+                    }
+                    this.rename.busy = true;
+                    // Renaming rewrites the Caddyfile, so the response can land
+                    // mid-reload exactly like a delete does — same retry policy.
+                    const res = await this.apiPostRetry('rename_site', { site_name: site.name, new_name: next });
+                    this.rename.busy = false;
+                    if (!res.success) return;   // apiPost surfaced the reason
+                    this.rename.open = false;
+                    // Carry over UI state that is keyed by name, or a pinned site
+                    // would silently unpin itself on rename.
+                    if (this.isPinned(site.name)) {
+                        this.pinned = this.pinned.map(n => (n === site.name ? next : n));
+                        localStorage.setItem('pinned', JSON.stringify(this.pinned));
+                    }
+                    if (this.selectedName === site.name) this.selectedName = next;
+                    this.showSnack(res.message || 'Renamed.');
+                    await this.getSites();
+                },
+
+                async revealSite(name) {
+                    const res = await this.apiPost('reveal_site', { site_name: name });
+                    if (res.success) this.showSnack(res.message || 'Opened in the file manager.');
+                },
+
+                openSiteDb(site) {
+                    // Adminer takes the schema in the query string, so this lands
+                    // on the site's own tables instead of the server root.
+                    const url = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) +
+                                '&db=' + encodeURIComponent(site.db_name || ('cove_' + site.name).replace(/[^a-zA-Z0-9_]/g, '_'));
+                    window.open(url, '_blank', 'noopener');
+                },
+
+                // Caddy writes one JSON object per line, which is unreadable as a
+                // wall of text. Fold each request down to the fields you'd
+                // actually scan for — time, status, method, path, duration —
+                // and leave anything that isn't a request line untouched.
+                get logDisplay() {
+                    if (this.logView.busy) return 'Loading…';
+                    const raw = this.logView.text || '';
+                    if (!raw) return 'No log entries yet.';
+                    if (this.logView.raw) return raw;
+                    const out = [];
+                    for (const line of raw.split('\n')) {
+                        const t = line.trim();
+                        if (!t) continue;
+                        if (t[0] !== '{') { out.push(t); continue; }
+                        let o;
+                        try { o = JSON.parse(t); } catch (e) { out.push(t); continue; }
+                        const req = o.request || {};
+                        if (!req.method) { out.push(o.msg ? (o.level || '') + ' ' + o.msg : t); continue; }
+                        const time = o.ts ? new Date(o.ts * 1000).toLocaleTimeString() : '';
+                        const status = o.status !== undefined ? String(o.status) : '';
+                        const dur = typeof o.duration === 'number' ? (o.duration * 1000).toFixed(0) + 'ms' : '';
+                        out.push([
+                            time,
+                            status.padEnd(3),
+                            (req.method || '').padEnd(6),
+                            req.uri || '',
+                            dur
+                        ].filter(Boolean).join('  '));
+                    }
+                    return out.join('\n') || 'No log entries yet.';
+                },
+
+                async viewLog(site, refresh = false) {
+                    this.logView = { open: true, site: site.name, text: refresh ? this.logView.text : '', truncated: false, busy: true };
+                    const res = await this.apiPost('site_log', { site_name: site.name });
+                    this.logView.busy = false;
+                    if (!res.success) { this.logView.open = false; return; }
+                    this.logView.text = res.log || '';
+                    this.logView.truncated = !!res.truncated;
+                    // Logs are read tail-first; jump to the newest lines.
+                    this.$nextTick(() => {
+                        const el = this.$refs.logPane;
+                        if (el) el.scrollTop = el.scrollHeight;
+                    });
                 },
 
                 openPalette() {
