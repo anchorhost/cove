@@ -2614,6 +2614,50 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .bulk-delete-btn:hover { color: var(--danger); border-color: var(--danger); }
         .bulk-delete-btn.armed { color: white; background: var(--danger); border-color: var(--danger); }
 
+        /* Service dots in the top bar. They used to live only in the footer,
+           which on an install with hundreds of sites sits ~14,000px down the
+           page — the most glanceable status was the least reachable thing. */
+        .nav-services { display: flex; align-items: center; gap: 0.85rem; margin-left: auto; margin-right: 0.85rem; font-family: var(--font-mono); font-size: 0.74rem; }
+
+        /* Keyboard selection. Distinct from :hover so the two can coexist. */
+        .site-row.is-selected { background: var(--panel-hover); box-shadow: inset 2px 0 0 var(--accent); }
+        .site-row.is-selected .site-actions { opacity: 1; }
+
+        /* Pinned sites float to the top of the list. */
+        .site-row.is-pinned .site-domain::before { content: '●'; color: var(--accent); font-size: 0.62rem; margin-right: 0.4rem; vertical-align: middle; opacity: 0.9; }
+
+        /* Row overflow trigger. Always rendered (not hover-gated) so the row's
+           actions are reachable by touch — Cove is explicitly used from phones
+           over Tailscale, where :hover never fires and the old text links were
+           therefore unreachable. */
+        .row-menu-btn { background: transparent; border: 0; color: var(--text-faint); cursor: pointer; font-size: 1rem; line-height: 1; padding: 0.15rem 0.4rem; border-radius: 6px; }
+        .row-menu-btn:hover, .row-menu-btn.active { color: var(--text); background: var(--panel-hover); }
+
+        /* Context menu — shared by right-click and the ⋯ button. */
+        .ctx-menu { position: fixed; z-index: 300; min-width: 190px; padding: 0.3rem; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; box-shadow: 0 12px 34px rgba(0,0,0,0.28); font-size: 0.85rem; }
+        .ctx-title { padding: 0.35rem 0.6rem 0.45rem; font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); border-bottom: 1px solid var(--panel-border); margin-bottom: 0.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ctx-item { display: flex; align-items: center; justify-content: space-between; gap: 1rem; width: 100%; background: transparent; border: 0; text-align: left; padding: 0.42rem 0.6rem; border-radius: 6px; color: var(--text); cursor: pointer; font: inherit; }
+        .ctx-item:hover { background: var(--panel-hover); }
+        .ctx-item.danger { color: var(--danger); }
+        .ctx-item .ctx-key { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .ctx-sep { height: 1px; background: var(--panel-border); margin: 0.25rem 0; }
+
+        /* Command palette. With 274 sites the list is not navigable by
+           scrolling, so search is the real navigation and deserves to be one
+           keystroke away. */
+        .palette-backdrop { position: fixed; inset: 0; z-index: 400; background: rgba(0,0,0,0.45); display: flex; align-items: flex-start; justify-content: center; padding: 12vh 1rem 1rem; }
+        .palette { width: 100%; max-width: 560px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px; box-shadow: 0 24px 60px rgba(0,0,0,0.4); overflow: hidden; display: flex; flex-direction: column; max-height: 70vh; }
+        .palette-input { width: 100%; background: transparent; border: 0; border-bottom: 1px solid var(--panel-border); padding: 0.95rem 1.1rem; color: var(--text); font-family: var(--font-mono); font-size: 0.95rem; outline: none; }
+        .palette-input::placeholder { color: var(--text-faint); }
+        .palette-list { list-style: none; margin: 0; padding: 0.35rem; overflow-y: auto; flex: 1; }
+        .palette-item { display: flex; align-items: center; gap: 0.7rem; padding: 0.5rem 0.75rem; border-radius: 8px; cursor: pointer; }
+        .palette-item.active { background: var(--panel-hover); }
+        .palette-item .pi-name { flex: 1; font-family: var(--font-mono); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .palette-item .pi-meta { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
+        .palette-item .pi-kind { font-family: var(--font-mono); font-size: 0.62rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint); border: 1px solid var(--panel-border); border-radius: var(--radius-pill); padding: 0.05rem 0.4rem; }
+        .palette-empty { padding: 1.4rem; text-align: center; color: var(--text-dim); font-size: 0.87rem; }
+        .palette-hint { display: flex; gap: 1rem; flex-wrap: wrap; padding: 0.5rem 0.9rem; border-top: 1px solid var(--panel-border); font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+
         /* Footer */
         .card-foot { display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1.5rem; border-top: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.78rem; gap: 1rem; flex-wrap: wrap; }
         .services { display: flex; gap: 1.1rem; flex-wrap: wrap; }
@@ -2685,6 +2729,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </svg>
                 <span>Cove</span>
             </a>
+            <div class="nav-services services">
+                <span class="dot" title="Caddy is serving this page — it's running">caddy</span>
+                <button type="button" class="dot link" @click="showDbModal = true" title="Database credentials">mariadb</button>
+                <a class="dot link" :href="mailpitUrl" target="_blank" rel="noopener" title="Open Mailpit">mailpit</a>
+            </div>
             <button class="theme-btn" @click="toggleTheme()" :title="theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'" aria-label="Toggle theme">
                 <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5a5.75 5.75 0 1 0 6.7 6.7Z"/></svg>
                 <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.8M8 12.7v1.8M2.6 2.6l1.3 1.3M12.1 12.1l1.3 1.3M1.5 8h1.8M12.7 8h1.8M2.6 13.4l1.3-1.3M12.1 3.9l1.3-1.3"/></svg>
@@ -2779,7 +2828,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     <span aria-hidden="true"></span>
                 </li>
                 <template x-for="site in filteredSites" :key="site.name">
-                    <li class="site-row" @click="openSite(site)">
+                    <li class="site-row" :class="{ 'is-selected': selectedName === site.name, 'is-pinned': isPinned(site.name) }" @click="openSite(site)" @contextmenu.prevent="openRowMenu(site, $event)">
                         <a class="site-domain" :href="site.domain" target="_blank" rel="noopener" @click.stop x-html="highlightedDomain(site.domain, filter)"></a>
                         <span class="site-type" :class="site.type === 'WordPress' ? 'wp' : 'static'" @click.stop="typeFilter = site.type" :title="'Filter to ' + (site.type === 'WordPress' ? 'WordPress' : 'static') + ' sites'" x-text="site.type === 'WordPress' ? 'WP' : 'STATIC'"></span>
                         <span class="site-modified" x-text="formatRelative(site.modified_at)" :title="site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : ''"></span>
@@ -2791,8 +2840,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                                     <span class="btn-spinner" aria-hidden="true"></span>
                                 </button>
                             </template>
-                            <button class="site-action-btn" @click.stop="copyPath(site.full_path)" title="Copy site path to clipboard">path</button>
-                            <button class="site-action-btn danger" @click.stop="deleteSite(site.name)" :title="'Delete ' + site.name">delete</button>
+                            <!-- Always rendered, unlike the hover-only links: this is the
+                                 only way the row's actions are reachable on touch. -->
+                            <button class="row-menu-btn" :class="{ active: ctxMenu.open && ctxMenu.site && ctxMenu.site.name === site.name }" @click.stop="openRowMenu(site, $event)" :aria-label="'Actions for ' + site.name" title="Actions">⋯</button>
                         </div>
                     </li>
                 </template>
@@ -2832,11 +2882,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </ul>
 
             <footer class="card-foot">
-                <div class="services">
-                    <span class="dot" title="Caddy is serving this page — it's running">caddy</span>
-                    <button type="button" class="dot link" @click="showDbModal = true" title="Database credentials">mariadb</button>
-                    <a class="dot link" :href="mailpitUrl" target="_blank" rel="noopener" title="Open Mailpit">mailpit</a>
-                </div>
                 <div class="totals">
                     <span x-text="siteCountLabel"></span>
                     <span x-show="totalBytes > 0" x-text="'· ' + formatSize(totalBytes)"></span>
@@ -2867,6 +2912,53 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         </div>
     </div>
 
+    <!-- Context menu: one component driven by both right-click on a row and the
+         row's ⋯ button, so the two affordances can never drift apart. -->
+    <div x-show="ctxMenu.open" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.outside="closeRowMenu()" x-transition.opacity.duration.100ms style="display: none;">
+        <template x-if="ctxMenu.site">
+            <div>
+                <div class="ctx-title" x-text="ctxMenu.site.domain.replace('https://','')"></div>
+                <button class="ctx-item" @click="openSite(ctxMenu.site); closeRowMenu()"><span>Open site</span><span class="ctx-key">↵</span></button>
+                <template x-if="ctxMenu.site.type === 'WordPress'">
+                    <button class="ctx-item" @click="getLoginLink(ctxMenu.site.name); closeRowMenu()"><span>Log in to admin</span><span class="ctx-key">⌘↵</span></button>
+                </template>
+                <button class="ctx-item" @click="copyPath(ctxMenu.site.full_path); closeRowMenu()"><span>Copy path</span></button>
+                <button class="ctx-item" @click="togglePin(ctxMenu.site.name); closeRowMenu()"><span x-text="isPinned(ctxMenu.site.name) ? 'Unpin from top' : 'Pin to top'"></span></button>
+                <div class="ctx-sep"></div>
+                <button class="ctx-item danger" @click="deleteSite(ctxMenu.site.name); closeRowMenu()"><span>Delete site</span><span class="ctx-key">⌘⌫</span></button>
+            </div>
+        </template>
+    </div>
+
+    <!-- Command palette. Primary navigation once the list is longer than a
+         screen, which on a real install it always is. -->
+    <div x-show="palette.open" class="palette-backdrop" @click.self="closePalette()" x-transition.opacity.duration.120ms style="display: none;">
+        <div class="palette">
+            <input class="palette-input" type="text" x-model="palette.query" x-ref="paletteInput"
+                placeholder="Search sites, or type a command…" spellcheck="false" autocomplete="off"
+                @keydown.arrow-down.prevent="paletteMove(1)"
+                @keydown.arrow-up.prevent="paletteMove(-1)"
+                @keydown.enter.prevent="paletteRun($event)"
+                @keydown.escape.prevent="closePalette()"
+                aria-label="Command palette">
+            <ul class="palette-list" x-ref="paletteList">
+                <template x-for="(item, i) in paletteResults" :key="item.key">
+                    <li class="palette-item" :class="{ active: i === palette.index }" @click="paletteRunItem(item)" @mouseenter="palette.index = i">
+                        <span class="pi-kind" x-text="item.kind"></span>
+                        <span class="pi-name" x-text="item.label"></span>
+                        <span class="pi-meta" x-text="item.meta"></span>
+                    </li>
+                </template>
+                <template x-if="paletteResults.length === 0">
+                    <li class="palette-empty">No matches.</li>
+                </template>
+            </ul>
+            <div class="palette-hint">
+                <span>↑↓ navigate</span><span>↵ open</span><span>⌘↵ log in</span><span>esc close</span>
+            </div>
+        </div>
+    </div>
+
     <div x-show="snackbar.visible" x-transition.opacity.duration.200ms class="snackbar" :class="{ error: snackbar.isError }" style="display: none;">
         <span x-text="snackbar.message"></span>
         <!-- !! matters: x-show/@click expressions that RESULT in a function get
@@ -2890,8 +2982,16 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 isRefreshingSizes: false,
                 filter: '',
                 typeFilter: null, // null | 'WordPress' | 'Plain' — set via the row type pills, cleared via the chip × or overall filter clear
-                sort: ['name', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'name',
-                sortDir: ['asc', 'desc'].includes(localStorage.getItem('sortDir')) ? localStorage.getItem('sortDir') : 'asc',
+                // Default to most-recently-modified rather than alphabetical: on an
+                // install with hundreds of sites, "what was I just working on" is a
+                // far better landing state than "what starts with A".
+                sort: ['name', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'modified',
+                sortDir: ['asc', 'desc'].includes(localStorage.getItem('sortDir')) ? localStorage.getItem('sortDir') : 'desc',
+                pinned: (() => { try { return JSON.parse(localStorage.getItem('pinned')) || []; } catch (e) { return []; } })(),
+                selectedName: null,
+                ctxMenu: { open: false, site: null, x: 0, y: 0 },
+                palette: { open: false, query: '', index: 0 },
+                _initialised: false,
                 newSite: { name: '', isPlain: false, isLoading: false },
                 snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
                 // Deletes are staged for a short undo window before anything is
@@ -2934,6 +3034,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     } else {
                         base.sort((a, b) => dir * a.name.localeCompare(b.name));
                     }
+                    // Pinned sites float above the chosen sort rather than replacing
+                    // it: out of hundreds of sites only a handful are ever active.
+                    if (this.pinned.length) {
+                        base.sort((a, b) => (this.pinned.includes(b.name) ? 1 : 0) - (this.pinned.includes(a.name) ? 1 : 0));
+                    }
                     return base;
                 },
 
@@ -2953,6 +3058,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 },
 
                 init() {
+                    if (this._initialised) return;
+                    this._initialised = true;
+
                     this.applyTheme();
                     this.$watch('theme', () => { this.applyTheme(); localStorage.setItem('theme', this.theme); });
 
@@ -2981,13 +3089,64 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     // `/` focuses the filter (GitHub-style). Ignored when typing
                     // in a form field or holding a modifier key.
                     window.addEventListener('keydown', (e) => {
-                        if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
                         const el = document.activeElement;
                         const tag = el && el.tagName;
-                        if (tag === 'INPUT' || tag === 'TEXTAREA' || (el && el.isContentEditable)) return;
-                        e.preventDefault();
-                        this.$refs.filterInput && this.$refs.filterInput.focus();
+                        const typing = tag === 'INPUT' || tag === 'TEXTAREA' || (el && el.isContentEditable);
+
+                        // Cmd/Ctrl+K opens the palette from anywhere, including
+                        // from inside the filter box — it's the one shortcut that
+                        // should never be swallowed by a focused field.
+                        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+                            e.preventDefault();
+                            this.palette.open ? this.closePalette() : this.openPalette();
+                            return;
+                        }
+                        if (this.palette.open) return; // palette owns its own keys
+
+                        // Arrows work while filtering (type to narrow, arrow to pick).
+                        // j/k only outside a text field, or they'd eat typed letters.
+                        const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
+                        const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
+                        if ((isDown || isUp) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                            e.preventDefault();
+                            this.moveSelection(isDown ? 1 : -1);
+                            return;
+                        }
+
+                        if (e.key === 'Enter' && this.selectedName && !this.adding) {
+                            const site = this.selectedSite();
+                            if (!site) return;
+                            e.preventDefault();
+                            if ((e.metaKey || e.ctrlKey) && site.type === 'WordPress') {
+                                this.getLoginLink(site.name);
+                            } else {
+                                this.openSite(site);
+                            }
+                            return;
+                        }
+
+                        if ((e.metaKey || e.ctrlKey) && (e.key === 'Backspace' || e.key === 'Delete') && this.selectedName) {
+                            e.preventDefault();
+                            this.deleteSite(this.selectedName);
+                            return;
+                        }
+
+                        if (e.key === 'Escape') {
+                            if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                            if (this.selectedName && !typing) { this.selectedName = null; return; }
+                        }
+
+                        if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                            if (typing) return;
+                            e.preventDefault();
+                            this.$refs.filterInput && this.$refs.filterInput.focus();
+                        }
                     });
+
+                    // A scroll or resize would leave the menu floating away from
+                    // the row it belongs to, so dismiss rather than reposition.
+                    window.addEventListener('scroll', () => { if (this.ctxMenu.open) this.closeRowMenu(); }, { passive: true });
+                    window.addEventListener('resize', () => { if (this.ctxMenu.open) this.closeRowMenu(); });
 
                     this.getSites().then(() => {
                         // If the size cache is empty (fresh install or just deleted),
@@ -3070,6 +3229,135 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     const name = stripped.slice(0, dotIdx);
                     const suffix = stripped.slice(dotIdx);
                     return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
+                },
+
+                // --- Command palette -------------------------------------------
+                // Results mix matching sites with global commands. Sites are ranked
+                // by match position so a prefix hit beats a mid-string one.
+                get paletteResults() {
+                    const q = this.palette.query.trim().toLowerCase();
+                    const out = [];
+                    const commands = [
+                        { key: 'cmd:add',     kind: 'cmd', label: 'Add site',            meta: '',  run: () => { this.closePalette(); this.toggleAdd(); } },
+                        { key: 'cmd:reload',  kind: 'cmd', label: 'Reload server',       meta: '',  run: () => { this.closePalette(); this.reloadServer(); } },
+                        { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
+                        { key: 'cmd:db',      kind: 'cmd', label: 'Open database',       meta: '',  run: () => { this.closePalette(); window.open('https://db.cove.localhost' + PORT_SUFFIX, '_blank', 'noopener'); } },
+                        { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: '',  run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
+                        { key: 'cmd:creds',   kind: 'cmd', label: 'Database credentials',meta: '',  run: () => { this.closePalette(); this.showDbModal = true; } },
+                        { key: 'cmd:theme',   kind: 'cmd', label: 'Toggle theme',        meta: '',  run: () => { this.closePalette(); this.toggleTheme(); } },
+                    ];
+                    let sites = this.sites;
+                    if (q) {
+                        sites = sites
+                            .map(s => ({ s, i: s.name.toLowerCase().indexOf(q) }))
+                            .filter(x => x.i !== -1)
+                            .sort((a, b) => a.i - b.i || a.s.name.localeCompare(b.s.name))
+                            .map(x => x.s);
+                    } else {
+                        // No query: show pinned first, then whatever the list is
+                        // sorted by, capped so the palette stays a menu not a dump.
+                        sites = this.filteredSites;
+                    }
+                    for (const site of sites.slice(0, 40)) {
+                        out.push({
+                            key: 'site:' + site.name,
+                            kind: site.type === 'WordPress' ? 'wp' : 'static',
+                            label: site.name + '.localhost',
+                            meta: this.formatSize(site.size_bytes),
+                            site,
+                            run: () => { this.closePalette(); this.openSite(site); }
+                        });
+                    }
+                    for (const c of commands) {
+                        if (!q || c.label.toLowerCase().includes(q)) out.push(c);
+                    }
+                    return out;
+                },
+
+                async reloadServer() {
+                    this.showSnack('Reloading server…');
+                    const res = await this.apiPostRetry('reload_server', {}, 3, 10000);
+                    if (res.success) this.showSnack('Server reloaded.');
+                },
+
+                openPalette() {
+                    this.palette.open = true;
+                    this.palette.query = '';
+                    this.palette.index = 0;
+                    this.closeRowMenu();
+                    this.$nextTick(() => this.$refs.paletteInput && this.$refs.paletteInput.focus());
+                },
+
+                closePalette() { this.palette.open = false; },
+
+                paletteMove(delta) {
+                    const n = this.paletteResults.length;
+                    if (!n) return;
+                    this.palette.index = (this.palette.index + delta + n) % n;
+                    this.$nextTick(() => {
+                        const list = this.$refs.paletteList;
+                        if (!list) return;
+                        const el = list.children[this.palette.index];
+                        if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+                    });
+                },
+
+                paletteRun(event) {
+                    const item = this.paletteResults[this.palette.index];
+                    if (!item) return;
+                    // Cmd/Ctrl+Enter logs into a WordPress site instead of opening it.
+                    if (event && (event.metaKey || event.ctrlKey) && item.site && item.site.type === 'WordPress') {
+                        this.closePalette();
+                        this.getLoginLink(item.site.name);
+                        return;
+                    }
+                    item.run();
+                },
+
+                paletteRunItem(item) { item.run(); },
+
+                // --- Row context menu ------------------------------------------
+                openRowMenu(site, event) {
+                    // Clamp into the viewport so a right-click near the right or
+                    // bottom edge doesn't push the menu off-screen.
+                    const w = 200, h = 230;
+                    const x = Math.min(event.clientX, window.innerWidth - w - 8);
+                    const y = Math.min(event.clientY, window.innerHeight - h - 8);
+                    this.ctxMenu = { open: true, site, x: Math.max(8, x), y: Math.max(8, y) };
+                    this.selectedName = site.name;
+                },
+
+                closeRowMenu() { this.ctxMenu.open = false; },
+
+                // --- Pinning ---------------------------------------------------
+                isPinned(name) { return this.pinned.includes(name); },
+
+                togglePin(name) {
+                    if (this.isPinned(name)) {
+                        this.pinned = this.pinned.filter(n => n !== name);
+                    } else {
+                        this.pinned = [...this.pinned, name];
+                    }
+                    localStorage.setItem('pinned', JSON.stringify(this.pinned));
+                },
+
+                // --- Keyboard list navigation ----------------------------------
+                moveSelection(delta) {
+                    const list = this.filteredSites;
+                    if (!list.length) return;
+                    const cur = list.findIndex(s => s.name === this.selectedName);
+                    let next = cur === -1 ? (delta > 0 ? 0 : list.length - 1) : cur + delta;
+                    next = Math.max(0, Math.min(list.length - 1, next));
+                    this.selectedName = list[next].name;
+                    this.$nextTick(() => {
+                        const rows = document.querySelectorAll('.site-row');
+                        const el = rows[next];
+                        if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+                    });
+                },
+
+                selectedSite() {
+                    return this.filteredSites.find(s => s.name === this.selectedName) || null;
                 },
 
                 setSort(key) {
