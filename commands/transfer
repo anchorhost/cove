@@ -395,6 +395,22 @@ cmd_restore() {
     site_dir=$(cd "$site_dir" && pwd -P)
     archive=$(cd "$(dirname "$archive")" && pwd -P)/$(basename "$archive")
 
+    # Defence in depth around the one destructive step in this engine (the
+    # rm -rf below). `cove pull` always targets a Cove-managed site directory,
+    # and `cove push` probes the remote first and refuses anything that isn't a
+    # live WordPress install — so a stray --path cannot reach the wipe today.
+    # But this helper is a standalone script piped over SSH, so any future
+    # caller that skips that probe would otherwise hand rm -rf whatever it was
+    # given. Refuse the obviously catastrophic targets outright, and require
+    # the destination to actually look like WordPress.
+    case "$site_dir" in
+        /|/usr|/etc|/var|/var/www|/home|/root|/Users|/opt|/srv|/tmp|"$HOME")
+            die "Refusing to restore over $site_dir." ;;
+    esac
+    if [ ! -f "$site_dir/wp-config.php" ] && [ ! -f "$site_dir/wp-load.php" ] && [ ! -d "$site_dir/wp-includes" ]; then
+        die "Refusing to restore over $site_dir: it does not look like a WordPress install."
+    fi
+
     local work
     work=$(mktemp -d "${TMPDIR:-/tmp}/cove-restore-XXXXXX") || die "mktemp failed"
     # shellcheck disable=SC2064
