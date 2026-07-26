@@ -57,6 +57,11 @@ cove_health() {
                 echo "  ℹ️  last exit -11 (SIGSEGV) — a prior instance segfaulted (persists until next clean restart)"
             elif [ "$last_exit" = "-6" ]; then
                 echo "  ℹ️  last exit -6 (SIGABRT) — a prior instance hit a Go fatal (PHP segfault turned abort)"
+            elif [ "$last_exit" = "-9" ]; then
+                # SIGKILL is what Cove's own watchdog sends, so this is usually
+                # a deliberate restart of a wedged server — not a crash. Say so
+                # rather than implying something went wrong unexplained.
+                echo "  ℹ️  last exit -9 (SIGKILL) — a prior instance was killed, typically the watchdog restarting a wedged server"
             else
                 echo "  ℹ️  last exit $last_exit — a prior instance died abnormally"
             fi
