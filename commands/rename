@@ -104,6 +104,17 @@ cove_rename() {
             gum style --foreground yellow "⚠️  search-replace did not complete cleanly; verify the site URL under the new name."
         fi
 
+        # Multisite (the marker moved with the site dir): wp_blogs/wp_site
+        # store bare hostnames the scheme'd pass above can't reach, and
+        # DOMAIN_CURRENT_SITE is a wp-config constant. Same handling as clone.
+        if [ -f "$new_site_dir/multisite" ]; then
+            if ! (cd "$new_site_dir/public" && $wp_cmd search-replace "$old_name.localhost" "$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet); then
+                gum style --foreground yellow "⚠️  network domain search-replace did not complete cleanly; verify subsite domains."
+            fi
+            (cd "$new_site_dir/public" && $wp_cmd config set DOMAIN_CURRENT_SITE "$new_name.localhost" --type=constant --quiet) || \
+                gum style --foreground yellow "⚠️  Could not update DOMAIN_CURRENT_SITE in wp-config.php."
+        fi
+
         echo "   - Dropping old database '$old_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
     fi

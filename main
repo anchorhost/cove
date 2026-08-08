@@ -2009,6 +2009,33 @@ emit_site_php_handler() {
     fi
 }
 
+# Read a site's multisite marker: "subdirectory", "subdomain", or "" when the
+# site is not a network. Written by `cove add --multisite`.
+site_multisite_mode() {
+    local site_path="$1"
+    [ -f "$site_path/multisite" ] && cat "$site_path/multisite"
+}
+
+# WordPress subdirectory-multisite rewrites, the Caddy translation of the
+# canonical nginx rules. A subsite request like /store/wp-admin/... or
+# /store/wp-login.php has no matching file on disk — the real files live at
+# the root — so rewrite the subsite prefix away. The `not file` guard is
+# load-bearing: it scopes the rewrite to paths that DON'T exist, so real
+# root files (/wp-admin/index.php itself) are never mangled. Caddy runs
+# redir/rewrite before php_server AND php_fastcgi in its standard directive
+# order, so this works for FrankenPHP and pinned-FPM sites alike.
+emit_multisite_subdir_rewrites() {
+    cat >> "$CADDYFILE_PATH" <<'EOM'
+    @cove_ms_admin path_regexp ^(/[_0-9a-zA-Z-]+)?/wp-admin$
+    redir @cove_ms_admin {path}/ permanent
+    @cove_ms_rewrite {
+        not file
+        path_regexp cove_ms ^/[_0-9a-zA-Z-]+(/wp-.*|/.*\.php)$
+    }
+    rewrite @cove_ms_rewrite {re.cove_ms.1}
+EOM
+}
+
 regenerate_caddyfile() {
     echo "🔄 Regenerating Caddyfile..."
     if ! command -v mailpit &> /dev/null; then
@@ -2124,7 +2151,17 @@ EOM
 
                 # Build the list of domains
                 local site_domains="$site_name"
-                
+
+                # Subdomain multisite: serve every subsite through a wildcard
+                # alias. Caddy's internal CA issues the *.name.localhost cert
+                # and *.localhost resolves to loopback natively, so subsites
+                # created in wp-admin work with no further configuration.
+                local ms_mode
+                ms_mode=$(site_multisite_mode "$site_path")
+                if [ "$ms_mode" == "subdomain" ]; then
+                    site_domains="$site_domains, *.$site_name"
+                fi
+
                 if [ -f "$site_path/mappings" ]; then
                     while IFS= read -r mapping || [ -n "$mapping" ]; do
                          if [ -n "$mapping" ]; then
@@ -2147,6 +2184,10 @@ EOM
                     echo "" >> "$CADDYFILE_PATH"
                     sed 's/^/    /' "$custom_conf_file" >> "$CADDYFILE_PATH"
                     echo "" >> "$CADDYFILE_PATH"
+                fi
+
+                if [ "$ms_mode" == "subdirectory" ]; then
+                    emit_multisite_subdir_rewrites
                 fi
 
                 emit_site_php_handler "$site_path"
@@ -2181,6 +2222,13 @@ EOM
                             echo "" >> "$CADDYFILE_PATH"
                             sed 's/^/    /' "$custom_conf_file" >> "$CADDYFILE_PATH"
                             echo "" >> "$CADDYFILE_PATH"
+                        fi
+
+                        # Subdirectory subsites work over the LAN IP too;
+                        # subdomain subsites can't (an IP has no subdomains),
+                        # so only the network's main site is reachable there.
+                        if [ "$ms_mode" == "subdirectory" ]; then
+                            emit_multisite_subdir_rewrites
                         fi
 
                         emit_site_php_handler "$site_path"
@@ -5253,12 +5301,19 @@ display_command_help() {
             echo ""
             echo "Flags:"
             echo "  --plain        Alias for the 'plain' flavor."
+            echo "  --php=<ver>    Pin the site to an older PHP (see 'cove php')."
+            echo "  --multisite    Install a WordPress multisite network (subdirectory"
+            echo "                 mode: <name>.localhost/store/). Use --multisite=subdomain"
+            echo "                 for subdomain mode (store.<name>.localhost) — subsites"
+            echo "                 resolve and get HTTPS automatically, no extra setup."
             echo ""
             echo "Examples:"
-            echo "  cove add mysite              Latest WordPress."
-            echo "  cove add mysite 6.4.3        WordPress pinned to 6.4.3."
-            echo "  cove add mysite nightly      WordPress trunk."
-            echo "  cove add mysite plain        Static site, no database."
+            echo "  cove add mysite                        Latest WordPress."
+            echo "  cove add mysite 6.4.3                  WordPress pinned to 6.4.3."
+            echo "  cove add mysite nightly                WordPress trunk."
+            echo "  cove add mysite plain                  Static site, no database."
+            echo "  cove add mysite --multisite            Subdirectory multisite network."
+            echo "  cove add mysite --multisite=subdomain  Subdomain multisite network."
             ;;
         clone)
             echo "Usage: cove clone <source> <new-name>"

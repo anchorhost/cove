@@ -7,7 +7,7 @@ cove_add() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [flavor] [--plain] [--php=8.2]"
+        echo "Usage: cove add <name> [flavor] [--plain] [--php=8.2] [--multisite[=subdomain]]"
         exit 1
     fi
 
@@ -34,6 +34,7 @@ cove_add() {
     local flavor=""
     local plain_flag=false
     local php_pin=""
+    local multisite_mode=""
     shift
     for arg in "$@"; do
         case "$arg" in
@@ -41,10 +42,28 @@ cove_add() {
             --no-reload)    no_reload_flag=true ;;
             --wp-version=*) flavor="${arg#*=}" ;;
             --php=*)        php_pin="${arg#*=}" ;;
+            --multisite)    multisite_mode="subdirectory" ;;
+            --multisite=*)  multisite_mode="${arg#*=}" ;;
+            --multisite-subdomain) multisite_mode="subdomain" ;;
             -*)             ;;  # unknown flags ignored, as before
             *)              [ -z "$flavor" ] && flavor="$arg" ;;
         esac
     done
+
+    # --multisite installs a network instead of a single site. Subdirectory
+    # (mysite.localhost/store/) is the default; subdomain mode
+    # (store.mysite.localhost) works because *.localhost resolves to loopback
+    # natively on macOS and Linux and Caddy's local CA issues the wildcard
+    # certificate — no per-subsite configuration ever.
+    if [ -n "$multisite_mode" ]; then
+        case "$multisite_mode" in
+            subdirectory|subdirectories|subdir|subfolder) multisite_mode="subdirectory" ;;
+            subdomain|subdomains) multisite_mode="subdomain" ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown multisite mode '$multisite_mode'." "Use --multisite (subdirectory) or --multisite=subdomain."
+                exit 1 ;;
+        esac
+    fi
 
     # --php pins the site to an older PHP served by native php-fpm (see
     # `cove php`). A flag rather than a second positional: the flavor slot
@@ -94,6 +113,11 @@ cove_add() {
             exit 1
         fi
         site_type="plain"
+    fi
+
+    if [ -n "$multisite_mode" ] && [ "$site_type" == "plain" ]; then
+        gum style --foreground red "❌ Error: Cannot combine --multisite with a plain site." "A plain site has no WordPress to network."
+        exit 1
     fi
 
     for protected_name in $PROTECTED_NAMES; do
@@ -191,8 +215,17 @@ define( 'WP_DEBUG_LOG', true );
 define( 'WP_DEBUG_DISPLAY', false );
 PHP
 
-            # 3. Install WordPress
-            if ! $wp_cmd core install --url="$(url_for "$full_hostname")" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email; then
+            # 3. Install WordPress — a network when --multisite was given.
+            # multisite-install also writes the MULTISITE / SUBDOMAIN_INSTALL /
+            # DOMAIN_CURRENT_SITE constants into wp-config.php itself.
+            if [ -n "$multisite_mode" ]; then
+                local subdomains_flag=""
+                [ "$multisite_mode" == "subdomain" ] && subdomains_flag="--subdomains"
+                if ! $wp_cmd core multisite-install --url="$(url_for "$full_hostname")" $subdomains_flag --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email; then
+                    echo "❌ Error: WordPress multisite install failed."
+                    exit 1
+                fi
+            elif ! $wp_cmd core install --url="$(url_for "$full_hostname")" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email; then
                 echo "❌ Error: WordPress core install failed."
                 exit 1
             fi
@@ -217,6 +250,14 @@ PHP
         
         # Generate must-use plugin
         inject_mu_plugin "$site_dir/public"
+
+        # The multisite marker drives Caddyfile generation (wildcard alias for
+        # subdomain networks, subdirectory rewrites otherwise), so it must be
+        # on disk before the regenerate below.
+        if [ -n "$multisite_mode" ]; then
+            echo "$multisite_mode" > "$site_dir/multisite"
+        fi
+
         one_time_login_url=$($wp_cmd user login "$admin_user" --path="$site_dir/public/")
     fi
 
@@ -242,6 +283,12 @@ PHP
     echo "✅ Site '$full_hostname' created successfully!"
     
     if [ "$site_type" == "wordpress" ]; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: $(url_for "$full_hostname")/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
+        if [ -n "$multisite_mode" ]; then
+            local subsite_example="$(url_for "$full_hostname")/store/"
+            [ "$multisite_mode" == "subdomain" ] && subsite_example="$(url_for "store.$full_hostname")/"
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Multisite Installed ($multisite_mode)" "Network admin: $(url_for "$full_hostname")/wp-admin/network/" "User: $admin_user" "Pass: $admin_pass" "New subsites (e.g. $subsite_example) work with no extra setup." "One-time login URL: $one_time_login_url"
+        else
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: $(url_for "$full_hostname")/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
+        fi
     fi
 }

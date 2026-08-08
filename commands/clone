@@ -97,6 +97,14 @@ cove_clone() {
         cp "$source_dir/php_version" "$new_dir/php_version"
     fi
 
+    # Carry the multisite marker so the clone's Caddy block keeps its wildcard
+    # alias / subdirectory rewrites. Must exist before the regenerate below.
+    local ms_mode=""
+    if [ -f "$source_dir/multisite" ]; then
+        ms_mode=$(cat "$source_dir/multisite")
+        cp "$source_dir/multisite" "$new_dir/multisite"
+    fi
+
     # --- Database ---
     if [ "$is_wordpress" = true ]; then
         source_config
@@ -146,6 +154,21 @@ cove_clone() {
         # rather than a reason to destroy the copy.
         if ! (cd "$new_dir/public" && $wp_cmd search-replace "$(url_for "$source_name.localhost")" "$(url_for "$new_name.localhost")" --all-tables --skip-plugins --skip-themes --quiet </dev/null); then
             gum style --foreground yellow "⚠️  search-replace did not complete cleanly; verify the cloned site's URLs."
+        fi
+
+        if [ -n "$ms_mode" ]; then
+            # Multisite stores BARE hostnames (no scheme) in wp_blogs.domain
+            # and wp_site.domain — for subdomain networks that includes every
+            # subsite (store.old.localhost). A bare-hostname pass rewrites
+            # them all in one sweep; the scheme'd pass above already handled
+            # option/content URLs.
+            if ! (cd "$new_dir/public" && $wp_cmd search-replace "$source_name.localhost" "$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet </dev/null); then
+                gum style --foreground yellow "⚠️  network domain search-replace did not complete cleanly; verify subsite domains."
+            fi
+            # DOMAIN_CURRENT_SITE is a wp-config constant, invisible to
+            # search-replace; stale, it points the whole network at the source.
+            (cd "$new_dir/public" && $wp_cmd config set DOMAIN_CURRENT_SITE "$new_name.localhost" --type=constant --quiet </dev/null) || \
+                gum style --foreground yellow "⚠️  Could not update DOMAIN_CURRENT_SITE in wp-config.php."
         fi
 
         inject_mu_plugin "$new_dir/public"

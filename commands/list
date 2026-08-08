@@ -80,7 +80,7 @@ cove_list() {
                 $sites[] = [
                     "name" => str_replace(".localhost", "", $item),
                     "domain" => "https://" . $item . $port_suffix,
-                    "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
+                    "type" => file_exists($site_path . "/multisite") ? "Multisite" : (file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain"),
                     "size" => $size,
                     // "!" marks a release wp.org considers insecure. Local sites
                     // are not exposed, so this is a nudge rather than an alarm.
