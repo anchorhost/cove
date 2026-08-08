@@ -279,6 +279,22 @@ cove_ini_get() {
     echo "${val:-$fallback}"
 }
 
+# Default FrankenPHP worker-thread count: 4x CPU cores, floor of 16.
+# FrankenPHP's own default (2x cores) is small enough that a handful of
+# long-running requests — an SSE long-poll, a slow loopback, a wedged
+# cron — can occupy every worker, and then EVERY site on the box hangs
+# even though the server is healthy (the watchdog then SIGKILLs a
+# starved-but-fine process). Idle threads are cheap; starvation is not.
+# Overridable via `num_threads = N` in ~/Cove/php.ini (cove_ini_get).
+cove_num_threads() {
+    local cores n
+    cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+    case "$cores" in (*[!0-9]*|'') cores=4;; esac
+    n=$(( cores * 4 ))
+    [ "$n" -lt 16 ] && n=16
+    echo "$n"
+}
+
 # --- Per-site PHP version helpers ---
 # A site pinned to an older PHP carries a single-line `php_version` file in its
 # site dir (peer of mappings/lan_config). FrankenPHP stays the front door for
@@ -2064,6 +2080,10 @@ regenerate_caddyfile() {
     cat > "$CADDYFILE_PATH" <<- EOM
 {
 ${port_directives}    frankenphp {
+        # Worker threads: see cove_num_threads(). Long-running requests
+        # (SSE long-polls, slow loopbacks) each pin a thread for their whole
+        # lifetime; the stock 2x-cores pool starves under a handful of them.
+        num_threads $(cove_ini_get num_threads "$(cove_num_threads)")
         php_ini sendmail_path "$mailpit_path sendmail -t"
         php_ini log_errors On
         php_ini display_errors Off
