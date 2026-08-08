@@ -84,6 +84,13 @@ static const NSInteger kServiceRowStartIndex = 2;
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+    // NSStatusItem persists its visible flag in this app's defaults domain
+    // (run.cove.menubar). A stale 0 there — e.g. left behind by the original
+    // standalone build — would make every launch silently invisible, and
+    // `cove menubar enable` replaces the bundle without touching preferences.
+    // The item is never removal-allowed, so a hidden state can only be stale;
+    // force it visible.
+    self.statusItem.visible = YES;
     [self loadStatusImages];
 
     // Seed the core trio before the first poll so the very first render
