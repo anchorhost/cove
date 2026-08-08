@@ -1077,7 +1077,7 @@ static const NSInteger kServiceRowStartIndex = 2;
                                              withExtension:@"svg"
                                               subdirectory:@"Assets"];
     NSImage *source = assetURL ? [[NSImage alloc] initWithContentsOfURL:assetURL] : nil;
-    if (!source) {
+    if (!source || ![self imageDrawsVisibly:source]) {
         return;
     }
 
@@ -1085,6 +1085,51 @@ static const NSInteger kServiceRowStartIndex = 2;
     self.runningImage = source;
     self.partialImage = [self imageByDesaturating:source brightness:0.02 contrast:1.05];
     self.stoppedImage = [self imageByDesaturating:source brightness:-0.12 contrast:1.20];
+}
+
+// CoreSVG can "succeed" on an SVG yet hand back a non-nil image with no
+// usable content (observed with viewBox-only SVGs on some macOS builds) —
+// which would put an invisible status item in the menu bar. Rasterize a
+// probe and require at least one visible pixel before trusting the icon.
+- (BOOL)imageDrawsVisibly:(NSImage *)image {
+    const NSInteger side = 18;
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc]
+        initWithBitmapDataPlanes:NULL
+                      pixelsWide:side
+                      pixelsHigh:side
+                   bitsPerSample:8
+                 samplesPerPixel:4
+                        hasAlpha:YES
+                        isPlanar:NO
+                  colorSpaceName:NSCalibratedRGBColorSpace
+                     bytesPerRow:0
+                    bitsPerPixel:0];
+    if (!rep || !rep.bitmapData) {
+        return NO;
+    }
+    memset(rep.bitmapData, 0, (size_t)(rep.bytesPerRow * side));
+
+    NSGraphicsContext *context =
+        [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+    if (!context) {
+        return NO;
+    }
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:context];
+    [image drawInRect:NSMakeRect(0, 0, side, side)
+             fromRect:NSZeroRect
+            operation:NSCompositingOperationSourceOver
+             fraction:1.0];
+    [NSGraphicsContext restoreGraphicsState];
+
+    const unsigned char *data = rep.bitmapData;
+    NSInteger byteCount = rep.bytesPerRow * side;
+    for (NSInteger i = 0; i < byteCount; i++) {
+        if (data[i] != 0) {
+            return YES;
+        }
+    }
+    return NO;
 }
 
 - (NSImage *)imageByDesaturating:(NSImage *)source
