@@ -4,7 +4,7 @@
 
 ### 🔒 Security & Bug Fixes
 
-* **Invisible Menu Bar Icon on Some Macs:** On certain macOS builds, Apple's SVG decoder would accept the menu bar logo but rasterize it as nothing, leaving a running app with an invisible status item — the existing fallback only caught an outright failed decode, not a "successful" blank one. The embedded logo now declares explicit dimensions (the shape CoreSVG reliably handles), and the app additionally draws the decoded icon into an offscreen probe and requires at least one visible pixel before using it, falling back to a "Cove" text item otherwise.
+* **Invisible Menu Bar Icon on Some Macs:** On certain macOS builds, Apple's SVG decoder would accept the menu bar logo but rasterize it as nothing, leaving a running app with an invisible status item — the existing fallback only caught an outright failed decode, not a "successful" blank one. The embedded logo now declares explicit dimensions (the shape CoreSVG reliably handles), and the app additionally draws the decoded icon into an offscreen probe and requires at least one visible pixel before using it, falling back to a "Cove" text item otherwise. The app delegate is also now held for the life of the process — `NSApplication` doesn't retain its delegate, and an aggressive ARC optimization could in principle release it before launch finished, another path to a running-but-iconless app.
 
 ## [1.14] - 2026-08-08
 
