@@ -1292,6 +1292,41 @@ if curl -sk --max-time 10 -o /dev/null \\
     "https://cove.localhost:\$https_port/" 2>/dev/null; then
     # Healthy: mark this pid up, clear the failure streak.
     echo "\$pid up 0" > "\$state_file"
+
+    # --- Nightly hygiene restart -----------------------------------------
+    # Under ZTS every recompile of a changed file wastes its old OPcache
+    # slot, and waste is only reclaimed by a shared-memory *restart* — the
+    # one event that corrupts SHM when it races concurrent compiles (the
+    # zend_mm_heap-corrupted / SA_ONSTACK abort class; see the OPcache
+    # comment in regenerate_caddyfile). On a busy dev box the arena refills
+    # in about a day, so rather than letting OPcache restart itself at a
+    # random busy moment, restart the whole process on schedule while the
+    # box is idle: a full process restart has no SHM race at all, and the
+    # service manager respawns it in seconds. Window-gated (04:30-05:59
+    # local), at most once per day, only from a healthy probe, never during
+    # an active reload. A box asleep through the window just skips the day
+    # — sleep also pauses the churn that fills the arena.
+    hygiene_stamp="$COVE_DIR/.watchdog.hygiene"
+    now_hhmm=\$((10#\$(date +%H%M)))
+    today=\$(date +%Y-%m-%d)
+    if [ "\$now_hhmm" -ge 430 ] && [ "\$now_hhmm" -lt 600 ] \\
+        && [ "\$(cat "\$hygiene_stamp" 2>/dev/null)" != "\$today" ]; then
+        hyg_lock="$COVE_DIR/.reload.lock"
+        hyg_lock_fresh=0
+        if [ -f "\$hyg_lock" ]; then
+            hyg_mtime=\$(stat -f%m "\$hyg_lock" 2>/dev/null || stat -c%Y "\$hyg_lock" 2>/dev/null || echo 0)
+            hyg_age=\$(( \$(date +%s) - hyg_mtime ))
+            [ "\$hyg_age" -ge 0 ] && [ "\$hyg_age" -lt 300 ] && hyg_lock_fresh=1
+        fi
+        if [ "\$hyg_lock_fresh" -eq 0 ]; then
+            echo "\$today" > "\$hygiene_stamp"
+            ts=\$(date '+%Y-%m-%dT%H:%M:%S%z')
+            echo "[\$ts] watchdog: pid=\$pid scheduled nightly restart (OPcache hygiene); SIGKILL for respawn" \\
+                >> "\$log_file"
+            kill -KILL "\$pid" 2>/dev/null || true
+            : > "\$state_file"
+        fi
+    fi
     exit 0
 fi
 
