@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### ✨ New Features
+
+* **WordPress Multisite Networks:** `cove add mysite --multisite` installs a subdirectory network (`mysite.localhost/store/`), and `cove add mysite --multisite=subdomain` installs a subdomain network (`store.mysite.localhost`) — the mode where Cove's stack quietly shines: because `*.localhost` resolves to loopback natively on macOS and Linux and Caddy's local CA issues a wildcard certificate for `*.mysite.localhost`, every subsite you create in Network Admin resolves and serves over valid HTTPS instantly, with no hosts-file entries or per-subsite configuration ever — friction even the GUI tools haven't eliminated. Subdirectory networks get the canonical rewrite rules translated to Caddy, guarded so they only fire on paths that don't exist on disk. The rest of Cove understands networks too: `cove clone` and `cove rename` rewrite the bare subsite domains in `wp_blogs`/`wp_site` and the `DOMAIN_CURRENT_SITE` constant that a plain URL search-replace can't reach, `cove list` shows a Multisite type, and `--php` pins work as on any other site. Subdirectory subsites are reachable over `cove lan` as well; subdomain subsites stay desktop-only there, since an IP address has no subdomains.
+
 ### 🔒 Security & Bug Fixes
 
 * **Invisible Menu Bar Icon on Some Macs:** On certain macOS builds, Apple's SVG decoder would accept the menu bar logo but rasterize it as nothing, leaving a running app with an invisible status item — the existing fallback only caught an outright failed decode, not a "successful" blank one. The embedded logo now declares explicit dimensions (the shape CoreSVG reliably handles), and the app additionally draws the decoded icon into an offscreen probe and requires at least one visible pixel before using it, falling back to a "Cove" text item otherwise. The app delegate is also now held for the life of the process — `NSApplication` doesn't retain its delegate, and an aggressive ARC optimization could in principle release it before launch finished, another path to a running-but-iconless app.
