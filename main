@@ -2156,7 +2156,14 @@ ${port_directives}    frankenphp {
     }
     order php_server before file_server
     servers {
-        protocols h1
+        # HTTP/1.1 and HTTP/2. The h1-only pin this replaces dated from
+        # FrankenPHP 1.11/1.12.2, where Chrome intermittently failed local
+        # requests with ERR_INCOMPLETE_CHUNKED_ENCODING over h2. Cove ships
+        # 1.12.4 now, which fixed those worker-mode races. h1 alone caps a
+        # browser at six connections per site, which serializes any app that
+        # opens with a fan-out of REST calls. h3 stays off: QUIC is UDP and
+        # brings its own local-certificate variables for no dev-time gain.
+        protocols h1 h2
     }
 }
 
