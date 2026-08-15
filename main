@@ -2506,8 +2506,21 @@ EOM
         if "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log"; then
             echo "✅ Caddy configuration reloaded."
         else
-            gum style --foreground red "❌ Caddy reload failed. See $LOGS_DIR/caddy-reload.log for details."
-            return 1
+            # A `caddy reload` adapts the Caddyfile with the *on-disk* binary
+            # and POSTs that JSON at the *running* process. After
+            # `cove upgrade` swaps FrankenPHP, those are different versions:
+            # 1.12.7's php_server adapter emits `route_group`, which 1.12.4's
+            # handler rejects as an unknown field. Same class of failure as
+            # any other binary/config skew. Fall through to a full restart
+            # so the new binary both adapts and serves.
+            echo "⚠️  Caddy reload rejected by the running process — restarting with the on-disk binary..."
+            echo "   (see $LOGS_DIR/caddy-reload.log)"
+            start_caddy_service
+            if ! is_caddy_running; then
+                gum style --foreground red "❌ Caddy failed to restart. See $LOGS_DIR/caddy-process.log for details."
+                return 1
+            fi
+            echo "✅ Caddy restarted."
         fi
     else
         echo "ℹ️  Caddy is not running — starting it now."

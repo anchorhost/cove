@@ -225,7 +225,17 @@ cove_upgrade() {
 
     if [ "$needs_upgrade" == "true" ]; then
         echo "🚀 Upgrading FrankenPHP to version $latest_frankenphp_version..."
-        upgrade_frankenphp
+        if upgrade_frankenphp; then
+            # The on-disk binary is new, but the running process is still the
+            # old one. `caddy reload` adapts with the NEW binary (which may
+            # emit JSON fields the old handler rejects — 1.12.7's php_server
+            # adapter adds `route_group`) and POSTs that at the old process.
+            # Stop it now so the later `cove reload` starts the new binary
+            # (launchd KeepAlive / systemd Restart=on-failure will also
+            # respawn it from the new file).
+            echo "   - Stopping the old FrankenPHP process so the next reload starts $latest_frankenphp_version..."
+            "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null || true
+        fi
     else
         echo "✅ FrankenPHP is already up to date."
     fi
