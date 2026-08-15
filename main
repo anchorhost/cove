@@ -195,7 +195,7 @@ WHOOPS_VERSION="2.18.0"
 # MUST match the `Version:` header in build_mu_plugin's heredoc — refresh_all_mu_plugins
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
-MU_PLUGIN_VERSION="0.5.0"
+MU_PLUGIN_VERSION="0.6.0"
 # Version of the macOS menu bar companion app (menubar/, embedded at compile
 # time). Bump whenever anything under menubar/ changes — post-upgrade compares
 # this against the installed bundle's CFBundleShortVersionString to decide
@@ -627,7 +627,7 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.5.0
+ * Version: 0.6.0
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
@@ -838,6 +838,36 @@ add_filter( 'wp_image_editors', function ( $editors ) {
 	}
 	return array( 'WP_Image_Editor_GD' );
 }, 999 );
+
+/**
+ * Don't let a plugin/theme install take the whole server down.
+ *
+ * After WP_Upgrader finishes — success or "folder already exists" — it
+ * fires upgrader_process_complete. On a site with a large plugin list
+ * that hook is a stampede: core pings api.wordpress.org
+ * (wp_update_plugins / wp_update_themes / wp_version_check), every
+ * license-aware plugin phones home off pre_set_site_transient_update_*,
+ * and Site Kit / Redirection call opcache_reset(). Under FrankenPHP's
+ * ZTS PHP both the HTTP fan-out and the OPcache reset abort the
+ * process (zend_mm_heap corrupted), so the install's JSON never comes
+ * back. Skip the core update pings (cron will catch up) and refuse
+ * outbound HTTP for the rest of this hook. OPcache resets are blocked
+ * separately by disable_functions=opcache_reset in the Caddyfile. Opt out with
+ * add_filter( 'cove_skip_upgrader_http', '__return_false' ).
+ */
+add_action( 'upgrader_process_complete', function () {
+	if ( ! apply_filters( 'cove_skip_upgrader_http', true ) ) {
+		return;
+	}
+	remove_action( 'upgrader_process_complete', 'wp_version_check', 10 );
+	remove_action( 'upgrader_process_complete', 'wp_update_plugins', 10 );
+	remove_action( 'upgrader_process_complete', 'wp_update_themes', 10 );
+	add_filter( 'pre_http_request', 'cove_block_upgrader_http', 0, 3 );
+}, 0 );
+
+function cove_block_upgrader_http( $preempt, $args = array(), $url = '' ) {
+	return new WP_Error( 'cove_skip_upgrader_http', 'Outbound HTTP skipped during a plugin or theme install.' );
+}
 heredoc
 
     local mu_plugins_dir="$public_dir/wp-content/mu-plugins"
@@ -2111,6 +2141,18 @@ regenerate_caddyfile() {
         port_directives+="    https_port $HTTPS_PORT"$'\n'
     fi
 
+    # Disable opcache_reset in the web SAPI. Plugins (Site Kit, Redirection)
+    # call it from upgrader_process_complete; under ZTS that restart races
+    # other threads and aborts the process. cove health still needs
+    # opcache_get_status, so we disable only the reset. Merge with any
+    # disable_functions the user already set in php.ini.
+    local disabled_fns
+    disabled_fns=$(cove_ini_get disable_functions "")
+    case ",$disabled_fns," in
+        *,opcache_reset,*) ;;
+        *) disabled_fns="${disabled_fns:+$disabled_fns,}opcache_reset" ;;
+    esac
+
     # Write the static header of the Caddyfile
     cat > "$CADDYFILE_PATH" <<- EOM
 {
@@ -2147,6 +2189,10 @@ ${port_directives}    frankenphp {
         php_ini opcache.interned_strings_buffer $(cove_ini_get opcache.interned_strings_buffer 64)
         php_ini opcache.max_accelerated_files $(cove_ini_get opcache.max_accelerated_files 100000)
         php_ini opcache.optimization_level $(cove_ini_get opcache.optimization_level 0)
+        # See the disabled_fns note above: opcache_reset under ZTS aborts
+        # the process. disable_functions leaves opcache_get_status intact
+        # so the health command can still read the arena.
+        php_ini disable_functions $disabled_fns
         # User-owned session dir. Linux apt's php.ini points sessions at
         # /var/lib/php-zts/session (owned by the frankenphp user); since
         # Cove runs FrankenPHP as the invoking user, that path is
