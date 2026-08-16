@@ -279,19 +279,37 @@ cove_ini_get() {
     echo "${val:-$fallback}"
 }
 
-# Default FrankenPHP worker-thread count: 4x CPU cores, floor of 16.
-# FrankenPHP's own default (2x cores) is small enough that a handful of
-# long-running requests — an SSE long-poll, a slow loopback, a wedged
-# cron — can occupy every worker, and then EVERY site on the box hangs
-# even though the server is healthy (the watchdog then SIGKILLs a
-# starved-but-fine process). Idle threads are cheap; starvation is not.
+# Default FrankenPHP worker-thread count: 4x CPU cores, floor of 16,
+# then capped at 1 thread per GB of RAM. FrankenPHP's own default
+# (2x cores) is small enough that a handful of long-running requests
+# — an SSE long-poll, a slow loopback, a wedged cron — can occupy
+# every worker, and then EVERY site on the box hangs even though the
+# server is healthy (the watchdog then SIGKILLs a starved-but-fine
+# process). Extra threads help with that, but under ZTS each extra
+# worker is another concurrent compile into the shared OPcache arena,
+# so a 16 GB laptop must not get the 32 workers 4x-cores would pick
+# (the zend_mm_panic abort class under a Playwright suite).
 # Overridable via `num_threads = N` in ~/Cove/php.ini (cove_ini_get).
 cove_num_threads() {
-    local cores n
+    local cores n ram_gb=0 mem_bytes mem_kb
     cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
     case "$cores" in (*[!0-9]*|'') cores=4;; esac
     n=$(( cores * 4 ))
     [ "$n" -lt 16 ] && n=16
+
+    mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
+    case "$mem_bytes" in (''|*[!0-9]*) mem_bytes=0;; esac
+    if [ "$mem_bytes" -gt 0 ]; then
+        ram_gb=$(( mem_bytes / 1024 / 1024 / 1024 ))
+    elif [ -r /proc/meminfo ]; then
+        mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)
+        case "$mem_kb" in (''|*[!0-9]*) mem_kb=0;; esac
+        [ "$mem_kb" -gt 0 ] && ram_gb=$(( mem_kb / 1024 / 1024 ))
+    fi
+    if [ "$ram_gb" -gt 0 ] && [ "$n" -gt "$ram_gb" ]; then
+        n=$ram_gb
+        [ "$n" -lt 8 ] && n=8
+    fi
     echo "$n"
 }
 
@@ -2160,6 +2178,9 @@ ${port_directives}    frankenphp {
         # Worker threads: see cove_num_threads(). Long-running requests
         # (SSE long-polls, slow loopbacks) each pin a thread for their whole
         # lifetime; the stock 2x-cores pool starves under a handful of them.
+        # Sized at 4x cores (floor 16), then capped at 1 thread per GB of
+        # RAM so a 16 GB box does not get 32 ZTS workers compiling into
+        # one OPcache arena.
         num_threads $(cove_ini_get num_threads "$(cove_num_threads)")
         php_ini sendmail_path "$mailpit_path sendmail -t"
         php_ini log_errors On
