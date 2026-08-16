@@ -195,7 +195,7 @@ WHOOPS_VERSION="2.18.0"
 # MUST match the `Version:` header in build_mu_plugin's heredoc — refresh_all_mu_plugins
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
-MU_PLUGIN_VERSION="0.6.0"
+MU_PLUGIN_VERSION="0.6.1"
 # Version of the macOS menu bar companion app (menubar/, embedded at compile
 # time). Bump whenever anything under menubar/ changes — post-upgrade compares
 # this against the installed bundle's CFBundleShortVersionString to decide
@@ -645,7 +645,7 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.6.0
+ * Version: 0.6.1
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
@@ -858,19 +858,16 @@ add_filter( 'wp_image_editors', function ( $editors ) {
 }, 999 );
 
 /**
- * Don't let a plugin/theme install take the whole server down.
+ * Don't let a plugin/theme install stampede wp.org mid-response.
  *
  * After WP_Upgrader finishes — success or "folder already exists" — it
- * fires upgrader_process_complete. On a site with a large plugin list
- * that hook is a stampede: core pings api.wordpress.org
- * (wp_update_plugins / wp_update_themes / wp_version_check), every
- * license-aware plugin phones home off pre_set_site_transient_update_*,
- * and Site Kit / Redirection call opcache_reset(). Under FrankenPHP's
- * ZTS PHP both the HTTP fan-out and the OPcache reset abort the
- * process (zend_mm_heap corrupted), so the install's JSON never comes
- * back. Skip the core update pings (cron will catch up) and refuse
- * outbound HTTP for the rest of this hook. OPcache resets are blocked
- * separately by disable_functions=opcache_reset in the Caddyfile. Opt out with
+ * fires upgrader_process_complete, and core's own listeners immediately
+ * ping api.wordpress.org (wp_update_plugins / wp_update_themes /
+ * wp_version_check). On a site with a large plugin list that is a
+ * multi-second fan-out the install JSON does not need. Unhook those
+ * three; cron will refresh updates. License phone-homes and other
+ * outbound HTTP are left alone. OPcache resets are blocked separately
+ * by disable_functions=opcache_reset in the Caddyfile. Opt out with
  * add_filter( 'cove_skip_upgrader_http', '__return_false' ).
  */
 add_action( 'upgrader_process_complete', function () {
@@ -880,12 +877,7 @@ add_action( 'upgrader_process_complete', function () {
 	remove_action( 'upgrader_process_complete', 'wp_version_check', 10 );
 	remove_action( 'upgrader_process_complete', 'wp_update_plugins', 10 );
 	remove_action( 'upgrader_process_complete', 'wp_update_themes', 10 );
-	add_filter( 'pre_http_request', 'cove_block_upgrader_http', 0, 3 );
 }, 0 );
-
-function cove_block_upgrader_http( $preempt, $args = array(), $url = '' ) {
-	return new WP_Error( 'cove_skip_upgrader_http', 'Outbound HTTP skipped during a plugin or theme install.' );
-}
 heredoc
 
     local mu_plugins_dir="$public_dir/wp-content/mu-plugins"
