@@ -199,3 +199,158 @@ cove_db_list() {
         echo "$php_output" | gum style --border normal --margin "1" --padding "1 2" --border-foreground 212
     fi
 }
+# Convert tables that MariaDB 11.5+ stamped with its uca1400 default
+# collations back to the classic *_unicode_ci ones. The drop-in written by
+# write_mariadb_config stops NEW tables from getting uca1400, but tables
+# imported or created before it landed keep the collation they were born
+# with — and every dump of them fails to import on MariaDB 10.x / MySQL
+# ("Unknown collation: 'utf8mb4_uca1400_ai_ci'"). Usage:
+#   cove db fix-collation <site> [--dry-run]
+#   cove db fix-collation --all  [--dry-run]
+cove_db_fix_collation() {
+    local site_name="" all=false dry_run=false
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --all)     all=true ;;
+            --dry-run) dry_run=true ;;
+            -*)
+                gum style --foreground red "❌ Unknown option: $arg"
+                echo "Usage: cove db fix-collation <site> | --all [--dry-run]"
+                exit 1
+                ;;
+            *)         site_name="$arg" ;;
+        esac
+    done
+
+    if ! $all && [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name (or --all) is required."
+        echo "Usage: cove db fix-collation <site> | --all [--dry-run]"
+        exit 1
+    fi
+    if [ -n "$site_name" ] && ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
+    local -a site_dirs=()
+    if $all; then
+        local d
+        for d in "$SITES_DIR"/*; do
+            [ -f "$d/public/wp-config.php" ] && site_dirs+=("$d")
+        done
+        if [ ${#site_dirs[@]} -eq 0 ]; then
+            gum style --foreground yellow "ℹ️ No WordPress sites found."
+            exit 0
+        fi
+    else
+        local site_dir="$SITES_DIR/$site_name.localhost"
+        if [ ! -f "$site_dir/public/wp-config.php" ]; then
+            gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
+            exit 1
+        fi
+        site_dirs=("$site_dir")
+    fi
+
+    local overall_success=true converted_total=0
+    local site_path
+    for site_path in "${site_dirs[@]}"; do
+        local name public_dir wp_cmd db_name db_user db_pass
+        name=$(basename "$site_path")
+        public_dir="$site_path/public"
+        wp_cmd=$(get_wp_cmd "$site_path")
+        echo "➡️ $name"
+
+        db_name=$(cd "$public_dir" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null)
+        db_user=$(cd "$public_dir" && $wp_cmd config get DB_USER --skip-plugins --skip-themes 2>/dev/null)
+        db_pass=$(cd "$public_dir" && $wp_cmd config get DB_PASSWORD --skip-plugins --skip-themes 2>/dev/null)
+        if [ -z "$db_name" ] || [ -z "$db_user" ]; then
+            echo "   ❌ Could not read database credentials from wp-config.php. Skipping."
+            overall_success=false
+            continue
+        fi
+        if printf '%s' "$db_name" | grep -qi sqlite; then
+            echo "   ℹ️ SQLite site — nothing to do."
+            continue
+        fi
+
+        # Tables whose default collation is uca1400. Emit "table<TAB>charset"
+        # so the ALTER keeps the charset and only swaps the collation. The
+        # charset is taken from the collation name's prefix on purpose:
+        # MariaDB 10.10+ lists uca1400 collations in
+        # collation_character_set_applicability under a charset-free name,
+        # so a join on collation_name finds nothing.
+        local rows
+        rows=$(mysql -u"$db_user" -p"$db_pass" -N -B -e "
+            SELECT table_name, SUBSTRING_INDEX(table_collation, '_', 1)
+              FROM information_schema.tables
+             WHERE table_schema = '${db_name//\'/\'\'}'
+               AND table_collation LIKE '%uca1400%'
+             ORDER BY table_name" 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            echo "   ❌ Could not query information_schema for '$db_name'. Skipping."
+            overall_success=false
+            continue
+        fi
+        if [ -z "$rows" ]; then
+            echo "   ✅ No uca1400 tables found."
+            continue
+        fi
+
+        local count
+        count=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+        local sql="" table charset target
+        while IFS=$'\t' read -r table charset; do
+            [ -z "$table" ] && continue
+            case "$charset" in
+                utf8mb3|utf8) target="utf8mb3_unicode_ci"; charset="utf8mb3" ;;
+                utf8mb4)      target="utf8mb4_unicode_ci" ;;
+                *)            echo "   ⚠️ Skipping \`$table\` (unhandled charset '$charset')."; continue ;;
+            esac
+            if $dry_run; then
+                echo "   would convert \`$table\` → $charset / $target"
+            fi
+            sql+="ALTER TABLE \`${table//\`/\`\`}\` CONVERT TO CHARACTER SET $charset COLLATE $target;"$'\n'
+        done <<< "$rows"
+
+        if $dry_run; then
+            echo "   ℹ️ Dry run: $count table(s) would be converted."
+            continue
+        fi
+
+        echo "   Converting $count table(s) to *_unicode_ci..."
+        if ! printf '%s' "$sql" | mysql -u"$db_user" -p"$db_pass" "$db_name"; then
+            echo "   ❌ One or more ALTER TABLE statements failed for '$db_name'."
+            overall_success=false
+            continue
+        fi
+
+        # CONVERT TO rewrites every string column, so what remains would be an
+        # explicitly-collated column in a table whose default was already
+        # something else. Rare, but worth pointing at rather than hiding.
+        local leftovers
+        leftovers=$(mysql -u"$db_user" -p"$db_pass" -N -B -e "
+            SELECT CONCAT(table_name, '.', column_name, ' (', collation_name, ')')
+              FROM information_schema.columns
+             WHERE table_schema = '${db_name//\'/\'\'}'
+               AND collation_name LIKE '%uca1400%'" 2>/dev/null)
+        if [ -n "$leftovers" ]; then
+            echo "   ⚠️ Columns still on a uca1400 collation (convert these by hand):"
+            printf '%s\n' "$leftovers" | sed 's/^/      /'
+        fi
+        converted_total=$((converted_total + count))
+        echo "   ✅ Converted $count table(s)."
+    done
+
+    echo "-----------------------------------------------------"
+    if $overall_success; then
+        if $dry_run; then
+            gum style --foreground 212 "Dry run complete. Re-run without --dry-run to convert."
+        else
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 Collation fix complete: $converted_total table(s) converted."
+        fi
+    else
+        gum style --foreground red "⚠️ Some sites could not be processed. Please review the output above."
+        exit 1
+    fi
+}

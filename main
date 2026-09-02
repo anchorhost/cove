@@ -1225,6 +1225,88 @@ update_etc_hosts() {
 
 # Probe Caddy's admin API to see if the server is running.
 # Uses bash's built-in /dev/tcp so we don't depend on nc/curl being installed.
+# Pin MariaDB's default collations so database dumps stay portable.
+#
+# MariaDB 11.5+ ships `character_set_collations` mapping utf8mb3/utf8mb4 to
+# the new uca1400 collations. Any table created from a dump (or by a plugin)
+# that says `DEFAULT CHARSET=utf8mb4` with no COLLATE clause — MySQL 8 dumps
+# omit it, and so do most plugins' CREATE TABLEs — silently becomes
+# utf8mb4_uca1400_ai_ci on import. The next `cove db backup` / `cove push`
+# then fails on every MariaDB 10.x / MySQL host with "Unknown collation".
+# WordPress core tables are unaffected (wpdb always writes an explicit
+# COLLATE), which is why the breakage only shows up on plugin tables and
+# on sites pulled in from another environment.
+#
+# Writes a Cove-managed drop-in mapping both charsets back to the classic
+# *_unicode_ci collations every server understands. The `loose-` prefix keeps
+# MariaDB 10.x (Debian/Ubuntu LTS), which lacks the variable, booting.
+#
+# Returns 0 when the file was written or changed (caller should restart
+# MariaDB), 1 when it was already current, 2 when no config dir was found.
+mariadb_config_dir() {
+    if [ "$OS" = "macos" ]; then
+        # Homebrew's my.cnf lives at <prefix>/etc/my.cnf and includes
+        # <prefix>/etc/my.cnf.d. Derive the prefix from BIN_DIR so the Intel
+        # (/usr/local) and Apple Silicon (/opt/homebrew) layouts both work.
+        echo "${BIN_DIR%/bin}/etc/my.cnf.d"
+        return 0
+    fi
+    local d
+    for d in /etc/mysql/mariadb.conf.d /etc/my.cnf.d /etc/mysql/conf.d; do
+        [ -d "$d" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+write_mariadb_config() {
+    local conf_dir
+    conf_dir=$(mariadb_config_dir) || return 2
+    local conf_file="$conf_dir/cove.cnf"
+    [ "$OS" = "linux" ] && [ "$conf_dir" = "/etc/mysql/mariadb.conf.d" ] && conf_file="$conf_dir/99-cove.cnf"
+
+    local content
+    content=$(cat <<'CNF'
+# Managed by Cove — rewritten on `cove install` and `cove upgrade`.
+# Put your own overrides in a separate file in this directory.
+[mariadbd]
+# MariaDB 11.5+ defaults new utf8/utf8mb4 tables to the uca1400 collations,
+# which older MariaDB and every MySQL reject on import ("Unknown collation").
+# Pin the classic collations so `cove db backup` / `cove push` dumps import
+# anywhere. `loose-` keeps MariaDB 10.x, which lacks this variable, booting.
+loose-character_set_collations = utf8mb3=utf8mb3_unicode_ci,utf8mb4=utf8mb4_unicode_ci
+CNF
+)
+
+    if [ -f "$conf_file" ] && [ "$(cat "$conf_file" 2>/dev/null)" = "$content" ]; then
+        return 1
+    fi
+
+    if [ "$OS" = "macos" ]; then
+        mkdir -p "$conf_dir" || return 2
+        printf '%s\n' "$content" > "$conf_file" || return 2
+        # Make sure the server actually reads the drop-in dir. Homebrew's
+        # stock my.cnf already carries the !includedir line; nanobrew or a
+        # hand-rolled my.cnf may not.
+        local my_cnf="${conf_dir%/my.cnf.d}/my.cnf"
+        if ! grep -qs "^!includedir[[:space:]]*$conf_dir" "$my_cnf" 2>/dev/null; then
+            printf '\n!includedir %s\n' "$conf_dir" >> "$my_cnf" || return 2
+        fi
+    else
+        printf '%s\n' "$content" | $SUDO_CMD tee "$conf_file" >/dev/null || return 2
+    fi
+    echo "   - ✅ Wrote MariaDB collation defaults to $conf_file"
+    return 0
+}
+
+# Restart MariaDB through whichever service manager owns it.
+restart_mariadb_service() {
+    if [ "$OS" = "macos" ]; then
+        start_macos_mariadb
+    else
+        $SUDO_CMD systemctl restart "$(get_mariadb_service_name)"
+    fi
+}
+
 is_caddy_running() {
     (echo > /dev/tcp/127.0.0.1/2019) &>/dev/null
 }
@@ -5603,8 +5685,13 @@ display_command_help() {
             echo "Manage databases."
             echo ""
             echo "Subcommands:"
-            echo "  backup      Creates a .sql dump for each WP site."
-            echo "  list        Lists database connection details for each WP site."
+            echo "  backup             Creates a .sql dump for each WP site."
+            echo "  list               Lists database connection details for each WP site."
+            echo "  fix-collation      Converts tables stamped with MariaDB 11.5+'s uca1400"
+            echo "                     collations back to utf8mb4_unicode_ci so dumps import"
+            echo "                     on older MariaDB / MySQL hosts."
+            echo ""
+            echo "Usage: cove db fix-collation <site> | --all [--dry-run]"
             ;;
         login)
             echo "Usage: cove login <site> [<user>]"
@@ -5940,6 +6027,12 @@ main() {
             create_whoops_bootstrap
             refresh_all_mu_plugins
             install_watchdog_service
+            # Pin portable collation defaults (MariaDB 11.5+ uca1400 trap).
+            # Only restarts MariaDB the first time the drop-in lands.
+            if write_mariadb_config; then
+                echo "   - Restarting MariaDB to apply collation defaults..."
+                restart_mariadb_service &>/dev/null || true
+            fi
             # Orphan-clearing mailpit runner + throttled KeepAlive. Safe to
             # re-run: rewrites the unit and restarts mailpit once.
             install_mailpit_service
@@ -5979,6 +6072,9 @@ main() {
                     ;;
                 list)
                     cove_db_list "$@"
+                    ;;
+                fix-collation)
+                    cove_db_fix_collation "$@"
                     ;;
                 *)
                     display_command_help "db"

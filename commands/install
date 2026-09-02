@@ -462,6 +462,9 @@ cove_install() {
 
     # MariaDB - Database server
     install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" ""
+    # Pin portable collation defaults before the first start (see
+    # write_mariadb_config in main for the MariaDB 11.5+ uca1400 trap).
+    write_mariadb_config || true
 
     # No standalone PHP install — wp-cli is invoked through `frankenphp php-cli`
     # (see get_wp_cmd in main), so FrankenPHP's bundled PHP is the single PHP
