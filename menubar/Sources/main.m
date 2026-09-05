@@ -1299,7 +1299,13 @@ int main(int argc, const char *argv[]) {
 
     @autoreleasepool {
         NSApplication *application = [NSApplication sharedApplication];
-        AppDelegate *delegate = [[AppDelegate alloc] init];
+        // NSApplication does not retain its delegate, and ARC may release a
+        // local as soon as its last use passes — before the run loop delivers
+        // applicationDidFinishLaunching:. A static keeps the delegate alive
+        // for the life of the process; without it the app can launch as a
+        // healthy event loop that never creates its status item.
+        static AppDelegate *delegate;
+        delegate = [[AppDelegate alloc] init];
         application.delegate = delegate;
         [application run];
     }
