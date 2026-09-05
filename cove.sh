@@ -186,7 +186,7 @@ RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.14"
+COVE_VERSION="1.15"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -195,12 +195,12 @@ WHOOPS_VERSION="2.18.0"
 # MUST match the `Version:` header in build_mu_plugin's heredoc — refresh_all_mu_plugins
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
-MU_PLUGIN_VERSION="0.5.0"
+MU_PLUGIN_VERSION="0.6.1"
 # Version of the macOS menu bar companion app (menubar/, embedded at compile
 # time). Bump whenever anything under menubar/ changes — post-upgrade compares
 # this against the installed bundle's CFBundleShortVersionString to decide
 # whether an enabled menu bar needs a rebuild. Opt-in: never auto-installed.
-MENUBAR_VERSION="1.0"
+MENUBAR_VERSION="1.1"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -277,6 +277,40 @@ cove_ini_get() {
             | sed -E 's/[[:space:]]+$//')
     fi
     echo "${val:-$fallback}"
+}
+
+# Default FrankenPHP worker-thread count: 4x CPU cores, floor of 16,
+# then capped at 1 thread per GB of RAM. FrankenPHP's own default
+# (2x cores) is small enough that a handful of long-running requests
+# — an SSE long-poll, a slow loopback, a wedged cron — can occupy
+# every worker, and then EVERY site on the box hangs even though the
+# server is healthy (the watchdog then SIGKILLs a starved-but-fine
+# process). Extra threads help with that, but under ZTS each extra
+# worker is another concurrent compile into the shared OPcache arena,
+# so a 16 GB laptop must not get the 32 workers 4x-cores would pick
+# (the zend_mm_panic abort class under a Playwright suite).
+# Overridable via `num_threads = N` in ~/Cove/php.ini (cove_ini_get).
+cove_num_threads() {
+    local cores n ram_gb=0 mem_bytes mem_kb
+    cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+    case "$cores" in (*[!0-9]*|'') cores=4;; esac
+    n=$(( cores * 4 ))
+    [ "$n" -lt 16 ] && n=16
+
+    mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
+    case "$mem_bytes" in (''|*[!0-9]*) mem_bytes=0;; esac
+    if [ "$mem_bytes" -gt 0 ]; then
+        ram_gb=$(( mem_bytes / 1024 / 1024 / 1024 ))
+    elif [ -r /proc/meminfo ]; then
+        mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)
+        case "$mem_kb" in (''|*[!0-9]*) mem_kb=0;; esac
+        [ "$mem_kb" -gt 0 ] && ram_gb=$(( mem_kb / 1024 / 1024 ))
+    fi
+    if [ "$ram_gb" -gt 0 ] && [ "$n" -gt "$ram_gb" ]; then
+        n=$ram_gb
+        [ "$n" -lt 8 ] && n=8
+    fi
+    echo "$n"
 }
 
 # --- Per-site PHP version helpers ---
@@ -611,7 +645,7 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.5.0
+ * Version: 0.6.1
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
@@ -822,6 +856,28 @@ add_filter( 'wp_image_editors', function ( $editors ) {
 	}
 	return array( 'WP_Image_Editor_GD' );
 }, 999 );
+
+/**
+ * Don't let a plugin/theme install stampede wp.org mid-response.
+ *
+ * After WP_Upgrader finishes — success or "folder already exists" — it
+ * fires upgrader_process_complete, and core's own listeners immediately
+ * ping api.wordpress.org (wp_update_plugins / wp_update_themes /
+ * wp_version_check). On a site with a large plugin list that is a
+ * multi-second fan-out the install JSON does not need. Unhook those
+ * three; cron will refresh updates. License phone-homes and other
+ * outbound HTTP are left alone. OPcache resets are blocked separately
+ * by disable_functions=opcache_reset in the Caddyfile. Opt out with
+ * add_filter( 'cove_skip_upgrader_http', '__return_false' ).
+ */
+add_action( 'upgrader_process_complete', function () {
+	if ( ! apply_filters( 'cove_skip_upgrader_http', true ) ) {
+		return;
+	}
+	remove_action( 'upgrader_process_complete', 'wp_version_check', 10 );
+	remove_action( 'upgrader_process_complete', 'wp_update_plugins', 10 );
+	remove_action( 'upgrader_process_complete', 'wp_update_themes', 10 );
+}, 0 );
 heredoc
 
     local mu_plugins_dir="$public_dir/wp-content/mu-plugins"
@@ -1034,6 +1090,57 @@ check_dependencies() {
 # is the only mechanism for setting ini values, hence the dedicated ini file.
 #
 # --allow-root is needed in WSL/Docker where the script runs as root.
+
+# True when a file is something PHP can run: it starts with `<?php`, or its
+# shebang invokes php (`#!/usr/bin/env php`, `#!/opt/homebrew/bin/php`). The
+# wp-cli phar begins with exactly such a shebang.
+wp_file_is_php() {
+    local first
+    first=$(head -n1 "$1" 2>/dev/null)
+    case "$first" in
+        '<?php'*|'#!'*php*) return 0 ;;
+    esac
+    return 1
+}
+
+# Resolve the `wp` on PATH to a file PHP can actually execute.
+#
+# get_wp_cmd hands the result to `frankenphp php-cli <path>` (or a pinned
+# native php), so it has to be wp-cli itself — the phar. It often isn't: a
+# common setup wraps wp in a shell script that pins a PHP binary or silences
+# deprecations. Handed to php-cli, that wrapper is not PHP, so PHP prints it
+# as literal text and exits 0 — every wp call "succeeds" while doing nothing,
+# and `cove add` created an empty site and reported it installed (#8).
+# Follow symlinks by hand (macOS readlink grew -f only in 12.3), and when the
+# target is a shell wrapper, pull out the phar it execs. Prints the wrapper
+# itself when it can't see through it, so the caller can run it directly.
+resolve_wp_phar() {
+    local p
+    p=$(command -v wp 2>/dev/null) || return 1
+    local hops=0 target
+    while [ -L "$p" ] && [ "$hops" -lt 20 ]; do
+        target=$(readlink "$p")
+        case "$target" in
+            /*) p="$target" ;;
+            *)  p="$(dirname "$p")/$target" ;;
+        esac
+        hops=$((hops + 1))
+    done
+    if [ ! -f "$p" ] || wp_file_is_php "$p"; then
+        echo "$p"
+        return 0
+    fi
+    local candidate
+    while read -r candidate; do
+        candidate="${candidate/#\~/$HOME}"
+        if [ -f "$candidate" ] && wp_file_is_php "$candidate"; then
+            echo "$candidate"
+            return 0
+        fi
+    done < <(grep -oE "[~/][^[:space:]'\"]*\.phar" "$p" 2>/dev/null)
+    echo "$p"
+}
+
 get_wp_cmd() {
     # Optional $1: a site dir. A site pinned to an older PHP (php_version
     # file) runs wp-cli under that same native php binary — version-gated
@@ -1043,10 +1150,17 @@ get_wp_cmd() {
     # FrankenPHP rather than failing.
     local site_dir="$1"
     local wp_path
-    wp_path=$(command -v wp)
+    wp_path=$(resolve_wp_phar)
     local root_flag=""
     if [ "$(id -u)" -eq 0 ]; then
         root_flag=" --allow-root"
+    fi
+    # A wrapper we could not see through has to run on its own: it pins a PHP
+    # of its choosing, and feeding it to php-cli is the exact bug resolve_wp_phar
+    # exists to prevent. A pinned site can't use it either — same reason.
+    if [ -n "$wp_path" ] && [ -f "$wp_path" ] && ! wp_file_is_php "$wp_path"; then
+        echo "$wp_path$root_flag"
+        return 0
     fi
     if [ -n "$site_dir" ]; then
         local pinned prefix
@@ -1169,6 +1283,88 @@ update_etc_hosts() {
 
 # Probe Caddy's admin API to see if the server is running.
 # Uses bash's built-in /dev/tcp so we don't depend on nc/curl being installed.
+# Pin MariaDB's default collations so database dumps stay portable.
+#
+# MariaDB 11.5+ ships `character_set_collations` mapping utf8mb3/utf8mb4 to
+# the new uca1400 collations. Any table created from a dump (or by a plugin)
+# that says `DEFAULT CHARSET=utf8mb4` with no COLLATE clause — MySQL 8 dumps
+# omit it, and so do most plugins' CREATE TABLEs — silently becomes
+# utf8mb4_uca1400_ai_ci on import. The next `cove db backup` / `cove push`
+# then fails on every MariaDB 10.x / MySQL host with "Unknown collation".
+# WordPress core tables are unaffected (wpdb always writes an explicit
+# COLLATE), which is why the breakage only shows up on plugin tables and
+# on sites pulled in from another environment.
+#
+# Writes a Cove-managed drop-in mapping both charsets back to the classic
+# *_unicode_ci collations every server understands. The `loose-` prefix keeps
+# MariaDB 10.x (Debian/Ubuntu LTS), which lacks the variable, booting.
+#
+# Returns 0 when the file was written or changed (caller should restart
+# MariaDB), 1 when it was already current, 2 when no config dir was found.
+mariadb_config_dir() {
+    if [ "$OS" = "macos" ]; then
+        # Homebrew's my.cnf lives at <prefix>/etc/my.cnf and includes
+        # <prefix>/etc/my.cnf.d. Derive the prefix from BIN_DIR so the Intel
+        # (/usr/local) and Apple Silicon (/opt/homebrew) layouts both work.
+        echo "${BIN_DIR%/bin}/etc/my.cnf.d"
+        return 0
+    fi
+    local d
+    for d in /etc/mysql/mariadb.conf.d /etc/my.cnf.d /etc/mysql/conf.d; do
+        [ -d "$d" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+write_mariadb_config() {
+    local conf_dir
+    conf_dir=$(mariadb_config_dir) || return 2
+    local conf_file="$conf_dir/cove.cnf"
+    [ "$OS" = "linux" ] && [ "$conf_dir" = "/etc/mysql/mariadb.conf.d" ] && conf_file="$conf_dir/99-cove.cnf"
+
+    local content
+    content=$(cat <<'CNF'
+# Managed by Cove — rewritten on `cove install` and `cove upgrade`.
+# Put your own overrides in a separate file in this directory.
+[mariadbd]
+# MariaDB 11.5+ defaults new utf8/utf8mb4 tables to the uca1400 collations,
+# which older MariaDB and every MySQL reject on import ("Unknown collation").
+# Pin the classic collations so `cove db backup` / `cove push` dumps import
+# anywhere. `loose-` keeps MariaDB 10.x, which lacks this variable, booting.
+loose-character_set_collations = utf8mb3=utf8mb3_unicode_ci,utf8mb4=utf8mb4_unicode_ci
+CNF
+)
+
+    if [ -f "$conf_file" ] && [ "$(cat "$conf_file" 2>/dev/null)" = "$content" ]; then
+        return 1
+    fi
+
+    if [ "$OS" = "macos" ]; then
+        mkdir -p "$conf_dir" || return 2
+        printf '%s\n' "$content" > "$conf_file" || return 2
+        # Make sure the server actually reads the drop-in dir. Homebrew's
+        # stock my.cnf already carries the !includedir line; nanobrew or a
+        # hand-rolled my.cnf may not.
+        local my_cnf="${conf_dir%/my.cnf.d}/my.cnf"
+        if ! grep -qs "^!includedir[[:space:]]*$conf_dir" "$my_cnf" 2>/dev/null; then
+            printf '\n!includedir %s\n' "$conf_dir" >> "$my_cnf" || return 2
+        fi
+    else
+        printf '%s\n' "$content" | $SUDO_CMD tee "$conf_file" >/dev/null || return 2
+    fi
+    echo "   - ✅ Wrote MariaDB collation defaults to $conf_file"
+    return 0
+}
+
+# Restart MariaDB through whichever service manager owns it.
+restart_mariadb_service() {
+    if [ "$OS" = "macos" ]; then
+        start_macos_mariadb
+    else
+        $SUDO_CMD systemctl restart "$(get_mariadb_service_name)"
+    fi
+}
+
 is_caddy_running() {
     (echo > /dev/tcp/127.0.0.1/2019) &>/dev/null
 }
@@ -1276,6 +1472,41 @@ if curl -sk --max-time 10 -o /dev/null \\
     "https://cove.localhost:\$https_port/" 2>/dev/null; then
     # Healthy: mark this pid up, clear the failure streak.
     echo "\$pid up 0" > "\$state_file"
+
+    # --- Nightly hygiene restart -----------------------------------------
+    # Under ZTS every recompile of a changed file wastes its old OPcache
+    # slot, and waste is only reclaimed by a shared-memory *restart* — the
+    # one event that corrupts SHM when it races concurrent compiles (the
+    # zend_mm_heap-corrupted / SA_ONSTACK abort class; see the OPcache
+    # comment in regenerate_caddyfile). On a busy dev box the arena refills
+    # in about a day, so rather than letting OPcache restart itself at a
+    # random busy moment, restart the whole process on schedule while the
+    # box is idle: a full process restart has no SHM race at all, and the
+    # service manager respawns it in seconds. Window-gated (04:30-05:59
+    # local), at most once per day, only from a healthy probe, never during
+    # an active reload. A box asleep through the window just skips the day
+    # — sleep also pauses the churn that fills the arena.
+    hygiene_stamp="$COVE_DIR/.watchdog.hygiene"
+    now_hhmm=\$((10#\$(date +%H%M)))
+    today=\$(date +%Y-%m-%d)
+    if [ "\$now_hhmm" -ge 430 ] && [ "\$now_hhmm" -lt 600 ] \\
+        && [ "\$(cat "\$hygiene_stamp" 2>/dev/null)" != "\$today" ]; then
+        hyg_lock="$COVE_DIR/.reload.lock"
+        hyg_lock_fresh=0
+        if [ -f "\$hyg_lock" ]; then
+            hyg_mtime=\$(stat -f%m "\$hyg_lock" 2>/dev/null || stat -c%Y "\$hyg_lock" 2>/dev/null || echo 0)
+            hyg_age=\$(( \$(date +%s) - hyg_mtime ))
+            [ "\$hyg_age" -ge 0 ] && [ "\$hyg_age" -lt 300 ] && hyg_lock_fresh=1
+        fi
+        if [ "\$hyg_lock_fresh" -eq 0 ]; then
+            echo "\$today" > "\$hygiene_stamp"
+            ts=\$(date '+%Y-%m-%dT%H:%M:%S%z')
+            echo "[\$ts] watchdog: pid=\$pid scheduled nightly restart (OPcache hygiene); SIGKILL for respawn" \\
+                >> "\$log_file"
+            kill -KILL "\$pid" 2>/dev/null || true
+            : > "\$state_file"
+        fi
+    fi
     exit 0
 fi
 
@@ -2009,6 +2240,33 @@ emit_site_php_handler() {
     fi
 }
 
+# Read a site's multisite marker: "subdirectory", "subdomain", or "" when the
+# site is not a network. Written by `cove add --multisite`.
+site_multisite_mode() {
+    local site_path="$1"
+    [ -f "$site_path/multisite" ] && cat "$site_path/multisite"
+}
+
+# WordPress subdirectory-multisite rewrites, the Caddy translation of the
+# canonical nginx rules. A subsite request like /store/wp-admin/... or
+# /store/wp-login.php has no matching file on disk — the real files live at
+# the root — so rewrite the subsite prefix away. The `not file` guard is
+# load-bearing: it scopes the rewrite to paths that DON'T exist, so real
+# root files (/wp-admin/index.php itself) are never mangled. Caddy runs
+# redir/rewrite before php_server AND php_fastcgi in its standard directive
+# order, so this works for FrankenPHP and pinned-FPM sites alike.
+emit_multisite_subdir_rewrites() {
+    cat >> "$CADDYFILE_PATH" <<'EOM'
+    @cove_ms_admin path_regexp ^(/[_0-9a-zA-Z-]+)?/wp-admin$
+    redir @cove_ms_admin {path}/ permanent
+    @cove_ms_rewrite {
+        not file
+        path_regexp cove_ms ^/[_0-9a-zA-Z-]+(/wp-.*|/.*\.php)$
+    }
+    rewrite @cove_ms_rewrite {re.cove_ms.1}
+EOM
+}
+
 regenerate_caddyfile() {
     echo "🔄 Regenerating Caddyfile..."
     if ! command -v mailpit &> /dev/null; then
@@ -2033,10 +2291,29 @@ regenerate_caddyfile() {
         port_directives+="    https_port $HTTPS_PORT"$'\n'
     fi
 
+    # Disable opcache_reset in the web SAPI. Plugins (Site Kit, Redirection)
+    # call it from upgrader_process_complete; under ZTS that restart races
+    # other threads and aborts the process. cove health still needs
+    # opcache_get_status, so we disable only the reset. Merge with any
+    # disable_functions the user already set in php.ini.
+    local disabled_fns
+    disabled_fns=$(cove_ini_get disable_functions "")
+    case ",$disabled_fns," in
+        *,opcache_reset,*) ;;
+        *) disabled_fns="${disabled_fns:+$disabled_fns,}opcache_reset" ;;
+    esac
+
     # Write the static header of the Caddyfile
     cat > "$CADDYFILE_PATH" <<- EOM
 {
 ${port_directives}    frankenphp {
+        # Worker threads: see cove_num_threads(). Long-running requests
+        # (SSE long-polls, slow loopbacks) each pin a thread for their whole
+        # lifetime; the stock 2x-cores pool starves under a handful of them.
+        # Sized at 4x cores (floor 16), then capped at 1 thread per GB of
+        # RAM so a 16 GB box does not get 32 ZTS workers compiling into
+        # one OPcache arena.
+        num_threads $(cove_ini_get num_threads "$(cove_num_threads)")
         php_ini sendmail_path "$mailpit_path sendmail -t"
         php_ini log_errors On
         php_ini display_errors Off
@@ -2065,6 +2342,10 @@ ${port_directives}    frankenphp {
         php_ini opcache.interned_strings_buffer $(cove_ini_get opcache.interned_strings_buffer 64)
         php_ini opcache.max_accelerated_files $(cove_ini_get opcache.max_accelerated_files 100000)
         php_ini opcache.optimization_level $(cove_ini_get opcache.optimization_level 0)
+        # See the disabled_fns note above: opcache_reset under ZTS aborts
+        # the process. disable_functions leaves opcache_get_status intact
+        # so the health command can still read the arena.
+        php_ini disable_functions $disabled_fns
         # User-owned session dir. Linux apt's php.ini points sessions at
         # /var/lib/php-zts/session (owned by the frankenphp user); since
         # Cove runs FrankenPHP as the invoking user, that path is
@@ -2074,7 +2355,14 @@ ${port_directives}    frankenphp {
     }
     order php_server before file_server
     servers {
-        protocols h1
+        # HTTP/1.1 and HTTP/2. The h1-only pin this replaces dated from
+        # FrankenPHP 1.11/1.12.2, where Chrome intermittently failed local
+        # requests with ERR_INCOMPLETE_CHUNKED_ENCODING over h2. Cove ships
+        # 1.12.4 now, which fixed those worker-mode races. h1 alone caps a
+        # browser at six connections per site, which serializes any app that
+        # opens with a fan-out of REST calls. h3 stays off: QUIC is UDP and
+        # brings its own local-certificate variables for no dev-time gain.
+        protocols h1 h2
     }
 }
 
@@ -2124,7 +2412,17 @@ EOM
 
                 # Build the list of domains
                 local site_domains="$site_name"
-                
+
+                # Subdomain multisite: serve every subsite through a wildcard
+                # alias. Caddy's internal CA issues the *.name.localhost cert
+                # and *.localhost resolves to loopback natively, so subsites
+                # created in wp-admin work with no further configuration.
+                local ms_mode
+                ms_mode=$(site_multisite_mode "$site_path")
+                if [ "$ms_mode" == "subdomain" ]; then
+                    site_domains="$site_domains, *.$site_name"
+                fi
+
                 if [ -f "$site_path/mappings" ]; then
                     while IFS= read -r mapping || [ -n "$mapping" ]; do
                          if [ -n "$mapping" ]; then
@@ -2147,6 +2445,10 @@ EOM
                     echo "" >> "$CADDYFILE_PATH"
                     sed 's/^/    /' "$custom_conf_file" >> "$CADDYFILE_PATH"
                     echo "" >> "$CADDYFILE_PATH"
+                fi
+
+                if [ "$ms_mode" == "subdirectory" ]; then
+                    emit_multisite_subdir_rewrites
                 fi
 
                 emit_site_php_handler "$site_path"
@@ -2181,6 +2483,13 @@ EOM
                             echo "" >> "$CADDYFILE_PATH"
                             sed 's/^/    /' "$custom_conf_file" >> "$CADDYFILE_PATH"
                             echo "" >> "$CADDYFILE_PATH"
+                        fi
+
+                        # Subdirectory subsites work over the LAN IP too;
+                        # subdomain subsites can't (an IP has no subdomains),
+                        # so only the network's main site is reachable there.
+                        if [ "$ms_mode" == "subdirectory" ]; then
+                            emit_multisite_subdir_rewrites
                         fi
 
                         emit_site_php_handler "$site_path"
@@ -2350,8 +2659,21 @@ EOM
         if "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log"; then
             echo "✅ Caddy configuration reloaded."
         else
-            gum style --foreground red "❌ Caddy reload failed. See $LOGS_DIR/caddy-reload.log for details."
-            return 1
+            # A `caddy reload` adapts the Caddyfile with the *on-disk* binary
+            # and POSTs that JSON at the *running* process. After
+            # `cove upgrade` swaps FrankenPHP, those are different versions:
+            # 1.12.7's php_server adapter emits `route_group`, which 1.12.4's
+            # handler rejects as an unknown field. Same class of failure as
+            # any other binary/config skew. Fall through to a full restart
+            # so the new binary both adapts and serves.
+            echo "⚠️  Caddy reload rejected by the running process — restarting with the on-disk binary..."
+            echo "   (see $LOGS_DIR/caddy-reload.log)"
+            start_caddy_service
+            if ! is_caddy_running; then
+                gum style --foreground red "❌ Caddy failed to restart. See $LOGS_DIR/caddy-process.log for details."
+                return 1
+            fi
+            echo "✅ Caddy restarted."
         fi
     else
         echo "ℹ️  Caddy is not running — starting it now."
@@ -5253,12 +5575,19 @@ display_command_help() {
             echo ""
             echo "Flags:"
             echo "  --plain        Alias for the 'plain' flavor."
+            echo "  --php=<ver>    Pin the site to an older PHP (see 'cove php')."
+            echo "  --multisite    Install a WordPress multisite network (subdirectory"
+            echo "                 mode: <name>.localhost/store/). Use --multisite=subdomain"
+            echo "                 for subdomain mode (store.<name>.localhost) — subsites"
+            echo "                 resolve and get HTTPS automatically, no extra setup."
             echo ""
             echo "Examples:"
-            echo "  cove add mysite              Latest WordPress."
-            echo "  cove add mysite 6.4.3        WordPress pinned to 6.4.3."
-            echo "  cove add mysite nightly      WordPress trunk."
-            echo "  cove add mysite plain        Static site, no database."
+            echo "  cove add mysite                        Latest WordPress."
+            echo "  cove add mysite 6.4.3                  WordPress pinned to 6.4.3."
+            echo "  cove add mysite nightly                WordPress trunk."
+            echo "  cove add mysite plain                  Static site, no database."
+            echo "  cove add mysite --multisite            Subdirectory multisite network."
+            echo "  cove add mysite --multisite=subdomain  Subdomain multisite network."
             ;;
         clone)
             echo "Usage: cove clone <source> <new-name>"
@@ -5414,8 +5743,13 @@ display_command_help() {
             echo "Manage databases."
             echo ""
             echo "Subcommands:"
-            echo "  backup      Creates a .sql dump for each WP site."
-            echo "  list        Lists database connection details for each WP site."
+            echo "  backup             Creates a .sql dump for each WP site."
+            echo "  list               Lists database connection details for each WP site."
+            echo "  fix-collation      Converts tables stamped with MariaDB 11.5+'s uca1400"
+            echo "                     collations back to utf8mb4_unicode_ci so dumps import"
+            echo "                     on older MariaDB / MySQL hosts."
+            echo ""
+            echo "Usage: cove db fix-collation <site> | --all [--dry-run]"
             ;;
         login)
             echo "Usage: cove login <site> [<user>]"
@@ -5751,6 +6085,12 @@ main() {
             create_whoops_bootstrap
             refresh_all_mu_plugins
             install_watchdog_service
+            # Pin portable collation defaults (MariaDB 11.5+ uca1400 trap).
+            # Only restarts MariaDB the first time the drop-in lands.
+            if write_mariadb_config; then
+                echo "   - Restarting MariaDB to apply collation defaults..."
+                restart_mariadb_service &>/dev/null || true
+            fi
             # Orphan-clearing mailpit runner + throttled KeepAlive. Safe to
             # re-run: rewrites the unit and restarts mailpit once.
             install_mailpit_service
@@ -5790,6 +6130,9 @@ main() {
                     ;;
                 list)
                     cove_db_list "$@"
+                    ;;
+                fix-collation)
+                    cove_db_fix_collation "$@"
                     ;;
                 *)
                     display_command_help "db"
@@ -5889,7 +6232,7 @@ cove_add() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [flavor] [--plain] [--php=8.2]"
+        echo "Usage: cove add <name> [flavor] [--plain] [--php=8.2] [--multisite[=subdomain]]"
         exit 1
     fi
 
@@ -5916,6 +6259,7 @@ cove_add() {
     local flavor=""
     local plain_flag=false
     local php_pin=""
+    local multisite_mode=""
     shift
     for arg in "$@"; do
         case "$arg" in
@@ -5923,10 +6267,28 @@ cove_add() {
             --no-reload)    no_reload_flag=true ;;
             --wp-version=*) flavor="${arg#*=}" ;;
             --php=*)        php_pin="${arg#*=}" ;;
+            --multisite)    multisite_mode="subdirectory" ;;
+            --multisite=*)  multisite_mode="${arg#*=}" ;;
+            --multisite-subdomain) multisite_mode="subdomain" ;;
             -*)             ;;  # unknown flags ignored, as before
             *)              [ -z "$flavor" ] && flavor="$arg" ;;
         esac
     done
+
+    # --multisite installs a network instead of a single site. Subdirectory
+    # (mysite.localhost/store/) is the default; subdomain mode
+    # (store.mysite.localhost) works because *.localhost resolves to loopback
+    # natively on macOS and Linux and Caddy's local CA issues the wildcard
+    # certificate — no per-subsite configuration ever.
+    if [ -n "$multisite_mode" ]; then
+        case "$multisite_mode" in
+            subdirectory|subdirectories|subdir|subfolder) multisite_mode="subdirectory" ;;
+            subdomain|subdomains) multisite_mode="subdomain" ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown multisite mode '$multisite_mode'." "Use --multisite (subdirectory) or --multisite=subdomain."
+                exit 1 ;;
+        esac
+    fi
 
     # --php pins the site to an older PHP served by native php-fpm (see
     # `cove php`). A flag rather than a second positional: the flavor slot
@@ -5976,6 +6338,11 @@ cove_add() {
             exit 1
         fi
         site_type="plain"
+    fi
+
+    if [ -n "$multisite_mode" ] && [ "$site_type" == "plain" ]; then
+        gum style --foreground red "❌ Error: Cannot combine --multisite with a plain site." "A plain site has no WordPress to network."
+        exit 1
     fi
 
     for protected_name in $PROTECTED_NAMES; do
@@ -6065,6 +6432,16 @@ cove_add() {
                 echo "❌ Error: Failed to download WordPress core. This might be a network issue, a permissions problem, or a WordPress version that does not exist."
                 exit 1 # Exit the subshell with an error
             fi
+            # A zero exit is not proof the files exist: a `wp` that php-cli
+            # can't run prints itself and exits 0 (#8). Only a WordPress tree
+            # on disk counts as a download, so the rest of this block can
+            # never report an install over an empty directory.
+            if [ ! -f "wp-includes/version.php" ]; then
+                echo "❌ Error: 'wp core download' reported success, but wp-includes/version.php is missing."
+                echo "   The 'wp' on your PATH ($(command -v wp)) may be a shell wrapper rather than wp-cli itself."
+                echo "   Point 'wp' at the wp-cli phar (a symlink works) and re-run. See https://github.com/anchorhost/cove/issues/8"
+                exit 1
+            fi
 
             # 2. Create the config file
             $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
@@ -6073,8 +6450,17 @@ define( 'WP_DEBUG_LOG', true );
 define( 'WP_DEBUG_DISPLAY', false );
 PHP
 
-            # 3. Install WordPress
-            if ! $wp_cmd core install --url="$(url_for "$full_hostname")" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email; then
+            # 3. Install WordPress — a network when --multisite was given.
+            # multisite-install also writes the MULTISITE / SUBDOMAIN_INSTALL /
+            # DOMAIN_CURRENT_SITE constants into wp-config.php itself.
+            if [ -n "$multisite_mode" ]; then
+                local subdomains_flag=""
+                [ "$multisite_mode" == "subdomain" ] && subdomains_flag="--subdomains"
+                if ! $wp_cmd core multisite-install --url="$(url_for "$full_hostname")" $subdomains_flag --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email; then
+                    echo "❌ Error: WordPress multisite install failed."
+                    exit 1
+                fi
+            elif ! $wp_cmd core install --url="$(url_for "$full_hostname")" --title="Welcome to $site_name" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="admin@$full_hostname" --skip-email; then
                 echo "❌ Error: WordPress core install failed."
                 exit 1
             fi
@@ -6099,6 +6485,14 @@ PHP
         
         # Generate must-use plugin
         inject_mu_plugin "$site_dir/public"
+
+        # The multisite marker drives Caddyfile generation (wildcard alias for
+        # subdomain networks, subdirectory rewrites otherwise), so it must be
+        # on disk before the regenerate below.
+        if [ -n "$multisite_mode" ]; then
+            echo "$multisite_mode" > "$site_dir/multisite"
+        fi
+
         one_time_login_url=$($wp_cmd user login "$admin_user" --path="$site_dir/public/")
     fi
 
@@ -6124,7 +6518,13 @@ PHP
     echo "✅ Site '$full_hostname' created successfully!"
     
     if [ "$site_type" == "wordpress" ]; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: $(url_for "$full_hostname")/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
+        if [ -n "$multisite_mode" ]; then
+            local subsite_example="$(url_for "$full_hostname")/store/"
+            [ "$multisite_mode" == "subdomain" ] && subsite_example="$(url_for "store.$full_hostname")/"
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Multisite Installed ($multisite_mode)" "Network admin: $(url_for "$full_hostname")/wp-admin/network/" "User: $admin_user" "Pass: $admin_pass" "New subsites (e.g. $subsite_example) work with no extra setup." "One-time login URL: $one_time_login_url"
+        else
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: $(url_for "$full_hostname")/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
+        fi
     fi
 }
 # Copy a directory tree, preferring a copy-on-write clone where the filesystem
@@ -6226,6 +6626,14 @@ cove_clone() {
         cp "$source_dir/php_version" "$new_dir/php_version"
     fi
 
+    # Carry the multisite marker so the clone's Caddy block keeps its wildcard
+    # alias / subdirectory rewrites. Must exist before the regenerate below.
+    local ms_mode=""
+    if [ -f "$source_dir/multisite" ]; then
+        ms_mode=$(cat "$source_dir/multisite")
+        cp "$source_dir/multisite" "$new_dir/multisite"
+    fi
+
     # --- Database ---
     if [ "$is_wordpress" = true ]; then
         source_config
@@ -6275,6 +6683,21 @@ cove_clone() {
         # rather than a reason to destroy the copy.
         if ! (cd "$new_dir/public" && $wp_cmd search-replace "$(url_for "$source_name.localhost")" "$(url_for "$new_name.localhost")" --all-tables --skip-plugins --skip-themes --quiet </dev/null); then
             gum style --foreground yellow "⚠️  search-replace did not complete cleanly; verify the cloned site's URLs."
+        fi
+
+        if [ -n "$ms_mode" ]; then
+            # Multisite stores BARE hostnames (no scheme) in wp_blogs.domain
+            # and wp_site.domain — for subdomain networks that includes every
+            # subsite (store.old.localhost). A bare-hostname pass rewrites
+            # them all in one sweep; the scheme'd pass above already handled
+            # option/content URLs.
+            if ! (cd "$new_dir/public" && $wp_cmd search-replace "$source_name.localhost" "$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet </dev/null); then
+                gum style --foreground yellow "⚠️  network domain search-replace did not complete cleanly; verify subsite domains."
+            fi
+            # DOMAIN_CURRENT_SITE is a wp-config constant, invisible to
+            # search-replace; stale, it points the whole network at the source.
+            (cd "$new_dir/public" && $wp_cmd config set DOMAIN_CURRENT_SITE "$new_name.localhost" --type=constant --quiet </dev/null) || \
+                gum style --foreground yellow "⚠️  Could not update DOMAIN_CURRENT_SITE in wp-config.php."
         fi
 
         inject_mu_plugin "$new_dir/public"
@@ -6714,20 +7137,25 @@ cove_db_list() {
         exit 0
     fi
 
-    # Determine if we need --allow-root for wp-cli (running as root in WSL/Docker)
-    local wp_root_flag=""
-    if [ "$(id -u)" -eq 0 ]; then
-        wp_root_flag="--allow-root"
-    fi
-
     # This heredoc contains a PHP script to find, connect, and format the database list.
     # We invoke it via `frankenphp php-cli -r` so we don't depend on a standalone php binary.
-    local wp_path
-    wp_path=$(command -v wp)
-    local frank
-    frank=$(command -v frankenphp)
-    local php_output
-    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" WP_ROOT_FLAG="$wp_root_flag" WP_PATH="$wp_path" FRANK_BIN="$frank" frankenphp php-cli -r '
+    #
+    # Driver note: this MUST use mysqli, not PDO. The Linux apt build of
+    # FrankenPHP (dunglas' frankenphp_*+php85 deb, php-zts) ships mysqli and
+    # mysqlnd but no PDO at all — `class_exists("PDO")` is false there, while
+    # the macOS build of the same version has it. Using PDO made this command
+    # fatal on every Linux install, and because the fatal went to stderr the
+    # empty stdout looked exactly like "no sites" (see the $php_status guard
+    # below). mysqli is also the driver WordPress itself connects with, so a
+    # site that loads is a site this command can read.
+    # get_wp_cmd carries --allow-root when needed and sees through a shell
+    # wrapper around wp (#8); hand-rolling `frankenphp php-cli $(command -v wp)`
+    # here reintroduced both problems.
+    local wp_invoker
+    wp_invoker=$(get_wp_cmd)
+    local php_output php_err php_status
+    php_err=$(mktemp)
+    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" WP_INVOKER="$wp_invoker" frankenphp php-cli -r '
         function formatSize(int $bytes): string {
             if ($bytes === 0) return "0 B";
             $units = ["B", "KB", "MB", "GB", "TB"];
@@ -6738,17 +7166,19 @@ cove_db_list() {
         $sites_dir = getenv("SITES_DIR");
         $db_user = getenv("DB_USER");
         $db_pass = getenv("DB_PASSWORD");
-        $wp_root_flag = getenv("WP_ROOT_FLAG");
-        $wp_path = getenv("WP_PATH");
-        $frank_bin = getenv("FRANK_BIN");
-        $wp_invoker = escapeshellarg($frank_bin) . " php-cli " . escapeshellarg($wp_path);
+        $wp_invoker = getenv("WP_INVOKER");
 
         if (!is_dir($sites_dir)) { exit; }
 
+        mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
         try {
-            $pdo = new PDO("mysql:host=localhost", $db_user, $db_pass, [PDO::ATTR_TIMEOUT => 2]);
-            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        } catch (PDOException $e) { exit; }
+            $mysqli = mysqli_init();
+            $mysqli->options(MYSQLI_OPT_CONNECT_TIMEOUT, 2);
+            $mysqli->real_connect("localhost", $db_user, $db_pass);
+        } catch (Throwable $e) {
+            fwrite(STDERR, "Could not connect to the database server: " . $e->getMessage() . "\n");
+            exit(1);
+        }
 
         $sites_info = [];
         foreach (scandir($sites_dir) as $item) {
@@ -6756,7 +7186,7 @@ cove_db_list() {
             if (is_file($public_dir . "/wp-config.php")) {
                 $site_name = str_replace(".localhost", "", $item);
                 $public_dir_esc = escapeshellarg($public_dir);
-                $cmd_suffix = " " . $wp_root_flag . " --skip-plugins --skip-themes --quiet 2>/dev/null";
+                $cmd_suffix = " --skip-plugins --skip-themes --quiet 2>/dev/null";
                 
                 $name_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_NAME" . $cmd_suffix);
                 if (is_null($name_raw)) { continue; }
@@ -6774,9 +7204,11 @@ cove_db_list() {
                     $pass_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_PASSWORD" . $cmd_suffix);
                     if (!is_null($pass_raw)) { $site_db_pass = trim($pass_raw); }
                     
-                    $stmt = $pdo->prepare("SELECT SUM(data_length + index_length) as size FROM information_schema.TABLES WHERE table_schema = ?");
-                    $stmt->execute([$site_db_name]);
-                    $size_bytes = $stmt->fetch(PDO::FETCH_ASSOC)["size"] ?? 0;
+                    $stmt = $mysqli->prepare("SELECT SUM(data_length + index_length) as size FROM information_schema.TABLES WHERE table_schema = ?");
+                    $stmt->bind_param("s", $site_db_name);
+                    $stmt->execute();
+                    $size_bytes = $stmt->get_result()->fetch_assoc()["size"] ?? 0;
+                    $stmt->close();
                     $size_str = formatSize((int)$size_bytes);
                 }
 
@@ -6806,7 +7238,20 @@ cove_db_list() {
             $output[] = $row;
         }
         echo implode("\n", $output);
-    ')
+    ' 2>"$php_err")
+    php_status=$?
+
+    # A crashing PHP block writes nothing to stdout, which is byte-identical to
+    # "there are genuinely no sites". Not separating the two is why the
+    # missing-PDO fatal above sat unnoticed for so long — so surface the real
+    # error instead of reporting a comforting empty list.
+    if [ "$php_status" -ne 0 ]; then
+        gum style --foreground red "❌ Could not read database information."
+        [ -s "$php_err" ] && sed 's/^/   /' "$php_err" >&2
+        rm -f "$php_err"
+        exit 1
+    fi
+    rm -f "$php_err"
 
     if [ -z "$php_output" ]; then
         gum style --padding "1 2" "ℹ️ No WordPress sites with readable database configurations found."
@@ -6814,6 +7259,162 @@ cove_db_list() {
         echo "$php_output" | gum style --border normal --margin "1" --padding "1 2" --border-foreground 212
     fi
 }
+# Convert tables that MariaDB 11.5+ stamped with its uca1400 default
+# collations back to the classic *_unicode_ci ones. The drop-in written by
+# write_mariadb_config stops NEW tables from getting uca1400, but tables
+# imported or created before it landed keep the collation they were born
+# with — and every dump of them fails to import on MariaDB 10.x / MySQL
+# ("Unknown collation: 'utf8mb4_uca1400_ai_ci'"). Usage:
+#   cove db fix-collation <site> [--dry-run]
+#   cove db fix-collation --all  [--dry-run]
+cove_db_fix_collation() {
+    local site_name="" all=false dry_run=false
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --all)     all=true ;;
+            --dry-run) dry_run=true ;;
+            -*)
+                gum style --foreground red "❌ Unknown option: $arg"
+                echo "Usage: cove db fix-collation <site> | --all [--dry-run]"
+                exit 1
+                ;;
+            *)         site_name="$arg" ;;
+        esac
+    done
+
+    if ! $all && [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name (or --all) is required."
+        echo "Usage: cove db fix-collation <site> | --all [--dry-run]"
+        exit 1
+    fi
+    if [ -n "$site_name" ] && ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
+    local -a site_dirs=()
+    if $all; then
+        local d
+        for d in "$SITES_DIR"/*; do
+            [ -f "$d/public/wp-config.php" ] && site_dirs+=("$d")
+        done
+        if [ ${#site_dirs[@]} -eq 0 ]; then
+            gum style --foreground yellow "ℹ️ No WordPress sites found."
+            exit 0
+        fi
+    else
+        local site_dir="$SITES_DIR/$site_name.localhost"
+        if [ ! -f "$site_dir/public/wp-config.php" ]; then
+            gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
+            exit 1
+        fi
+        site_dirs=("$site_dir")
+    fi
+
+    local overall_success=true converted_total=0
+    local site_path
+    for site_path in "${site_dirs[@]}"; do
+        local name public_dir wp_cmd db_name db_user db_pass
+        name=$(basename "$site_path")
+        public_dir="$site_path/public"
+        wp_cmd=$(get_wp_cmd "$site_path")
+        echo "➡️ $name"
+
+        db_name=$(cd "$public_dir" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null)
+        db_user=$(cd "$public_dir" && $wp_cmd config get DB_USER --skip-plugins --skip-themes 2>/dev/null)
+        db_pass=$(cd "$public_dir" && $wp_cmd config get DB_PASSWORD --skip-plugins --skip-themes 2>/dev/null)
+        if [ -z "$db_name" ] || [ -z "$db_user" ]; then
+            echo "   ❌ Could not read database credentials from wp-config.php. Skipping."
+            overall_success=false
+            continue
+        fi
+        if printf '%s' "$db_name" | grep -qi sqlite; then
+            echo "   ℹ️ SQLite site — nothing to do."
+            continue
+        fi
+
+        # Tables whose default collation is uca1400. Emit "table<TAB>charset"
+        # so the ALTER keeps the charset and only swaps the collation. The
+        # charset is taken from the collation name's prefix on purpose:
+        # MariaDB 10.10+ lists uca1400 collations in
+        # collation_character_set_applicability under a charset-free name,
+        # so a join on collation_name finds nothing.
+        local rows
+        rows=$(mysql -u"$db_user" -p"$db_pass" -N -B -e "
+            SELECT table_name, SUBSTRING_INDEX(table_collation, '_', 1)
+              FROM information_schema.tables
+             WHERE table_schema = '${db_name//\'/\'\'}'
+               AND table_collation LIKE '%uca1400%'
+             ORDER BY table_name" 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            echo "   ❌ Could not query information_schema for '$db_name'. Skipping."
+            overall_success=false
+            continue
+        fi
+        if [ -z "$rows" ]; then
+            echo "   ✅ No uca1400 tables found."
+            continue
+        fi
+
+        local count
+        count=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+        local sql="" table charset target
+        while IFS=$'\t' read -r table charset; do
+            [ -z "$table" ] && continue
+            case "$charset" in
+                utf8mb3|utf8) target="utf8mb3_unicode_ci"; charset="utf8mb3" ;;
+                utf8mb4)      target="utf8mb4_unicode_ci" ;;
+                *)            echo "   ⚠️ Skipping \`$table\` (unhandled charset '$charset')."; continue ;;
+            esac
+            if $dry_run; then
+                echo "   would convert \`$table\` → $charset / $target"
+            fi
+            sql+="ALTER TABLE \`${table//\`/\`\`}\` CONVERT TO CHARACTER SET $charset COLLATE $target;"$'\n'
+        done <<< "$rows"
+
+        if $dry_run; then
+            echo "   ℹ️ Dry run: $count table(s) would be converted."
+            continue
+        fi
+
+        echo "   Converting $count table(s) to *_unicode_ci..."
+        if ! printf '%s' "$sql" | mysql -u"$db_user" -p"$db_pass" "$db_name"; then
+            echo "   ❌ One or more ALTER TABLE statements failed for '$db_name'."
+            overall_success=false
+            continue
+        fi
+
+        # CONVERT TO rewrites every string column, so what remains would be an
+        # explicitly-collated column in a table whose default was already
+        # something else. Rare, but worth pointing at rather than hiding.
+        local leftovers
+        leftovers=$(mysql -u"$db_user" -p"$db_pass" -N -B -e "
+            SELECT CONCAT(table_name, '.', column_name, ' (', collation_name, ')')
+              FROM information_schema.columns
+             WHERE table_schema = '${db_name//\'/\'\'}'
+               AND collation_name LIKE '%uca1400%'" 2>/dev/null)
+        if [ -n "$leftovers" ]; then
+            echo "   ⚠️ Columns still on a uca1400 collation (convert these by hand):"
+            printf '%s\n' "$leftovers" | sed 's/^/      /'
+        fi
+        converted_total=$((converted_total + count))
+        echo "   ✅ Converted $count table(s)."
+    done
+
+    echo "-----------------------------------------------------"
+    if $overall_success; then
+        if $dry_run; then
+            gum style --foreground 212 "Dry run complete. Re-run without --dry-run to convert."
+        else
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🎉 Collation fix complete: $converted_total table(s) converted."
+        fi
+    else
+        gum style --foreground red "⚠️ Some sites could not be processed. Please review the output above."
+        exit 1
+    fi
+}
+
 cove_delete() {
     source_config
     local site_name="$1"
@@ -8033,6 +8634,9 @@ cove_install() {
 
     # MariaDB - Database server
     install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" ""
+    # Pin portable collation defaults before the first start (see
+    # write_mariadb_config in main for the MariaDB 11.5+ uca1400 trap).
+    write_mariadb_config || true
 
     # No standalone PHP install — wp-cli is invoked through `frankenphp php-cli`
     # (see get_wp_cmd in main), so FrankenPHP's bundled PHP is the single PHP
@@ -8663,7 +9267,7 @@ cove_list() {
                 $sites[] = [
                     "name" => str_replace(".localhost", "", $item),
                     "domain" => "https://" . $item . $port_suffix,
-                    "type" => file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain",
+                    "type" => file_exists($site_path . "/multisite") ? "Multisite" : (file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain"),
                     "size" => $size,
                     // "!" marks a release wp.org considers insecure. Local sites
                     // are not exposed, so this is a nudge rather than an alarm.
@@ -10840,6 +11444,17 @@ cove_rename() {
             gum style --foreground yellow "⚠️  search-replace did not complete cleanly; verify the site URL under the new name."
         fi
 
+        # Multisite (the marker moved with the site dir): wp_blogs/wp_site
+        # store bare hostnames the scheme'd pass above can't reach, and
+        # DOMAIN_CURRENT_SITE is a wp-config constant. Same handling as clone.
+        if [ -f "$new_site_dir/multisite" ]; then
+            if ! (cd "$new_site_dir/public" && $wp_cmd search-replace "$old_name.localhost" "$new_name.localhost" --all-tables --skip-plugins --skip-themes --quiet); then
+                gum style --foreground yellow "⚠️  network domain search-replace did not complete cleanly; verify subsite domains."
+            fi
+            (cd "$new_site_dir/public" && $wp_cmd config set DOMAIN_CURRENT_SITE "$new_name.localhost" --type=constant --quiet) || \
+                gum style --foreground yellow "⚠️  Could not update DOMAIN_CURRENT_SITE in wp-config.php."
+        fi
+
         echo "   - Dropping old database '$old_db_name'..."
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
     fi
@@ -11580,6 +12195,21 @@ resolve_wp() {
     return 1
 }
 
+# $table_prefix straight out of a wp-config.php, without booting PHP — the
+# source's config may name a database that does not exist on this machine.
+read_table_prefix() {
+    [ -f "$1" ] || return 0
+    grep -m1 -E '^[[:space:]]*\$table_prefix[[:space:]]*=' "$1" 2>/dev/null \
+        | sed -nE "s/.*=[[:space:]]*['\"]([A-Za-z0-9_]+)['\"].*/\1/p"
+}
+
+# Fallback when the archive carries no readable config: the prefix is whatever
+# precedes `options` in the dump's CREATE TABLE for the options table.
+infer_table_prefix_from_dump() {
+    grep -m1 -oE 'CREATE TABLE `?[A-Za-z0-9_]*options`?' "$1" 2>/dev/null \
+        | sed -E 's/CREATE TABLE `?([A-Za-z0-9_]*)options`?/\1/'
+}
+
 # --- capability detection -----------------------------------------------------
 # php_has <extension|class> — asks PHP directly rather than guessing from the
 # distro, since ZipArchive in particular is a separate package on many hosts.
@@ -11936,6 +12566,25 @@ cmd_restore() {
         -exec cp -R {} "$site_dir/" \; ) || die "Copying files failed."
     if [ -n "$keep_config" ]; then
         cp "$keep_config" "$site_dir/wp-config.php"
+
+        # Keeping the config also keeps its $table_prefix — almost always `wp_`
+        # from `cove add` — while the dump carries the source's tables under
+        # whatever prefix the source used. Left alone, WordPress looks for
+        # wp_options in a database full of xyz_options, and the URL rewrite
+        # below silently no-ops too, since it can't read `home` either (#7).
+        # The source's own config travelled in the archive even though it is
+        # never copied into place, so sync the prefix from it — or, failing
+        # that, from the dump's table names.
+        local src_prefix dest_prefix
+        src_prefix=$(read_table_prefix "$src/wp-config.php")
+        [ -n "$src_prefix" ] || src_prefix=$(infer_table_prefix_from_dump "$sql")
+        dest_prefix=$(read_table_prefix "$site_dir/wp-config.php")
+        if [ -n "$src_prefix" ] && [ "$src_prefix" != "$dest_prefix" ]; then
+            log "Setting \$table_prefix to '$src_prefix' to match the imported tables (was '${dest_prefix:-unset}')..."
+            $WP config set table_prefix "$src_prefix" --type=variable --path="$site_dir" \
+                --skip-plugins --skip-themes >&2 \
+                || die "Could not update \$table_prefix in wp-config.php."
+        fi
     fi
     rm -f "$site_dir"/*.sql
 
@@ -12400,7 +13049,17 @@ cove_upgrade() {
 
     if [ "$needs_upgrade" == "true" ]; then
         echo "🚀 Upgrading FrankenPHP to version $latest_frankenphp_version..."
-        upgrade_frankenphp
+        if upgrade_frankenphp; then
+            # The on-disk binary is new, but the running process is still the
+            # old one. `caddy reload` adapts with the NEW binary (which may
+            # emit JSON fields the old handler rejects — 1.12.7's php_server
+            # adapter adds `route_group`) and POSTs that at the old process.
+            # Stop it now so the later `cove reload` starts the new binary
+            # (launchd KeepAlive / systemd Restart=on-failure will also
+            # respawn it from the new file).
+            echo "   - Stopping the old FrankenPHP process so the next reload starts $latest_frankenphp_version..."
+            "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null || true
+        fi
     else
         echo "✅ FrankenPHP is already up to date."
     fi
@@ -12776,6 +13435,13 @@ static const NSInteger kServiceRowStartIndex = 2;
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+    // NSStatusItem persists its visible flag in this app's defaults domain
+    // (run.cove.menubar). A stale 0 there — e.g. left behind by the original
+    // standalone build — would make every launch silently invisible, and
+    // `cove menubar enable` replaces the bundle without touching preferences.
+    // The item is never removal-allowed, so a hidden state can only be stale;
+    // force it visible.
+    self.statusItem.visible = YES;
     [self loadStatusImages];
 
     // Seed the core trio before the first poll so the very first render
@@ -13769,7 +14435,7 @@ static const NSInteger kServiceRowStartIndex = 2;
                                              withExtension:@"svg"
                                               subdirectory:@"Assets"];
     NSImage *source = assetURL ? [[NSImage alloc] initWithContentsOfURL:assetURL] : nil;
-    if (!source) {
+    if (!source || ![self imageDrawsVisibly:source]) {
         return;
     }
 
@@ -13777,6 +14443,51 @@ static const NSInteger kServiceRowStartIndex = 2;
     self.runningImage = source;
     self.partialImage = [self imageByDesaturating:source brightness:0.02 contrast:1.05];
     self.stoppedImage = [self imageByDesaturating:source brightness:-0.12 contrast:1.20];
+}
+
+// CoreSVG can "succeed" on an SVG yet hand back a non-nil image with no
+// usable content (observed with viewBox-only SVGs on some macOS builds) —
+// which would put an invisible status item in the menu bar. Rasterize a
+// probe and require at least one visible pixel before trusting the icon.
+- (BOOL)imageDrawsVisibly:(NSImage *)image {
+    const NSInteger side = 18;
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc]
+        initWithBitmapDataPlanes:NULL
+                      pixelsWide:side
+                      pixelsHigh:side
+                   bitsPerSample:8
+                 samplesPerPixel:4
+                        hasAlpha:YES
+                        isPlanar:NO
+                  colorSpaceName:NSCalibratedRGBColorSpace
+                     bytesPerRow:0
+                    bitsPerPixel:0];
+    if (!rep || !rep.bitmapData) {
+        return NO;
+    }
+    memset(rep.bitmapData, 0, (size_t)(rep.bytesPerRow * side));
+
+    NSGraphicsContext *context =
+        [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+    if (!context) {
+        return NO;
+    }
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:context];
+    [image drawInRect:NSMakeRect(0, 0, side, side)
+             fromRect:NSZeroRect
+            operation:NSCompositingOperationSourceOver
+             fraction:1.0];
+    [NSGraphicsContext restoreGraphicsState];
+
+    const unsigned char *data = rep.bitmapData;
+    NSInteger byteCount = rep.bytesPerRow * side;
+    for (NSInteger i = 0; i < byteCount; i++) {
+        if (data[i] != 0) {
+            return YES;
+        }
+    }
+    return NO;
 }
 
 - (NSImage *)imageByDesaturating:(NSImage *)source
@@ -13939,7 +14650,13 @@ int main(int argc, const char *argv[]) {
 
     @autoreleasepool {
         NSApplication *application = [NSApplication sharedApplication];
-        AppDelegate *delegate = [[AppDelegate alloc] init];
+        // NSApplication does not retain its delegate, and ARC may release a
+        // local as soon as its last use passes — before the run loop delivers
+        // applicationDidFinishLaunching:. A static keeps the delegate alive
+        // for the life of the process; without it the app can launch as a
+        // healthy event loop that never creates its status item.
+        static AppDelegate *delegate;
+        delegate = [[AppDelegate alloc] init];
         application.delegate = delegate;
         [application run];
     }
@@ -13987,7 +14704,7 @@ COVE_MENUBAR_PLIST_EOF
 
 emit_menubar_icon_svg() {
 cat <<'COVE_MENUBAR_ICON_EOF'
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" stroke-linecap="round" stroke-linejoin="round">
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" stroke-linecap="round" stroke-linejoin="round">
     <defs>
         <clipPath id="cove-clip"><circle cx="32" cy="32" r="28"/></clipPath>
     </defs>

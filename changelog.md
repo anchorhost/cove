@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [1.15] - 2026-09-05
+
+Multisite arrives. `cove add mysite --multisite` builds a subdirectory network, `--multisite=subdomain` builds a subdomain one, and because `*.localhost` resolves natively and Caddy issues wildcard certificates, every subsite serves over valid HTTPS the moment you create it. FrankenPHP gets a bigger thread pool, HTTP/2, and a nightly OPcache hygiene restart, which together close out the remaining "random crash while editing a heavy plugin" class. Two community reports are fixed: `cove pull` now carries the source's `$table_prefix` across (#7), and `cove add` can no longer report success over an empty site when `wp` on your PATH is a shell wrapper (#8). Linux users also get a working `cove db list`, and MariaDB 11.5+ collations are pinned so your dumps import cleanly on other hosts.
 
 ### ✨ New Features
 
