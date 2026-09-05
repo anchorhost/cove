@@ -168,14 +168,23 @@ cove_upgrade() {
         # 6. Perform the Cove upgrade
         echo "🚀 Upgrading Cove to version $new_version..."
 
-        if [ ! -w "$(dirname "$install_path")" ]; then
-            echo "❌ Error: No write permissions for '$(dirname "$install_path")'."
-            echo "   Please try running with sudo: 'sudo cove upgrade'"
+        # The install dir is root-owned on Linux. Escalate for just this copy
+        # rather than asking the user to run the whole upgrade under sudo — a
+        # root-run upgrade lands in /root/Cove (see the guard at the top of
+        # main). cp over the existing file keeps its root ownership; mv would
+        # hand the binary to whoever downloaded it.
+        local replaced=false
+        if [ -w "$(dirname "$install_path")" ] && [ -w "$install_path" ]; then
+            mv "$temp_script" "$install_path" && replaced=true
+        elif [ -n "$SUDO_CMD" ]; then
+            echo "   - Replacing $install_path (requires sudo — you may be prompted)..."
+            if $SUDO_CMD cp "$temp_script" "$install_path" && $SUDO_CMD chmod 755 "$install_path"; then
+                replaced=true
+            fi
             rm -f "$temp_script" 2>/dev/null
-            return 1
         fi
 
-        if ! mv "$temp_script" "$install_path"; then
+        if [ "$replaced" != true ]; then
             echo "❌ Error: Failed to replace the old script at '$install_path'."
             rm -f "$temp_script" 2>/dev/null
         else

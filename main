@@ -5986,6 +5986,25 @@ display_command_help() {
 # --- Main Command Router ---
 main() {
 
+    # --- Drop root when invoked through sudo ---
+    # People run `sudo cove …` — for years `cove upgrade` even asked for it,
+    # since the binary in /usr/local/bin is root-owned. Debian-family sudo
+    # resets HOME=/root, and Cove derives everything from $HOME, so a root-run
+    # Cove targeted /root/Cove: a parallel tree the user never sees. A root-run
+    # `post-upgrade` regenerated a Caddyfile full of /root paths and pushed it
+    # into a FrankenPHP running as the user, 403-ing every site until the next
+    # reload; a root-run `upgrade` looked for Adminer under /root and silently
+    # skipped updating it. Cove is designed to run as the user and escalate
+    # through $SUDO_CMD only where needed (package installs, the binary swap in
+    # upgrade, systemd units), so hand control straight back to whoever typed
+    # sudo — their sudo ticket is still fresh for the few steps that need it.
+    # A genuine root login (WSL, containers) has no SUDO_USER and is left alone.
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        local self="$0"
+        [ -x "$self" ] || self=$(command -v cove)
+        exec sudo -u "$SUDO_USER" -H -- "$self" "$@"
+    fi
+
     # Determine the path to the cove command
     local COVE_CMD
     if command -v cove &> /dev/null; then
