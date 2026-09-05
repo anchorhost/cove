@@ -98,6 +98,21 @@ resolve_wp() {
     return 1
 }
 
+# $table_prefix straight out of a wp-config.php, without booting PHP — the
+# source's config may name a database that does not exist on this machine.
+read_table_prefix() {
+    [ -f "$1" ] || return 0
+    grep -m1 -E '^[[:space:]]*\$table_prefix[[:space:]]*=' "$1" 2>/dev/null \
+        | sed -nE "s/.*=[[:space:]]*['\"]([A-Za-z0-9_]+)['\"].*/\1/p"
+}
+
+# Fallback when the archive carries no readable config: the prefix is whatever
+# precedes `options` in the dump's CREATE TABLE for the options table.
+infer_table_prefix_from_dump() {
+    grep -m1 -oE 'CREATE TABLE `?[A-Za-z0-9_]*options`?' "$1" 2>/dev/null \
+        | sed -E 's/CREATE TABLE `?([A-Za-z0-9_]*)options`?/\1/'
+}
+
 # --- capability detection -----------------------------------------------------
 # php_has <extension|class> — asks PHP directly rather than guessing from the
 # distro, since ZipArchive in particular is a separate package on many hosts.
@@ -454,6 +469,25 @@ cmd_restore() {
         -exec cp -R {} "$site_dir/" \; ) || die "Copying files failed."
     if [ -n "$keep_config" ]; then
         cp "$keep_config" "$site_dir/wp-config.php"
+
+        # Keeping the config also keeps its $table_prefix — almost always `wp_`
+        # from `cove add` — while the dump carries the source's tables under
+        # whatever prefix the source used. Left alone, WordPress looks for
+        # wp_options in a database full of xyz_options, and the URL rewrite
+        # below silently no-ops too, since it can't read `home` either (#7).
+        # The source's own config travelled in the archive even though it is
+        # never copied into place, so sync the prefix from it — or, failing
+        # that, from the dump's table names.
+        local src_prefix dest_prefix
+        src_prefix=$(read_table_prefix "$src/wp-config.php")
+        [ -n "$src_prefix" ] || src_prefix=$(infer_table_prefix_from_dump "$sql")
+        dest_prefix=$(read_table_prefix "$site_dir/wp-config.php")
+        if [ -n "$src_prefix" ] && [ "$src_prefix" != "$dest_prefix" ]; then
+            log "Setting \$table_prefix to '$src_prefix' to match the imported tables (was '${dest_prefix:-unset}')..."
+            $WP config set table_prefix "$src_prefix" --type=variable --path="$site_dir" \
+                --skip-plugins --skip-themes >&2 \
+                || die "Could not update \$table_prefix in wp-config.php."
+        fi
     fi
     rm -f "$site_dir"/*.sql
 
