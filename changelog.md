@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### 🔒 Security & Bug Fixes
+
+* **`sudo cove …` No Longer Builds a Second Cove Under `/root`:** On Debian, Ubuntu, and their derivatives, `sudo` resets `HOME` to `/root`, and Cove derives everything from `$HOME`. So any command run through sudo quietly operated on a parallel `/root/Cove` tree the user never sees — and `sudo cove upgrade` was the documented way to upgrade on Linux, since the binary in `/usr/local/bin` is root-owned. Two things went wrong from there. A root-run `post-upgrade` regenerated `/root/Cove/Caddyfile` with `/root/...` paths and pushed it into the FrankenPHP running as the user, which could not read them, so every site and the dashboard answered 403/500 until the next reload happened to fix it. And a root-run `upgrade` looked for Adminer under `/root/Cove` and silently skipped updating it, on every Linux upgrade. Cove now hands control straight back to the user who typed sudo: every command re-executes itself as that user, and the one step that genuinely needs root — replacing the binary during `upgrade` — escalates on its own, reusing the sudo ticket you already have. `sudo cove upgrade` keeps working, and plain `cove upgrade` now works too (it asks for your password once). A genuine root login, as in WSL or a container, has no invoking user and behaves as before. The release test matrix gained a lane for exactly this path.
+
 ## [1.15] - 2026-09-05
 
 Multisite arrives. `cove add mysite --multisite` builds a subdirectory network, `--multisite=subdomain` builds a subdomain one, and because `*.localhost` resolves natively and Caddy issues wildcard certificates, every subsite serves over valid HTTPS the moment you create it. FrankenPHP gets a bigger thread pool, HTTP/2, and a nightly OPcache hygiene restart, which together close out the remaining "random crash while editing a heavy plugin" class. Two community reports are fixed: `cove pull` now carries the source's `$table_prefix` across (#7), and `cove add` can no longer report success over an empty site when `wp` on your PATH is a shell wrapper (#8). Linux users also get a working `cove db list`, and MariaDB 11.5+ collations are pinned so your dumps import cleanly on other hosts.
