@@ -107,11 +107,21 @@ cove_db_list() {
 
     # This heredoc contains a PHP script to find, connect, and format the database list.
     # We invoke it via `frankenphp php-cli -r` so we don't depend on a standalone php binary.
+    #
+    # Driver note: this MUST use mysqli, not PDO. The Linux apt build of
+    # FrankenPHP (dunglas' frankenphp_*+php85 deb, php-zts) ships mysqli and
+    # mysqlnd but no PDO at all — `class_exists("PDO")` is false there, while
+    # the macOS build of the same version has it. Using PDO made this command
+    # fatal on every Linux install, and because the fatal went to stderr the
+    # empty stdout looked exactly like "no sites" (see the $php_status guard
+    # below). mysqli is also the driver WordPress itself connects with, so a
+    # site that loads is a site this command can read.
     local wp_path
     wp_path=$(command -v wp)
     local frank
     frank=$(command -v frankenphp)
-    local php_output
+    local php_output php_err php_status
+    php_err=$(mktemp)
     php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" WP_ROOT_FLAG="$wp_root_flag" WP_PATH="$wp_path" FRANK_BIN="$frank" frankenphp php-cli -r '
         function formatSize(int $bytes): string {
             if ($bytes === 0) return "0 B";
@@ -130,10 +140,15 @@ cove_db_list() {
 
         if (!is_dir($sites_dir)) { exit; }
 
+        mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
         try {
-            $pdo = new PDO("mysql:host=localhost", $db_user, $db_pass, [PDO::ATTR_TIMEOUT => 2]);
-            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        } catch (PDOException $e) { exit; }
+            $mysqli = mysqli_init();
+            $mysqli->options(MYSQLI_OPT_CONNECT_TIMEOUT, 2);
+            $mysqli->real_connect("localhost", $db_user, $db_pass);
+        } catch (Throwable $e) {
+            fwrite(STDERR, "Could not connect to the database server: " . $e->getMessage() . "\n");
+            exit(1);
+        }
 
         $sites_info = [];
         foreach (scandir($sites_dir) as $item) {
@@ -159,9 +174,11 @@ cove_db_list() {
                     $pass_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_PASSWORD" . $cmd_suffix);
                     if (!is_null($pass_raw)) { $site_db_pass = trim($pass_raw); }
                     
-                    $stmt = $pdo->prepare("SELECT SUM(data_length + index_length) as size FROM information_schema.TABLES WHERE table_schema = ?");
-                    $stmt->execute([$site_db_name]);
-                    $size_bytes = $stmt->fetch(PDO::FETCH_ASSOC)["size"] ?? 0;
+                    $stmt = $mysqli->prepare("SELECT SUM(data_length + index_length) as size FROM information_schema.TABLES WHERE table_schema = ?");
+                    $stmt->bind_param("s", $site_db_name);
+                    $stmt->execute();
+                    $size_bytes = $stmt->get_result()->fetch_assoc()["size"] ?? 0;
+                    $stmt->close();
                     $size_str = formatSize((int)$size_bytes);
                 }
 
@@ -191,7 +208,20 @@ cove_db_list() {
             $output[] = $row;
         }
         echo implode("\n", $output);
-    ')
+    ' 2>"$php_err")
+    php_status=$?
+
+    # A crashing PHP block writes nothing to stdout, which is byte-identical to
+    # "there are genuinely no sites". Not separating the two is why the
+    # missing-PDO fatal above sat unnoticed for so long — so surface the real
+    # error instead of reporting a comforting empty list.
+    if [ "$php_status" -ne 0 ]; then
+        gum style --foreground red "❌ Could not read database information."
+        [ -s "$php_err" ] && sed 's/^/   /' "$php_err" >&2
+        rm -f "$php_err"
+        exit 1
+    fi
+    rm -f "$php_err"
 
     if [ -z "$php_output" ]; then
         gum style --padding "1 2" "ℹ️ No WordPress sites with readable database configurations found."
