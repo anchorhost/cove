@@ -297,12 +297,27 @@ lane_c() { # non-root user + sudo — the path most real Linux users hit
         else
             res "$c" sudo_install FAIL
             res "$c" sudo_add SKIP
+            res "$c" sudo_upgrade SKIP
             return
         fi
         if cx "$c" su - dev -c 'cove add usr1' && [ "$(http_code "$c" usr1)" = "200" ]; then
             res "$c" sudo_add PASS
         else
             res "$c" sudo_add FAIL
+        fi
+        # The follow-ups `sudo cove upgrade` runs, as the user actually runs
+        # them. Debian-family sudo resets HOME=/root, which used to make a
+        # root-run post-upgrade/reload build /root/Cove and push /root paths
+        # into the user's FrankenPHP. Cove must hand control back to the
+        # invoking user: no /root/Cove, nothing root-owned under ~/Cove, and
+        # the dashboard still serving afterwards.
+        if cx "$c" su - dev -c 'sudo cove post-upgrade >/dev/null 2>&1 && sudo cove reload >/dev/null 2>&1' \
+            && ! cx "$c" test -d /root/Cove \
+            && ! cx "$c" bash -c 'find /home/dev/Cove -maxdepth 3 ! -user dev -print -quit 2>/dev/null | grep -q .' \
+            && [ "$(http_code "$c" cove)" = "200" ]; then
+            res "$c" sudo_upgrade PASS
+        else
+            res "$c" sudo_upgrade FAIL
         fi
     } >> "$L" 2>&1
 }
