@@ -1090,6 +1090,57 @@ check_dependencies() {
 # is the only mechanism for setting ini values, hence the dedicated ini file.
 #
 # --allow-root is needed in WSL/Docker where the script runs as root.
+
+# True when a file is something PHP can run: it starts with `<?php`, or its
+# shebang invokes php (`#!/usr/bin/env php`, `#!/opt/homebrew/bin/php`). The
+# wp-cli phar begins with exactly such a shebang.
+wp_file_is_php() {
+    local first
+    first=$(head -n1 "$1" 2>/dev/null)
+    case "$first" in
+        '<?php'*|'#!'*php*) return 0 ;;
+    esac
+    return 1
+}
+
+# Resolve the `wp` on PATH to a file PHP can actually execute.
+#
+# get_wp_cmd hands the result to `frankenphp php-cli <path>` (or a pinned
+# native php), so it has to be wp-cli itself — the phar. It often isn't: a
+# common setup wraps wp in a shell script that pins a PHP binary or silences
+# deprecations. Handed to php-cli, that wrapper is not PHP, so PHP prints it
+# as literal text and exits 0 — every wp call "succeeds" while doing nothing,
+# and `cove add` created an empty site and reported it installed (#8).
+# Follow symlinks by hand (macOS readlink grew -f only in 12.3), and when the
+# target is a shell wrapper, pull out the phar it execs. Prints the wrapper
+# itself when it can't see through it, so the caller can run it directly.
+resolve_wp_phar() {
+    local p
+    p=$(command -v wp 2>/dev/null) || return 1
+    local hops=0 target
+    while [ -L "$p" ] && [ "$hops" -lt 20 ]; do
+        target=$(readlink "$p")
+        case "$target" in
+            /*) p="$target" ;;
+            *)  p="$(dirname "$p")/$target" ;;
+        esac
+        hops=$((hops + 1))
+    done
+    if [ ! -f "$p" ] || wp_file_is_php "$p"; then
+        echo "$p"
+        return 0
+    fi
+    local candidate
+    while read -r candidate; do
+        candidate="${candidate/#\~/$HOME}"
+        if [ -f "$candidate" ] && wp_file_is_php "$candidate"; then
+            echo "$candidate"
+            return 0
+        fi
+    done < <(grep -oE "[~/][^[:space:]'\"]*\.phar" "$p" 2>/dev/null)
+    echo "$p"
+}
+
 get_wp_cmd() {
     # Optional $1: a site dir. A site pinned to an older PHP (php_version
     # file) runs wp-cli under that same native php binary — version-gated
@@ -1099,10 +1150,17 @@ get_wp_cmd() {
     # FrankenPHP rather than failing.
     local site_dir="$1"
     local wp_path
-    wp_path=$(command -v wp)
+    wp_path=$(resolve_wp_phar)
     local root_flag=""
     if [ "$(id -u)" -eq 0 ]; then
         root_flag=" --allow-root"
+    fi
+    # A wrapper we could not see through has to run on its own: it pins a PHP
+    # of its choosing, and feeding it to php-cli is the exact bug resolve_wp_phar
+    # exists to prevent. A pinned site can't use it either — same reason.
+    if [ -n "$wp_path" ] && [ -f "$wp_path" ] && ! wp_file_is_php "$wp_path"; then
+        echo "$wp_path$root_flag"
+        return 0
     fi
     if [ -n "$site_dir" ]; then
         local pinned prefix

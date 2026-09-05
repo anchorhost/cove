@@ -207,6 +207,16 @@ cove_add() {
                 echo "❌ Error: Failed to download WordPress core. This might be a network issue, a permissions problem, or a WordPress version that does not exist."
                 exit 1 # Exit the subshell with an error
             fi
+            # A zero exit is not proof the files exist: a `wp` that php-cli
+            # can't run prints itself and exits 0 (#8). Only a WordPress tree
+            # on disk counts as a download, so the rest of this block can
+            # never report an install over an empty directory.
+            if [ ! -f "wp-includes/version.php" ]; then
+                echo "❌ Error: 'wp core download' reported success, but wp-includes/version.php is missing."
+                echo "   The 'wp' on your PATH ($(command -v wp)) may be a shell wrapper rather than wp-cli itself."
+                echo "   Point 'wp' at the wp-cli phar (a symlink works) and re-run. See https://github.com/anchorhost/cove/issues/8"
+                exit 1
+            fi
 
             # 2. Create the config file
             $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP

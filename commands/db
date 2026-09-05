@@ -99,12 +99,6 @@ cove_db_list() {
         exit 0
     fi
 
-    # Determine if we need --allow-root for wp-cli (running as root in WSL/Docker)
-    local wp_root_flag=""
-    if [ "$(id -u)" -eq 0 ]; then
-        wp_root_flag="--allow-root"
-    fi
-
     # This heredoc contains a PHP script to find, connect, and format the database list.
     # We invoke it via `frankenphp php-cli -r` so we don't depend on a standalone php binary.
     #
@@ -116,13 +110,14 @@ cove_db_list() {
     # empty stdout looked exactly like "no sites" (see the $php_status guard
     # below). mysqli is also the driver WordPress itself connects with, so a
     # site that loads is a site this command can read.
-    local wp_path
-    wp_path=$(command -v wp)
-    local frank
-    frank=$(command -v frankenphp)
+    # get_wp_cmd carries --allow-root when needed and sees through a shell
+    # wrapper around wp (#8); hand-rolling `frankenphp php-cli $(command -v wp)`
+    # here reintroduced both problems.
+    local wp_invoker
+    wp_invoker=$(get_wp_cmd)
     local php_output php_err php_status
     php_err=$(mktemp)
-    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" WP_ROOT_FLAG="$wp_root_flag" WP_PATH="$wp_path" FRANK_BIN="$frank" frankenphp php-cli -r '
+    php_output=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" SITES_DIR="$SITES_DIR" WP_INVOKER="$wp_invoker" frankenphp php-cli -r '
         function formatSize(int $bytes): string {
             if ($bytes === 0) return "0 B";
             $units = ["B", "KB", "MB", "GB", "TB"];
@@ -133,10 +128,7 @@ cove_db_list() {
         $sites_dir = getenv("SITES_DIR");
         $db_user = getenv("DB_USER");
         $db_pass = getenv("DB_PASSWORD");
-        $wp_root_flag = getenv("WP_ROOT_FLAG");
-        $wp_path = getenv("WP_PATH");
-        $frank_bin = getenv("FRANK_BIN");
-        $wp_invoker = escapeshellarg($frank_bin) . " php-cli " . escapeshellarg($wp_path);
+        $wp_invoker = getenv("WP_INVOKER");
 
         if (!is_dir($sites_dir)) { exit; }
 
@@ -156,7 +148,7 @@ cove_db_list() {
             if (is_file($public_dir . "/wp-config.php")) {
                 $site_name = str_replace(".localhost", "", $item);
                 $public_dir_esc = escapeshellarg($public_dir);
-                $cmd_suffix = " " . $wp_root_flag . " --skip-plugins --skip-themes --quiet 2>/dev/null";
+                $cmd_suffix = " --skip-plugins --skip-themes --quiet 2>/dev/null";
                 
                 $name_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_NAME" . $cmd_suffix);
                 if (is_null($name_raw)) { continue; }
