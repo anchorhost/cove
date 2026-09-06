@@ -13,30 +13,46 @@
   var MIN_W = 180, MAX_W = 480;
   var html = document.documentElement;
 
-  /* ---------- Theme ---------- */
-  function readTheme() {
+  /* ---------- Theme ----------
+     Preference: 'light' | 'dark' | 'system' (default). data-theme carries the
+     effective mode the tokens read; data-theme-pref drives the toggle icon.
+     Click flips light and dark; right-click picks from a small menu. */
+  function readPref() {
     try {
       var s = localStorage.getItem(KEY_THEME);
       if (s === 'dark' || s === 'light') return s;
     } catch (e) {}
-    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    return 'system';
   }
+  function osTheme() {
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  function effective(pref) { return pref === 'system' ? osTheme() : pref; }
 
-  function applyTheme(t) {
-    html.setAttribute('data-theme', t);
-    try { localStorage.setItem(KEY_THEME, t); } catch (e) {}
+  function applyPref(pref) {
+    pref = (pref === 'dark' || pref === 'light') ? pref : 'system';
+    html.setAttribute('data-theme', effective(pref));
+    html.setAttribute('data-theme-pref', pref);
+    try { localStorage.setItem(KEY_THEME, pref); } catch (e) {}
     var btn = document.querySelector('.cove-theme-toggle');
     if (btn) {
-      btn.setAttribute(
-        'aria-label',
-        t === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'
-      );
+      var label = { system: 'System', light: 'Light', dark: 'Dark' }[pref];
+      btn.setAttribute('aria-label', 'Theme: ' + label + ' (click to switch light and dark, right-click for options)');
+      btn.title = btn.getAttribute('aria-label');
+    }
+    var menu = document.querySelector('.cove-theme-menu');
+    if (menu) {
+      var items = menu.querySelectorAll('button');
+      for (var i = 0; i < items.length; i++) items[i].setAttribute('aria-checked', String(items[i].getAttribute('data-pref') === pref));
     }
   }
 
-  if (!html.hasAttribute('data-theme')) {
-    html.setAttribute('data-theme', readTheme());
-  }
+  if (!html.hasAttribute('data-theme')) applyPref(readPref());
+  try {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+      if (readPref() === 'system') applyPref('system');
+    });
+  } catch (e) {}
 
   /* ---------- Menu width ---------- */
   function clampWidth(w) {
@@ -61,6 +77,7 @@
   /* ---------- Toggle button ---------- */
   var SUN  = '<svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41"/></svg>';
   var MOON = '<svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+  var SYSTEM = '<svg class="icon-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>';
 
   function makeToggle() {
     if (document.querySelector('.cove-theme-toggle')) return;
@@ -68,12 +85,45 @@
     var btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'cove-theme-toggle';
-    btn.setAttribute('aria-label', 'Toggle theme');
-    btn.innerHTML = SUN + MOON;
+    btn.setAttribute('aria-haspopup', 'menu');
+    btn.innerHTML = SYSTEM + SUN + MOON;
+
+    var menu = document.createElement('div');
+    menu.className = 'cove-theme-menu';
+    menu.setAttribute('role', 'menu');
+    menu.hidden = true;
+    var prefs = [['system', 'System'], ['light', 'Light'], ['dark', 'Dark']];
+    for (var i = 0; i < prefs.length; i++) {
+      var item = document.createElement('button');
+      item.type = 'button';
+      item.setAttribute('role', 'menuitemradio');
+      item.setAttribute('data-pref', prefs[i][0]);
+      item.textContent = prefs[i][1];
+      menu.appendChild(item);
+    }
+    document.body.appendChild(menu);
+
     btn.addEventListener('click', function () {
-      var current = html.getAttribute('data-theme') || 'light';
-      applyTheme(current === 'dark' ? 'light' : 'dark');
+      menu.hidden = true;
+      applyPref(effective(readPref()) === 'dark' ? 'light' : 'dark');
     });
+    btn.addEventListener('contextmenu', function (e) {
+      e.preventDefault();
+      menu.hidden = !menu.hidden;
+    });
+    menu.addEventListener('click', function (e) {
+      var b = e.target.closest('[data-pref]');
+      if (!b) return;
+      applyPref(b.getAttribute('data-pref'));
+      menu.hidden = true;
+    });
+    document.addEventListener('click', function (e) {
+      if (!menu.hidden && !e.target.closest('.cove-theme-menu, .cove-theme-toggle')) menu.hidden = true;
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && !menu.hidden) menu.hidden = true;
+    });
+    applyPref(readPref());
 
     var logout = document.querySelector('.logout');
     if (logout && logout.parentNode) {
