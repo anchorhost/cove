@@ -1,16 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" stroke-linecap="round" stroke-linejoin="round">
-    <defs>
-        <clipPath id="cove-clip"><circle cx="32" cy="32" r="28"/></clipPath>
-    </defs>
-    <g clip-path="url(#cove-clip)">
-        <rect x="0" y="0" width="64" height="64" fill="#f6f1e8"/>
-        <rect x="0" y="32" width="64" height="32" fill="#3a97a9"/>
-        <path fill="#58b293" d="M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z"/>
-        <line x1="2" y1="32" x2="62" y2="32" stroke="#1c4c58" fill="none" stroke-width="2.5"/>
-        <g stroke="#1c4c58" fill="none" stroke-width="2.6">
-            <path d="M 10 42 Q 18 38, 26 42 T 42 42 T 56 42"/>
-            <path d="M 14 50 Q 22 46, 30 50 T 46 50 T 56 50"/>
-        </g>
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+    <!-- The Cove mark in its filled form: the ring becomes a solid disc so the
+         icon reads as a coin at 18px in the menu bar and fills the app-icon
+         slots. Same two waves as the brand mark (assets/brand on cove.run). -->
+    <circle cx="32" cy="32" r="30" fill="#009b95"/>
+    <g fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M 17 27 Q 24.5 20 32 27 T 47 27"/>
+        <path d="M 17 40 Q 24.5 33 32 40 T 47 40"/>
     </g>
-    <circle cx="32" cy="32" r="28" stroke="#1c4c58" fill="none" stroke-width="3"/>
 </svg>
