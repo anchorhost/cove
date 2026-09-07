@@ -14,7 +14,9 @@
 # (Ubuntu ships it enabled; vanilla GNOME and Debian do not). The menu itself
 # is rendered by the desktop's panel over DBus, which is why there is no
 # Option-key trick here: the panel never tells us which modifiers were held.
-# WordPress sites therefore get a small submenu — Open, or Log in — instead.
+# WordPress sites therefore get a second, indented "Log in as admin" row right
+# under their open row. Not a nested submenu: COSMIC's panel renders submenus
+# inline and cannot drill into a second level at all.
 #
 # Written out and launched by `cove menubar enable`; there is no build step.
 # Runtime needs: python3, GTK 3 and AyatanaAppIndicator3 introspection data
@@ -521,17 +523,12 @@ class CoveTray:
 
     def add_site_entry(self, site):
         host = site["name"]
-        if not site["wp"]:
-            self.add_item(host, lambda h=host: open_uri(cove_url(h)), menu=self.sites_menu)
-            return
-        # The panel renders this menu and never reports modifier keys, so the
-        # macOS Option-key alternate becomes a two-item submenu per site.
-        item = Gtk.MenuItem(label=host)
-        submenu = Gtk.Menu()
-        self.add_item(f"Open {host}", lambda h=host: open_uri(cove_url(h)), menu=submenu)
-        self.add_item(f"Log in to {host}", lambda h=host: self.login_to_site(h), menu=submenu)
-        item.set_submenu(submenu)
-        self.sites_menu.append(item)
+        self.add_item(host, lambda h=host: open_uri(cove_url(h)), menu=self.sites_menu)
+        # The panel renders this menu and never reports modifier keys, and
+        # COSMIC cannot open a submenu inside a submenu, so the macOS
+        # Option-key alternate becomes a flat, indented row under the site.
+        if site["wp"]:
+            self.add_item("      ↳ Log in as admin", lambda h=host: self.login_to_site(h), menu=self.sites_menu)
 
     def login_to_site(self, host):
         site_name = host[:-len(".localhost")] if host.endswith(".localhost") else host

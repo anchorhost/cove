@@ -43,8 +43,10 @@ gir1.2-ayatanaappindicator3-0.1`, which enable offers to install with apt —
 plus optional `gir1.2-notify-0.7` for desktop notifications.
 
 The menu is rendered by the desktop's panel over DBus, which never reports
-which modifier keys were held. The macOS Option-key alternate therefore
-becomes a small submenu per WordPress site: **Open** or **Log in**. Everything
+which modifier keys were held — and COSMIC's panel draws submenus inline and
+cannot drill into a second level. The macOS Option-key alternate therefore
+becomes a flat, indented **↳ Log in as admin** row under each WordPress site's
+open row. Everything
 else matches: the three icon states (derived from the one SVG at startup),
 service rows including PHP-FPM pools, start/stop/reload, the Recent section,
 "New Site…", the daily update check (opening `cove upgrade` in the desktop's
