@@ -2841,6 +2841,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         }
                     }
 
+                    // The database name as WordPress actually uses it — read
+                    // from wp-config.php rather than recomputed, because
+                    // cove_add's `echo … | tr -c` folds echo's newline into a
+                    // trailing underscore (cove_mysite_), which a mimic would
+                    // have to reproduce forever.
+                    $db_name = preg_replace('/[^a-zA-Z0-9_]/', '_', 'cove_' . str_replace('.localhost', '', $item));
+                    $cfg_file = $site_path . '/public/wp-config.php';
+                    if (is_file($cfg_file)) {
+                        $cfg_head = @file_get_contents($cfg_file, false, null, 0, 16384);
+                        if ($cfg_head !== false && preg_match('/define\s*\(\s*[\'"]DB_NAME[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $cfg_head, $m)) $db_name = $m[1];
+                    }
+
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
                         'domain' => 'https://' . $item . $__cove_port_suffix,
@@ -2853,9 +2865,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'full_path' => $site_path,
                         'size_bytes' => isset($size_cache[$item]) ? (int) $size_cache[$item] : null,
                         'modified_at' => $mtime ?: null,
-                        // Mirrors cove_add's `echo "cove_$name" | tr -c '[:alnum:]_' '_'`,
-                        // so the UI can deep-link Adminer straight at this site's schema.
-                        'db_name' => preg_replace('/[^a-zA-Z0-9_]/', '_', 'cove_' . str_replace('.localhost', '', $item)),
+                        'db_name' => $db_name,
                         // Per-site PHP pin (`cove php`); null = Cove's default PHP.
                         'php_version' => is_file($site_path . '/php_version') ? trim((string) @file_get_contents($site_path . '/php_version')) : null,
                     ];
@@ -3161,7 +3171,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         ['adminer', $adminer],
                     ],
                     'note' => 'Credentials stored in ~/Cove/config. Cove uses them to create new WordPress databases.',
-                    'actions' => [['kind' => 'open', 'label' => 'open adminer', 'href' => $adminer]],
+                    'actions' => [['kind' => 'db', 'label' => 'open databases'], ['kind' => 'open', 'label' => 'adminer ↗', 'href' => $adminer]],
                 ],
                 'mailpit' => [
                     'label' => 'Mailpit', 'running' => $mp_up,
@@ -3177,6 +3187,280 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ],
             ]]);
             exit;
+        case 'db_list':
+        case 'db_tables':
+        case 'db_rows':
+        case 'db_cell':
+        case 'db_update':
+        case 'db_delete_row':
+        case 'db_structure':
+        case 'db_query':
+            // --- Database view -------------------------------------------
+            // The dashboard talks to MariaDB directly over mysqli (PDO is
+            // missing from some FrankenPHP builds; mysqli is what WordPress
+            // itself needs, so it is always present). Same-origin POST only,
+            // like every action here. This is a local dev box: the SQL console
+            // is deliberately unrestricted, and every identifier is quoted
+            // rather than allow-listed so any schema a site created works.
+            $__db_cfg = isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : [];
+            mysqli_report(MYSQLI_REPORT_OFF);
+            $__db = @new mysqli('127.0.0.1', $__db_cfg['DB_USER'] ?? '', $__db_cfg['DB_PASSWORD'] ?? '', null, 3306);
+            if ($__db->connect_error) {
+                echo json_encode(['success' => false, 'message' => 'MariaDB is not answering: ' . $__db->connect_error]);
+                exit;
+            }
+            $__db->set_charset('utf8mb4');
+            $__q = function ($id) { return '`' . str_replace('`', '``', $id) . '`'; };
+            $__ident = function ($s) { return is_string($s) && $s !== '' && strlen($s) <= 64 && !preg_match('/[\x00-\x1f]/', $s); };
+            $__fail = function ($msg) { echo json_encode(['success' => false, 'message' => $msg]); exit; };
+            $__system = ['information_schema', 'performance_schema', 'mysql', 'sys'];
+            // JSON-safe cell values: strings and NULL pass through; anything
+            // that is not UTF-8 is shown as a hex prefix, and long text is cut
+            // so a 2 MB serialized option doesn't ride along with every page.
+            $__cell = function ($v) {
+                if ($v === null) return null;
+                $v = (string) $v;
+                if (!mb_check_encoding($v, 'UTF-8')) return ['t' => 'bin', 'hex' => bin2hex(substr($v, 0, 48)), 'len' => strlen($v)];
+                if (strlen($v) > 2000) return ['t' => 'long', 'text' => mb_substr($v, 0, 2000), 'len' => strlen($v)];
+                return $v;
+            };
+            $__rows_of = function ($res) use ($__cell) {
+                $out = [];
+                while ($r = $res->fetch_row()) $out[] = array_map($__cell, $r);
+                return $out;
+            };
+            $__db_name = $input['db'] ?? '';
+            $__table = $input['table'] ?? '';
+            if ($action !== 'db_list' && !($action === 'db_query' && $__db_name === '')) {
+                if (!$__ident($__db_name) || in_array($__db_name, $__system, true)) $__fail('Invalid database.');
+                $st = $__db->prepare('SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?');
+                $st->execute([$__db_name]);
+                if (!$st->get_result()->fetch_row()) $__fail('No such database.');
+            }
+            if (in_array($action, ['db_rows', 'db_cell', 'db_update', 'db_delete_row', 'db_structure'], true)) {
+                if (!$__ident($__table)) $__fail('Invalid table.');
+                $st = $__db->prepare('SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?');
+                $st->execute([$__db_name, $__table]);
+                if (!$st->get_result()->fetch_row()) $__fail('No such table.');
+            }
+            // Columns + the key used to address a row: the primary key, else
+            // the first unique index whose columns are all NOT NULL. Without
+            // one the grid is read-only — there is no safe way to say "this
+            // row" in SQL.
+            $__describe = function () use ($__db, $__q, $__db_name, $__table) {
+                $cols = [];
+                $res = $__db->query('SHOW FULL COLUMNS FROM ' . $__q($__db_name) . '.' . $__q($__table));
+                while ($c = $res->fetch_assoc()) {
+                    $cols[] = ['name' => $c['Field'], 'type' => $c['Type'], 'null' => $c['Null'] === 'YES', 'key' => $c['Key'], 'default' => $c['Default'], 'extra' => $c['Extra'], 'collation' => $c['Collation'], 'comment' => $c['Comment']];
+                }
+                $pk = array_values(array_map(fn($c) => $c['name'], array_filter($cols, fn($c) => $c['key'] === 'PRI')));
+                $indexes = [];
+                $res = $__db->query('SHOW INDEX FROM ' . $__q($__db_name) . '.' . $__q($__table));
+                while ($i = $res->fetch_assoc()) {
+                    $k = $i['Key_name'];
+                    if (!isset($indexes[$k])) $indexes[$k] = ['name' => $k, 'unique' => $i['Non_unique'] === '0' || $i['Non_unique'] === 0, 'type' => $i['Index_type'], 'columns' => []];
+                    $indexes[$k]['columns'][] = $i['Column_name'];
+                }
+                $indexes = array_values($indexes);
+                if (!$pk) {
+                    $notnull = array_map(fn($c) => $c['name'], array_filter($cols, fn($c) => !$c['null']));
+                    foreach ($indexes as $ix) {
+                        if ($ix['unique'] && !array_diff($ix['columns'], $notnull)) { $pk = $ix['columns']; break; }
+                    }
+                }
+                return [$cols, $pk, $indexes];
+            };
+            // WHERE for one row from the client's {col: value} key map.
+            $__row_where = function ($cols, $pk) use ($input, $__q, $__fail) {
+                if (!$pk) $__fail('This table has no primary key, so rows cannot be addressed.');
+                $key = $input['pk'] ?? null;
+                if (!is_array($key)) $__fail('Missing row key.');
+                $parts = []; $params = [];
+                foreach ($pk as $c) {
+                    if (!array_key_exists($c, $key)) $__fail('Missing row key.');
+                    if ($key[$c] === null) { $parts[] = $__q($c) . ' IS NULL'; }
+                    else { $parts[] = $__q($c) . ' = ?'; $params[] = (string) $key[$c]; }
+                }
+                return [implode(' AND ', $parts), $params];
+            };
+
+            if ($action === 'db_list') {
+                // Sizes come from information_schema.TABLES, which opens every
+                // table the first time (a few seconds with thousands of them),
+                // so the UI asks for names first ('light') and sizes second.
+                $light = !empty($input['light']);
+                $res = $light
+                    ? $__db->query('SELECT SCHEMA_NAME AS name, NULL AS tables_count, NULL AS bytes FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME')
+                    : $__db->query('SELECT s.SCHEMA_NAME AS name, COUNT(t.TABLE_NAME) AS tables_count, COALESCE(SUM(t.DATA_LENGTH + t.INDEX_LENGTH), 0) AS bytes FROM information_schema.SCHEMATA s LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = s.SCHEMA_NAME GROUP BY s.SCHEMA_NAME ORDER BY s.SCHEMA_NAME');
+                $out = [];
+                while ($r = $res->fetch_assoc()) {
+                    if (in_array($r['name'], $__system, true)) continue;
+                    $out[] = ['name' => $r['name'], 'tables' => $light ? null : (int) $r['tables_count'], 'bytes' => $light ? null : (int) $r['bytes']];
+                }
+                echo json_encode(['success' => true, 'databases' => $out, 'server' => $__db->server_info]);
+                exit;
+            }
+
+            if ($action === 'db_tables') {
+                $st = $__db->prepare('SELECT TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_ROWS, DATA_LENGTH + INDEX_LENGTH AS bytes, TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME');
+                $st->execute([$__db_name]);
+                $tables = []; $names = [];
+                foreach ($st->get_result()->fetch_all(MYSQLI_ASSOC) as $t) {
+                    $names[] = $t['TABLE_NAME'];
+                    $tables[] = ['name' => $t['TABLE_NAME'], 'view' => $t['TABLE_TYPE'] === 'VIEW', 'engine' => $t['ENGINE'], 'rows' => $t['TABLE_ROWS'] === null ? null : (int) $t['TABLE_ROWS'], 'bytes' => (int) $t['bytes'], 'collation' => $t['TABLE_COLLATION']];
+                }
+                // WordPress summary: the shortest prefix that owns both an
+                // options and a posts table (a multisite has wp_2_options too).
+                $wp = null;
+                $prefixes = [];
+                foreach ($names as $n) {
+                    if (preg_match('/^(.*)options$/', $n, $m) && in_array($m[1] . 'posts', $names, true)) $prefixes[] = $m[1];
+                }
+                if ($prefixes) {
+                    usort($prefixes, fn($a, $b) => strlen($a) - strlen($b));
+                    $p = $prefixes[0];
+                    $opt = $__q($__db_name) . '.' . $__q($p . 'options');
+                    $wp = ['prefix' => $p, 'siteurl' => null, 'home' => null, 'options' => 0, 'autoload_bytes' => 0, 'autoload_count' => 0, 'largest' => []];
+                    $res = $__db->query("SELECT option_name, option_value FROM $opt WHERE option_name IN ('siteurl', 'home', 'blogname', 'template', 'stylesheet')");
+                    while ($res && ($r = $res->fetch_assoc())) $wp[$r['option_name']] = $r['option_value'];
+                    $res = $__db->query("SELECT COUNT(*) AS n, COALESCE(SUM(IF(autoload IN ('yes', 'on', 'auto-on', 'auto'), LENGTH(option_value), 0)), 0) AS ab, SUM(autoload IN ('yes', 'on', 'auto-on', 'auto')) AS ac FROM $opt");
+                    if ($res && ($r = $res->fetch_assoc())) { $wp['options'] = (int) $r['n']; $wp['autoload_bytes'] = (int) $r['ab']; $wp['autoload_count'] = (int) $r['ac']; }
+                    $res = $__db->query("SELECT option_name, LENGTH(option_value) AS len FROM $opt WHERE autoload IN ('yes', 'on', 'auto-on', 'auto') ORDER BY len DESC LIMIT 8");
+                    while ($res && ($r = $res->fetch_assoc())) $wp['largest'][] = ['name' => $r['option_name'], 'bytes' => (int) $r['len']];
+                    foreach (['posts', 'users', 'comments'] as $t) {
+                        $res = $__db->query('SELECT COUNT(*) AS n FROM ' . $__q($__db_name) . '.' . $__q($p . $t));
+                        $wp[$t] = ($res && ($r = $res->fetch_assoc())) ? (int) $r['n'] : null;
+                    }
+                }
+                echo json_encode(['success' => true, 'tables' => $tables, 'wp' => $wp]);
+                exit;
+            }
+
+            if ($action === 'db_structure') {
+                [$cols, $pk, $indexes] = $__describe();
+                $res = $__db->query('SHOW CREATE TABLE ' . $__q($__db_name) . '.' . $__q($__table));
+                $create = ($res && ($r = $res->fetch_row())) ? ($r[1] ?? '') : '';
+                echo json_encode(['success' => true, 'columns' => $cols, 'pk' => $pk, 'indexes' => $indexes, 'create' => $create]);
+                exit;
+            }
+
+            if ($action === 'db_rows') {
+                [$cols, $pk] = $__describe();
+                $names = array_map(fn($c) => $c['name'], $cols);
+                $limit = max(10, min(500, (int) ($input['limit'] ?? 100)));
+                $start = max(0, (int) ($input['start'] ?? 0));
+                $where = ''; $params = [];
+                $q = (string) ($input['q'] ?? '');
+                $col = (string) ($input['col'] ?? '');
+                if ($q !== '') {
+                    $like = '%' . $q . '%';
+                    if ($col !== '' && in_array($col, $names, true)) {
+                        $where = ' WHERE ' . $__q($col) . ' LIKE ?'; $params[] = $like;
+                    } else {
+                        $parts = [];
+                        foreach (array_slice($names, 0, 60) as $n) { $parts[] = 'CAST(' . $__q($n) . ' AS CHAR) LIKE ?'; $params[] = $like; }
+                        $where = ' WHERE ' . implode(' OR ', $parts);
+                    }
+                }
+                $order = '';
+                $sort = (string) ($input['sort'] ?? '');
+                $dir = ($input['dir'] ?? 'asc') === 'desc' ? 'DESC' : 'ASC';
+                if ($sort !== '' && in_array($sort, $names, true)) $order = ' ORDER BY ' . $__q($sort) . ' ' . $dir;
+                elseif ($pk) $order = ' ORDER BY ' . implode(', ', array_map($__q, $pk));
+                $from = ' FROM ' . $__q($__db_name) . '.' . $__q($__table);
+                $st = $__db->prepare('SELECT COUNT(*)' . $from . $where);
+                if (!$st) $__fail($__db->error);
+                $st->execute($params);
+                $total = (int) ($st->get_result()->fetch_row()[0] ?? 0);
+                $st = $__db->prepare('SELECT *' . $from . $where . $order . ' LIMIT ' . $start . ', ' . $limit);
+                if (!$st) $__fail($__db->error);
+                if (!$st->execute($params)) $__fail($st->error);
+                $rows = $__rows_of($st->get_result());
+                echo json_encode(['success' => true, 'columns' => $cols, 'pk' => $pk, 'rows' => $rows, 'total' => $total, 'start' => $start, 'limit' => $limit]);
+                exit;
+            }
+
+            if ($action === 'db_cell') {
+                [$cols, $pk] = $__describe();
+                $col = (string) ($input['col'] ?? '');
+                if (!in_array($col, array_map(fn($c) => $c['name'], $cols), true)) $__fail('Unknown column.');
+                [$w, $params] = $__row_where($cols, $pk);
+                $st = $__db->prepare('SELECT ' . $__q($col) . ' FROM ' . $__q($__db_name) . '.' . $__q($__table) . ' WHERE ' . $w . ' LIMIT 1');
+                $st->execute($params);
+                $r = $st->get_result()->fetch_row();
+                if (!$r) $__fail('Row not found.');
+                if ($r[0] !== null && !mb_check_encoding((string) $r[0], 'UTF-8')) $__fail('Binary values cannot be edited here.');
+                echo json_encode(['success' => true, 'value' => $r[0] === null ? null : (string) $r[0]]);
+                exit;
+            }
+
+            if ($action === 'db_update') {
+                [$cols, $pk] = $__describe();
+                $col = (string) ($input['col'] ?? '');
+                if (!in_array($col, array_map(fn($c) => $c['name'], $cols), true)) $__fail('Unknown column.');
+                [$w, $params] = $__row_where($cols, $pk);
+                $isNull = !empty($input['null']);
+                $value = $isNull ? null : (string) ($input['value'] ?? '');
+                $sql = 'UPDATE ' . $__q($__db_name) . '.' . $__q($__table) . ' SET ' . $__q($col) . ' = ' . ($isNull ? 'NULL' : '?') . ' WHERE ' . $w . ' LIMIT 1';
+                $st = $__db->prepare($sql);
+                if (!$st) $__fail($__db->error);
+                if (!$st->execute($isNull ? $params : array_merge([$value], $params))) $__fail($st->error);
+                $affected = $st->affected_rows;
+                // Hand back the row as it now is, keyed the same way the grid
+                // is, so a trigger or a type coercion shows up immediately.
+                $keyMap = $input['pk'];
+                if (!$isNull && in_array($col, $pk, true)) $keyMap[$col] = $value;
+                $parts = []; $p2 = [];
+                foreach ($pk as $c) { if ($keyMap[$c] === null) $parts[] = $__q($c) . ' IS NULL'; else { $parts[] = $__q($c) . ' = ?'; $p2[] = (string) $keyMap[$c]; } }
+                $st = $__db->prepare('SELECT * FROM ' . $__q($__db_name) . '.' . $__q($__table) . ' WHERE ' . implode(' AND ', $parts) . ' LIMIT 1');
+                $st->execute($p2);
+                $row = $st->get_result()->fetch_row();
+                echo json_encode(['success' => true, 'affected' => $affected, 'row' => $row ? array_map($__cell, $row) : null]);
+                exit;
+            }
+
+            if ($action === 'db_delete_row') {
+                [$cols, $pk] = $__describe();
+                [$w, $params] = $__row_where($cols, $pk);
+                $st = $__db->prepare('DELETE FROM ' . $__q($__db_name) . '.' . $__q($__table) . ' WHERE ' . $w . ' LIMIT 1');
+                if (!$st) $__fail($__db->error);
+                if (!$st->execute($params)) $__fail($st->error);
+                echo json_encode(['success' => true, 'affected' => $st->affected_rows]);
+                exit;
+            }
+
+            if ($action === 'db_query') {
+                $sql = (string) ($input['sql'] ?? '');
+                if (trim($sql) === '') $__fail('Nothing to run.');
+                if ($__db_name !== '') $__db->select_db($__db_name);
+                $results = [];
+                $t0 = microtime(true);
+                $cap = 500;
+                if ($__db->multi_query($sql)) {
+                    while (true) {
+                        $res = $__db->store_result();
+                        if ($res) {
+                            $fields = array_map(fn($f) => $f->name, $res->fetch_fields());
+                            $rows = []; $n = 0;
+                            while ($r = $res->fetch_row()) { if ($n++ < $cap) $rows[] = array_map($__cell, $r); }
+                            $results[] = ['type' => 'rows', 'columns' => $fields, 'rows' => $rows, 'total' => $res->num_rows, 'truncated' => $res->num_rows > $cap];
+                            $res->free();
+                        } elseif ($__db->errno) {
+                            $results[] = ['type' => 'error', 'message' => $__db->error];
+                            break;
+                        } else {
+                            $results[] = ['type' => 'ok', 'affected' => $__db->affected_rows, 'insert_id' => $__db->insert_id, 'info' => $__db->info];
+                        }
+                        if (!$__db->more_results()) break;
+                        if (!$__db->next_result()) { $results[] = ['type' => 'error', 'message' => $__db->error]; break; }
+                    }
+                } else {
+                    $results[] = ['type' => 'error', 'message' => $__db->error];
+                }
+                echo json_encode(['success' => true, 'results' => $results, 'ms' => round((microtime(true) - $t0) * 1000, 1)]);
+                exit;
+            }
+            $__fail('Unknown database action.');
         case 'reload_server':
             // This command is run in the background to prevent deadlocking the server.
             // Output is redirected to /dev/null and the '&' backgrounds the process.
@@ -3780,6 +4064,96 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             .mail-link a { max-width: 240px; }
         }
 
+        /* Databases. Wider still: a grid of a dozen columns needs the room. */
+        body.view-db .wrap { max-width: 1280px; }
+        .db-body { display: grid; grid-template-columns: minmax(250px, 330px) minmax(0, 1fr); height: calc(100vh - 262px); min-height: 460px; }
+        .db-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; border-right: 1px solid var(--panel-border); }
+        .db-row { display: flex; flex-direction: column; gap: 0.2rem; padding: 0.55rem 1rem 0.55rem 0.9rem; border-bottom: 1px solid var(--panel-border); cursor: pointer; transition: background 100ms; min-width: 0; }
+        .db-row-line { display: flex; align-items: baseline; gap: 0.6rem; min-width: 0; }
+        .db-row-site { align-self: flex-start; }
+        .db-row:hover { background: var(--panel-hover); }
+        .db-row.is-selected { background: var(--panel-hover); box-shadow: inset 2px 0 0 var(--accent); }
+        .db-row-name { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 0.82rem; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .db-row.is-view .db-row-name { font-style: italic; color: var(--text-dim); }
+        .db-row-meta { flex: none; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; }
+        .db-list > .empty, .db-list > .loading { padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .db-main { overflow: hidden; min-width: 0; display: flex; flex-direction: column; }
+        .db-main > div { min-height: 0; }
+        #dbTable, #dbSql { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+        .db-bar { flex: none; }
+        .db-rows-search { display: flex; align-items: center; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--input-bg); overflow: hidden; }
+        .db-rows-search select { background: transparent; border: 0; border-right: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.28rem 0.4rem; max-width: 150px; cursor: pointer; }
+        .db-rows-search input { background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.76rem; padding: 0.28rem 0.55rem; width: 180px; outline: 0; }
+        .db-rows-search:focus-within { border-color: var(--accent); }
+        /* Grid: the wrap scrolls both ways, the header sticks, and every
+           cell stays on one line — a 4 KB serialized option gets an ellipsis
+           and shows itself on a double-click. */
+        .db-grid-wrap { flex: 1; overflow: auto; min-height: 0; }
+        .db-grid { border-collapse: separate; border-spacing: 0; font-family: var(--font-mono); font-size: 0.76rem; min-width: 100%; }
+        .db-grid th { position: sticky; top: 0; z-index: 2; background: var(--panel); text-align: left; font-weight: 500; padding: 0.45rem 0.7rem; border-bottom: 1px solid var(--panel-border); border-right: 1px solid var(--panel-border); white-space: nowrap; cursor: pointer; user-select: none; vertical-align: bottom; }
+        .db-grid th:hover { background: var(--panel-hover); }
+        .db-grid th .col-type { display: block; font-size: 0.62rem; font-weight: 400; color: var(--text-faint); letter-spacing: 0.02em; }
+        .db-grid th .col-key { color: var(--accent); margin-right: 0.25rem; }
+        .db-grid th .sort-arrow { color: var(--text-dim); margin-left: 0.3rem; }
+        .db-grid td { padding: 0.32rem 0.7rem; border-bottom: 1px solid var(--panel-border); border-right: 1px solid var(--panel-border); white-space: nowrap; max-width: 360px; overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); vertical-align: top; }
+        .db-grid tr:hover td { background: var(--panel-hover); }
+        .db-grid td.is-null { color: var(--text-faint); font-style: italic; }
+        .db-grid td.is-num { text-align: right; color: var(--text); }
+        .db-grid td.is-bin { color: var(--text-faint); }
+        .db-grid td.is-editable { cursor: text; }
+        .db-grid td.is-editing { padding: 0; max-width: none; overflow: visible; white-space: normal; }
+        .db-edit { display: block; width: 100%; min-width: 260px; min-height: 2.4rem; box-sizing: border-box; background: var(--input-bg); color: var(--text); border: 1px solid var(--accent); border-radius: 0; padding: 0.3rem 0.6rem; font: inherit; line-height: 1.4; resize: vertical; outline: 0; }
+        .db-edit-hint { display: block; padding: 0.15rem 0.6rem 0.25rem; font-size: 0.64rem; color: var(--text-faint); background: var(--input-bg); }
+        .db-grid td.db-row-actions { padding: 0.15rem 0.35rem; border-right: 0; width: 1%; }
+        .db-row-del { visibility: hidden; background: transparent; border: 1px solid transparent; color: var(--text-faint); font: inherit; font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: var(--radius-sm); cursor: pointer; white-space: nowrap; }
+        .db-grid tr:hover .db-row-del, .db-row-del.armed { visibility: visible; }
+        .db-row-del:hover { color: var(--danger); border-color: var(--danger); }
+        .db-row-del.armed { visibility: visible; color: white; background: var(--danger); border-color: var(--danger); }
+        .db-grid-empty { padding: 2.5rem 1.5rem; text-align: center; color: var(--text-dim); font-family: var(--font-sans); }
+        /* Overview of a database: what a WordPress install would tell you
+           first if it could. */
+        .db-overview { padding: 1.25rem 1.5rem; overflow-y: auto; }
+        .db-overview h2 { font-family: var(--font-serif); font-weight: 500; font-size: 1.25rem; margin: 0 0 0.25rem; letter-spacing: -0.01em; }
+        .db-overview .db-ov-sub { color: var(--text-dim); font-size: 0.88rem; margin: 0 0 1rem; }
+        .db-ov-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0.6rem; margin-bottom: 1.1rem; }
+        .db-ov-stat { border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.6rem 0.8rem; min-width: 0; }
+        .db-ov-stat .k { display: block; font-family: var(--font-mono); font-size: 0.64rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint); margin-bottom: 0.2rem; }
+        .db-ov-stat .v { display: block; font-family: var(--font-mono); font-size: 0.86rem; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .db-ov-stat .v a { color: var(--accent); text-decoration: none; }
+        .db-ov-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--panel-border); border-radius: var(--radius-md); overflow: hidden; }
+        .db-ov-list li { display: flex; justify-content: space-between; gap: 1rem; padding: 0.4rem 0.8rem; border-bottom: 1px solid var(--panel-border); font-family: var(--font-mono); font-size: 0.76rem; cursor: pointer; }
+        .db-ov-list li:last-child { border-bottom: 0; }
+        .db-ov-list li:hover { background: var(--panel-hover); }
+        .db-ov-list li span:first-child { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .db-ov-list li span:last-child { color: var(--text-faint); flex: none; }
+        .db-ov-label { font-family: var(--font-mono); font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); margin: 0 0 0.4rem; }
+        /* Structure */
+        .db-structure { flex: 1; overflow: auto; padding: 1rem 1.5rem; }
+        .db-structure table { border-collapse: collapse; font-family: var(--font-mono); font-size: 0.76rem; width: 100%; margin-bottom: 1.2rem; }
+        .db-structure th { text-align: left; font-weight: 500; font-size: 0.64rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint); padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--panel-border); }
+        .db-structure td { padding: 0.32rem 0.6rem; border-bottom: 1px solid var(--panel-border); color: var(--text-dim); vertical-align: top; }
+        .db-structure td:first-child { color: var(--text); }
+        .db-structure pre { margin: 0; padding: 0.9rem 1rem; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--bg-sunk); font-family: var(--font-mono); font-size: 0.74rem; line-height: 1.5; color: var(--text-dim); white-space: pre-wrap; overflow-wrap: anywhere; }
+        /* SQL console */
+        .db-sql-editor { flex: none; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
+        .db-sql-editor textarea { display: block; width: 100%; box-sizing: border-box; background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.84rem; line-height: 1.55; padding: 0.9rem 1.5rem 0.4rem; resize: vertical; outline: 0; min-height: 6.5rem; }
+        .db-sql-editor textarea::placeholder { color: var(--text-faint); }
+        .db-sql-actions { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 1.5rem 0.7rem; }
+        .db-sql-actions .mail-bar-note { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .db-sql-actions select { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.3rem 0.5rem; border-radius: var(--radius-md); max-width: 220px; cursor: pointer; }
+        .db-kbd { opacity: 0.7; font-size: 0.7em; margin-left: 0.2rem; }
+        .db-sql-results { flex: 1; overflow: auto; min-height: 0; }
+        .db-sql-result { border-bottom: 1px solid var(--panel-border); }
+        .db-sql-result-head { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 1.5rem; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); background: var(--panel); border-bottom: 1px solid var(--panel-border); position: sticky; top: 0; }
+        .db-sql-result-head.is-error { color: var(--danger); }
+        .db-sql-result-head.is-ok { color: var(--text); }
+        .db-sql-result .db-grid-wrap { max-height: 60vh; }
+        @media (max-width: 860px) {
+            .db-body { grid-template-columns: 1fr; height: auto; min-height: 60vh; }
+            .db-list { border-right: 0; max-height: 40vh; }
+            .db-main { min-height: 50vh; }
+        }
+
         /* Responsive */
         @media (max-width: 620px) {
             body { padding: 1.25rem 0.75rem 3rem; }
@@ -3806,6 +4180,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <div class="nav-views" role="tablist" aria-label="View">
                 <button type="button" class="nav-view is-active" role="tab" data-view="sites" aria-selected="true">sites</button>
                 <button type="button" class="nav-view" role="tab" data-view="mail" aria-selected="false">mail<span class="nav-badge" id="mailBadge" style="display: none;"></span></button>
+                <button type="button" class="nav-view" role="tab" data-view="db" aria-selected="false">db</button>
             </div>
             <div class="nav-services services">
                 <button type="button" class="dot link" data-service="caddy" title="Caddy status">caddy</button>
@@ -3828,10 +4203,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <header class="card-head">
                 <h1 class="card-title">Sites</h1>
                 <div class="card-actions">
-                    <a class="pill" href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Adminer">
+                    <button type="button" class="pill" id="btnDbView" title="Open databases">
                         <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5v-9"/><path d="M3 8c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5"/></svg>
                         db
-                    </a>
+                    </button>
                     <button type="button" class="pill" id="btnMailView" title="Open mail">
                         <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="12" height="9" rx="1.5"/><path d="M2.5 5 8 9l5.5-4"/></svg>
                         mail
@@ -4117,6 +4492,122 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </div>
             </footer>
         </section>
+
+        <!-- Databases: a native browser over MariaDB. Adminer stays a click
+             away for exports, imports and schema work. -->
+        <section class="card db-card" id="dbCard" style="display: none;">
+            <header class="card-head">
+                <h1 class="card-title">Databases</h1>
+                <div class="card-actions">
+                    <a class="pill" id="dbAdminerLink" href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Adminer — exports, imports, schema changes, users">
+                        adminer
+                        <svg class="pill-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4.5h5v5"/><path d="M11.5 4.5 4.5 11.5"/></svg>
+                    </a>
+                    <button type="button" class="pill" id="btnDbSql" title="SQL console (⌘↵ runs)">sql</button>
+                </div>
+            </header>
+
+            <div class="filter-row">
+                <span class="filter-chip" id="dbChip" aria-label="Selected database" style="display: none;">
+                    <span id="dbChipLabel"></span>
+                    <button type="button" class="filter-chip-x" id="dbChipClear" aria-label="Back to all databases" title="All databases">×</button>
+                </span>
+                <input
+                    class="filter-input"
+                    id="dbFilter"
+                    type="text"
+                    placeholder="filter databases…"
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    aria-label="Filter"
+                >
+                <span class="filter-kbd" id="dbKbd" aria-hidden="true">/</span>
+                <button class="filter-clear" id="btnDbFilterClear" aria-label="Clear filter" title="Clear (Esc)" style="display: none;">×</button>
+            </div>
+
+            <div class="db-body" id="dbBody">
+                <ul class="db-list" id="dbList">
+                    <template id="tpl-db-row">
+                        <li class="db-row">
+                            <div class="db-row-line">
+                                <span class="db-row-name"></span>
+                                <span class="db-row-meta"></span>
+                            </div>
+                            <span class="mail-site db-row-site"></span>
+                        </li>
+                    </template>
+                    <li class="loading" id="dbLoading">Loading…</li>
+                    <li class="empty" id="dbError" style="display: none;">
+                        <div>MariaDB isn't answering.</div>
+                        <div class="empty-hint">Check the mariadb dot in the top bar, or run <code>cove status</code>.</div>
+                    </li>
+                    <li class="empty" id="dbEmpty" style="display: none;">
+                        <div>Nothing matches <code id="dbEmptyQuery"></code>.</div>
+                        <div class="empty-hint">Press Esc to clear.</div>
+                    </li>
+                </ul>
+
+                <div class="db-main" id="dbMain">
+                    <div class="mail-reader-empty" id="dbMainEmpty">
+                        <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path class="art-fill" d="M34 18 c0 -4 8 -7 18 -7 s18 3 18 7 v26 c0 4 -8 7 -18 7 s-18 -3 -18 -7 Z"/>
+                            <ellipse class="art-line" cx="52" cy="18" rx="18" ry="7"/>
+                            <path class="art-line" d="M34 18 v26 c0 4 8 7 18 7 s18 -3 18 -7 V18"/>
+                            <path class="art-line" d="M34 31 c0 4 8 7 18 7 s18 -3 18 -7"/>
+                            <path class="art-wave" d="M8 60 Q 15 56, 22 60 T 36 60 T 50 60 T 64 60 T 78 60 T 92 60"/>
+                        </svg>
+                        <div id="dbMainEmptyText">Select a database.</div>
+                        <div class="empty-hint" id="dbMainEmptyHint">Each site has one. Pick a table to browse, or open the SQL console.</div>
+                    </div>
+
+                    <div class="db-overview" id="dbOverview" style="display: none;"></div>
+
+                    <div id="dbTable" style="display: none;">
+                        <div class="mail-msg-bar db-bar">
+                            <div class="mail-parts" id="dbParts" role="tablist">
+                                <button type="button" class="mail-part" role="tab" data-part="rows">rows</button>
+                                <button type="button" class="mail-part" role="tab" data-part="structure">structure</button>
+                            </div>
+                            <div class="db-rows-search" id="dbRowsSearch">
+                                <select id="dbRowsCol" title="Column to search" aria-label="Column to search"><option value="">any column</option></select>
+                                <input type="text" id="dbRowsFilter" placeholder="contains…" spellcheck="false" autocomplete="off" aria-label="Filter rows">
+                            </div>
+                            <span class="mail-bar-note" id="dbRowsNote"></span>
+                            <div class="mail-msg-actions">
+                                <button type="button" class="pill" id="btnDbRowsRefresh" title="Reload rows">refresh</button>
+                            </div>
+                        </div>
+                        <div class="db-grid-wrap" id="dbGridWrap"><table class="db-grid" id="dbGrid"></table></div>
+                        <div class="db-structure" id="dbStructure" style="display: none;"></div>
+                    </div>
+
+                    <div id="dbSql" style="display: none;">
+                        <div class="db-sql-editor">
+                            <textarea id="dbSqlText" spellcheck="false" autocapitalize="off" autocorrect="off" rows="6" placeholder="SELECT option_name, LENGTH(option_value) AS bytes FROM wp_options WHERE autoload = 'yes' ORDER BY bytes DESC LIMIT 20"></textarea>
+                            <div class="db-sql-actions">
+                                <span class="mail-bar-note" id="dbSqlNote"></span>
+                                <select id="dbSqlHistory" title="Previous queries" aria-label="Previous queries"><option value="">history</option></select>
+                                <button type="button" class="pill primary" id="btnDbRun">run <span class="db-kbd">⌘↵</span></button>
+                            </div>
+                        </div>
+                        <div class="db-sql-results" id="dbSqlResults"></div>
+                    </div>
+                </div>
+            </div>
+
+            <footer class="card-foot">
+                <div class="totals">
+                    <span id="dbCount"></span>
+                </div>
+                <div class="mail-pager" id="dbPager" style="display: none;">
+                    <span id="dbRange"></span>
+                    <button type="button" class="pager-btn" id="btnDbNewer" title="Previous page">‹</button>
+                    <button type="button" class="pager-btn" id="btnDbOlder" title="Next page">›</button>
+                </div>
+            </footer>
+        </section>
     </div>
 
     <div class="modal-backdrop" id="dbModal" style="display: none;">
@@ -4310,6 +4801,16 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 deleteArmed: false, armTimer: null, searchTimer: null, syncTimer: null,
                 seq: 0, ws: null, pollTimer: null, wsRetry: null, info: null,
             },
+            db: {
+                list: [], tables: [], tablesFor: null, wp: null, server: '',
+                name: null, table: null, part: 'rows', sql: false,
+                filter: '', loading: false, loaded: false, error: null,
+                rows: { columns: [], pk: [], items: [], total: 0, start: 0, limit: 100, sort: '', dir: 'asc', q: '', col: '', loading: false, error: null, seq: 0, timer: null },
+                structure: null,
+                edit: null, // { row, col, value, busy }
+                delArm: null, delTimer: null,
+                console: { text: '', results: null, ms: 0, running: false, history: [] },
+            },
 
             get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
             get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
@@ -4389,6 +4890,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.applyTheme();
                 this.bindStaticEvents();
                 this.bindMailEvents();
+                this.bindDbEvents();
                 this.render();
 
                 // If the tab closes during an undo window, flush the staged
@@ -4427,6 +4929,19 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         // Palette owns its own keys via its input's listeners;
                         // catch Esc here too in case the input lost focus.
                         if (e.key === 'Escape') this.closePalette();
+                        return;
+                    }
+
+                    if (this.view === 'db') {
+                        if (this.dbKeydown(e, typing)) return;
+                        if (e.key === 'Escape') {
+                            if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                            if (this.showDbModal) { this.setDbModal(false); return; }
+                        }
+                        if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey && !typing) {
+                            e.preventDefault();
+                            $id('dbFilter').focus();
+                        }
                         return;
                     }
 
@@ -4633,7 +5148,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('ctxLogin').addEventListener('click', withCtxSite(s => this.getLoginLink(s.name)));
                 $id('ctxRename').addEventListener('click', withCtxSite(s => this.promptRename(s)));
                 $id('ctxReveal').addEventListener('click', withCtxSite(s => this.revealSite(s.name)));
-                $id('ctxDb').addEventListener('click', withCtxSite(s => this.openSiteDb(s)));
+                $id('ctxDb').addEventListener('click', withCtxSite(s => this.openDbForSite(s)));
                 $id('ctxPhp').addEventListener('click', withCtxSite(s => this.openPhpModal(s)));
                 $id('ctxLog').addEventListener('click', withCtxSite(s => this.viewLog(s)));
                 $id('ctxMail').addEventListener('click', withCtxSite(s => this.openMailForSite(s.name)));
@@ -4713,6 +5228,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderCtxMenu();
                 this.renderModals();
                 this.renderView();
+                // Site chips in the database list and overview come from the
+                // sites list, which usually lands after the first db render.
+                if (this.view === 'db') { this.renderDbList(); if (this.db.name && !this.db.table && !this.db.sql) this.renderDbOverview(); }
                 if (this.palette.open) this.renderPalette();
             },
 
@@ -5144,28 +5662,52 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             setView(view, opts = {}) {
-                view = view === 'mail' ? 'mail' : 'sites';
+                view = ['mail', 'db'].includes(view) ? view : 'sites';
                 if (view === this.view && !opts.force) return;
                 this.view = view;
                 this.closeRowMenu();
                 document.body.classList.toggle('view-mail', view === 'mail');
-                document.title = view === 'mail' ? 'Cove — mail' : 'Cove — sites';
-                const hash = view === 'mail' ? ('#mail' + (this.mail.site ? '/' + this.mail.site : '')) : '';
-                if ((location.hash || '') !== hash) history.replaceState(null, '', location.pathname + location.search + hash);
+                document.body.classList.toggle('view-db', view === 'db');
+                document.title = { mail: 'Cove — mail', db: 'Cove — databases', sites: 'Cove — sites' }[view];
+                this.syncHash();
                 this.render();
                 if (view === 'mail') {
                     this.loadMail();
                     this.loadMailInfo();
                     if (!this.mail.selectedId) $id('mailSearch').focus();
                 }
+                if (view === 'db') {
+                    if (!this.db.loaded) this.loadDbList();
+                    if (this.db.name && this.db.tablesFor !== this.db.name) this.loadDbTables();
+                    if (this.db.name && this.db.table) this.loadDbRows();
+                }
+            },
+
+            // The hash names the view and what is open in it, so a location
+            // can be bookmarked or pasted: #mail, #mail/<site>, #db,
+            // #db/<database>, #db/<database>/<table>.
+            syncHash() {
+                let hash = '';
+                if (this.view === 'mail') hash = '#mail' + (this.mail.site ? '/' + this.mail.site : '');
+                if (this.view === 'db') hash = '#db' + (this.db.name ? '/' + encodeURIComponent(this.db.name) + (this.db.table ? '/' + encodeURIComponent(this.db.table) : '') : '');
+                if ((location.hash || '') !== hash) history.replaceState(null, '', location.pathname + location.search + hash);
             },
 
             readViewFromHash() {
-                const m = /^#mail(?:\/([a-z0-9-]+))?$/i.exec(location.hash || '');
-                if (m) {
+                const h = location.hash || '';
+                let m;
+                if ((m = /^#mail(?:\/([a-z0-9-]+))?$/i.exec(h))) {
                     this.mail.site = m[1] ? m[1].toLowerCase() : null;
                     this.setView('mail', { force: true });
-                } else if (this.view === 'mail') {
+                } else if ((m = /^#db(?:\/([^\/]+)(?:\/([^\/]+))?)?$/.exec(h))) {
+                    const name = m[1] ? decodeURIComponent(m[1]) : null;
+                    const table = m[2] ? decodeURIComponent(m[2]) : null;
+                    if (name !== this.db.name) { this.db.tables = []; this.db.wp = null; this.db.tablesFor = null; }
+                    if (table !== this.db.table) this.resetDbTable();
+                    this.db.name = name;
+                    this.db.table = table;
+                    this.setView('db', { force: true });
+                } else if (this.view !== 'sites') {
                     this.setView('sites');
                 }
             },
@@ -5732,8 +6274,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             renderView() {
-                show($id('sitesCard'), this.view !== 'mail');
+                show($id('sitesCard'), this.view === 'sites');
                 show($id('mailCard'), this.view === 'mail');
+                show($id('dbCard'), this.view === 'db');
                 document.querySelectorAll('.nav-view').forEach(b => {
                     const on = b.dataset.view === this.view;
                     b.classList.toggle('is-active', on);
@@ -5804,6 +6347,664 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 });
             },
 
+            // --- Databases -------------------------------------------------
+            // A native browser over MariaDB via api.php's db_* actions. Every
+            // Cove site owns one database (its name is in wp-config.php), so
+            // the list maps databases back to sites the way the inbox maps
+            // recipients. Adminer remains the tool for exports, imports and
+            // schema changes; this covers looking, fixing a value, and asking
+            // the database a question.
+            dbSiteOf(name) {
+                const s = this.sites.find(x => x.db_name === name);
+                return s ? s.name : null;
+            },
+
+            get dbVisibleList() {
+                const q = this.db.filter.trim().toLowerCase();
+                if (this.db.name) {
+                    return this.db.tables.filter(t => !q || t.name.toLowerCase().includes(q));
+                }
+                return this.db.list.filter(d => !q || d.name.toLowerCase().includes(q) || (this.dbSiteOf(d.name) || '').includes(q));
+            },
+
+            resetDbTable() {
+                const r = this.db.rows;
+                Object.assign(r, { columns: [], pk: [], items: [], total: 0, start: 0, sort: '', dir: 'asc', q: '', col: '', loading: false, error: null });
+                this.db.structure = null;
+                this.db.edit = null;
+                this.db.delArm = null;
+                this.db.part = 'rows';
+                const f = $id('dbRowsFilter'); if (f) f.value = '';
+            },
+
+            async loadDbList() {
+                const d = this.db;
+                d.loading = !d.loaded;
+                this.renderDb();
+                // Names first (instant), then a second pass for table counts
+                // and sizes, which can take seconds on a box with thousands
+                // of tables.
+                const res = await this.apiPost('db_list', { light: true }, { quiet: true, timeoutMs: 15000 });
+                if (res.success) { d.list = res.databases || []; d.server = res.server || ''; d.error = null; }
+                else d.error = res.message || 'MariaDB is not answering.';
+                d.loaded = true;
+                d.loading = false;
+                this.renderDb();
+                if (!res.success) return;
+                const full = await this.apiPost('db_list', {}, { quiet: true, timeoutMs: 60000 });
+                if (full.success) { d.list = full.databases || d.list; this.renderDbList(); this.renderDbFooter(); if (d.name && !d.table && !d.sql) this.renderDbOverview(); }
+            },
+
+            async loadDbTables() {
+                const d = this.db;
+                const name = d.name;
+                if (!name) return;
+                this.renderDb();
+                const res = await this.apiPost('db_tables', { db: name }, { quiet: true, timeoutMs: 20000 });
+                if (d.name !== name) return;
+                if (res.success) { d.tables = res.tables || []; d.wp = res.wp || null; d.error = null; }
+                else { d.error = res.message || 'Could not read that database.'; d.tables = []; }
+                d.tablesFor = name;
+                this.renderDb();
+            },
+
+            openDb(name) {
+                if (name === this.db.name) return;
+                this.db.name = name;
+                this.db.tables = [];
+                this.db.tablesFor = null;
+                this.db.wp = null;
+                this.db.filter = '';
+                $id('dbFilter').value = '';
+                this.resetDbTable();
+                this.db.table = null;
+                this.syncHash();
+                this.renderDb();
+                this.loadDbTables();
+            },
+
+            closeDb() {
+                this.db.name = null;
+                this.db.table = null;
+                this.db.tables = [];
+                this.db.tablesFor = null;
+                this.db.wp = null;
+                this.db.filter = '';
+                $id('dbFilter').value = '';
+                this.resetDbTable();
+                this.syncHash();
+                this.renderDb();
+                if (!this.db.list.length) this.loadDbList();
+            },
+
+            openDbTable(table, opts = {}) {
+                if (table === this.db.table && !opts.force) { this.db.sql = false; this.renderDb(); return; }
+                this.resetDbTable();
+                this.db.table = table;
+                this.db.sql = false;
+                if (opts.q) { this.db.rows.q = opts.q; this.db.rows.col = opts.col || ''; $id('dbRowsFilter').value = opts.q; }
+                this.syncHash();
+                this.renderDb();
+                this.loadDbRows();
+            },
+
+            closeDbTable() {
+                this.db.table = null;
+                this.resetDbTable();
+                this.syncHash();
+                this.renderDb();
+            },
+
+            // From a site's row menu or the palette: straight to its schema.
+            openDbForSite(site) {
+                const name = site.db_name || ('cove_' + site.name).replace(/[^a-zA-Z0-9_]/g, '_');
+                if (name !== this.db.name) { this.db.tables = []; this.db.tablesFor = null; this.db.wp = null; this.resetDbTable(); this.db.table = null; }
+                this.db.name = name;
+                this.db.filter = '';
+                $id('dbFilter').value = '';
+                this.setView('db', { force: true });
+            },
+
+            async loadDbRows() {
+                const d = this.db, r = d.rows;
+                if (!d.name || !d.table) return;
+                const seq = ++r.seq;
+                r.loading = r.items.length === 0;
+                r.error = null;
+                this.renderDbTable();
+                const res = await this.apiPost('db_rows', { db: d.name, table: d.table, start: r.start, limit: r.limit, sort: r.sort, dir: r.dir, q: r.q, col: r.col }, { quiet: true, timeoutMs: 30000 });
+                if (seq !== r.seq) return;
+                if (res.success) {
+                    r.columns = res.columns || []; r.pk = res.pk || []; r.items = res.rows || []; r.total = res.total || 0;
+                    if (r.start > 0 && r.items.length === 0 && r.total > 0) {
+                        r.start = Math.max(0, Math.floor((r.total - 1) / r.limit) * r.limit);
+                        return this.loadDbRows();
+                    }
+                } else {
+                    r.error = res.message || 'Could not read rows.';
+                    r.items = []; r.total = 0;
+                }
+                r.loading = false;
+                this.renderDbTable();
+                this.renderDbFooter();
+            },
+
+            dbPage(delta) {
+                const r = this.db.rows;
+                const next = r.start + delta * r.limit;
+                if (next < 0 || next >= r.total) return;
+                r.start = next;
+                this.loadDbRows();
+                $id('dbGridWrap').scrollTop = 0;
+            },
+
+            dbSort(col) {
+                const r = this.db.rows;
+                if (r.sort === col) r.dir = r.dir === 'asc' ? 'desc' : 'asc';
+                else { r.sort = col; r.dir = 'asc'; }
+                r.start = 0;
+                this.loadDbRows();
+            },
+
+            setDbPart(part) {
+                this.db.part = part;
+                this.db.edit = null;
+                if (part === 'structure' && this.db.structure === null) {
+                    const d = this.db, name = d.name, table = d.table;
+                    d.structure = { loading: true };
+                    this.apiPost('db_structure', { db: name, table }, { quiet: true, timeoutMs: 20000 }).then(res => {
+                        if (d.name !== name || d.table !== table) return;
+                        d.structure = res.success ? res : { error: res.message || 'Could not read the structure.' };
+                        this.renderDbTable();
+                    });
+                }
+                this.renderDbTable();
+            },
+
+            toggleDbSql(on) {
+                this.db.sql = typeof on === 'boolean' ? on : !this.db.sql;
+                this.db.edit = null;
+                this.renderDb();
+                if (this.db.sql) $id('dbSqlText').focus();
+            },
+
+            // Returns true when the key was consumed.
+            dbKeydown(e, typing) {
+                const d = this.db;
+                const el = document.activeElement;
+                if (el && el.id === 'dbSqlText') {
+                    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); this.runDbSql(); return true; }
+                    if (e.key === 'Escape') { e.preventDefault(); el.blur(); return true; }
+                    return false;
+                }
+                if (el && el.classList && el.classList.contains('db-edit')) return false; // the editor owns its keys
+                if (typing) return false;
+                if (e.metaKey || e.ctrlKey || e.altKey) return false;
+                if (e.key === 'Escape') {
+                    if (this.showDbModal || this.ctxMenu.open) return false;
+                    if (d.edit) { this.cancelDbEdit(); return true; }
+                    if (d.sql) { this.toggleDbSql(false); return true; }
+                    if (d.filter) { d.filter = ''; $id('dbFilter').value = ''; this.renderDb(); return true; }
+                    if (d.table) { this.closeDbTable(); return true; }
+                    if (d.name) { this.closeDb(); return true; }
+                    return false;
+                }
+                return false;
+            },
+
+            // --- Editing a cell. Double-click; ↵ saves, Esc cancels,
+            // ⌘⌫ writes NULL. Long values are fetched in full first.
+            async startDbEdit(rowIdx, colIdx) {
+                const d = this.db, r = d.rows;
+                if (!r.pk.length || d.part !== 'rows') return;
+                const col = r.columns[colIdx];
+                if (!col) return;
+                let value = r.items[rowIdx] ? r.items[rowIdx][colIdx] : undefined;
+                if (value === undefined) return;
+                if (value && typeof value === 'object') {
+                    if (value.t === 'bin') { this.showSnack('Binary values cannot be edited here.', true); return; }
+                    const res = await this.apiPost('db_cell', { db: d.name, table: d.table, pk: this.dbRowKey(rowIdx), col: col.name }, { timeoutMs: 20000 });
+                    if (!res.success) return;
+                    value = res.value;
+                }
+                d.edit = { row: rowIdx, col: colIdx, value: value === null ? '' : String(value), isNull: value === null, busy: false };
+                this.renderDbGrid();
+                const ta = $id('dbGrid').querySelector('.db-edit');
+                if (ta) { ta.focus(); ta.select(); }
+            },
+
+            cancelDbEdit() {
+                this.db.edit = null;
+                this.renderDbGrid();
+            },
+
+            dbRowKey(rowIdx) {
+                const r = this.db.rows;
+                const row = r.items[rowIdx];
+                const key = {};
+                for (const c of r.pk) {
+                    const i = r.columns.findIndex(x => x.name === c);
+                    const v = row[i];
+                    key[c] = (v && typeof v === 'object') ? null : v;
+                }
+                return key;
+            },
+
+            async saveDbEdit(asNull = false) {
+                const d = this.db, r = d.rows, ed = d.edit;
+                if (!ed || ed.busy) return;
+                const col = r.columns[ed.col];
+                const original = r.items[ed.row][ed.col];
+                const unchanged = asNull ? original === null : (original !== null && typeof original !== 'object' && String(original) === ed.value);
+                if (unchanged) { this.cancelDbEdit(); return; }
+                ed.busy = true;
+                const res = await this.apiPost('db_update', { db: d.name, table: d.table, pk: this.dbRowKey(ed.row), col: col.name, value: ed.value, null: asNull }, { timeoutMs: 20000 });
+                if (!res.success) { ed.busy = false; this.renderDbGrid(); return; }
+                if (res.row) r.items[ed.row] = res.row;
+                else r.items[ed.row][ed.col] = asNull ? null : ed.value;
+                d.edit = null;
+                this.renderDbGrid();
+                this.showSnack(res.affected ? 'Saved.' : 'No change.');
+            },
+
+            async deleteDbRow(rowIdx) {
+                const d = this.db, r = d.rows;
+                if (d.delArm !== rowIdx) {
+                    d.delArm = rowIdx;
+                    clearTimeout(d.delTimer);
+                    d.delTimer = setTimeout(() => { d.delArm = null; this.renderDbGrid(); }, 3500);
+                    this.renderDbGrid();
+                    return;
+                }
+                d.delArm = null;
+                clearTimeout(d.delTimer);
+                const res = await this.apiPost('db_delete_row', { db: d.name, table: d.table, pk: this.dbRowKey(rowIdx) }, { timeoutMs: 20000 });
+                if (!res.success) { this.renderDbGrid(); return; }
+                r.items.splice(rowIdx, 1);
+                r.total = Math.max(0, r.total - 1);
+                this.showSnack('Row deleted.');
+                this.renderDbGrid();
+                this.renderDbFooter();
+                if (r.items.length === 0 && r.total > 0) this.loadDbRows();
+            },
+
+            // --- SQL console ------------------------------------------------
+            async runDbSql() {
+                const c = this.db.console;
+                const sql = $id('dbSqlText').value;
+                c.text = sql;
+                if (!sql.trim() || c.running) return;
+                c.running = true;
+                this.renderDbSql();
+                const res = await this.apiPost('db_query', { db: this.db.name || '', sql }, { quiet: true, timeoutMs: 120000 });
+                c.running = false;
+                if (!res.success) {
+                    c.results = [{ type: 'error', message: res.message || (res.transport ? 'The dashboard did not answer.' : 'Query failed.') }];
+                } else {
+                    c.results = res.results || [];
+                    c.ms = res.ms || 0;
+                    this.pushDbHistory(sql);
+                    // Data-changing statements: freshen whatever is open behind the console.
+                    if (c.results.some(x => x.type === 'ok')) {
+                        if (this.db.table) this.loadDbRows();
+                        if (this.db.name) this.loadDbTables();
+                    }
+                }
+                this.renderDbSql();
+            },
+
+            get dbHistory() {
+                try { return JSON.parse(localStorage.getItem('cove-sql-history') || '[]'); } catch (e) { return []; }
+            },
+
+            pushDbHistory(sql) {
+                const h = this.dbHistory.filter(x => x !== sql);
+                h.unshift(sql);
+                try { localStorage.setItem('cove-sql-history', JSON.stringify(h.slice(0, 40))); } catch (e) {}
+            },
+
+            // --- Rendering ---------------------------------------------------
+            renderDb() {
+                if (this.view !== 'db') return;
+                this.renderDbChrome();
+                this.renderDbList();
+                this.renderDbMain();
+                this.renderDbFooter();
+            },
+
+            renderDbChrome() {
+                const d = this.db;
+                const chip = $id('dbChip');
+                show(chip, !!d.name);
+                if (d.name) $id('dbChipLabel').textContent = d.name;
+                $id('dbFilter').placeholder = d.name ? 'filter tables…' : 'filter databases…';
+                show($id('dbKbd'), !d.filter);
+                show($id('btnDbFilterClear'), !!d.filter);
+                $id('btnDbSql').classList.toggle('primary', d.sql);
+                const site = d.name ? this.dbSiteOf(d.name) : null;
+                const adminer = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) + (d.name ? '&db=' + encodeURIComponent(d.name) + (d.table ? '&select=' + encodeURIComponent(d.table) : '') : '');
+                $id('dbAdminerLink').href = adminer;
+                $id('dbAdminerLink').title = 'Open ' + (d.table ? d.table + ' in Adminer' : d.name ? d.name + ' in Adminer' : 'Adminer') + (site ? ' (' + site + '.localhost)' : '') + ' — exports, imports, schema changes, users';
+            },
+
+            renderDbList() {
+                const d = this.db;
+                const list = $id('dbList');
+                list.querySelectorAll('.db-row').forEach(n => n.remove());
+                const loading = d.name ? d.tablesFor !== d.name : d.loading;
+                show($id('dbLoading'), loading);
+                show($id('dbError'), !loading && !!d.error);
+                const rows = loading ? [] : this.dbVisibleList;
+                const empty = !loading && !d.error && rows.length === 0;
+                show($id('dbEmpty'), empty);
+                if (empty) $id('dbEmptyQuery').textContent = d.filter || (d.name ? '(no tables)' : '(no databases)');
+                const tpl = $id('tpl-db-row');
+                const anchor = $id('dbLoading');
+                for (const it of rows) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.name = it.name;
+                    row.querySelector('.db-row-name').textContent = it.name;
+                    row.querySelector('.db-row-name').title = it.name;
+                    const chip = row.querySelector('.db-row-site');
+                    if (d.name) {
+                        chip.remove();
+                        row.classList.toggle('is-view', !!it.view);
+                        row.classList.toggle('is-selected', it.name === d.table);
+                        row.querySelector('.db-row-meta').textContent = it.view ? 'view' : ((it.rows === null ? '' : '~' + this.formatCount(it.rows)) + (it.bytes ? ' · ' + this.formatSize(it.bytes) : ''));
+                        row.querySelector('.db-row-meta').title = it.view ? 'View' : (it.engine || '') + (it.collation ? ' · ' + it.collation : '') + ' · row count is the engine\'s estimate';
+                    } else {
+                        const site = this.dbSiteOf(it.name);
+                        if (site) { chip.textContent = site; chip.title = site + '.localhost'; chip.setAttribute('role', 'presentation'); }
+                        else chip.remove();
+                        row.classList.toggle('is-selected', it.name === d.name);
+                        row.querySelector('.db-row-meta').textContent = it.tables === null ? '' : it.tables + ' table' + (it.tables === 1 ? '' : 's') + (it.bytes ? ' · ' + this.formatSize(it.bytes) : '');
+                    }
+                    list.insertBefore(row, anchor);
+                }
+            },
+
+            renderDbMain() {
+                const d = this.db;
+                const mode = d.sql ? 'sql' : d.table ? 'table' : d.name ? 'overview' : 'empty';
+                show($id('dbMainEmpty'), mode === 'empty');
+                show($id('dbOverview'), mode === 'overview');
+                show($id('dbTable'), mode === 'table');
+                show($id('dbSql'), mode === 'sql');
+                if (mode === 'overview') this.renderDbOverview();
+                if (mode === 'table') this.renderDbTable();
+                if (mode === 'sql') this.renderDbSql();
+            },
+
+            renderDbOverview() {
+                const d = this.db, esc = (s) => this.escapeHtml(s == null ? '—' : String(s));
+                const box = $id('dbOverview');
+                const meta = d.list.find(x => x.name === d.name);
+                const site = this.dbSiteOf(d.name);
+                let html = '<h2>' + esc(d.name) + '</h2>';
+                const sub = [];
+                if (site) sub.push('<a href="https://' + esc(site) + '.localhost' + PORT_SUFFIX + '" target="_blank" rel="noopener" style="color: var(--accent); text-decoration: none;">' + esc(site) + '.localhost</a>');
+                if (meta && meta.tables !== null) sub.push(meta.tables + ' table' + (meta.tables === 1 ? '' : 's') + ' · ' + this.formatSize(meta.bytes));
+                if (d.server) sub.push('MariaDB ' + esc(d.server.replace(/-MariaDB.*$/, '')));
+                html += '<p class="db-ov-sub">' + sub.join(' · ') + '</p>';
+                if (d.tablesFor !== d.name) { html += '<div class="loading">Loading…</div>'; box.innerHTML = html; return; }
+                if (d.error) { html += '<div class="mail-msg-error">' + esc(d.error) + '</div>'; box.innerHTML = html; return; }
+                const wp = d.wp;
+                if (wp) {
+                    const stat = (k, v, title) => '<div class="db-ov-stat"' + (title ? ' title="' + esc(title) + '"' : '') + '><span class="k">' + k + '</span><span class="v">' + v + '</span></div>';
+                    html += '<div class="db-ov-grid">'
+                        + stat('site url', wp.siteurl ? '<a href="' + esc(wp.siteurl) + '" target="_blank" rel="noopener">' + esc(wp.siteurl.replace(/^https?:\/\//, '')) + '</a>' : '—', wp.siteurl)
+                        + stat('home', wp.home ? '<a href="' + esc(wp.home) + '" target="_blank" rel="noopener">' + esc(wp.home.replace(/^https?:\/\//, '')) + '</a>' : '—', wp.home)
+                        + stat('prefix', esc(wp.prefix))
+                        + stat('theme', esc(wp.stylesheet || wp.template || '—'))
+                        + stat('posts · users · comments', esc(this.formatCount(wp.posts)) + ' · ' + esc(this.formatCount(wp.users)) + ' · ' + esc(this.formatCount(wp.comments)))
+                        + stat('options', esc(this.formatCount(wp.options)) + ' · ' + this.formatSize(wp.autoload_bytes) + ' autoloaded', wp.autoload_count + ' autoloaded options are read on every request')
+                        + '</div>';
+                    if (wp.largest && wp.largest.length) {
+                        html += '<p class="db-ov-label">largest autoloaded options</p><ul class="db-ov-list" id="dbOvLargest">'
+                            + wp.largest.map(o => '<li data-option="' + esc(o.name) + '" title="Open in ' + esc(wp.prefix) + 'options"><span>' + esc(o.name) + '</span><span>' + this.formatSize(o.bytes) + '</span></li>').join('')
+                            + '</ul>';
+                    }
+                } else if (d.tables.length) {
+                    html += '<p class="db-ov-sub">Not a WordPress database — pick a table on the left, or open the SQL console.</p>';
+                } else {
+                    html += '<p class="db-ov-sub">Empty database. The SQL console is the place to start.</p>';
+                }
+                box.innerHTML = html;
+            },
+
+            renderDbTable() {
+                const d = this.db, r = d.rows;
+                if (this.view !== 'db' || !d.table || d.sql) return;
+                document.querySelectorAll('#dbParts .mail-part').forEach(b => {
+                    b.classList.toggle('is-active', d.part === b.dataset.part);
+                    b.setAttribute('aria-selected', d.part === b.dataset.part ? 'true' : 'false');
+                });
+                show($id('dbRowsSearch'), d.part === 'rows');
+                show($id('btnDbRowsRefresh'), d.part === 'rows');
+                show($id('dbGridWrap'), d.part === 'rows');
+                show($id('dbStructure'), d.part === 'structure');
+                // Column picker for the filter
+                const sel = $id('dbRowsCol');
+                const want = ['<option value="">any column</option>'].concat(r.columns.map(c => '<option value="' + this.escapeHtml(c.name) + '"' + (r.col === c.name ? ' selected' : '') + '>' + this.escapeHtml(c.name) + '</option>')).join('');
+                if (sel.innerHTML !== want) sel.innerHTML = want;
+                const note = $id('dbRowsNote');
+                if (d.part === 'rows') {
+                    note.textContent = r.error ? r.error : (!r.pk.length && r.columns.length ? 'read-only — no primary key' : (r.columns.length ? 'double-click a cell to edit' : ''));
+                    note.style.color = r.error ? 'var(--danger)' : '';
+                } else note.textContent = '';
+                if (d.part === 'rows') this.renderDbGrid();
+                else this.renderDbStructure();
+            },
+
+            dbCellHtml(v, col) {
+                if (v === null) return { cls: 'is-null', text: 'NULL', title: '' };
+                if (typeof v === 'object') {
+                    if (v.t === 'bin') return { cls: 'is-bin', text: '0x' + v.hex + (v.len > 48 ? '…' : '') + ' (' + this.formatSize(v.len) + ')', title: 'Binary, ' + v.len + ' bytes' };
+                    return { cls: '', text: v.text, title: this.formatSize(v.len) + ' — double-click to see it all' };
+                }
+                const num = col && /^(tiny|small|medium|big)?int|^(decimal|float|double|numeric|bit)/i.test(col.type || '');
+                return { cls: num ? 'is-num' : '', text: String(v), title: String(v).length > 60 ? String(v).slice(0, 400) : '' };
+            },
+
+            renderDbGrid() {
+                const d = this.db, r = d.rows, esc = (s) => this.escapeHtml(s);
+                const grid = $id('dbGrid');
+                if (r.loading) { grid.innerHTML = '<tbody><tr><td class="db-grid-empty">Loading rows…</td></tr></tbody>'; return; }
+                if (!r.columns.length) { grid.innerHTML = r.error ? '' : '<tbody><tr><td class="db-grid-empty">No columns.</td></tr></tbody>'; return; }
+                const editable = r.pk.length > 0;
+                let html = '<thead><tr>' + r.columns.map(c =>
+                    '<th data-col="' + esc(c.name) + '" title="' + esc(c.type + (c.null ? ', nullable' : '') + (c.extra ? ', ' + c.extra : '') + ' — click to sort') + '">'
+                    + (r.pk.includes(c.name) ? '<span class="col-key" title="key">⚿</span>' : '') + esc(c.name)
+                    + (r.sort === c.name ? '<span class="sort-arrow">' + (r.dir === 'asc' ? '↑' : '↓') + '</span>' : '')
+                    + '<span class="col-type">' + esc(c.type) + '</span></th>').join('')
+                    + (editable ? '<th class="db-row-actions" aria-hidden="true"></th>' : '') + '</tr></thead><tbody>';
+                if (!r.items.length) {
+                    html += '<tr><td class="db-grid-empty" colspan="' + (r.columns.length + 1) + '">' + (r.q ? 'No rows contain “' + esc(r.q) + '”.' : 'No rows.') + '</td></tr>';
+                }
+                r.items.forEach((row, ri) => {
+                    html += '<tr data-row="' + ri + '">';
+                    row.forEach((v, ci) => {
+                        const ed = d.edit && d.edit.row === ri && d.edit.col === ci ? d.edit : null;
+                        if (ed) {
+                            html += '<td class="is-editing" data-row="' + ri + '" data-col="' + ci + '"><textarea class="db-edit" rows="' + Math.min(12, Math.max(1, (ed.value.match(/\n/g) || []).length + 1)) + '"' + (ed.busy ? ' disabled' : '') + '>' + esc(ed.value) + '</textarea><span class="db-edit-hint">↵ save · shift+↵ newline · esc cancel · ⌘⌫ NULL</span></td>';
+                            return;
+                        }
+                        const cell = this.dbCellHtml(v, r.columns[ci]);
+                        html += '<td class="' + cell.cls + (editable ? ' is-editable' : '') + '" data-row="' + ri + '" data-col="' + ci + '"' + (cell.title ? ' title="' + esc(cell.title) + '"' : '') + '>' + esc(cell.text) + '</td>';
+                    });
+                    if (editable) html += '<td class="db-row-actions"><button type="button" class="db-row-del' + (d.delArm === ri ? ' armed' : '') + '" data-row="' + ri + '" title="Delete this row">' + (d.delArm === ri ? 'sure?' : '×') + '</button></td>';
+                    html += '</tr>';
+                });
+                grid.innerHTML = html + '</tbody>';
+            },
+
+            renderDbStructure() {
+                const d = this.db, s = d.structure, esc = (s) => this.escapeHtml(s == null ? '' : String(s));
+                const box = $id('dbStructure');
+                if (!s || s.loading) { box.innerHTML = '<div class="loading">Loading structure…</div>'; return; }
+                if (s.error) { box.innerHTML = '<div class="mail-msg-error">' + esc(s.error) + '</div>'; return; }
+                let html = '<p class="db-ov-label">columns</p><table><thead><tr><th>name</th><th>type</th><th>null</th><th>key</th><th>default</th><th>extra</th><th>collation</th></tr></thead><tbody>';
+                html += s.columns.map(c => '<tr><td>' + esc(c.name) + '</td><td>' + esc(c.type) + '</td><td>' + (c.null ? 'yes' : 'no') + '</td><td>' + esc(c.key) + '</td><td>' + (c.default === null ? '<span style="color: var(--text-faint); font-style: italic;">NULL</span>' : esc(c.default)) + '</td><td>' + esc(c.extra) + '</td><td>' + esc(c.collation) + '</td></tr>').join('');
+                html += '</tbody></table>';
+                if (s.indexes && s.indexes.length) {
+                    html += '<p class="db-ov-label">indexes</p><table><thead><tr><th>name</th><th>columns</th><th>type</th></tr></thead><tbody>';
+                    html += s.indexes.map(i => '<tr><td>' + esc(i.name) + '</td><td>' + esc(i.columns.join(', ')) + '</td><td>' + (i.unique ? 'unique · ' : '') + esc(i.type) + '</td></tr>').join('');
+                    html += '</tbody></table>';
+                }
+                if (s.create) html += '<p class="db-ov-label">create table</p><pre>' + esc(s.create) + '</pre>';
+                box.innerHTML = html;
+            },
+
+            renderDbSql() {
+                const d = this.db, c = d.console, esc = (s) => this.escapeHtml(s == null ? '' : String(s));
+                if (this.view !== 'db' || !d.sql) return;
+                $id('dbSqlNote').textContent = d.name ? 'runs against ' + d.name : 'no database selected — qualify tables as database.table';
+                const hist = this.dbHistory;
+                const sel = $id('dbSqlHistory');
+                sel.innerHTML = '<option value="">history</option>' + hist.map((h, i) => '<option value="' + i + '">' + esc(h.replace(/\s+/g, ' ').slice(0, 60)) + '</option>').join('');
+                sel.disabled = hist.length === 0;
+                const run = $id('btnDbRun');
+                run.disabled = c.running;
+                run.innerHTML = c.running ? 'running…' : 'run <span class="db-kbd">⌘↵</span>';
+                const out = $id('dbSqlResults');
+                if (!c.results) { out.innerHTML = ''; return; }
+                let html = '';
+                c.results.forEach((res, i) => {
+                    if (res.type === 'error') {
+                        html += '<div class="db-sql-result"><div class="db-sql-result-head is-error">' + esc(res.message) + '</div></div>';
+                    } else if (res.type === 'ok') {
+                        html += '<div class="db-sql-result"><div class="db-sql-result-head is-ok">' + res.affected + ' row' + (res.affected === 1 ? '' : 's') + ' affected' + (res.insert_id ? ' · insert id ' + res.insert_id : '') + (res.info ? ' · ' + esc(res.info) : '') + (i === c.results.length - 1 ? ' · ' + c.ms + ' ms' : '') + '</div></div>';
+                    } else {
+                        html += '<div class="db-sql-result"><div class="db-sql-result-head">' + res.total + ' row' + (res.total === 1 ? '' : 's') + (res.truncated ? ' · showing the first ' + res.rows.length : '') + (i === c.results.length - 1 ? ' · ' + c.ms + ' ms' : '') + '</div>';
+                        html += '<div class="db-grid-wrap"><table class="db-grid"><thead><tr>' + res.columns.map(col => '<th style="cursor: default;">' + esc(col) + '</th>').join('') + '</tr></thead><tbody>';
+                        if (!res.rows.length) html += '<tr><td class="db-grid-empty" colspan="' + res.columns.length + '">Empty result.</td></tr>';
+                        for (const row of res.rows) {
+                            html += '<tr>' + row.map(v => { const cell = this.dbCellHtml(v, null); return '<td class="' + cell.cls + '"' + (cell.title ? ' title="' + esc(cell.title) + '"' : '') + '>' + esc(cell.text) + '</td>'; }).join('') + '</tr>';
+                        }
+                        html += '</tbody></table></div></div>';
+                    }
+                });
+                out.innerHTML = html;
+            },
+
+            renderDbFooter() {
+                if (this.view !== 'db') return;
+                const d = this.db, r = d.rows;
+                let label = '';
+                if (d.table && !d.sql) {
+                    label = d.table + ' · ' + this.formatCount(r.total) + ' row' + (r.total === 1 ? '' : 's') + (r.q ? ' matching' : '');
+                } else if (d.name) {
+                    label = d.tablesFor === d.name ? d.tables.length + ' table' + (d.tables.length === 1 ? '' : 's') : '';
+                } else {
+                    label = d.list.length + ' database' + (d.list.length === 1 ? '' : 's') + (d.server ? ' · MariaDB ' + d.server.replace(/-MariaDB.*$/, '') : '');
+                }
+                $id('dbCount').textContent = label;
+                const pager = $id('dbPager');
+                const paged = !!d.table && !d.sql && r.total > r.limit;
+                show(pager, paged);
+                if (paged) {
+                    $id('dbRange').textContent = (r.start + 1) + '–' + Math.min(r.start + r.limit, r.total);
+                    $id('btnDbNewer').disabled = r.start === 0;
+                    $id('btnDbOlder').disabled = r.start + r.limit >= r.total;
+                }
+            },
+
+            formatCount(n) {
+                if (n === null || n === undefined) return '—';
+                return Number(n).toLocaleString();
+            },
+
+            bindDbEvents() {
+                $id('btnDbView').addEventListener('click', () => this.setView('db'));
+                const filter = $id('dbFilter');
+                filter.addEventListener('input', () => { this.db.filter = filter.value; this.renderDbChrome(); this.renderDbList(); });
+                filter.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.db.filter = ''; filter.value = ''; filter.blur(); this.renderDbChrome(); this.renderDbList(); }
+                    if (e.key === 'Enter') {
+                        const first = this.dbVisibleList[0];
+                        if (!first) return;
+                        e.preventDefault();
+                        if (this.db.name) this.openDbTable(first.name); else this.openDb(first.name);
+                    }
+                });
+                $id('btnDbFilterClear').addEventListener('click', () => { this.db.filter = ''; filter.value = ''; this.renderDbChrome(); this.renderDbList(); filter.focus(); });
+                $id('dbChipClear').addEventListener('click', () => this.closeDb());
+                $id('btnDbSql').addEventListener('click', () => this.toggleDbSql());
+                $id('dbList').addEventListener('click', (e) => {
+                    const row = e.target.closest('.db-row');
+                    if (!row) return;
+                    if (this.db.name) this.openDbTable(row.dataset.name); else this.openDb(row.dataset.name);
+                });
+                $id('dbOverview').addEventListener('click', (e) => {
+                    const li = e.target.closest('#dbOvLargest li');
+                    if (!li || !this.db.wp) return;
+                    this.openDbTable(this.db.wp.prefix + 'options', { q: li.dataset.option, col: 'option_name', force: true });
+                });
+                $id('dbParts').addEventListener('click', (e) => {
+                    const b = e.target.closest('.mail-part');
+                    if (b) this.setDbPart(b.dataset.part);
+                });
+                const rowsFilter = $id('dbRowsFilter');
+                rowsFilter.addEventListener('input', () => {
+                    const r = this.db.rows;
+                    r.q = rowsFilter.value; r.start = 0;
+                    clearTimeout(r.timer);
+                    r.timer = setTimeout(() => this.loadDbRows(), 300);
+                });
+                rowsFilter.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); clearTimeout(this.db.rows.timer); this.loadDbRows(); }
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.db.rows.q = ''; rowsFilter.value = ''; rowsFilter.blur(); this.db.rows.start = 0; this.loadDbRows(); }
+                });
+                $id('dbRowsCol').addEventListener('change', (e) => { this.db.rows.col = e.target.value; if (this.db.rows.q) { this.db.rows.start = 0; this.loadDbRows(); } });
+                $id('btnDbRowsRefresh').addEventListener('click', () => { this.db.structure = null; this.loadDbRows(); });
+                $id('btnDbNewer').addEventListener('click', () => this.dbPage(-1));
+                $id('btnDbOlder').addEventListener('click', () => this.dbPage(1));
+
+                const grid = $id('dbGrid');
+                grid.addEventListener('click', (e) => {
+                    const th = e.target.closest('th[data-col]');
+                    if (th) { this.dbSort(th.dataset.col); return; }
+                    const del = e.target.closest('.db-row-del');
+                    if (del) { this.deleteDbRow(Number(del.dataset.row)); return; }
+                });
+                grid.addEventListener('dblclick', (e) => {
+                    const td = e.target.closest('td.is-editable');
+                    if (!td) return;
+                    e.preventDefault();
+                    this.startDbEdit(Number(td.dataset.row), Number(td.dataset.col));
+                });
+                grid.addEventListener('keydown', (e) => {
+                    const ta = e.target.closest('.db-edit');
+                    if (!ta) return;
+                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.db.edit.value = ta.value; this.saveDbEdit(false); }
+                    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.cancelDbEdit(); }
+                    else if ((e.metaKey || e.ctrlKey) && e.key === 'Backspace') { e.preventDefault(); this.saveDbEdit(true); }
+                });
+                grid.addEventListener('input', (e) => { const ta = e.target.closest('.db-edit'); if (ta && this.db.edit) this.db.edit.value = ta.value; });
+                grid.addEventListener('focusout', (e) => {
+                    // Clicking away saves, the way a spreadsheet does. Esc and
+                    // ↵ have already cleared or marked the edit by the time
+                    // this fires, so they are not double-handled.
+                    const ta = e.target.closest && e.target.closest('.db-edit');
+                    if (!ta) return;
+                    setTimeout(() => {
+                        const ed = this.db.edit;
+                        if (!ed || ed.busy || document.activeElement === ta) return;
+                        ed.value = ta.value;
+                        this.saveDbEdit(false);
+                    }, 0);
+                });
+
+                $id('btnDbRun').addEventListener('click', () => this.runDbSql());
+                $id('dbSqlText').addEventListener('input', (e) => { this.db.console.text = e.target.value; });
+                $id('dbSqlHistory').addEventListener('change', (e) => {
+                    const h = this.dbHistory[Number(e.target.value)];
+                    if (h !== undefined) { $id('dbSqlText').value = h; this.db.console.text = h; }
+                    e.target.value = '';
+                    $id('dbSqlText').focus();
+                });
+            },
+
             // --- Command palette -------------------------------------------
             // Results mix matching sites with global commands. Sites are ranked
             // by match position so a prefix hit beats a mid-string one.
@@ -5814,7 +7015,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     { key: 'cmd:add',     kind: 'cmd', label: 'Add site',            meta: '',  run: () => { this.closePalette(); this.toggleAdd(); } },
                     { key: 'cmd:reload',  kind: 'cmd', label: 'Reload server',       meta: '',  run: () => { this.closePalette(); this.reloadServer(); } },
                     { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
-                    { key: 'cmd:db',      kind: 'cmd', label: 'Open database',       meta: '',  run: () => { this.closePalette(); window.open('https://db.cove.localhost' + PORT_SUFFIX, '_blank', 'noopener'); } },
+                    { key: 'cmd:db',      kind: 'cmd', label: 'Databases',           meta: '',  run: () => { this.closePalette(); this.setView('db'); } },
+                    { key: 'cmd:adminer', kind: 'cmd', label: 'Open Adminer',        meta: 'external', run: () => { this.closePalette(); window.open(this.adminerUrl, '_blank', 'noopener'); } },
                     { key: 'cmd:mailview',kind: 'cmd', label: 'Mail',                meta: '',  run: () => { this.closePalette(); this.setView('mail'); } },
                     { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: 'external', run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
                     { key: 'cmd:creds',   kind: 'cmd', label: 'Database credentials',meta: '',  run: () => { this.closePalette(); this.setDbModal(true); } },
@@ -5899,7 +7101,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     (svc.actions || []).forEach(a => {
                         let el;
                         if (a.kind === 'open') { el = document.createElement('a'); el.href = a.href; el.target = '_blank'; el.rel = 'noopener'; }
-                        else { el = document.createElement('button'); el.type = 'button'; el.addEventListener('click', () => { this.setDbModal(false); if (a.kind === 'reload') this.reloadServer(); if (a.kind === 'mail') this.setView('mail'); }); }
+                        else { el = document.createElement('button'); el.type = 'button'; el.addEventListener('click', () => { this.setDbModal(false); if (a.kind === 'reload') this.reloadServer(); if (a.kind === 'mail') this.setView('mail'); if (a.kind === 'db') this.setView('db'); }); }
                         el.className = 'pill'; el.textContent = a.label;
                         svcActions.insertBefore(el, $id('btnDbClose'));
                     });
