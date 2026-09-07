@@ -1709,7 +1709,7 @@ if [ ! -x "\$mailpit_bin" ]; then
     exit 127
 fi
 
-exec "\$mailpit_bin" --database "\$db_path"
+exec "\$mailpit_bin" --database "\$db_path" --label Cove
 EOM
     chmod +x "$script_path"
     echo "$script_path"
@@ -2396,6 +2396,18 @@ db.cove.localhost {
 
 cove.localhost {
     root * "$GUI_DIR"
+    # Mailpit's REST API, same-origin for the dashboard's Mail view:
+    # /mail-api/v1/... -> 127.0.0.1:8025/api/v1/... (the websocket at
+    # /mail-api/events rides the same route). Mailpit answers 403 to any
+    # request whose Origin header is not its own host — even a GET or the
+    # websocket upgrade — so the browser's Origin is dropped on the way in.
+    handle_path /mail-api/* {
+        rewrite * /api{uri}
+        reverse_proxy 127.0.0.1:8025 {
+            header_up -Origin
+            header_up Host {upstream_hostport}
+        }
+    }
     php_server
     tls internal
 }
@@ -3161,7 +3173,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         ['delivers', 'nowhere — mail never leaves this machine'],
                     ],
                     'note' => 'WordPress on every Cove site is pointed at the SMTP port above.',
-                    'actions' => [['kind' => 'open', 'label' => 'open mailpit', 'href' => $mailui]],
+                    'actions' => [['kind' => 'mail', 'label' => 'open inbox'], ['kind' => 'open', 'label' => 'mailpit ↗', 'href' => $mailui]],
                 ],
             ]]);
             exit;
@@ -3689,6 +3701,85 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .snackbar-action { background: transparent; border: 0; padding: 0; color: inherit; font: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
         .snackbar-action:hover { opacity: 0.8; }
 
+        /* View switch: sites | mail. Mail is a sibling view rather than a
+           card below the sites — on a real install the list is thousands of
+           pixels tall, so anything under it is unreachable. */
+        .nav-views { display: flex; align-items: center; gap: 0.15rem; margin-left: 1.4rem; }
+        .nav-view { position: relative; display: inline-flex; align-items: center; gap: 0.4rem; background: transparent; border: 0; padding: 0.35rem 0.55rem; font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-dim); cursor: pointer; border-radius: var(--radius-sm); }
+        .nav-view:hover { color: var(--text); background: var(--panel-hover); }
+        .nav-view.is-active { color: var(--text); }
+        .nav-view.is-active::after { content: ''; position: absolute; left: 0.55rem; right: 0.55rem; bottom: -3px; height: 2px; background: var(--brand); }
+        .nav-badge { font-size: 0.64rem; font-weight: 500; line-height: 1; padding: 0.22rem 0.42rem; border-radius: var(--radius-pill); background: var(--accent); color: var(--accent-fg); }
+
+        /* Mail. The reader needs the width an HTML email was designed for,
+           so this view alone widens the page. */
+        body.view-mail .wrap { max-width: 1120px; }
+        .mail-unread-toggle { display: inline-flex; align-items: center; gap: 0.35rem; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); cursor: pointer; white-space: nowrap; user-select: none; }
+        .mail-unread-toggle input { accent-color: var(--accent); margin: 0; }
+        .mail-delete-all.armed { color: white; background: var(--danger); border-color: var(--danger); }
+        .mail-body { display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); height: calc(100vh - 262px); min-height: 460px; }
+        .mail-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; border-right: 1px solid var(--panel-border); }
+        .mail-row { display: grid; grid-template-columns: 10px minmax(0, 1fr); column-gap: 0.55rem; padding: 0.7rem 1rem 0.7rem 0.9rem; border-bottom: 1px solid var(--panel-border); cursor: pointer; transition: background 100ms; }
+        .mail-row:hover { background: var(--panel-hover); }
+        .mail-row.is-selected { background: var(--panel-hover); box-shadow: inset 2px 0 0 var(--accent); }
+        .mail-dot { width: 7px; height: 7px; border-radius: 50%; margin-top: 0.45rem; background: transparent; }
+        .mail-row.is-unread .mail-dot { background: var(--accent); }
+        .mail-main { min-width: 0; }
+        .mail-line { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+        .mail-from { flex: 1; min-width: 0; font-size: 0.86rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .mail-row.is-unread .mail-from, .mail-row.is-unread .mail-subject { color: var(--text); font-weight: 500; }
+        .mail-age { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); flex: none; }
+        .mail-att { flex: none; width: 12px; height: 12px; color: var(--text-faint); }
+        .mail-subject { font-size: 0.86rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin: 0.1rem 0 0.15rem; }
+        .mail-site { flex: none; font-family: var(--font-mono); font-size: 0.62rem; letter-spacing: 0.04em; padding: 0.06rem 0.45rem; border-radius: var(--radius-pill); background: var(--pill-wp-bg); color: var(--pill-wp-fg); cursor: pointer; white-space: nowrap; }
+        .mail-site:hover { filter: brightness(1.15); }
+        .mail-snippet { flex: 1; min-width: 0; font-size: 0.76rem; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .mail-list > .empty, .mail-list > .loading { padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .mail-reader { overflow-y: auto; min-width: 0; display: flex; flex-direction: column; }
+        .mail-reader-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-dim); padding: 2rem; text-align: center; }
+        .mail-msg-head { padding: 1.1rem 1.5rem 0.9rem; border-bottom: 1px solid var(--panel-border); }
+        .mail-msg-head .loading { color: var(--text-dim); }
+        .mail-msg-error { color: var(--danger); font-size: 0.9rem; }
+        .mail-msg-subject { font-family: var(--font-serif); font-weight: 500; font-size: 1.25rem; margin: 0 0 0.55rem; letter-spacing: -0.01em; line-height: 1.3; overflow-wrap: anywhere; }
+        .mail-meta-row { display: grid; grid-template-columns: 3rem minmax(0, 1fr); gap: 0.5rem; align-items: baseline; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.6; }
+        .mail-meta-k { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.64rem; }
+        .mail-meta-v { color: var(--text-dim); overflow-wrap: anywhere; }
+        /* Links found in the message — most local mail exists to carry one
+           (password reset, login, verification), so they get a front-row seat
+           with a copy button beside each. */
+        .mail-links { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.7rem; }
+        .mail-links:empty { display: none; }
+        .mail-link { display: inline-flex; align-items: stretch; border: 1px solid var(--panel-border); border-radius: var(--radius-md); font-family: var(--font-mono); font-size: 0.74rem; max-width: 100%; overflow: hidden; }
+        .mail-link a { color: var(--accent); text-decoration: none; padding: 0.3rem 0.6rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 440px; }
+        .mail-link a:hover { background: var(--panel-hover); }
+        .mail-link-copy { background: transparent; border: 0; border-left: 1px solid var(--panel-border); color: var(--text-dim); font: inherit; padding: 0 0.55rem; cursor: pointer; }
+        .mail-link-copy:hover { color: var(--text); background: var(--panel-hover); }
+        .mail-msg-bar { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); flex-wrap: wrap; }
+        .mail-parts { display: flex; gap: 0.15rem; }
+        .mail-part { background: transparent; border: 1px solid transparent; padding: 0.28rem 0.55rem; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); cursor: pointer; border-radius: var(--radius-sm); }
+        .mail-part:hover { color: var(--text); background: var(--panel-hover); }
+        .mail-part.is-active { color: var(--text); background: var(--panel); border-color: var(--panel-border); }
+        .mail-bar-note { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .mail-msg-actions { margin-left: auto; display: flex; gap: 0.35rem; }
+        .mail-msg-actions .pill { padding: 0.26rem 0.6rem; font-size: 0.74rem; }
+        .mail-frame { display: block; width: 100%; border: 0; background: #fff; min-height: 240px; color-scheme: light; }
+        .mail-pre { margin: 0; padding: 1.1rem 1.5rem; font-family: var(--font-mono); font-size: 0.82rem; line-height: 1.55; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+        .mail-pre a { color: var(--accent); }
+        .mail-attachments { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.8rem 1.5rem; border-top: 1px solid var(--panel-border); }
+        .mail-back { display: none; margin-bottom: 0.7rem; }
+        .mail-pager { display: flex; align-items: center; gap: 0.35rem; margin-left: auto; }
+        .pager-btn { background: transparent; border: 1px solid var(--panel-border); color: var(--text-dim); width: 26px; height: 24px; border-radius: var(--radius-sm); cursor: pointer; font-size: 0.95rem; line-height: 1; padding: 0; }
+        .pager-btn:hover { color: var(--text); }
+        .pager-btn:disabled { opacity: 0.35; cursor: default; }
+        @media (max-width: 860px) {
+            .mail-body { grid-template-columns: 1fr; height: auto; min-height: 60vh; }
+            .mail-list { border-right: 0; }
+            .mail-body.has-msg .mail-list { display: none; }
+            .mail-body:not(.has-msg) .mail-reader { display: none; }
+            .mail-back { display: inline-flex; }
+            .mail-link a { max-width: 240px; }
+        }
+
         /* Responsive */
         @media (max-width: 620px) {
             body { padding: 1.25rem 0.75rem 3rem; }
@@ -3712,6 +3803,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </svg>
                 <span>Cove</span>
             </a>
+            <div class="nav-views" role="tablist" aria-label="View">
+                <button type="button" class="nav-view is-active" role="tab" data-view="sites" aria-selected="true">sites</button>
+                <button type="button" class="nav-view" role="tab" data-view="mail" aria-selected="false">mail<span class="nav-badge" id="mailBadge" style="display: none;"></span></button>
+            </div>
             <div class="nav-services services">
                 <button type="button" class="dot link" data-service="caddy" title="Caddy status">caddy</button>
                 <button type="button" class="dot link" data-service="mariadb" title="MariaDB status and credentials">mariadb</button>
@@ -3729,7 +3824,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </div>
         </nav>
 
-        <section class="card">
+        <section class="card" id="sitesCard">
             <header class="card-head">
                 <h1 class="card-title">Sites</h1>
                 <div class="card-actions">
@@ -3737,10 +3832,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5v-9"/><path d="M3 8c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5"/></svg>
                         db
                     </a>
-                    <a class="pill" href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Mailpit">
+                    <button type="button" class="pill" id="btnMailView" title="Open mail">
                         <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="12" height="9" rx="1.5"/><path d="M2.5 5 8 9l5.5-4"/></svg>
                         mail
-                    </a>
+                    </button>
                     <button class="pill primary" id="btnToggleAdd">+ add site</button>
                 </div>
             </header>
@@ -3873,6 +3968,155 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </div>
             </footer>
         </section>
+
+        <!-- Mail: a Cove-native inbox over Mailpit's API (proxied same-origin
+             at /mail-api/). Every Cove site receives mail at its own
+             <site>.localhost domain, so the To address is the site — the one
+             filter Mailpit's own UI cannot offer. -->
+        <section class="card mail-card" id="mailCard" style="display: none;">
+            <header class="card-head">
+                <h1 class="card-title">Mail</h1>
+                <div class="card-actions">
+                    <a class="pill" href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Mailpit's own interface">
+                        mailpit
+                        <svg class="pill-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4.5h5v5"/><path d="M11.5 4.5 4.5 11.5"/></svg>
+                    </a>
+                    <button type="button" class="pill" id="btnMailReadAll" title="Mark every listed message as read">mark all read</button>
+                    <button type="button" class="pill mail-delete-all" id="btnMailDeleteAll" title="Delete every message matching the current filter">delete all</button>
+                </div>
+            </header>
+
+            <div class="filter-row">
+                <span class="filter-chip" id="mailSiteChip" aria-label="Active site filter" style="display: none;">
+                    <span id="mailSiteChipLabel"></span>
+                    <button type="button" class="filter-chip-x" id="mailSiteChipClear" aria-label="Remove site filter" title="Remove">×</button>
+                </span>
+                <input
+                    class="filter-input"
+                    id="mailSearch"
+                    type="text"
+                    placeholder="search mail… (from: to: subject: has:attachment)"
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    aria-label="Search mail"
+                >
+                <label class="mail-unread-toggle" title="Only unread messages">
+                    <input type="checkbox" id="mailUnreadOnly">
+                    unread
+                </label>
+                <span class="filter-kbd" id="mailKbd" aria-hidden="true">/</span>
+                <button class="filter-clear" id="btnMailSearchClear" aria-label="Clear search" title="Clear all (Esc)" style="display: none;">×</button>
+            </div>
+
+            <div class="mail-body" id="mailBody">
+                <ul class="mail-list" id="mailList">
+                    <template id="tpl-mail-row">
+                        <li class="mail-row">
+                            <span class="mail-dot" aria-hidden="true"></span>
+                            <div class="mail-main">
+                                <div class="mail-line">
+                                    <span class="mail-from"></span>
+                                    <svg class="mail-att" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 5.5 6 10a1.6 1.6 0 0 0 2.3 2.3l5-5a3 3 0 0 0-4.3-4.3l-5.5 5.5a4.4 4.4 0 0 0 6.2 6.2l4-4"/></svg>
+                                    <span class="mail-age"></span>
+                                </div>
+                                <div class="mail-subject"></div>
+                                <div class="mail-line">
+                                    <span class="mail-site" role="button"></span>
+                                    <span class="mail-snippet"></span>
+                                </div>
+                            </div>
+                        </li>
+                    </template>
+                    <li class="loading" id="mailLoading">Loading mail…</li>
+                    <li class="empty" id="mailError" style="display: none;">
+                        <div>Mailpit isn't answering.</div>
+                        <div class="empty-hint">Check the mailpit dot in the top bar, or run <code>cove status</code>.</div>
+                    </li>
+                    <li class="empty" id="mailEmptyNone" style="display: none;">
+                        <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path class="art-fill" d="M30 18 h44 v30 H30 Z"/>
+                            <path class="art-line" d="M30 18 h44 v30 H30 Z"/>
+                            <path class="art-line" d="M30 18 L52 36 L74 18"/>
+                            <path class="art-wave" d="M8 56 Q 15 52, 22 56 T 36 56 T 50 56 T 64 56 T 78 56 T 92 56"/>
+                            <path class="art-wave" d="M20 62 Q 27 58, 34 62 T 48 62 T 62 62 T 76 62" opacity="0.35"/>
+                        </svg>
+                        <div>No mail yet.</div>
+                        <div class="empty-hint">Everything your sites send lands here instead of the internet.</div>
+                    </li>
+                    <li class="empty" id="mailEmptyFilter" style="display: none;">
+                        <div>Nothing matches <code id="mailEmptyQuery"></code>.</div>
+                        <div class="empty-hint">Press Esc to clear.</div>
+                    </li>
+                </ul>
+
+                <div class="mail-reader" id="mailReader">
+                    <div class="mail-reader-empty" id="mailReaderEmpty">
+                        <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path class="art-line" d="M34 14 h36 v40 H34 Z"/>
+                            <path class="art-line" d="M41 24 h22 M41 32 h22 M41 40 h14"/>
+                            <path class="art-wave" d="M8 60 Q 15 56, 22 60 T 36 60 T 50 60 T 64 60 T 78 60 T 92 60"/>
+                        </svg>
+                        <div>Select a message.</div>
+                        <div class="empty-hint">↑↓ to move · ⌫ to delete · u to toggle unread</div>
+                    </div>
+                    <div id="mailMsg" style="display: none;">
+                        <div class="mail-msg-head">
+                            <button type="button" class="pill mail-back" id="btnMailBack">← inbox</button>
+                            <div class="loading" id="mailMsgLoading">Loading message…</div>
+                            <div class="mail-msg-error" id="mailMsgError" style="display: none;"></div>
+                            <div id="mailMsgHead" style="display: none;">
+                                <h2 class="mail-msg-subject" id="mailMsgSubject"></h2>
+                                <div id="mailMsgMeta"></div>
+                                <div class="mail-links" id="mailMsgLinks"></div>
+                            </div>
+                        </div>
+                        <div id="mailMsgMain" style="display: none;">
+                            <div class="mail-msg-bar">
+                                <div class="mail-parts" id="mailParts" role="tablist">
+                                    <button type="button" class="mail-part" role="tab" data-part="html">html</button>
+                                    <button type="button" class="mail-part" role="tab" data-part="text">text</button>
+                                    <button type="button" class="mail-part" role="tab" data-part="headers">headers</button>
+                                </div>
+                                <span class="mail-bar-note" id="mailRemoteNote" style="display: none;"></span>
+                                <div class="mail-msg-actions">
+                                    <button type="button" class="pill" id="btnMailUnread">mark unread</button>
+                                    <button type="button" class="pill" id="btnMailDelete">delete</button>
+                                    <a class="pill" id="mailOpenInMailpit" target="_blank" rel="noopener" title="Open this message in Mailpit (raw source, spam score, HTML check)">mailpit ↗</a>
+                                </div>
+                            </div>
+                            <div class="mail-msg-body">
+                                <!-- No scripts, no forms, no remote loads: the sandbox denies
+                                     script execution, and the CSP injected into the srcdoc
+                                     limits images to inline parts served via /mail-api/.
+                                     allow-same-origin is what lets the frame be measured
+                                     (and 'self' resolve for those inline parts); with no
+                                     allow-scripts nothing inside can act on that origin.
+                                     Popups escape the sandbox so a reset link opens as a
+                                     normal tab. -->
+                                <iframe class="mail-frame" id="mailFrame" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" title="Message"></iframe>
+                                <pre class="mail-pre" id="mailText"></pre>
+                                <pre class="mail-pre" id="mailHeaders"></pre>
+                            </div>
+                            <div class="mail-attachments" id="mailAttachments" style="display: none;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <footer class="card-foot">
+                <div class="totals">
+                    <span id="mailCount"></span>
+                    <span id="mailDbSize" style="display: none;"></span>
+                </div>
+                <div class="mail-pager" id="mailPager" style="display: none;">
+                    <span id="mailRange"></span>
+                    <button type="button" class="pager-btn" id="btnMailNewer" title="Newer">‹</button>
+                    <button type="button" class="pager-btn" id="btnMailOlder" title="Older">›</button>
+                </div>
+            </footer>
+        </section>
     </div>
 
     <div class="modal-backdrop" id="dbModal" style="display: none;">
@@ -3950,6 +4194,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <button class="ctx-item" id="ctxDb"><span>Open database</span></button>
             <button class="ctx-item" id="ctxPhp"><span>PHP version…</span><span class="ctx-key" id="ctxPhpMeta"></span></button>
             <button class="ctx-item" id="ctxLog"><span>View log</span></button>
+            <button class="ctx-item" id="ctxMail"><span>View mail</span></button>
             <div class="ctx-sep"></div>
             <button class="ctx-item" id="ctxCopy"><span>Copy path</span></button>
             <button class="ctx-item" id="ctxPin"><span>Pin to top</span></button>
@@ -4051,6 +4296,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             deleteQueue: [],
             isProcessingQueue: false,
             _paletteItems: [],
+            // 'sites' | 'mail'. Mail is a sibling view of the sites list,
+            // reachable from the nav, the hash (#mail, #mail/<site>), a
+            // site's row menu, and the palette.
+            view: 'sites',
+            mail: {
+                items: [], total: 0, unread: 0, matched: 0,
+                start: 0, limit: 50,
+                query: '', site: null, unreadOnly: false,
+                loading: false, loaded: false, error: null,
+                selectedId: null, msg: null, msgLoading: false, msgError: null,
+                part: 'html', headers: null, renderedId: null, remoteBlocked: 0,
+                deleteArmed: false, armTimer: null, searchTimer: null, syncTimer: null,
+                seq: 0, ws: null, pollTimer: null, wsRetry: null, info: null,
+            },
 
             get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
             get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
@@ -4129,6 +4388,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             init() {
                 this.applyTheme();
                 this.bindStaticEvents();
+                this.bindMailEvents();
                 this.render();
 
                 // If the tab closes during an undo window, flush the staged
@@ -4167,6 +4427,21 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         // Palette owns its own keys via its input's listeners;
                         // catch Esc here too in case the input lost focus.
                         if (e.key === 'Escape') this.closePalette();
+                        return;
+                    }
+
+                    // The mail view has its own keys; the site-list keys below
+                    // would otherwise act on rows the user cannot see.
+                    if (this.view === 'mail') {
+                        if (this.mailKeydown(e, typing)) return;
+                        if (e.key === 'Escape') {
+                            if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                            if (this.showDbModal) { this.setDbModal(false); return; }
+                        }
+                        if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey && !typing) {
+                            e.preventDefault();
+                            $id('mailSearch').focus();
+                        }
                         return;
                     }
 
@@ -4238,6 +4513,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         this.refreshSizes();
                     }
                 });
+
+                // Mail: pick the view from the hash, then keep the unread
+                // badge live over Mailpit's websocket (or a poll when the
+                // socket is unavailable).
+                this.readViewFromHash();
+                this.refreshMailCounts();
+                this.connectMailEvents();
             },
 
             // One-time listeners on elements that are never re-created. Row,
@@ -4354,6 +4636,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('ctxDb').addEventListener('click', withCtxSite(s => this.openSiteDb(s)));
                 $id('ctxPhp').addEventListener('click', withCtxSite(s => this.openPhpModal(s)));
                 $id('ctxLog').addEventListener('click', withCtxSite(s => this.viewLog(s)));
+                $id('ctxMail').addEventListener('click', withCtxSite(s => this.openMailForSite(s.name)));
 
                 // PHP version picker
                 $id('btnPhpClose').addEventListener('click', () => this.closePhpModal());
@@ -4429,6 +4712,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderFooter();
                 this.renderCtxMenu();
                 this.renderModals();
+                this.renderView();
                 if (this.palette.open) this.renderPalette();
             },
 
@@ -4836,6 +5120,690 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
             },
 
+            // --- Mail ------------------------------------------------------
+            // A Cove-native inbox over Mailpit's REST API, proxied same-origin
+            // at /mail-api/ by the Caddyfile. Mailpit's own UI stays one click
+            // away for what it does better (spam scoring, HTML checks, relay,
+            // raw source); what it cannot do is filter by site — every Cove
+            // site receives mail at its own <site>.localhost, so the To
+            // address is the site.
+            mailApi(path, opts = {}) {
+                const { method = 'GET', body, timeoutMs = 10000 } = opts;
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+                return fetch('/mail-api' + path, {
+                    method,
+                    headers: body ? { 'Content-Type': 'application/json' } : {},
+                    body: body ? JSON.stringify(body) : undefined,
+                    signal: ctrl.signal,
+                }).then(async (r) => {
+                    if (!r.ok) throw new Error('mailpit ' + r.status);
+                    const ct = r.headers.get('content-type') || '';
+                    return ct.includes('json') ? r.json() : r.text();
+                }).finally(() => clearTimeout(timer));
+            },
+
+            setView(view, opts = {}) {
+                view = view === 'mail' ? 'mail' : 'sites';
+                if (view === this.view && !opts.force) return;
+                this.view = view;
+                this.closeRowMenu();
+                document.body.classList.toggle('view-mail', view === 'mail');
+                document.title = view === 'mail' ? 'Cove — mail' : 'Cove — sites';
+                const hash = view === 'mail' ? ('#mail' + (this.mail.site ? '/' + this.mail.site : '')) : '';
+                if ((location.hash || '') !== hash) history.replaceState(null, '', location.pathname + location.search + hash);
+                this.render();
+                if (view === 'mail') {
+                    this.loadMail();
+                    this.loadMailInfo();
+                    if (!this.mail.selectedId) $id('mailSearch').focus();
+                }
+            },
+
+            readViewFromHash() {
+                const m = /^#mail(?:\/([a-z0-9-]+))?$/i.exec(location.hash || '');
+                if (m) {
+                    this.mail.site = m[1] ? m[1].toLowerCase() : null;
+                    this.setView('mail', { force: true });
+                } else if (this.view === 'mail') {
+                    this.setView('sites');
+                }
+            },
+
+            // From a site's row menu: the inbox scoped to that site.
+            openMailForSite(name) {
+                this.mail.site = name;
+                this.mail.query = '';
+                this.mail.start = 0;
+                $id('mailSearch').value = '';
+                this.setView('mail', { force: true });
+            },
+
+            setMailSite(site) {
+                this.mail.site = site || null;
+                this.mail.start = 0;
+                const hash = '#mail' + (this.mail.site ? '/' + this.mail.site : '');
+                history.replaceState(null, '', location.pathname + location.search + hash);
+                this.loadMail();
+            },
+
+            mailClearFilters() {
+                this.mail.query = '';
+                $id('mailSearch').value = '';
+                this.mail.unreadOnly = false;
+                $id('mailUnreadOnly').checked = false;
+                this.setMailSite(null);
+            },
+
+            get mailQuery() {
+                const parts = [];
+                if (this.mail.site) parts.push('to:@' + this.mail.site + '.localhost');
+                if (this.mail.unreadOnly) parts.push('is:unread');
+                if (this.mail.query.trim()) parts.push(this.mail.query.trim());
+                return parts.join(' ');
+            },
+
+            async loadMail(opts = {}) {
+                const m = this.mail;
+                if (!opts.keepStart) m.start = 0;
+                const seq = ++m.seq;
+                // Only the first paint shows the loading row; refreshes keep the
+                // rows in place so a search keystroke doesn't flash the list.
+                m.loading = !m.loaded;
+                const q = this.mailQuery;
+                const qs = 'limit=' + m.limit + '&start=' + m.start;
+                const path = q ? '/v1/search?query=' + encodeURIComponent(q) + '&' + qs : '/v1/messages?' + qs;
+                this.renderMail();
+                try {
+                    const data = await this.mailApi(path);
+                    if (seq !== m.seq) return; // superseded by a newer request
+                    m.items = Array.isArray(data.messages) ? data.messages : [];
+                    m.total = data.total || 0;
+                    m.unread = data.unread || 0;
+                    // messages_count is the filtered total on a search, the
+                    // overall total on a plain listing.
+                    m.matched = typeof data.messages_count === 'number' ? data.messages_count : m.total;
+                    m.error = null;
+                    // A new filter or search that no longer contains the open
+                    // message closes the reader; a refresh or page turn keeps it.
+                    if (!opts.keepStart && m.selectedId && !m.items.some(x => x.ID === m.selectedId)) {
+                        m.selectedId = null; m.msg = null; m.renderedId = null;
+                    }
+                    // Paged past the end (e.g. after deletes): step back.
+                    if (m.start > 0 && m.items.length === 0 && m.matched > 0) {
+                        m.start = Math.max(0, Math.floor((m.matched - 1) / m.limit) * m.limit);
+                        return this.loadMail({ keepStart: true });
+                    }
+                } catch (e) {
+                    if (seq !== m.seq) return;
+                    m.error = 'Mailpit is not answering.';
+                }
+                m.loaded = true;
+                m.loading = false;
+                this.renderMail();
+                this.renderView();
+            },
+
+            mailPage(delta) {
+                const m = this.mail;
+                const next = m.start + delta * m.limit;
+                if (next < 0 || next >= m.matched) return;
+                m.start = next;
+                this.loadMail({ keepStart: true });
+                $id('mailList').scrollTop = 0;
+            },
+
+            async loadMailInfo() {
+                try { this.mail.info = await this.mailApi('/v1/info', { timeoutMs: 4000 }); } catch (e) { this.mail.info = null; }
+                this.renderMailFooter();
+            },
+
+            // Cheap: one row, but the envelope carries the global counts.
+            async refreshMailCounts() {
+                try {
+                    const d = await this.mailApi('/v1/messages?limit=1', { timeoutMs: 4000 });
+                    this.mail.total = d.total || 0;
+                    this.mail.unread = d.unread || 0;
+                } catch (e) { /* badge simply stays put */ }
+                this.renderView();
+                if (this.view === 'mail') this.renderMailFooter();
+            },
+
+            // Mailpit pushes {Type:'new'|'delete'|'update'|'prune'|'truncate', Data}
+            // and {Type:'stats', Data:{Total, Unread}} over a websocket. It is
+            // not a documented contract, so a poll takes over whenever the
+            // socket is unavailable and the socket is retried in the background.
+            connectMailEvents() {
+                const m = this.mail;
+                if (m.ws || !('WebSocket' in window)) { this.startMailPolling(); return; }
+                let ws;
+                try {
+                    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/mail-api/events');
+                } catch (e) { this.startMailPolling(); return; }
+                m.ws = ws;
+                ws.onopen = () => this.stopMailPolling();
+                ws.onmessage = (ev) => {
+                    let evt;
+                    try { evt = JSON.parse(ev.data); } catch (e) { return; }
+                    if (evt.Type === 'stats' && evt.Data) {
+                        m.total = evt.Data.Total || 0;
+                        m.unread = evt.Data.Unread || 0;
+                        this.renderView();
+                        if (this.view === 'mail') this.renderMailFooter();
+                        return;
+                    }
+                    if (this.view === 'mail') {
+                        clearTimeout(m.syncTimer);
+                        m.syncTimer = setTimeout(() => this.loadMail({ keepStart: true }), 300);
+                    }
+                };
+                ws.onclose = () => {
+                    m.ws = null;
+                    this.startMailPolling();
+                    clearTimeout(m.wsRetry);
+                    m.wsRetry = setTimeout(() => this.connectMailEvents(), 15000);
+                };
+                ws.onerror = () => { try { ws.close(); } catch (e) {} };
+            },
+
+            startMailPolling() {
+                if (this.mail.pollTimer) return;
+                this.mail.pollTimer = setInterval(() => {
+                    if (document.hidden) return;
+                    if (this.view === 'mail') this.loadMail({ keepStart: true });
+                    else this.refreshMailCounts();
+                }, 15000);
+            },
+
+            stopMailPolling() {
+                clearInterval(this.mail.pollTimer);
+                this.mail.pollTimer = null;
+            },
+
+            async openMail(id) {
+                const m = this.mail;
+                if (!id) return;
+                m.selectedId = id;
+                m.msg = null; m.msgError = null; m.headers = null; m.msgLoading = true;
+                this.renderMail();
+                try {
+                    const msg = await this.mailApi('/v1/message/' + encodeURIComponent(id));
+                    if (m.selectedId !== id) return;
+                    m.msg = msg;
+                    m.part = msg.HTML ? 'html' : 'text';
+                    // Fetching a message marks it read on Mailpit's side too.
+                    const row = m.items.find(x => x.ID === id);
+                    if (row && !row.Read) { row.Read = true; m.unread = Math.max(0, m.unread - 1); }
+                } catch (e) {
+                    if (m.selectedId !== id) return;
+                    m.msgError = 'Could not load this message. It may have been deleted.';
+                }
+                m.msgLoading = false;
+                this.renderMail();
+                this.renderView();
+            },
+
+            closeMail() {
+                this.mail.selectedId = null;
+                this.mail.msg = null;
+                this.mail.renderedId = null;
+                this.renderMail();
+            },
+
+            mailMove(delta) {
+                const m = this.mail;
+                if (!m.items.length) return;
+                let i = m.items.findIndex(x => x.ID === m.selectedId);
+                i = i === -1 ? (delta > 0 ? 0 : m.items.length - 1) : Math.max(0, Math.min(m.items.length - 1, i + delta));
+                this.openMail(m.items[i].ID);
+                const row = $id('mailList').querySelector('.mail-row[data-id="' + CSS.escape(m.items[i].ID) + '"]');
+                if (row && row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
+            },
+
+            // Returns true when the key was consumed.
+            mailKeydown(e, typing) {
+                const m = this.mail;
+                if (e.metaKey || e.ctrlKey || e.altKey) return false;
+                const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
+                const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
+                if (isDown || isUp) { e.preventDefault(); this.mailMove(isDown ? 1 : -1); return true; }
+                if (typing) return false; // the search box handles its own Esc
+                if (this.showDbModal || this.ctxMenu.open) return false;
+                if ((e.key === 'Backspace' || e.key === 'Delete') && m.selectedId) {
+                    e.preventDefault();
+                    this.mailDelete([m.selectedId]);
+                    return true;
+                }
+                if (e.key === 'u' && m.selectedId) {
+                    const it = m.items.find(x => x.ID === m.selectedId);
+                    if (it) this.mailSetRead([it.ID], !it.Read);
+                    return true;
+                }
+                if (e.key === 'Escape') {
+                    if (m.selectedId) { this.closeMail(); return true; }
+                    if (this.mailQuery) { this.mailClearFilters(); return true; }
+                    return false;
+                }
+                return false;
+            },
+
+            setMailPart(part) {
+                const m = this.mail;
+                m.part = part;
+                if (part === 'headers' && m.msg && m.headers === null) {
+                    const id = m.msg.ID;
+                    m.headers = '';
+                    this.mailApi('/v1/message/' + encodeURIComponent(id) + '/headers').then(h => {
+                        if (!m.msg || m.msg.ID !== id) return;
+                        m.headers = Object.keys(h || {}).sort().map(k => (h[k] || []).map(v => k + ': ' + v).join('\n')).join('\n');
+                        this.renderMailReader();
+                    }).catch(() => {
+                        if (!m.msg || m.msg.ID !== id) return;
+                        m.headers = '(could not load headers)';
+                        this.renderMailReader();
+                    });
+                }
+                this.renderMailReader();
+            },
+
+            async mailSetRead(ids, read) {
+                try {
+                    await this.mailApi('/v1/messages', { method: 'PUT', body: { IDs: ids, Read: read } });
+                } catch (e) {
+                    this.showSnack('Mailpit did not answer.', true);
+                    return false;
+                }
+                // An empty ID list means "everything" to Mailpit.
+                for (const it of this.mail.items) if (!ids.length || ids.includes(it.ID)) it.Read = read;
+                this.refreshMailCounts();
+                this.renderMail();
+                return true;
+            },
+
+            async mailReadAll() {
+                const q = this.mailQuery;
+                let ids = [];
+                if (q) {
+                    // No read-by-search endpoint in Mailpit 1.30, so page the
+                    // search for its IDs. Capped: a filter is rarely huge.
+                    try {
+                        for (let start = 0; start < 5000; start += 200) {
+                            const d = await this.mailApi('/v1/search?query=' + encodeURIComponent(q) + '&limit=200&start=' + start);
+                            const page = Array.isArray(d.messages) ? d.messages : [];
+                            ids.push(...page.map(x => x.ID));
+                            if (page.length < 200) break;
+                        }
+                    } catch (e) { this.showSnack('Mailpit did not answer.', true); return; }
+                    if (!ids.length) return;
+                }
+                if (await this.mailSetRead(ids, true)) this.showSnack(q ? 'Matching mail marked read.' : 'Everything marked read.');
+            },
+
+            async mailDelete(ids) {
+                const m = this.mail;
+                try {
+                    await this.mailApi('/v1/messages', { method: 'DELETE', body: { IDs: ids } });
+                } catch (e) {
+                    this.showSnack('Mailpit did not answer.', true);
+                    return;
+                }
+                const idx = m.items.findIndex(x => x.ID === m.selectedId);
+                m.items = m.items.filter(x => !ids.includes(x.ID));
+                m.matched = Math.max(0, m.matched - ids.length);
+                if (ids.includes(m.selectedId)) {
+                    // Land on the neighbour so triaging a pile is ⌫ ⌫ ⌫.
+                    m.selectedId = null; m.msg = null; m.renderedId = null;
+                    const next = m.items[Math.min(idx, m.items.length - 1)];
+                    if (next) this.openMail(next.ID);
+                }
+                this.showSnack(ids.length === 1 ? 'Message deleted.' : ids.length + ' messages deleted.');
+                this.loadMail({ keepStart: true });
+            },
+
+            // Two clicks, like the sites' bulk delete: the first arms the
+            // button for a few seconds, the second fires.
+            async mailDeleteAll() {
+                const m = this.mail;
+                if (!m.deleteArmed) {
+                    m.deleteArmed = true;
+                    clearTimeout(m.armTimer);
+                    m.armTimer = setTimeout(() => { m.deleteArmed = false; this.renderMailChrome(); }, 3500);
+                    this.renderMailChrome();
+                    return;
+                }
+                m.deleteArmed = false;
+                clearTimeout(m.armTimer);
+                const q = this.mailQuery;
+                try {
+                    if (q) await this.mailApi('/v1/search?query=' + encodeURIComponent(q), { method: 'DELETE' });
+                    else await this.mailApi('/v1/messages', { method: 'DELETE', body: { IDs: [] } });
+                } catch (e) {
+                    this.showSnack('Mailpit did not answer.', true);
+                    this.renderMailChrome();
+                    return;
+                }
+                m.selectedId = null; m.msg = null; m.renderedId = null; m.items = [];
+                this.showSnack(q ? 'Matching mail deleted.' : 'Inbox emptied.');
+                this.loadMail();
+            },
+
+            mailAddrLabel(a) {
+                if (!a) return '';
+                return a.Name || a.Address || '';
+            },
+
+            mailAddrFull(a) {
+                if (!a) return '';
+                return a.Name ? a.Name + ' <' + a.Address + '>' : (a.Address || '');
+            },
+
+            // The site a message belongs to: the first recipient at a
+            // *.localhost domain. Mail from a site to an outside address still
+            // maps by its sender.
+            mailSiteOf(it) {
+                const pick = (list) => {
+                    for (const a of (list || [])) {
+                        const mm = /@([a-z0-9-]+)\.localhost$/i.exec(a.Address || '');
+                        if (mm) return mm[1].toLowerCase();
+                    }
+                    return null;
+                };
+                return pick(it.To) || pick(it.Cc) || pick(it.From ? [it.From] : []);
+            },
+
+            mailLinks(msg) {
+                const out = [], seen = new Set();
+                const push = (u) => {
+                    u = String(u || '').trim().replace(/[)\].,;'"!>]+$/, '');
+                    if (!/^https?:\/\//i.test(u) || seen.has(u)) return;
+                    seen.add(u); out.push(u);
+                };
+                if (msg.HTML) {
+                    const re = /href\s*=\s*["']([^"']+)["']/gi;
+                    let x;
+                    while ((x = re.exec(msg.HTML))) push(this.decodeEntities(x[1]));
+                }
+                if (msg.Text) {
+                    const re = /https?:\/\/[^\s<>"']+/gi;
+                    let x;
+                    while ((x = re.exec(msg.Text))) push(x[0]);
+                }
+                return out.slice(0, 8);
+            },
+
+            decodeEntities(s) {
+                const t = document.createElement('textarea');
+                t.innerHTML = s;
+                return t.value;
+            },
+
+            linkify(text) {
+                return this.escapeHtml(text).replace(/https?:\/\/[^\s<>"']+/g, (u) => {
+                    const clean = u.replace(/[)\].,;'"!]+$/, '');
+                    const tail = u.slice(clean.length);
+                    return '<a href="' + clean + '" target="_blank" rel="noopener noreferrer">' + clean + '</a>' + tail;
+                });
+            },
+
+            // The srcdoc for the sandboxed frame. Mailpit hands back the HTML
+            // untouched with cid: references intact and lists the inline parts
+            // separately, so the references are pointed at the proxied part
+            // URLs here. A CSP inside the document keeps everything else out —
+            // the sandbox already denies scripts and forms; this also stops
+            // remote images, fonts and stylesheets so a message never phones
+            // home when opened.
+            mailHtmlDoc(msg) {
+                let html = msg.HTML || '';
+                for (const p of (msg.Inline || [])) {
+                    if (!p.ContentID) continue;
+                    const url = '/mail-api/v1/message/' + encodeURIComponent(msg.ID) + '/part/' + encodeURIComponent(p.PartID);
+                    html = html.split('cid:' + p.ContentID).join(url);
+                }
+                html = html.replace(/<script[\s\S]*?<\/script\s*>/gi, '').replace(/<meta[^>]+http-equiv[^>]*>/gi, '');
+                const csp = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'none'";
+                const head = '<meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + csp + '"><base target="_blank">'
+                    + '<style>html{color-scheme:light}body{margin:0;padding:16px;background:#fff;color:#1a1c1b;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',system-ui,sans-serif;line-height:1.45}</style>';
+                if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, (t) => t + head);
+                if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, (t) => t + '<head>' + head + '</head>');
+                return '<!doctype html><html><head>' + head + '</head><body>' + html + '</body></html>';
+            },
+
+            renderMail() {
+                if (this.view !== 'mail') return;
+                this.renderMailChrome();
+                this.renderMailList();
+                this.renderMailReader();
+                this.renderMailFooter();
+            },
+
+            renderMailChrome() {
+                const m = this.mail;
+                const chip = $id('mailSiteChip');
+                show(chip, !!m.site);
+                if (m.site) $id('mailSiteChipLabel').textContent = 'site: ' + m.site;
+                const active = !!(m.query || m.site || m.unreadOnly);
+                show($id('mailKbd'), !active);
+                show($id('btnMailSearchClear'), active);
+                const del = $id('btnMailDeleteAll');
+                del.classList.toggle('armed', m.deleteArmed);
+                del.textContent = m.deleteArmed ? ('sure? delete ' + m.matched) : (active ? 'delete matching' : 'delete all');
+                del.disabled = !m.matched;
+                $id('btnMailReadAll').disabled = !m.matched;
+            },
+
+            renderMailList() {
+                const m = this.mail;
+                const list = $id('mailList');
+                list.querySelectorAll('.mail-row').forEach(n => n.remove());
+                show($id('mailLoading'), m.loading);
+                show($id('mailError'), !m.loading && !!m.error);
+                const empty = !m.loading && !m.error && m.items.length === 0;
+                const q = this.mailQuery;
+                show($id('mailEmptyNone'), empty && !q);
+                show($id('mailEmptyFilter'), empty && !!q);
+                if (empty && q) $id('mailEmptyQuery').textContent = q;
+
+                const tpl = $id('tpl-mail-row');
+                const anchor = $id('mailLoading');
+                for (const it of m.items) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.id = it.ID;
+                    row.classList.toggle('is-unread', !it.Read);
+                    row.classList.toggle('is-selected', it.ID === m.selectedId);
+                    const from = row.querySelector('.mail-from');
+                    from.textContent = this.mailAddrLabel(it.From) || '(unknown sender)';
+                    from.title = this.mailAddrFull(it.From);
+                    const age = row.querySelector('.mail-age');
+                    const ts = Date.parse(it.Created) / 1000;
+                    age.textContent = this.formatRelative(ts);
+                    age.title = isNaN(ts) ? '' : new Date(it.Created).toLocaleString();
+                    row.querySelector('.mail-subject').textContent = it.Subject || '(no subject)';
+                    const site = this.mailSiteOf(it);
+                    const chip = row.querySelector('.mail-site');
+                    if (site) { chip.textContent = site; chip.title = 'Only mail for ' + site + '.localhost'; }
+                    else chip.remove();
+                    const att = row.querySelector('.mail-att');
+                    if (it.Attachments) att.setAttribute('title', it.Attachments + ' attachment' + (it.Attachments === 1 ? '' : 's'));
+                    else att.remove();
+                    row.querySelector('.mail-snippet').textContent = it.Snippet || '';
+                    list.insertBefore(row, anchor);
+                }
+            },
+
+            renderMailReader() {
+                const m = this.mail;
+                const has = !!m.selectedId;
+                $id('mailBody').classList.toggle('has-msg', has);
+                show($id('mailReaderEmpty'), !has);
+                show($id('mailMsg'), has);
+                if (!has) return;
+                show($id('mailMsgLoading'), m.msgLoading);
+                show($id('mailMsgError'), !m.msgLoading && !!m.msgError);
+                if (m.msgError) $id('mailMsgError').textContent = m.msgError;
+                const ready = !!m.msg && !m.msgLoading;
+                show($id('mailMsgHead'), ready);
+                show($id('mailMsgMain'), ready);
+                if (!ready) return;
+                const msg = m.msg;
+
+                if (m.renderedId !== msg.ID) {
+                    m.renderedId = msg.ID;
+                    m.remoteBlocked = 0;
+                    $id('mailMsgSubject').textContent = msg.Subject || '(no subject)';
+                    const meta = [['from', this.mailAddrFull(msg.From)], ['to', (msg.To || []).map(a => this.mailAddrFull(a)).join(', ')]];
+                    if (msg.Cc && msg.Cc.length) meta.push(['cc', msg.Cc.map(a => this.mailAddrFull(a)).join(', ')]);
+                    if (msg.Bcc && msg.Bcc.length) meta.push(['bcc', msg.Bcc.map(a => this.mailAddrFull(a)).join(', ')]);
+                    if (msg.ReplyTo && msg.ReplyTo.length) meta.push(['reply', msg.ReplyTo.map(a => this.mailAddrFull(a)).join(', ')]);
+                    const when = Date.parse(msg.Date);
+                    meta.push(['date', isNaN(when) ? (msg.Date || '—') : new Date(when).toLocaleString()]);
+                    $id('mailMsgMeta').innerHTML = meta.map(([k, v]) =>
+                        '<div class="mail-meta-row"><span class="mail-meta-k">' + k + '</span><span class="mail-meta-v">' + this.escapeHtml(v || '—') + '</span></div>').join('');
+                    $id('mailMsgLinks').innerHTML = this.mailLinks(msg).map(u => {
+                        const label = u.replace(/^https?:\/\//i, '');
+                        return '<span class="mail-link"><a href="' + this.escapeHtml(u) + '" target="_blank" rel="noopener noreferrer" title="' + this.escapeHtml(u) + '">' + this.escapeHtml(label) + '</a>'
+                            + '<button type="button" class="mail-link-copy" data-url="' + this.escapeHtml(u) + '" title="Copy link">copy</button></span>';
+                    }).join('');
+
+                    const frame = $id('mailFrame');
+                    frame.style.height = '';
+                    if (msg.HTML) {
+                        frame.onload = () => {
+                            try {
+                                const d = frame.contentDocument;
+                                const h = Math.max(d.documentElement.scrollHeight, d.body ? d.body.scrollHeight : 0);
+                                frame.style.height = Math.min(Math.max(h + 8, 240), 6000) + 'px';
+                                m.remoteBlocked = d.querySelectorAll('img[src^="http"], img[src^="//"]').length;
+                                this.renderMailReader();
+                            } catch (e) {}
+                        };
+                        frame.srcdoc = this.mailHtmlDoc(msg);
+                    } else {
+                        frame.onload = null;
+                        frame.srcdoc = '';
+                    }
+                    $id('mailText').innerHTML = msg.Text ? this.linkify(msg.Text) : '<span style="color: var(--text-faint)">(no text part)</span>';
+
+                    const att = $id('mailAttachments');
+                    const files = msg.Attachments || [];
+                    show(att, files.length > 0);
+                    att.innerHTML = files.map(f =>
+                        '<a class="pill" href="/mail-api/v1/message/' + encodeURIComponent(msg.ID) + '/part/' + encodeURIComponent(f.PartID) + '" target="_blank" rel="noopener" download="' + this.escapeHtml(f.FileName || 'attachment') + '">'
+                        + this.escapeHtml(f.FileName || 'attachment') + ' <span style="color: var(--text-faint)">' + this.formatSize(f.Size) + '</span></a>').join('');
+                    $id('mailOpenInMailpit').href = this.mailpitUrl + '/view/' + encodeURIComponent(msg.ID);
+                }
+
+                const row = m.items.find(x => x.ID === msg.ID);
+                $id('btnMailUnread').textContent = (row && !row.Read) ? 'mark read' : 'mark unread';
+                document.querySelectorAll('#mailParts .mail-part').forEach(b => {
+                    const part = b.dataset.part;
+                    show(b, part !== 'html' || !!msg.HTML);
+                    b.classList.toggle('is-active', m.part === part);
+                    b.setAttribute('aria-selected', m.part === part ? 'true' : 'false');
+                });
+                show($id('mailFrame'), m.part === 'html');
+                show($id('mailText'), m.part === 'text');
+                show($id('mailHeaders'), m.part === 'headers');
+                if (m.part === 'headers') $id('mailHeaders').textContent = m.headers === '' ? 'Loading…' : (m.headers || '');
+                const note = $id('mailRemoteNote');
+                show(note, m.part === 'html' && m.remoteBlocked > 0);
+                note.textContent = m.remoteBlocked + ' remote image' + (m.remoteBlocked === 1 ? '' : 's') + ' blocked';
+            },
+
+            renderMailFooter() {
+                if (this.view !== 'mail') return;
+                const m = this.mail;
+                const total = m.total, unread = m.unread;
+                const q = this.mailQuery;
+                let label;
+                if (m.error && !m.loaded) label = '';
+                else if (q) label = m.matched + ' of ' + total + ' message' + (total === 1 ? '' : 's');
+                else label = total + ' message' + (total === 1 ? '' : 's') + (unread ? ' · ' + unread + ' unread' : '');
+                $id('mailCount').textContent = label;
+                const db = $id('mailDbSize');
+                show(db, !!(m.info && m.info.DatabaseSize));
+                if (m.info && m.info.DatabaseSize) { db.textContent = '· ' + this.formatSize(m.info.DatabaseSize) + ' on disk'; db.title = m.info.Database || ''; }
+                const pager = $id('mailPager');
+                show(pager, m.matched > m.limit);
+                if (m.matched > m.limit) {
+                    $id('mailRange').textContent = (m.start + 1) + '–' + Math.min(m.start + m.limit, m.matched);
+                    $id('btnMailNewer').disabled = m.start === 0;
+                    $id('btnMailOlder').disabled = m.start + m.limit >= m.matched;
+                }
+            },
+
+            renderView() {
+                show($id('sitesCard'), this.view !== 'mail');
+                show($id('mailCard'), this.view === 'mail');
+                document.querySelectorAll('.nav-view').forEach(b => {
+                    const on = b.dataset.view === this.view;
+                    b.classList.toggle('is-active', on);
+                    b.setAttribute('aria-selected', on ? 'true' : 'false');
+                });
+                const badge = $id('mailBadge');
+                const n = this.mail.unread;
+                show(badge, n > 0);
+                badge.textContent = n > 99 ? '99+' : String(n);
+                $id('btnMailView').title = n ? (n + ' unread message' + (n === 1 ? '' : 's')) : 'Open mail';
+            },
+
+            bindMailEvents() {
+                document.querySelectorAll('.nav-view').forEach(b => b.addEventListener('click', () => this.setView(b.dataset.view)));
+                $id('btnMailView').addEventListener('click', () => this.setView('mail'));
+                window.addEventListener('hashchange', () => this.readViewFromHash());
+
+                const search = $id('mailSearch');
+                search.addEventListener('input', () => {
+                    this.mail.query = search.value;
+                    clearTimeout(this.mail.searchTimer);
+                    this.mail.searchTimer = setTimeout(() => this.loadMail(), 250);
+                    this.renderMailChrome();
+                });
+                search.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); clearTimeout(this.mail.searchTimer); this.loadMail(); }
+                    if (e.key === 'Escape') {
+                        e.preventDefault(); e.stopPropagation();
+                        this.mail.query = ''; search.value = ''; search.blur();
+                        this.loadMail();
+                    }
+                });
+                $id('btnMailSearchClear').addEventListener('click', () => { this.mailClearFilters(); search.focus(); });
+                $id('mailSiteChipClear').addEventListener('click', () => { this.setMailSite(null); search.focus(); });
+                $id('mailUnreadOnly').addEventListener('change', (e) => { this.mail.unreadOnly = e.target.checked; this.loadMail(); });
+                $id('btnMailReadAll').addEventListener('click', () => this.mailReadAll());
+                $id('btnMailDeleteAll').addEventListener('click', () => this.mailDeleteAll());
+                $id('btnMailNewer').addEventListener('click', () => this.mailPage(-1));
+                $id('btnMailOlder').addEventListener('click', () => this.mailPage(1));
+
+                $id('mailList').addEventListener('click', (e) => {
+                    const row = e.target.closest('.mail-row');
+                    if (!row) return;
+                    const chip = e.target.closest('.mail-site');
+                    if (chip) { this.setMailSite(chip.textContent); return; }
+                    this.openMail(row.dataset.id);
+                });
+                $id('mailParts').addEventListener('click', (e) => {
+                    const b = e.target.closest('.mail-part');
+                    if (b) this.setMailPart(b.dataset.part);
+                });
+                $id('btnMailUnread').addEventListener('click', () => {
+                    const it = this.mail.items.find(x => x.ID === this.mail.selectedId);
+                    if (it) this.mailSetRead([it.ID], !it.Read);
+                    else if (this.mail.selectedId) this.mailSetRead([this.mail.selectedId], false);
+                });
+                $id('btnMailDelete').addEventListener('click', () => { if (this.mail.selectedId) this.mailDelete([this.mail.selectedId]); });
+                $id('btnMailBack').addEventListener('click', () => this.closeMail());
+                $id('mailMsgLinks').addEventListener('click', (e) => {
+                    const b = e.target.closest('.mail-link-copy');
+                    if (!b) return;
+                    navigator.clipboard.writeText(b.dataset.url)
+                        .then(() => this.showSnack('Link copied.'))
+                        .catch(() => this.showSnack('Could not copy.', true));
+                });
+                document.addEventListener('visibilitychange', () => {
+                    if (!document.hidden && this.view === 'mail') this.loadMail({ keepStart: true });
+                });
+            },
+
             // --- Command palette -------------------------------------------
             // Results mix matching sites with global commands. Sites are ranked
             // by match position so a prefix hit beats a mid-string one.
@@ -4847,7 +5815,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     { key: 'cmd:reload',  kind: 'cmd', label: 'Reload server',       meta: '',  run: () => { this.closePalette(); this.reloadServer(); } },
                     { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
                     { key: 'cmd:db',      kind: 'cmd', label: 'Open database',       meta: '',  run: () => { this.closePalette(); window.open('https://db.cove.localhost' + PORT_SUFFIX, '_blank', 'noopener'); } },
-                    { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: '',  run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
+                    { key: 'cmd:mailview',kind: 'cmd', label: 'Mail',                meta: '',  run: () => { this.closePalette(); this.setView('mail'); } },
+                    { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: 'external', run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
                     { key: 'cmd:creds',   kind: 'cmd', label: 'Database credentials',meta: '',  run: () => { this.closePalette(); this.setDbModal(true); } },
                     { key: 'cmd:theme',   kind: 'cmd', label: 'Toggle theme',        meta: '',  run: () => { this.closePalette(); this.toggleTheme(); } },
                 ];
@@ -4930,7 +5899,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     (svc.actions || []).forEach(a => {
                         let el;
                         if (a.kind === 'open') { el = document.createElement('a'); el.href = a.href; el.target = '_blank'; el.rel = 'noopener'; }
-                        else { el = document.createElement('button'); el.type = 'button'; el.addEventListener('click', () => { this.setDbModal(false); if (a.kind === 'reload') this.reloadServer(); }); }
+                        else { el = document.createElement('button'); el.type = 'button'; el.addEventListener('click', () => { this.setDbModal(false); if (a.kind === 'reload') this.reloadServer(); if (a.kind === 'mail') this.setView('mail'); }); }
                         el.className = 'pill'; el.textContent = a.label;
                         svcActions.insertBefore(el, $id('btnDbClose'));
                     });
