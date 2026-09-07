@@ -3698,7 +3698,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             font-feature-settings: "ss01", "cv11";
         }
 
-        .wrap { max-width: 820px; margin: 0 auto; }
+        /* The page widens for mail and databases; ease the width so a view
+           switch reads as the same page reshaping, not a new one landing. */
+        .wrap { max-width: 820px; margin: 0 auto; transition: max-width 280ms cubic-bezier(0.2, 0.7, 0.2, 1); }
 
         /* Top nav */
         .nav { position: relative; }
@@ -3939,6 +3941,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            an element is all it takes to get the fade. */
         @keyframes cove-fade { from { opacity: 0; } }
         .new-site-alert, .filter-chip, .add-row, .modal-backdrop, .ctx-menu, .palette-backdrop, .snackbar { animation: cove-fade 140ms ease; }
+        /* Views are swapped with display, which restarts the animation, so
+           the incoming card fades and settles as the wrap eases to its width. */
+        @keyframes cove-view-in { from { opacity: 0; transform: translateY(4px); } }
+        .wrap > .card { animation: cove-view-in 220ms ease; }
+        @media (prefers-reduced-motion: reduce) {
+            .wrap { transition: none; }
+            .wrap > .card { animation: none; }
+        }
 
         /* Modal */
         .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: grid; place-items: center; z-index: 80; padding: 1rem; }
