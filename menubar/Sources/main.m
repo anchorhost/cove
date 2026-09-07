@@ -554,7 +554,7 @@ static const NSInteger kServiceRowStartIndex = 2;
 
     [self.menu addItem:[NSMenuItem separatorItem]];
 
-    self.dashboardItem = [self linkItemWithTitle:@"Open Cove Dashboard"
+    self.dashboardItem = [self linkItemWithTitle:@"Open Dashboard"
                                           action:@selector(openDashboard)];
     [self.menu addItem:self.dashboardItem];
     self.adminerItem = [self linkItemWithTitle:@"Open Adminer"
