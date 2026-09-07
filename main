@@ -186,7 +186,7 @@ RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.15"
+COVE_VERSION="1.16"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -200,7 +200,7 @@ MU_PLUGIN_VERSION="0.6.1"
 # time). Bump whenever anything under menubar/ changes — post-upgrade compares
 # this against the installed bundle's CFBundleShortVersionString to decide
 # whether an enabled menu bar needs a rebuild. Opt-in: never auto-installed.
-MENUBAR_VERSION="1.1"
+MENUBAR_VERSION="1.2"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture

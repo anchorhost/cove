@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [1.16] - 2026-09-07
+
+The dashboard becomes the place you actually work. Three new views sit beside the site list — **mail**, an inbox of everything your sites send, scoped per site with reset links lifted out of each message; **databases**, a browser with in-place editing and a SQL console; and **logs**, PHP errors per site, `debug.log`, and access logs, live — each with a real URL and a crossfade between them. Cove has a new mark, the "Inked" surfaces to go with it, three-way theming, service panels in the top bar, and Adminer that signs you in. Mailpit no longer throws away mail past 500 messages, and `sudo cove upgrade` no longer builds a second Cove under `/root`.
 
 ### ✨ New Features
 
