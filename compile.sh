@@ -28,7 +28,7 @@ fi
 # would exit 0 and ship a cove.sh whose `cove menubar enable` is broken for
 # every user.
 MENUBAR_DIR="menubar"
-for menubar_file in Sources/main.m Resources/Info.plist Resources/Assets/cove-logo.svg; do
+for menubar_file in Sources/main.m Resources/Info.plist Resources/Assets/cove-logo.svg Linux/cove-tray.py; do
     if [ ! -f "$MENUBAR_DIR/$menubar_file" ]; then
         echo "Error: ${MENUBAR_DIR}/${menubar_file} not found — cannot embed the menu bar app." >&2
         exit 1
@@ -58,17 +58,18 @@ for cmd_file in $(find "$COMMANDS_DIR" -type f | sort); do
     fi
 done
 
-# 4. Embed the macOS menu bar app (menubar/) as emitter functions so the
+# 4. Embed the menu bar apps (menubar/) as emitter functions so the
 #    distributed cove.sh stays a single self-contained file. Sources are kept
 #    as real editable files in menubar/ and inlined here at compile time:
-#    main.m + Info.plist + the SVG logo as quoted heredocs.
-#    `cove menubar enable` writes these out and builds locally with clang.
-#    Presence of all three source files was asserted up top, before any
+#    main.m + Info.plist + the SVG logo (macOS) and cove-tray.py (Linux) as
+#    quoted heredocs. `cove menubar enable` writes these out — building
+#    locally with clang on macOS, running as-is under python3 on Linux.
+#    Presence of all four source files was asserted up top, before any
 #    output was written.
 if [ -d "$MENUBAR_DIR" ]; then
-    echo "   - Embedding macOS menu bar app from ${MENUBAR_DIR}/"
+    echo "   - Embedding menu bar apps (macOS + Linux) from ${MENUBAR_DIR}/"
     {
-        echo "# --- Embedded macOS Menu Bar App (generated from ${MENUBAR_DIR}/ by compile.sh) ---"
+        echo "# --- Embedded Menu Bar Apps (generated from ${MENUBAR_DIR}/ by compile.sh) ---"
         echo ""
         echo "emit_menubar_main_m() {"
         echo "cat <<'COVE_MENUBAR_MAIN_M_EOF'"
@@ -86,6 +87,12 @@ if [ -d "$MENUBAR_DIR" ]; then
         echo "cat <<'COVE_MENUBAR_ICON_EOF'"
         cat "$MENUBAR_DIR/Resources/Assets/cove-logo.svg"
         echo "COVE_MENUBAR_ICON_EOF"
+        echo "}"
+        echo ""
+        echo "emit_menubar_tray_py() {"
+        echo "cat <<'COVE_MENUBAR_TRAY_EOF'"
+        cat "$MENUBAR_DIR/Linux/cove-tray.py"
+        echo "COVE_MENUBAR_TRAY_EOF"
         echo "}"
         echo ""
     } >> "$OUTPUT_FILE"

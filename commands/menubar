@@ -1,23 +1,64 @@
-# --- macOS Menu Bar App ---
-# Native menu bar companion (menubar/ in the repo), embedded into cove.sh at
-# compile time and built locally with clang. Originally by Robby McCullough
-# (github.com/RobbyMcCullough/cove-menubar, MIT), folded in with his blessing.
+# --- Menu Bar App ---
+# Menu bar companion (menubar/ in the repo), embedded into cove.sh at compile
+# time. On macOS it is a native app (menubar/Sources/main.m) built locally with
+# clang; on Linux it is a system tray app (menubar/Linux/cove-tray.py) run
+# as-is under python3 with GTK 3 + AyatanaAppIndicator3. Originally by Robby
+# McCullough (github.com/RobbyMcCullough/cove-menubar, MIT), folded in with
+# his blessing.
 MENUBAR_APP_PATH="$HOME/Applications/Cove Menu Bar.app"
+MENUBAR_LINUX_DIR="$HOME/.local/share/cove-menubar"
+MENUBAR_AUTOSTART_FILE="$HOME/.config/autostart/cove-menubar.desktop"
 
-# Prints the CFBundleShortVersionString of the installed app, or nothing if the
-# app is missing or the plist is unreadable (e.g. a pre-official install).
+# Prints the installed app's version, or nothing if it is missing or unreadable
+# (e.g. a pre-official macOS install): the bundle's CFBundleShortVersionString
+# on macOS, the VERSION file on Linux.
 menubar_installed_version() {
-    /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
-        "$MENUBAR_APP_PATH/Contents/Info.plist" 2>/dev/null
+    if [ "$OS" == "macos" ]; then
+        /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
+            "$MENUBAR_APP_PATH/Contents/Info.plist" 2>/dev/null
+    else
+        cat "$MENUBAR_LINUX_DIR/VERSION" 2>/dev/null
+    fi
+}
+
+# True when the companion is installed on this platform.
+menubar_is_enabled() {
+    if [ "$OS" == "macos" ]; then
+        [ -d "$MENUBAR_APP_PATH" ]
+    else
+        [ -d "$MENUBAR_LINUX_DIR" ]
+    fi
+}
+
+# Platform gate shared by enable/disable. WSL has no system tray to host an
+# indicator, so it is refused up front rather than failing at launch.
+menubar_require_platform() {
+    if [ "$OS" == "macos" ]; then
+        return 0
+    fi
+    if [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; then
+        return 0
+    fi
+    if [ "$IS_WSL" = true ]; then
+        gum style --foreground red "❌ The menu bar app needs a desktop session; WSL has no system tray."
+    else
+        gum style --foreground red "❌ The menu bar app is only available on macOS and Linux desktops."
+    fi
+    exit 1
 }
 
 cove_menubar_enable() {
     local quiet="$1"
-
-    if [ "$OS" != "macos" ]; then
-        gum style --foreground red "❌ The menu bar app is only available on macOS."
-        exit 1
+    menubar_require_platform
+    if [ "$OS" == "macos" ]; then
+        cove_menubar_enable_macos "$quiet"
+    else
+        cove_menubar_enable_linux "$quiet"
     fi
+}
+
+cove_menubar_enable_macos() {
+    local quiet="$1"
 
     # clang ships with the Command Line Tools, which Homebrew already requires.
     if ! command -v clang &>/dev/null || ! xcode-select -p &>/dev/null; then
@@ -118,15 +159,123 @@ cove_menubar_enable() {
         "Remove it anytime with: cove menubar disable"
 }
 
-cove_menubar_disable() {
-    if [ "$OS" != "macos" ]; then
-        gum style --foreground red "❌ The menu bar app is only available on macOS."
-        exit 1
+# Can python3 load the two GObject-introspection libraries the tray needs?
+menubar_linux_deps_ok() {
+    command -v python3 &>/dev/null || return 1
+    python3 - <<'EOM' &>/dev/null
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import Gtk, AyatanaAppIndicator3
+EOM
+}
+
+cove_menubar_enable_linux() {
+    local quiet="$1"
+
+    if ! menubar_linux_deps_ok; then
+        echo "📦 The tray app needs python3 with GTK 3 and AyatanaAppIndicator3 bindings."
+        if command -v apt-get &>/dev/null; then
+            local pkgs="python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7"
+            if [ -t 0 ]; then
+                if ! gum confirm "Install them now? (sudo apt-get install $pkgs)"; then
+                    echo "Aborted."
+                    exit 1
+                fi
+            else
+                echo "   Installing via apt..."
+            fi
+            # shellcheck disable=SC2086
+            if ! $SUDO_CMD apt-get install -y $pkgs; then
+                gum style --foreground red "❌ apt-get install failed."
+                exit 1
+            fi
+        else
+            gum style --foreground red "❌ Install them with your package manager, then re-run 'cove menubar enable':"
+            echo "   Fedora: sudo dnf install python3-gobject gtk3 libayatana-appindicator-gtk3"
+            echo "   Arch:   sudo pacman -S python-gobject gtk3 libayatana-appindicator"
+            exit 1
+        fi
+        if ! menubar_linux_deps_ok; then
+            gum style --foreground red "❌ python3 still cannot load GTK 3 / AyatanaAppIndicator3."
+            exit 1
+        fi
     fi
 
-    if [ ! -d "$MENUBAR_APP_PATH" ]; then
+    # GNOME hides StatusNotifierItems unless an AppIndicator extension is on
+    # (Ubuntu enables one out of the box; vanilla GNOME and Debian do not).
+    # Warn rather than refuse: the extension can be enabled afterwards and the
+    # already-running tray will appear as soon as it is.
+    case "${XDG_CURRENT_DESKTOP:-}" in
+        *GNOME*)
+            if command -v gnome-extensions &>/dev/null \
+                && ! gnome-extensions list --enabled 2>/dev/null | grep -qi appindicator; then
+                echo "⚠️  GNOME only shows tray icons with an AppIndicator extension enabled."
+                echo "   Ubuntu:  gnome-extensions enable ubuntu-appindicators@ubuntu.com"
+                echo "   Others:  install 'AppIndicator and KStatusNotifierItem Support' from extensions.gnome.org"
+            fi
+            ;;
+    esac
+
+    echo "🛠️  Installing Cove Menu Bar v${MENUBAR_VERSION}..."
+    pkill -f "cove-menubar/cove-tray.py" 2>/dev/null || true
+    mkdir -p "$MENUBAR_LINUX_DIR" "$LOGS_DIR" "$(dirname "$MENUBAR_AUTOSTART_FILE")"
+    emit_menubar_tray_py > "$MENUBAR_LINUX_DIR/cove-tray.py"
+    emit_menubar_icon_svg > "$MENUBAR_LINUX_DIR/cove-logo.svg"
+    echo "$MENUBAR_VERSION" > "$MENUBAR_LINUX_DIR/VERSION"
+    chmod +x "$MENUBAR_LINUX_DIR/cove-tray.py"
+    # The tray owns the autostart entry (its "Launch at Login" toggle removes
+    # and re-creates it), so let it write the file: one source of truth.
+    python3 "$MENUBAR_LINUX_DIR/cove-tray.py" --autostart-entry > "$MENUBAR_AUTOSTART_FILE"
+
+    # Launch into the current desktop session. From a terminal inside the
+    # session the bus address and display are already exported; from SSH or a
+    # bare tty they are not, and the autostart entry covers the next login.
+    local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$runtime_dir/bus" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
+    fi
+    local launched=false
+    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && { [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; }; then
+        setsid nohup python3 "$MENUBAR_LINUX_DIR/cove-tray.py" \
+            >"$LOGS_DIR/menubar-stderr.log" 2>&1 </dev/null &
+        launched=true
+    fi
+
+    if [ "$quiet" == "quiet" ]; then
+        echo "   - Cove Menu Bar updated to v${MENUBAR_VERSION}."
+        return 0
+    fi
+
+    echo ""
+    if [ "$launched" = true ]; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Cove Menu Bar is enabled" \
+            "Look for the Cove icon in your system tray." \
+            "It starts at login and stays up to date via 'cove upgrade'." \
+            "Remove it anytime with: cove menubar disable"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Cove Menu Bar is enabled" \
+            "No desktop session was detected from this shell, so the tray" \
+            "will appear at your next login (or run it now from a terminal" \
+            "inside your session: python3 $MENUBAR_LINUX_DIR/cove-tray.py &)." \
+            "Remove it anytime with: cove menubar disable"
+    fi
+}
+
+cove_menubar_disable() {
+    menubar_require_platform
+    if ! menubar_is_enabled; then
         echo "The menu bar app is not enabled."
         exit 0
+    fi
+    if [ "$OS" != "macos" ]; then
+        pkill -f "cove-menubar/cove-tray.py" 2>/dev/null || true
+        rm -rf "$MENUBAR_LINUX_DIR"
+        rm -f "$MENUBAR_AUTOSTART_FILE"
+        echo "✅ Cove Menu Bar disabled and removed."
+        return 0
     fi
 
     pkill -x CoveMenuBar 2>/dev/null || true
@@ -139,11 +288,14 @@ cove_menubar_disable() {
 }
 
 # Called from post-upgrade. Strictly opt-in: does nothing unless the app is
-# already installed. Rebuilds only when the installed bundle's version differs
-# from MENUBAR_VERSION (a missing/unreadable version — e.g. the original
-# standalone install — counts as out of date and gets adopted).
+# already installed. Rebuilds only when the installed version differs from
+# MENUBAR_VERSION (a missing/unreadable version — e.g. the original
+# standalone macOS install — counts as out of date and gets adopted).
 menubar_refresh_if_enabled() {
-    if [ "$OS" != "macos" ] || [ ! -d "$MENUBAR_APP_PATH" ]; then
+    if [ "$OS" == "linux" ] && [ "$IS_WSL" = true ]; then
+        return 0
+    fi
+    if ! menubar_is_enabled; then
         return 0
     fi
 
@@ -169,18 +321,19 @@ cove_menubar() {
         *)
             echo "Usage: cove menubar <subcommand>"
             echo ""
-            echo "Manage the native macOS menu bar companion app."
-            echo "Shows service status at a glance and can start/stop Cove,"
-            echo "open the Dashboard, Adminer, Mailpit, and logs."
+            echo "Manage the menu bar companion app (a native menu bar app on macOS,"
+            echo "a system tray app on Linux desktops). Shows service status at a"
+            echo "glance and can start/stop Cove, open or log in to sites, and open"
+            echo "the Dashboard, Adminer, Mailpit, and logs."
             echo ""
             echo "Subcommands:"
             echo "  enable     Build, install, and launch the menu bar app (also updates it)"
             echo "  disable    Quit and remove the menu bar app"
             echo ""
-            if [ "$OS" == "macos" ]; then
+            if [ "$OS" == "macos" ] || { [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; }; then
                 local installed
                 installed=$(menubar_installed_version)
-                if [ -d "$MENUBAR_APP_PATH" ]; then
+                if menubar_is_enabled; then
                     echo "Currently: enabled (v${installed:-unknown})"
                 else
                     echo "Currently: disabled"

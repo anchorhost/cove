@@ -196,9 +196,11 @@ WHOOPS_VERSION="2.18.0"
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
 MU_PLUGIN_VERSION="0.6.1"
-# Version of the macOS menu bar companion app (menubar/, embedded at compile
-# time). Bump whenever anything under menubar/ changes — post-upgrade compares
-# this against the installed bundle's CFBundleShortVersionString to decide
+# Version of the menu bar companion apps (menubar/, embedded at compile
+# time): the macOS app under Sources/ and the Linux tray under Linux/ share
+# this one number. Bump whenever anything under menubar/ changes — post-upgrade
+# compares it against the installed copy (the bundle's
+# CFBundleShortVersionString on macOS, the VERSION file on Linux) to decide
 # whether an enabled menu bar needs a rebuild. Opt-in: never auto-installed.
 MENUBAR_VERSION="1.2"
 CADDY_CMD="frankenphp"
@@ -8611,6 +8613,8 @@ show_general_help() {
     echo "  tailscale        Expose all sites to your Tailscale network."
     if [ "$OS" == "macos" ]; then
         echo "  menubar          Manage the macOS menu bar companion app."
+    elif [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; then
+        echo "  menubar          Manage the system tray companion app."
     fi
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  lan              Enable LAN access to sites for mobile app sync."
@@ -8867,16 +8871,18 @@ display_command_help() {
         menubar)
             echo "Usage: cove menubar <subcommand>"
             echo ""
-            echo "Manage the native macOS menu bar companion app."
-            echo "The menu bar icon shows Cove's status at a glance and can start/stop"
-            echo "services and open the Dashboard, Adminer, Mailpit, and logs."
+            echo "Manage the menu bar companion app: a native menu bar app on macOS,"
+            echo "a system tray app on Linux desktops. The icon shows Cove's status at"
+            echo "a glance; the menu can start/stop services, open sites (or log in to"
+            echo "them), and open the Dashboard, Adminer, Mailpit, and logs."
             echo ""
             echo "Subcommands:"
             echo "  enable     Build, install, and launch the menu bar app (also updates it)"
             echo "  disable    Quit and remove the menu bar app"
             echo ""
-            echo "The app is built locally (requires Apple Command Line Tools) and is"
-            echo "strictly opt-in — once enabled, 'cove upgrade' keeps it up to date."
+            echo "macOS builds the app locally (requires Apple Command Line Tools); Linux"
+            echo "needs python3 with GTK 3 and AyatanaAppIndicator3 (offered via apt)."
+            echo "Strictly opt-in — once enabled, 'cove upgrade' keeps it up to date."
             echo ""
             echo "Examples:"
             echo "  cove menubar enable"

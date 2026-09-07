@@ -22,7 +22,7 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
   * **Hosts File Automation**: Cove manages `/etc/hosts` entries for you — no manual editing.
   * **Pretty Errors**: Whoops renders beautiful PHP error pages with stack traces and editor integration.
   * **Health Check**: `cove health` diagnoses crashes, OPcache pressure, and on-disk hygiene, and recommends fixes without changing anything.
-  * **Menu Bar App**: On macOS, `cove menubar enable` builds a tiny native companion showing service status at a glance.
+  * **Menu Bar App**: `cove menubar enable` adds a tiny companion showing service status at a glance — a native menu bar app on macOS, a system tray app on Linux desktops — with start/stop, one-click site open or admin login, and quick links.
   * **Custom Caddy Rules**: Per-site directives for reverse proxies, auth, headers, or anything else Caddy supports.
 
 ## Core Technologies
@@ -101,7 +101,7 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove status` | Checks the status of all background services. |
 | `cove reload` | Regenerates the Caddyfile and reloads the Caddy server. |
 | `cove health` | Read-only diagnostic: service liveness, FrankenPHP process state and last exit, recent segfaults classified by cause, live OPcache pressure, and on-disk hygiene. Recommends fixes, changes nothing. |
-| `cove menubar <enable\|disable>` | (macOS only) Native menu bar app showing service status at a glance, with start/stop controls and quick links to the Dashboard, Adminer, and Mailpit. Opt-in; built locally, no extra download. Originally by [Robby McCullough](https://github.com/RobbyMcCullough/cove-menubar). |
+| `cove menubar <enable\|disable>` | Menu bar companion showing service status at a glance, with start/stop controls, a Sites menu (open a site, or log in to a WordPress site as admin), and quick links to the Dashboard, Adminer, and Mailpit. Native menu bar app on macOS (built locally with clang), system tray app on Linux desktops (python3 + GTK 3 + AyatanaAppIndicator3, offered via apt). Opt-in; no extra download. Originally by [Robby McCullough](https://github.com/RobbyMcCullough/cove-menubar). |
 
 ### Database
 
@@ -261,7 +261,7 @@ Cove is built from modular source files that are compiled into a single distribu
 cove/
 ├── main                 # Core script: globals, helpers, the dashboard, and command routing
 ├── commands/            # Individual command files (one per command)
-├── menubar/             # Source for the macOS menu bar app, embedded into cove.sh at compile time
+├── menubar/             # Menu bar apps (macOS native + Linux tray), embedded into cove.sh at compile time
 ├── adminer-theme/       # The Cove theme for Adminer (fetched at install/upgrade)
 ├── compile.sh           # Combines main + commands + menubar into cove.sh
 ├── cove.sh              # Compiled output (auto-generated, do not edit directly)
