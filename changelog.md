@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### ✨ New Features
+
+* **Menu Bar App for Linux:** `cove menubar enable` now works on Linux desktops too. It installs a system tray companion — the same menu as the macOS app, published as a StatusNotifierItem so it appears on COSMIC, KDE, XFCE, MATE, Cinnamon, and GNOME with an AppIndicator extension. The icon reads Cove's state at a glance (colour when everything is running, light grey when some services are, dark grey when stopped); the menu shows each service, starts and stops Cove, reloads Caddy, lists every site with **Open** or **Log in** for WordPress sites, creates a new site, opens the Dashboard, Adminer, Mailpit, the logs and the Sites folder, checks daily for Cove updates, and notifies when a service dies unexpectedly. **Launch at Login** is an XDG autostart entry. There is no build step: it is a single Python file over GTK 3 and AyatanaAppIndicator3, and enable offers to install those bindings with apt when they are missing. WSL is refused up front since it has no tray to host an icon.
+
+### 🛠️ Improvements & Changes
+
+* **Menu Bar Wording:** The macOS menu's "Open Cove Dashboard" is now "Open Dashboard", matching its Adminer and Mailpit neighbours and the new Linux tray.
+
 ## [1.16] - 2026-09-07
 
 The dashboard becomes the place you actually work. Three new views sit beside the site list — **mail**, an inbox of everything your sites send, scoped per site with reset links lifted out of each message; **databases**, a browser with in-place editing and a SQL console; and **logs**, PHP errors per site, `debug.log`, and access logs, live — each with a real URL and a crossfade between them. Cove has a new mark, the "Inked" surfaces to go with it, three-way theming, service panels in the top bar, and Adminer that signs you in. Mailpit no longer throws away mail past 500 messages, and `sudo cove upgrade` no longer builds a second Cove under `/root`.
