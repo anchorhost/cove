@@ -6020,7 +6020,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (this.db.name && this.db.table) this.loadDbRows();
                 }
                 if (view === 'logs') {
-                    if (!this.logs.sourcesLoaded) this.loadLogSources();
+                    // Chrome and sidebar reflect the (possibly new) site right
+                    // away; sizes and last-activity times are refreshed each
+                    // visit, since they are cheap and change constantly.
+                    this.renderLogs();
+                    this.loadLogSources();
                     this.loadLogs();
                     this.startLogsPolling();
                 } else {
