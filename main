@@ -1709,7 +1709,9 @@ if [ ! -x "\$mailpit_bin" ]; then
     exit 127
 fi
 
-exec "\$mailpit_bin" --database "\$db_path" --label Cove
+# --max 0 lifts Mailpit's default cap of 500 stored messages; local mail is
+# small and the point of catching it is to still have it later.
+exec "\$mailpit_bin" --database "\$db_path" --label Cove --max 0
 EOM
     chmod +x "$script_path"
     echo "$script_path"
