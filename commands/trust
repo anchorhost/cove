@@ -2,9 +2,9 @@ cove_trust() {
     echo "🔐 Installing Cove's local root certificate..."
 
     # FrankenPHP's `trust` subcommand writes the Caddy local root into the
-    # system store and any NSS DBs it discovers at the standard paths. On
-    # macOS that's the login keychain; on Linux it's /usr/local/share/ca-
-    # certificates + ~/.pki/nssdb + ~/.mozilla/firefox/*.
+    # system store: the login keychain on macOS, /usr/local/share/ca-
+    # certificates on Linux. Browsers on Linux need their NSS databases
+    # handled separately below.
     #
     # Safe to re-run — all writes are idempotent.
 
@@ -41,9 +41,13 @@ cove_trust() {
     fi
     echo "$trust_output" | grep -vE '^\{|^$' || true
 
-    # Linux-only: Firefox and Chromium ship as snaps on Ubuntu 22+ and
-    # store their NSS DBs under ~/snap/... — a path that neither Caddy nor
-    # mkcert scans. Inject the root explicitly for each profile we find.
+    # Linux-only: browsers do not read the system store. Chrome, Chromium,
+    # Brave, Edge and Vivaldi (deb/rpm builds) read the shared NSS DB at
+    # ~/.pki/nssdb; Firefox keeps one per profile under ~/.mozilla/firefox;
+    # the snap builds live under ~/snap/<app>/...; Flatpak builds under
+    # ~/.var/app/<id>/.... `frankenphp trust` runs under sudo above, so its
+    # own NSS scan looks in root's home and never reaches any of these.
+    # Inject the root explicitly into every NSS DB we can find.
     if [ "$OS" = "linux" ] && command -v certutil &>/dev/null; then
         local root_cert
         root_cert=$(find "$HOME/.local/share/caddy/pki/authorities/local" \
@@ -55,9 +59,17 @@ cove_trust() {
         fi
 
         if [ -n "$root_cert" ] && [ -r "$root_cert" ]; then
-            # Snap Firefox, snap Chromium, plus any other NSS DB under ~/snap.
+            # Chrome creates ~/.pki/nssdb on first run, but a fresh machine
+            # that installs Cove before ever launching a browser has none —
+            # create it (empty password, Chrome's own default) so the root is
+            # already trusted the first time Chrome opens.
+            if [ ! -f "$HOME/.pki/nssdb/cert9.db" ]; then
+                mkdir -p "$HOME/.pki/nssdb"
+                certutil -N -d sql:"$HOME/.pki/nssdb" --empty-password 2>/dev/null || true
+            fi
+
             # The `sql:` prefix tells certutil the DB is the modern cert9 format.
-            local db
+            local db trusted_dbs=0
             while IFS= read -r db; do
                 [ -z "$db" ] && continue
                 local profile_dir
@@ -66,11 +78,36 @@ cove_trust() {
                 # Remove any prior entry under our nickname so re-runs don't
                 # layer stale copies, then add the current root.
                 certutil -D -d sql:"$profile_dir" -n "Cove Local Authority" 2>/dev/null || true
-                certutil -A -d sql:"$profile_dir" -n "Cove Local Authority" -t "C,," -i "$root_cert" 2>/dev/null || true
-            done < <(find "$HOME/snap" "$HOME/.mozilla/firefox" \
+                if certutil -A -d sql:"$profile_dir" -n "Cove Local Authority" -t "C,," -i "$root_cert" 2>/dev/null; then
+                    trusted_dbs=$((trusted_dbs + 1))
+                fi
+            done < <(find "$HOME/.pki" "$HOME/.mozilla/firefox" "$HOME/snap" "$HOME/.var/app" \
                 -name 'cert9.db' 2>/dev/null)
+            if [ "$trusted_dbs" -eq 0 ]; then
+                gum style --foreground yellow "⚠️ No browser certificate databases found — open a browser once, then re-run 'cove trust'."
+            fi
+
+            # Every root rotation (a reinstall, a wiped Caddy data dir) leaves
+            # the previous Caddy_Local_Authority_*.crt behind in the system
+            # store. They are Cove's own files and trust nothing current, so
+            # prune the ones whose fingerprint no longer matches the live root.
+            local live_fp stale_fp stale_file pruned=0
+            live_fp=$(openssl x509 -in "$root_cert" -noout -fingerprint -sha256 2>/dev/null)
+            if [ -n "$live_fp" ]; then
+                for stale_file in /usr/local/share/ca-certificates/Caddy_Local_Authority*.crt; do
+                    [ -f "$stale_file" ] || continue
+                    stale_fp=$(openssl x509 -in "$stale_file" -noout -fingerprint -sha256 2>/dev/null)
+                    if [ -n "$stale_fp" ] && [ "$stale_fp" != "$live_fp" ]; then
+                        $SUDO_CMD rm -f "$stale_file" && pruned=$((pruned + 1))
+                    fi
+                done
+                if [ "$pruned" -gt 0 ]; then
+                    echo "   - Removed $pruned stale Cove root(s) from the system store"
+                    $SUDO_CMD update-ca-certificates --fresh >/dev/null 2>&1 || true
+                fi
+            fi
         else
-            gum style --foreground yellow "⚠️ Could not locate Caddy root.crt — snap Firefox/Chromium trust skipped."
+            gum style --foreground yellow "⚠️ Could not locate Caddy root.crt — browser trust skipped."
         fi
     fi
 

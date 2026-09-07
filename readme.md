@@ -136,7 +136,7 @@ For browsing and editing, the dashboard's **databases** view lists every databas
 | Command | Description |
 | --- | --- |
 | `cove install` | Installs and configures all required dependencies. |
-| `cove trust` | Installs Cove's local root certificate into the system trust store and every Firefox/Chromium profile it can find (snap browsers included). Fresh installs run it automatically; re-run any time the root rotates. |
+| `cove trust` | Installs Cove's local root certificate into the system trust store and every browser certificate database it can find: Chrome/Chromium/Brave/Edge's shared `~/.pki/nssdb`, Firefox profiles, snap and Flatpak browsers. Fresh installs run it automatically; re-run any time the root rotates. |
 | `cove upgrade` | Upgrades Cove, FrankenPHP, and Adminer to the latest versions, and refreshes the managed bits (Whoops, the login helper, the watchdog) across every site. |
 | `cove version` | Displays the current version of Cove. |
 
