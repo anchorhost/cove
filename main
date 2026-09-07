@@ -3700,7 +3700,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
         /* The page widens for mail and databases; ease the width so a view
            switch reads as the same page reshaping, not a new one landing. */
-        .wrap { max-width: 820px; margin: 0 auto; transition: max-width 280ms cubic-bezier(0.2, 0.7, 0.2, 1); }
+        .wrap { position: relative; max-width: 820px; margin: 0 auto; transition: max-width 280ms cubic-bezier(0.2, 0.7, 0.2, 1); }
 
         /* Top nav */
         .nav { position: relative; }
@@ -3941,13 +3941,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            an element is all it takes to get the fade. */
         @keyframes cove-fade { from { opacity: 0; } }
         .new-site-alert, .filter-chip, .add-row, .modal-backdrop, .ctx-menu, .palette-backdrop, .snackbar { animation: cove-fade 140ms ease; }
-        /* Views are swapped with display, which restarts the animation, so
-           the incoming card fades and settles as the wrap eases to its width. */
-        @keyframes cove-view-in { from { opacity: 0; transform: translateY(4px); } }
-        .wrap > .card { animation: cove-view-in 220ms ease; }
+        /* View switch: the incoming card takes the flow at once, while the
+           outgoing one is lifted out of flow, pinned where it was, and faded
+           over it — a crossfade with no frame where the background shows. */
+        @keyframes cove-view-out { to { opacity: 0; } }
+        .wrap > .card.is-leaving { position: absolute; left: 0; right: 0; max-height: 90vh; overflow: hidden; pointer-events: none; z-index: 5; animation: cove-view-out 200ms ease forwards; }
         @media (prefers-reduced-motion: reduce) {
             .wrap { transition: none; }
-            .wrap > .card { animation: none; }
+            .wrap > .card.is-leaving { display: none !important; }
         }
 
         /* Modal */
@@ -5668,8 +5669,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             setView(view, opts = {}) {
                 view = ['mail', 'db'].includes(view) ? view : 'sites';
                 if (view === this.view && !opts.force) return;
+                const prev = this.view;
                 this.view = view;
                 this.closeRowMenu();
+                if (prev !== view) this.crossfadeFrom(prev);
                 document.body.classList.toggle('view-mail', view === 'mail');
                 document.body.classList.toggle('view-db', view === 'db');
                 document.title = { mail: 'Cove — mail', db: 'Cove — databases', sites: 'Cove — sites' }[view];
@@ -6277,10 +6280,27 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 }
             },
 
+            // Keep the outgoing card on screen, out of flow, while it fades;
+            // renderView leaves .is-leaving cards alone until the fade ends.
+            crossfadeFrom(prev) {
+                const out = $id({ sites: 'sitesCard', mail: 'mailCard', db: 'dbCard' }[prev]);
+                if (!out || out.style.display === 'none') return;
+                if (window.scrollY > 0) window.scrollTo({ top: 0, behavior: 'instant' });
+                document.querySelectorAll('.wrap > .card.is-leaving').forEach(el => { el.classList.remove('is-leaving'); el.style.top = ''; el.style.display = 'none'; });
+                out.style.top = out.offsetTop + 'px';
+                out.classList.add('is-leaving');
+                setTimeout(() => {
+                    out.classList.remove('is-leaving');
+                    out.style.top = '';
+                    this.renderView();
+                }, 220);
+            },
+
             renderView() {
-                show($id('sitesCard'), this.view === 'sites');
-                show($id('mailCard'), this.view === 'mail');
-                show($id('dbCard'), this.view === 'db');
+                const card = (id, on) => { const el = $id(id); if (!el.classList.contains('is-leaving')) show(el, on); };
+                card('sitesCard', this.view === 'sites');
+                card('mailCard', this.view === 'mail');
+                card('dbCard', this.view === 'db');
                 document.querySelectorAll('.nav-view').forEach(b => {
                     const on = b.dataset.view === this.view;
                     b.classList.toggle('is-active', on);
