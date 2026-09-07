@@ -6036,7 +6036,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             get viewPath() {
                 if (this.view === 'mail') return '/mail' + (this.mail.site ? '/' + this.mail.site : '');
                 if (this.view === 'db') return '/db' + (this.db.name ? '/' + encodeURIComponent(this.db.name) + (this.db.table ? '/' + encodeURIComponent(this.db.table) : '') : '');
-                if (this.view === 'logs') return '/logs' + (this.logs.site ? '/' + this.logs.site + '/' + this.logs.tab : (this.logs.source !== 'errors' ? '/@' + this.logs.source : ''));
+                if (this.view === 'logs') return '/logs' + (this.logs.site ? '/' + this.logs.site + (this.logs.tab ? '/' + this.logs.tab : '') : (this.logs.source !== 'errors' ? '/@' + this.logs.source : ''));
                 return '/';
             },
 
@@ -6069,7 +6069,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.setView('db', { force: true });
                 } else if ((m = /^\/logs(?:\/(?:@([a-z0-9.-]+)|([a-z0-9-]+)(?:\/(errors|debug|access))?))?$/i.exec(p))) {
                     if (m[1]) { this.logs.site = null; this.logs.source = m[1].toLowerCase(); }
-                    else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : 'errors'; }
+                    else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : null; }
                     else { this.logs.site = null; this.logs.source = 'errors'; }
                     this.setView('logs', { force: true });
                 } else {
@@ -7408,20 +7408,39 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 return { source: l.source, site: '' };
             },
 
-            async loadLogSources() {
+            loadLogSources() {
                 const l = this.logs;
-                const res = await this.apiPost('log_sources', {}, { quiet: true, timeoutMs: 20000 });
-                if (!res.success) return;
-                l.system = res.system || [];
-                l.sites = (res.sites || []).sort((a, b) => (b.mtime || 0) - (a.mtime || 0) || a.name.localeCompare(b.name));
-                l.dir = res.dir || '';
-                l.sourcesLoaded = true;
-                this.renderLogsSide();
+                if (l.sourcesPromise) return l.sourcesPromise;
+                l.sourcesPromise = this.apiPost('log_sources', {}, { quiet: true, timeoutMs: 20000 }).then(res => {
+                    l.sourcesPromise = null;
+                    if (!res.success) return;
+                    l.system = res.system || [];
+                    l.sites = (res.sites || []).sort((a, b) => (b.mtime || 0) - (a.mtime || 0) || a.name.localeCompare(b.name));
+                    l.dir = res.dir || '';
+                    l.sourcesLoaded = true;
+                    this.renderLogsSide();
+                });
+                return l.sourcesPromise;
+            },
+
+            // A site's PHP errors live in its own debug.log when WordPress
+            // has WP_DEBUG_LOG on (PHP's error_log is pointed there), and in
+            // the shared error log otherwise. With no tab asked for, open
+            // whichever one this site actually writes to.
+            async pickLogsTab() {
+                const l = this.logs;
+                if (!l.site || l.tab) return;
+                if (!l.sourcesLoaded) await this.loadLogSources();
+                const meta = l.sites.find(x => x.name === l.site);
+                l.tab = meta && meta.debug ? 'debug' : 'errors';
+                this.syncUrl({ replace: true });
+                this.renderLogsBar();
             },
 
             async loadLogs(opts = {}) {
                 const l = this.logs;
                 const seq = ++l.seq;
+                if (l.site && !l.tab) { await this.pickLogsTab(); if (seq !== l.seq) return; }
                 const sel = this.logsSelection;
                 if (!opts.older) { l.entries = []; l.nextBefore = null; l.scanned = 0; l.expanded = {}; l.newIds = {}; }
                 l.loading = true; l.error = null;
@@ -7482,8 +7501,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             setLogsSite(name, tab) {
                 const l = this.logs;
                 l.site = name || null;
-                if (tab) l.tab = tab;
-                if (l.site && !['errors', 'debug', 'access'].includes(l.tab)) l.tab = 'errors';
+                l.tab = tab && ['errors', 'debug', 'access'].includes(tab) ? tab : null;
                 this.syncUrl();
                 this.renderLogsChrome();
                 this.renderLogsSide();
@@ -7492,7 +7510,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             openLogsForSite(name) {
                 this.logs.site = name;
-                this.logs.tab = 'errors';
+                this.logs.tab = null;
                 this.setView('logs', { force: true });
             },
 
@@ -7667,6 +7685,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     row.querySelector('.db-row-meta').title = (s.debug ? 'debug.log ' + this.formatSize(s.debug) : 'no debug.log') + ' · ' + (s.access ? 'access log ' + this.formatSize(s.access) : 'no access log');
                     list.insertBefore(row, anchor);
                 }
+                if (l.site && l.scrolledFor !== l.site) {
+                    const sel = list.querySelector('.db-row.is-selected');
+                    if (sel) { l.scrolledFor = l.site; sel.scrollIntoView({ block: 'nearest' }); }
+                }
             },
 
             renderLogsBar() {
@@ -7700,9 +7722,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (empty) {
                     const filtered = l.entries.length > 0;
                     $id('logsEmptyText').textContent = l.missing ? 'No log file yet.' : filtered ? 'Nothing matches.' : (l.site && l.tab === 'errors' ? 'No PHP errors mention this site.' : 'Nothing logged.');
+                    const meta = l.site ? l.sites.find(x => x.name === l.site) : null;
                     $id('logsEmptyHint').textContent = l.missing
                         ? (l.tab === 'debug' ? 'Set WP_DEBUG and WP_DEBUG_LOG in wp-config.php and WordPress will write one.' : '')
-                        : filtered ? 'Press Esc to clear the filters.' : (l.scanned ? 'Looked through the last ' + this.formatSize(l.scanned) + '.' : '');
+                        : filtered ? 'Press Esc to clear the filters.'
+                        : (l.site && l.tab === 'errors' && meta && meta.debug) ? 'This site keeps its PHP errors in its own debug.log — see the debug.log tab.'
+                        : (l.scanned ? 'Looked through the last ' + this.formatSize(l.scanned) + '.' : '');
                 }
                 const tpl = $id('tpl-log-row');
                 const anchor = $id('logsLoading');
