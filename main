@@ -4182,7 +4182,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <div class="nav-views" role="tablist" aria-label="View">
                 <button type="button" class="nav-view is-active" role="tab" data-view="sites" aria-selected="true">sites</button>
                 <button type="button" class="nav-view" role="tab" data-view="mail" aria-selected="false">mail<span class="nav-badge" id="mailBadge" style="display: none;"></span></button>
-                <button type="button" class="nav-view" role="tab" data-view="db" aria-selected="false">db</button>
+                <button type="button" class="nav-view" role="tab" data-view="db" aria-selected="false">databases</button>
             </div>
             <div class="nav-services services">
                 <button type="button" class="dot link" data-service="caddy" title="Caddy status">caddy</button>
@@ -4205,14 +4205,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <header class="card-head">
                 <h1 class="card-title">Sites</h1>
                 <div class="card-actions">
-                    <button type="button" class="pill" id="btnDbView" title="Open databases">
-                        <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5v-9"/><path d="M3 8c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5"/></svg>
-                        db
-                    </button>
-                    <button type="button" class="pill" id="btnMailView" title="Open mail">
-                        <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="12" height="9" rx="1.5"/><path d="M2.5 5 8 9l5.5-4"/></svg>
-                        mail
-                    </button>
                     <button class="pill primary" id="btnToggleAdd">+ add site</button>
                 </div>
             </header>
@@ -6288,12 +6280,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const n = this.mail.unread;
                 show(badge, n > 0);
                 badge.textContent = n > 99 ? '99+' : String(n);
-                $id('btnMailView').title = n ? (n + ' unread message' + (n === 1 ? '' : 's')) : 'Open mail';
+                document.querySelector('.nav-view[data-view="mail"]').title = n ? (n + ' unread message' + (n === 1 ? '' : 's')) : 'Mail';
             },
 
             bindMailEvents() {
                 document.querySelectorAll('.nav-view').forEach(b => b.addEventListener('click', () => this.setView(b.dataset.view)));
-                $id('btnMailView').addEventListener('click', () => this.setView('mail'));
                 window.addEventListener('hashchange', () => this.readViewFromHash());
 
                 const search = $id('mailSearch');
@@ -6917,7 +6908,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             bindDbEvents() {
-                $id('btnDbView').addEventListener('click', () => this.setView('db'));
                 const filter = $id('dbFilter');
                 filter.addEventListener('input', () => { this.db.filter = filter.value; this.renderDbChrome(); this.renderDbList(); });
                 filter.addEventListener('keydown', (e) => {
