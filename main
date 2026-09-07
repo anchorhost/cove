@@ -5218,7 +5218,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 window.addEventListener('pagehide', () => {
                     if (!this.pendingDelete) return;
                     for (const s of this.pendingDelete.sites) {
-                        fetch('api.php', {
+                        fetch('/api.php', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ action: 'delete_site', site_name: s.name }),
@@ -5364,7 +5364,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 // Mail: pick the view from the hash, then keep the unread
                 // badge live over Mailpit's websocket (or a poll when the
                 // socket is unavailable).
-                this.readViewFromHash();
+                this.readViewFromUrl();
                 this.refreshMailCounts();
                 this.connectMailEvents();
             },
@@ -5895,7 +5895,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (this.wpVersionsLoaded) return;
                 this.wpVersionsLoaded = true;
                 try {
-                    const res = await fetch('api.php?action=wp_versions');
+                    const res = await fetch('/api.php?action=wp_versions');
                     const data = await res.json();
                     if (Array.isArray(data)) {
                         this.wpVersions = data;
@@ -6004,7 +6004,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 document.body.classList.toggle('view-db', view === 'db');
                 document.body.classList.toggle('view-logs', view === 'logs');
                 document.title = { mail: 'Cove — mail', db: 'Cove — databases', logs: 'Cove — logs', sites: 'Cove — sites' }[view];
-                this.syncHash();
+                this.syncUrl();
                 this.render();
                 if (view === 'mail') {
                     this.loadMail();
@@ -6025,24 +6025,38 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 }
             },
 
-            // The hash names the view and what is open in it, so a location
-            // can be bookmarked or pasted: #mail, #mail/<site>, #db,
-            // #db/<database>, #db/<database>/<table>.
-            syncHash() {
-                let hash = '';
-                if (this.view === 'mail') hash = '#mail' + (this.mail.site ? '/' + this.mail.site : '');
-                if (this.view === 'db') hash = '#db' + (this.db.name ? '/' + encodeURIComponent(this.db.name) + (this.db.table ? '/' + encodeURIComponent(this.db.table) : '') : '');
-                if (this.view === 'logs') hash = '#logs' + (this.logs.site ? '/' + this.logs.site + '/' + this.logs.tab : (this.logs.source !== 'errors' ? '/@' + this.logs.source : ''));
-                if ((location.hash || '') !== hash) history.replaceState(null, '', location.pathname + location.search + hash);
+            // The URL is a real path naming the view and what is open in
+            // it, pushed with history.pushState so Back and Forward walk the
+            // views: /, /mail, /mail/<site>, /db, /db/<database>[/<table>],
+            // /logs, /logs/@<source>, /logs/<site>/<tab>. The old #hash form
+            // is still understood on load and rewritten.
+            get viewPath() {
+                if (this.view === 'mail') return '/mail' + (this.mail.site ? '/' + this.mail.site : '');
+                if (this.view === 'db') return '/db' + (this.db.name ? '/' + encodeURIComponent(this.db.name) + (this.db.table ? '/' + encodeURIComponent(this.db.table) : '') : '');
+                if (this.view === 'logs') return '/logs' + (this.logs.site ? '/' + this.logs.site + '/' + this.logs.tab : (this.logs.source !== 'errors' ? '/@' + this.logs.source : ''));
+                return '/';
             },
 
-            readViewFromHash() {
-                const h = location.hash || '';
+            syncUrl(opts = {}) {
+                const path = this.viewPath;
+                if (location.pathname === path && !location.hash) return;
+                const url = path + location.search;
+                if (opts.replace) history.replaceState({ cove: true }, '', url);
+                else history.pushState({ cove: true }, '', url);
+            },
+
+            readViewFromUrl() {
+                let p = location.pathname.replace(/\/+$/, '') || '/';
+                // Legacy #mail / #db / #logs links: same grammar, hash-prefixed.
+                if (p === '/' && /^#(mail|db|logs)(\/|$)/i.test(location.hash || '')) {
+                    p = '/' + location.hash.slice(1);
+                    history.replaceState({ cove: true }, '', p + location.search);
+                }
                 let m;
-                if ((m = /^#mail(?:\/([a-z0-9-]+))?$/i.exec(h))) {
+                if ((m = /^\/mail(?:\/([a-z0-9-]+))?$/i.exec(p))) {
                     this.mail.site = m[1] ? m[1].toLowerCase() : null;
                     this.setView('mail', { force: true });
-                } else if ((m = /^#db(?:\/([^\/]+)(?:\/([^\/]+))?)?$/.exec(h))) {
+                } else if ((m = /^\/db(?:\/([^\/]+)(?:\/([^\/]+))?)?$/.exec(p))) {
                     const name = m[1] ? decodeURIComponent(m[1]) : null;
                     const table = m[2] ? decodeURIComponent(m[2]) : null;
                     if (name !== this.db.name) { this.db.tables = []; this.db.wp = null; this.db.tablesFor = null; }
@@ -6050,13 +6064,16 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.db.name = name;
                     this.db.table = table;
                     this.setView('db', { force: true });
-                } else if ((m = /^#logs(?:\/(?:@([a-z0-9.-]+)|([a-z0-9-]+)(?:\/(errors|debug|access))?))?$/i.exec(h))) {
+                } else if ((m = /^\/logs(?:\/(?:@([a-z0-9.-]+)|([a-z0-9-]+)(?:\/(errors|debug|access))?))?$/i.exec(p))) {
                     if (m[1]) { this.logs.site = null; this.logs.source = m[1].toLowerCase(); }
                     else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : 'errors'; }
                     else { this.logs.site = null; this.logs.source = 'errors'; }
                     this.setView('logs', { force: true });
-                } else if (this.view !== 'sites') {
-                    this.setView('sites');
+                } else {
+                    // Unknown path (or /): the sites list, and the address bar
+                    // brought back to a real one.
+                    this.setView('sites', { force: true });
+                    if (p !== '/') history.replaceState({ cove: true }, '', '/' + location.search);
                 }
             },
 
@@ -6072,8 +6089,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             setMailSite(site) {
                 this.mail.site = site || null;
                 this.mail.start = 0;
-                const hash = '#mail' + (this.mail.site ? '/' + this.mail.site : '');
-                history.replaceState(null, '', location.pathname + location.search + hash);
+                this.syncUrl();
                 this.loadMail();
             },
 
@@ -6666,7 +6682,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (this.view !== 'sites') { this.setView('sites'); return; }
                     if (window.scrollY > 0) window.scrollTo({ top: 0, behavior: 'smooth' });
                 });
-                window.addEventListener('hashchange', () => this.readViewFromHash());
+                window.addEventListener('popstate', () => this.readViewFromUrl());
 
                 const search = $id('mailSearch');
                 search.addEventListener('input', () => {
@@ -6792,7 +6808,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('dbFilter').value = '';
                 this.resetDbTable();
                 this.db.table = null;
-                this.syncHash();
+                this.syncUrl();
                 this.renderDb();
                 this.loadDbTables();
             },
@@ -6806,7 +6822,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.db.filter = '';
                 $id('dbFilter').value = '';
                 this.resetDbTable();
-                this.syncHash();
+                this.syncUrl();
                 this.renderDb();
                 if (!this.db.list.length) this.loadDbList();
             },
@@ -6817,7 +6833,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.db.table = table;
                 this.db.sql = false;
                 if (opts.q) { this.db.rows.q = opts.q; this.db.rows.col = opts.col || ''; $id('dbRowsFilter').value = opts.q; }
-                this.syncHash();
+                this.syncUrl();
                 this.renderDb();
                 this.loadDbRows();
             },
@@ -6825,7 +6841,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             closeDbTable() {
                 this.db.table = null;
                 this.resetDbTable();
-                this.syncHash();
+                this.syncUrl();
                 this.renderDb();
             },
 
@@ -7455,7 +7471,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             setLogsSource(key) {
                 const l = this.logs;
                 l.site = null; l.source = key;
-                this.syncHash();
+                this.syncUrl();
                 this.renderLogsSide();
                 this.loadLogs();
             },
@@ -7465,7 +7481,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 l.site = name || null;
                 if (tab) l.tab = tab;
                 if (l.site && !['errors', 'debug', 'access'].includes(l.tab)) l.tab = 'errors';
-                this.syncHash();
+                this.syncUrl();
                 this.renderLogsChrome();
                 this.renderLogsSide();
                 this.loadLogs();
@@ -7958,7 +7974,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // --- Per-site PHP version ---------------------------------------
             loadPhpInfo(force = false) {
                 if (this.phpInfo && !force) return Promise.resolve(this.phpInfo);
-                return fetch('api.php?action=php_info')
+                return fetch('/api.php?action=php_info')
                     .then(r => r.json())
                     .then(d => { this.phpInfo = d; return d; })
                     .catch(() => null); // offline/mid-reload — the modal shows Loading… until retried
@@ -8018,7 +8034,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const wantPin = version === 'default' ? null : version;
                 this.phpInstallPoll = setInterval(async () => {
                     try {
-                        const r = await fetch('api.php?action=list_sites');
+                        const r = await fetch('/api.php?action=list_sites');
                         const data = await r.json();
                         const site = data.find(s => s.name === name);
                         if (site && (site.php_version || null) === wantPin) {
@@ -8222,7 +8238,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const ctrl = timeoutMs ? new AbortController() : null;
                 const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
                 try {
-                    const res = await fetch('api.php', {
+                    const res = await fetch('/api.php', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ action, ...payload }),
@@ -8259,7 +8275,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.isLoading = true;
                 this.render();
                 try {
-                    const r = await fetch('api.php?action=list_sites');
+                    const r = await fetch('/api.php?action=list_sites');
                     const data = await r.json();
                     // Sites staged for deletion are still on disk (nothing
                     // is sent to the backend until the undo window closes),
