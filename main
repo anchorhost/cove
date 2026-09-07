@@ -6315,6 +6315,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             bindMailEvents() {
                 document.querySelectorAll('.nav-view').forEach(b => b.addEventListener('click', () => this.setView(b.dataset.view)));
+                // The wordmark is "home": the sites view, in place. Plain
+                // left-clicks only, so ⌘-click and middle-click still open a
+                // fresh tab like any link.
+                document.querySelector('.nav .logo').addEventListener('click', (e) => {
+                    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+                    e.preventDefault();
+                    if (this.view !== 'sites') { this.setView('sites'); return; }
+                    if (window.scrollY > 0) window.scrollTo({ top: 0, behavior: 'smooth' });
+                });
                 window.addEventListener('hashchange', () => this.readViewFromHash());
 
                 const search = $id('mailSearch');
