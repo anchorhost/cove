@@ -3773,6 +3773,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --panel: #181c19;
             --panel-hover: #1e2320;
             --panel-border: #3a3f3a;
+            --panel-border-strong: #565c56;
             --brand: #1dbcb5;
             --brand: oklch(72% 0.12 190);
             --text: #edeee9;
@@ -3801,6 +3802,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --panel: #ffffff;
             --panel-hover: #f6f4ee;
             --panel-border: #c9c4b6;
+            --panel-border-strong: #9a948a;
             --brand: #00746f;
             --brand: oklch(48% 0.14 190);
             --text: #1a1c1b;
@@ -4023,7 +4025,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .nav-services { display: flex; align-items: center; gap: 0.85rem; margin-left: auto; margin-right: 0.85rem; font-family: var(--font-mono); font-size: 0.74rem; }
 
         /* Keyboard selection. Distinct from :hover so the two can coexist. */
-        .site-row.is-selected { background: var(--panel-hover); box-shadow: inset 2px 0 0 var(--accent); }
+        /* Selected rows: fill plus a hairline, never an accent stripe. */
+        .site-row.is-selected { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--panel-border-strong); }
         .site-row.is-selected .site-actions { opacity: 1; }
         /* Transient: only while this row's context menu is open. Deliberately
            separate from .is-selected — a mouse action shouldn't leave keyboard
@@ -4154,7 +4157,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .mail-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; border-right: 1px solid var(--panel-border); }
         .mail-row { display: grid; grid-template-columns: 10px minmax(0, 1fr); column-gap: 0.55rem; padding: 0.7rem 1rem 0.7rem 0.9rem; border-bottom: 1px solid var(--panel-border); cursor: pointer; transition: background 100ms; }
         .mail-row:hover { background: var(--panel-hover); }
-        .mail-row.is-selected { background: var(--panel-hover); box-shadow: inset 2px 0 0 var(--accent); }
+        .mail-row.is-selected { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--panel-border-strong); }
         .mail-dot { width: 7px; height: 7px; border-radius: 50%; margin-top: 0.45rem; background: transparent; }
         .mail-row.is-unread .mail-dot { background: var(--accent); }
         .mail-main { min-width: 0; }
@@ -4221,7 +4224,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .db-row-line { display: flex; align-items: baseline; gap: 0.6rem; min-width: 0; }
         .db-row-site { align-self: flex-start; }
         .db-row:hover { background: var(--panel-hover); }
-        .db-row.is-selected { background: var(--panel-hover); box-shadow: inset 2px 0 0 var(--accent); }
+        .db-row.is-selected { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--panel-border-strong); }
         .db-row-name { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 0.82rem; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .db-row.is-view .db-row-name { font-style: italic; color: var(--text-dim); }
         .db-row-meta { flex: none; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; }
