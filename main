@@ -3160,7 +3160,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         ['caddyfile', '~/Cove/Caddyfile'],
                     ],
                     'note' => 'One binary: Caddy and the PHP runtime share a process.',
-                    'actions' => [['kind' => 'reload', 'label' => 'reload caddy']],
+                    'actions' => [['kind' => 'logs', 'label' => 'open logs'], ['kind' => 'reload', 'label' => 'reload caddy']],
                 ],
                 'mariadb' => [
                     'label' => 'MariaDB', 'running' => $db_up,
@@ -3463,6 +3463,142 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
             }
             $__fail('Unknown database action.');
+        case 'log_sources':
+        case 'log_read':
+        case 'log_clear':
+            // --- Logs view -------------------------------------------------
+            // Read-only tails of the files Cove already writes: the shared
+            // PHP error log, Caddy's process/reload logs, the watchdog and
+            // Mailpit logs, and per site its WordPress debug.log and Caddy
+            // access log. Files are read backwards in chunks so a 100 MB
+            // error log costs the same as a small one, and the shared error
+            // log can be scoped to one site by the paths in its entries.
+            $__logs_dir = $user_home . '/Cove/Logs';
+            $__log_site = (string) ($input['site'] ?? '');
+            $__log_fail = function ($msg) { echo json_encode(['success' => false, 'message' => $msg]); exit; };
+            if ($__log_site !== '' && !preg_match('/^[a-zA-Z0-9-]+$/', $__log_site)) $__log_fail('Invalid site name.');
+            $__log_resolve = function ($source, $site) use ($__logs_dir, $sitedir) {
+                $site_dir = $site !== '' ? $sitedir . '/' . $site . '.localhost' : null;
+                switch ($source) {
+                    case 'errors':   return [$__logs_dir . '/errors.log', 'php', $site !== '' ? '/Sites/' . $site . '.localhost/' : null];
+                    case 'caddy':    return [$__logs_dir . '/caddy-process.log', 'caddy', null];
+                    case 'reload':   return [$__logs_dir . '/caddy-reload.log', 'caddy', null];
+                    case 'watchdog': return [$__logs_dir . '/watchdog.log', 'plain', null];
+                    case 'mailpit':  return [$__logs_dir . '/mailpit.log', 'plain', null];
+                    case 'debug':    return $site_dir ? [$site_dir . '/public/wp-content/debug.log', 'php', null] : null;
+                    case 'access':   return $site_dir ? [$site_dir . '/logs/caddy.log', 'caddy', null] : null;
+                }
+                if (preg_match('/^fpm-(\d+\.\d+)$/', $source, $m)) return [$__logs_dir . '/php-fpm-' . $m[1] . '.log', 'plain', null];
+                return null;
+            };
+
+            if ($action === 'log_sources') {
+                $system = [];
+                foreach ([['errors', 'php errors'], ['caddy', 'caddy'], ['watchdog', 'watchdog'], ['mailpit', 'mailpit'], ['reload', 'reloads']] as [$key, $label]) {
+                    [$p] = $__log_resolve($key, '');
+                    $system[] = ['key' => $key, 'label' => $label, 'size' => is_file($p) ? filesize($p) : null, 'mtime' => is_file($p) ? filemtime($p) : null];
+                }
+                foreach (glob($__logs_dir . '/php-fpm-*.log') ?: [] as $p) {
+                    if (preg_match('/php-fpm-(\d+\.\d+)\.log$/', $p, $m)) $system[] = ['key' => 'fpm-' . $m[1], 'label' => 'php-fpm ' . $m[1], 'size' => filesize($p), 'mtime' => filemtime($p)];
+                }
+                $sites = [];
+                if (is_dir($sitedir)) {
+                    foreach (scandir($sitedir) as $item) {
+                        if ($item === '.' || $item === '..' || substr($item, -10) !== '.localhost' || !is_dir($sitedir . '/' . $item)) continue;
+                        $name = substr($item, 0, -10);
+                        $dbg = $sitedir . '/' . $item . '/public/wp-content/debug.log';
+                        $acc = $sitedir . '/' . $item . '/logs/caddy.log';
+                        $d = is_file($dbg) ? filesize($dbg) : null; $a = is_file($acc) ? filesize($acc) : null;
+                        $sites[] = ['name' => $name, 'debug' => $d, 'access' => $a, 'mtime' => max($d ? filemtime($dbg) : 0, $a ? filemtime($acc) : 0) ?: null];
+                    }
+                }
+                echo json_encode(['success' => true, 'system' => $system, 'sites' => $sites, 'dir' => $__logs_dir]);
+                exit;
+            }
+
+            $__log_source = (string) ($input['source'] ?? 'errors');
+            $__resolved = $__log_resolve($__log_source, $__log_site);
+            if (!$__resolved) $__log_fail('Unknown log.');
+            [$__log_path, $__log_kind, $__log_needle] = $__resolved;
+
+            if ($action === 'log_clear') {
+                if (is_file($__log_path) && !is_writable($__log_path)) $__log_fail('That log is not writable.');
+                if (is_file($__log_path)) file_put_contents($__log_path, '');
+                echo json_encode(['success' => true]);
+                exit;
+            }
+
+            // log_read. Entries come back as raw strings (newest last) and the
+            // browser parses them; the server only decides where one entry
+            // ends and the next begins, which for PHP logs means a line that
+            // opens with a "[timestamp]" — anything else (stack traces,
+            // wrapped messages) belongs to the entry before it.
+            $__split = function ($text) use ($__log_kind) {
+                $out = [];
+                foreach (explode("\n", $text) as $line) {
+                    if ($line === '' || $line === "\r") continue;
+                    if ($__log_kind === 'php' && $out && $line[0] !== '[') { $out[count($out) - 1] .= "\n" . $line; continue; }
+                    $out[] = $line;
+                }
+                return $out;
+            };
+            $__filter = function ($entries) use ($__log_needle) {
+                if ($__log_needle === null) return $entries;
+                return array_values(array_filter($entries, fn($e) => strpos($e, $__log_needle) !== false));
+            };
+            if (!is_file($__log_path)) {
+                echo json_encode(['success' => true, 'entries' => [], 'size' => 0, 'next_before' => null, 'scanned' => 0, 'path' => $__log_path, 'kind' => $__log_kind, 'missing' => true]);
+                exit;
+            }
+            clearstatcache(true, $__log_path);
+            $size = filesize($__log_path);
+            $fh = fopen($__log_path, 'r');
+            if (!$fh) $__log_fail('Could not open that log.');
+            $limit = max(50, min(1000, (int) ($input['limit'] ?? 300)));
+
+            if (isset($input['since']) && $input['since'] !== null) {
+                // Live tail: everything written after the offset the browser
+                // last saw. A burst larger than 1 MB is trimmed to its tail.
+                $since = max(0, (int) $input['since']);
+                if ($since > $size) $since = 0; // truncated or rotated underneath us
+                $gap = false;
+                if ($size - $since > 1048576) { $since = $size - 1048576; $gap = true; }
+                fseek($fh, $since);
+                $text = $since < $size ? stream_get_contents($fh) : '';
+                if ($gap) { $nl = strpos($text, "\n"); $text = $nl === false ? '' : substr($text, $nl + 1); }
+                fclose($fh);
+                $entries = $__filter($__split($text));
+                echo json_encode(['success' => true, 'entries' => $entries, 'size' => $size, 'gap' => $gap, 'path' => $__log_path, 'kind' => $__log_kind]);
+                exit;
+            }
+
+            $end = isset($input['before']) && $input['before'] !== null ? min((int) $input['before'], $size) : $size;
+            $chunk = 262144;
+            // Scoping the shared error log to one site may mean reading a lot
+            // of other sites' noise to find a few lines; allow more for that.
+            $cap = $__log_needle !== null ? 12 * 1048576 : 2 * 1048576;
+            $collected = []; $scanned = 0;
+            while ($end > 0 && count($collected) < $limit && $scanned < $cap) {
+                $start = max(0, $end - $chunk);
+                fseek($fh, $start);
+                $text = fread($fh, $end - $start);
+                if ($start > 0) {
+                    // Drop the partial entry at the top of the chunk; the next
+                    // (older) chunk will contain it whole.
+                    $pos = $__log_kind === 'php' ? strpos($text, "\n[") : strpos($text, "\n");
+                    if ($pos === false) { $scanned += $end - $start; $end = $start; continue; }
+                    $text = substr($text, $pos + 1);
+                    $start += $pos + 1;
+                }
+                $entries = $__filter($__split($text));
+                $collected = array_merge($entries, $collected);
+                $scanned += $end - $start;
+                $end = $start;
+            }
+            fclose($fh);
+            if (count($collected) > $limit) $collected = array_slice($collected, -$limit);
+            echo json_encode(['success' => true, 'entries' => $collected, 'size' => $size, 'next_before' => $end > 0 ? $end : null, 'scanned' => $scanned, 'path' => $__log_path, 'kind' => $__log_kind]);
+            exit;
         case 'reload_server':
             // This command is run in the background to prevent deadlocking the server.
             // Output is redirected to /dev/null and the '&' backgrounds the process.
@@ -4167,6 +4303,54 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             .db-main { min-height: 50vh; }
         }
 
+        /* Logs. Same two-column shape as mail and databases. */
+        body.view-logs .wrap { max-width: 1180px; }
+        .logs-body { display: grid; grid-template-columns: minmax(220px, 260px) minmax(0, 1fr); height: calc(100vh - 262px); min-height: 460px; }
+        .logs-side { overflow-y: auto; border-right: 1px solid var(--panel-border); display: flex; flex-direction: column; }
+        .logs-side .db-list { border-right: 0; overflow: visible; flex: none; }
+        .logs-side .logs-sites { flex: 1; }
+        .logs-group { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.45rem 0.9rem 0.3rem; font-family: var(--font-mono); font-size: 0.64rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
+        .logs-group-sites { border-top: 1px solid var(--panel-border); }
+        .logs-site-filter { width: 90px; background: transparent; border: 0; border-bottom: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.7rem; text-transform: none; letter-spacing: 0; padding: 0.1rem 0; outline: 0; }
+        .logs-site-filter::placeholder { color: var(--text-faint); }
+        .logs-site-filter:focus { border-bottom-color: var(--accent); }
+        .logs-side .db-row { padding: 0.45rem 1rem 0.45rem 0.9rem; }
+        .logs-side .db-row.is-quiet .db-row-name { color: var(--text-dim); }
+        .logs-side .db-row-name { font-size: 0.8rem; }
+        .logs-main { min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+        .logs-bar { flex: none; }
+        .logs-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: copy; }
+        .logs-path:hover { color: var(--text-dim); }
+        .logs-live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
+        .logs-live-dot.is-live { background: var(--accent); animation: php-pulse 2.4s ease-in-out infinite; }
+        .log-levels { display: flex; gap: 0.15rem; }
+        .log-level { background: transparent; border: 1px solid transparent; padding: 0.18rem 0.5rem; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-dim); cursor: pointer; border-radius: var(--radius-sm); }
+        .log-level:hover { color: var(--text); background: var(--panel-hover); }
+        .log-level.is-active { color: var(--text); border-color: var(--panel-border); background: var(--bg-sunk); }
+        .log-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; min-height: 0; }
+        .log-list > .empty, .log-list > .loading { padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .log-row { display: grid; grid-template-columns: 3.4rem auto minmax(0, 1fr); column-gap: 0.7rem; align-items: start; padding: 0.55rem 1.25rem 0.55rem 1rem; border-bottom: 1px solid var(--panel-border); cursor: pointer; }
+        .log-row:hover { background: var(--panel-hover); }
+        .log-row.is-new { animation: cove-fade 400ms ease; }
+        .log-time { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); padding-top: 0.15rem; white-space: nowrap; }
+        .log-level-chip { font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.06em; text-transform: uppercase; padding: 0.12rem 0.45rem; border-radius: var(--radius-pill); border: 1px solid var(--panel-border); color: var(--text-dim); white-space: nowrap; margin-top: 0.1rem; min-width: 4.6rem; text-align: center; }
+        .log-level-chip.error { color: var(--danger); border-color: var(--danger); }
+        .log-level-chip.warning { color: var(--pill-warn-fg, #d08c30); border-color: var(--pill-warn-fg, #d08c30); }
+        .log-level-chip.deprecated, .log-level-chip.notice { color: var(--text-faint); }
+        .log-level-chip.info { color: var(--text-dim); }
+        .log-main { min-width: 0; }
+        .log-msg { font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.45; color: var(--text); overflow-wrap: anywhere; }
+        .log-row.is-collapsed .log-msg { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .log-meta { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.15rem; min-width: 0; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .log-file { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+        .log-count { flex: none; padding: 0.02rem 0.4rem; border-radius: var(--radius-pill); background: var(--panel-border); color: var(--text-dim); font-size: 0.64rem; }
+        .log-detail { margin: 0.5rem 0 0; padding: 0.7rem 0.9rem; background: var(--bg-sunk); border: 1px solid var(--panel-border); border-radius: var(--radius-md); font-family: var(--font-mono); font-size: 0.72rem; line-height: 1.5; color: var(--text-dim); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow: auto; }
+        @media (max-width: 860px) {
+            .logs-body { grid-template-columns: 1fr; height: auto; min-height: 60vh; }
+            .logs-side { border-right: 0; max-height: 36vh; }
+            .log-levels { display: none; }
+        }
+
         /* Responsive */
         @media (max-width: 620px) {
             body { padding: 1.25rem 0.75rem 3rem; }
@@ -4194,6 +4378,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 <button type="button" class="nav-view is-active" role="tab" data-view="sites" aria-selected="true">sites</button>
                 <button type="button" class="nav-view" role="tab" data-view="mail" aria-selected="false">mail<span class="nav-badge" id="mailBadge" style="display: none;"></span></button>
                 <button type="button" class="nav-view" role="tab" data-view="db" aria-selected="false">databases</button>
+                <button type="button" class="nav-view" role="tab" data-view="logs" aria-selected="false">logs</button>
             </div>
             <div class="nav-services services">
                 <button type="button" class="dot link" data-service="caddy" title="Caddy status">caddy</button>
@@ -4613,6 +4798,125 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </div>
             </footer>
         </section>
+
+        <!-- Logs: the files Cove already writes, read backwards in chunks.
+             The shared PHP error log can be scoped to a site by the paths in
+             its entries; each site also has its own debug.log and access log. -->
+        <section class="card logs-card" id="logsCard" style="display: none;">
+            <header class="card-head">
+                <h1 class="card-title">Logs</h1>
+                <div class="card-actions">
+                    <label class="mail-unread-toggle" title="Follow the log as it grows">
+                        <input type="checkbox" id="logsLive" checked>
+                        live
+                    </label>
+                    <button type="button" class="pill" id="btnLogsRefresh" title="Reload from the top">refresh</button>
+                    <button type="button" class="pill mail-delete-all" id="btnLogsClear" title="Empty this log file">clear log</button>
+                </div>
+            </header>
+
+            <div class="filter-row">
+                <span class="filter-chip" id="logsSiteChip" aria-label="Site" style="display: none;">
+                    <span id="logsSiteChipLabel"></span>
+                    <button type="button" class="filter-chip-x" id="logsSiteChipClear" aria-label="Back to system logs" title="System logs">×</button>
+                </span>
+                <input
+                    class="filter-input"
+                    id="logsSearch"
+                    type="text"
+                    placeholder="search entries…"
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    aria-label="Search entries"
+                >
+                <div class="log-levels" id="logsLevels" role="group" aria-label="Level">
+                    <button type="button" class="log-level is-active" data-level="all">all</button>
+                    <button type="button" class="log-level" data-level="error">errors</button>
+                    <button type="button" class="log-level" data-level="warning">warnings</button>
+                    <button type="button" class="log-level" data-level="deprecated">deprecated</button>
+                </div>
+                <span class="filter-kbd" id="logsKbd" aria-hidden="true">/</span>
+                <button class="filter-clear" id="btnLogsSearchClear" aria-label="Clear search" title="Clear (Esc)" style="display: none;">×</button>
+            </div>
+
+            <div class="logs-body" id="logsBody">
+                <div class="logs-side" id="logsSide">
+                    <div class="logs-group">system</div>
+                    <ul class="db-list logs-sources" id="logsSystem">
+                        <template id="tpl-log-source">
+                            <li class="db-row log-source">
+                                <div class="db-row-line">
+                                    <span class="db-row-name"></span>
+                                    <span class="db-row-meta"></span>
+                                </div>
+                            </li>
+                        </template>
+                    </ul>
+                    <div class="logs-group logs-group-sites">
+                        <span>sites</span>
+                        <input type="text" class="logs-site-filter" id="logsSiteFilter" placeholder="filter…" spellcheck="false" autocomplete="off" aria-label="Filter sites">
+                    </div>
+                    <ul class="db-list logs-sites" id="logsSites">
+                        <li class="loading" id="logsSitesLoading">Loading…</li>
+                        <li class="empty" id="logsSitesEmpty" style="display: none;">No sites match.</li>
+                    </ul>
+                </div>
+
+                <div class="logs-main">
+                    <div class="mail-msg-bar logs-bar">
+                        <div class="mail-parts" id="logsParts" role="tablist" style="display: none;">
+                            <button type="button" class="mail-part" role="tab" data-tab="errors" title="Entries from the shared PHP error log that mention this site">php errors</button>
+                            <button type="button" class="mail-part" role="tab" data-tab="debug" title="wp-content/debug.log">debug.log</button>
+                            <button type="button" class="mail-part" role="tab" data-tab="access" title="Caddy access log">access</button>
+                        </div>
+                        <span class="mail-bar-note logs-path" id="logsPath" title="Click to copy the path"></span>
+                        <div class="mail-msg-actions">
+                            <span class="logs-live-dot" id="logsLiveDot" title="Following"></span>
+                        </div>
+                    </div>
+                    <ul class="log-list" id="logsList">
+                        <template id="tpl-log-row">
+                            <li class="log-row">
+                                <span class="log-time"></span>
+                                <span class="log-level-chip"></span>
+                                <div class="log-main">
+                                    <div class="log-msg"></div>
+                                    <div class="log-meta">
+                                        <span class="mail-site log-site" role="button"></span>
+                                        <span class="log-file"></span>
+                                        <span class="log-count"></span>
+                                    </div>
+                                    <pre class="log-detail" style="display: none;"></pre>
+                                </div>
+                            </li>
+                        </template>
+                        <li class="loading" id="logsLoading">Loading…</li>
+                        <li class="empty" id="logsError" style="display: none;"><div id="logsErrorText"></div></li>
+                        <li class="empty" id="logsEmpty" style="display: none;">
+                            <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path class="art-fill" d="M30 12 h44 v42 H30 Z"/>
+                                <path class="art-line" d="M30 12 h44 v42 H30 Z"/>
+                                <path class="art-line" d="M38 24 h28 M38 32 h20 M38 40 h24"/>
+                                <path class="art-wave" d="M8 60 Q 15 56, 22 60 T 36 60 T 50 60 T 64 60 T 78 60 T 92 60"/>
+                            </svg>
+                            <div id="logsEmptyText">Nothing logged.</div>
+                            <div class="empty-hint" id="logsEmptyHint"></div>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+
+            <footer class="card-foot">
+                <div class="totals">
+                    <span id="logsCount"></span>
+                </div>
+                <div class="mail-pager">
+                    <button type="button" class="pill" id="btnLogsOlder" style="display: none;">older</button>
+                </div>
+            </footer>
+        </section>
     </div>
 
     <div class="modal-backdrop" id="dbModal" style="display: none;">
@@ -4816,6 +5120,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 delArm: null, delTimer: null,
                 console: { text: '', results: null, ms: 0, running: false, history: [] },
             },
+            logs: {
+                system: [], sites: [], dir: '', sourcesLoaded: false, siteFilter: '',
+                source: 'errors', site: null, tab: 'errors',
+                level: 'all', query: '',
+                entries: [], size: 0, nextBefore: null, scanned: 0, path: '', kind: 'php', missing: false,
+                loading: false, error: null, seq: 0, live: true, pollTimer: null,
+                expanded: {}, clearArm: false, armTimer: null, newIds: {},
+            },
 
             get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
             get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
@@ -4896,6 +5208,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.bindStaticEvents();
                 this.bindMailEvents();
                 this.bindDbEvents();
+                this.bindLogsEvents();
                 this.render();
 
                 // If the tab closes during an undo window, flush the staged
@@ -4934,6 +5247,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         // Palette owns its own keys via its input's listeners;
                         // catch Esc here too in case the input lost focus.
                         if (e.key === 'Escape') this.closePalette();
+                        return;
+                    }
+
+                    if (this.view === 'logs') {
+                        if (e.key === 'Escape' && !typing) {
+                            if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                            if (this.showDbModal) { this.setDbModal(false); return; }
+                            if (this.logs.query || this.logs.level !== 'all') { this.logsClearFilters(); return; }
+                            if (this.logs.site) { this.setLogsSite(null); return; }
+                        }
+                        if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey && !typing) {
+                            e.preventDefault();
+                            $id('logsSearch').focus();
+                        }
                         return;
                     }
 
@@ -5155,7 +5482,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('ctxReveal').addEventListener('click', withCtxSite(s => this.revealSite(s.name)));
                 $id('ctxDb').addEventListener('click', withCtxSite(s => this.openDbForSite(s)));
                 $id('ctxPhp').addEventListener('click', withCtxSite(s => this.openPhpModal(s)));
-                $id('ctxLog').addEventListener('click', withCtxSite(s => this.viewLog(s)));
+                $id('ctxLog').addEventListener('click', withCtxSite(s => this.openLogsForSite(s.name)));
                 $id('ctxMail').addEventListener('click', withCtxSite(s => this.openMailForSite(s.name)));
 
                 // PHP version picker
@@ -5667,7 +5994,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             setView(view, opts = {}) {
-                view = ['mail', 'db'].includes(view) ? view : 'sites';
+                view = ['mail', 'db', 'logs'].includes(view) ? view : 'sites';
                 if (view === this.view && !opts.force) return;
                 const prev = this.view;
                 this.view = view;
@@ -5675,7 +6002,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (prev !== view) this.crossfadeFrom(prev);
                 document.body.classList.toggle('view-mail', view === 'mail');
                 document.body.classList.toggle('view-db', view === 'db');
-                document.title = { mail: 'Cove — mail', db: 'Cove — databases', sites: 'Cove — sites' }[view];
+                document.body.classList.toggle('view-logs', view === 'logs');
+                document.title = { mail: 'Cove — mail', db: 'Cove — databases', logs: 'Cove — logs', sites: 'Cove — sites' }[view];
                 this.syncHash();
                 this.render();
                 if (view === 'mail') {
@@ -5688,6 +6016,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (this.db.name && this.db.tablesFor !== this.db.name) this.loadDbTables();
                     if (this.db.name && this.db.table) this.loadDbRows();
                 }
+                if (view === 'logs') {
+                    if (!this.logs.sourcesLoaded) this.loadLogSources();
+                    this.loadLogs();
+                    this.startLogsPolling();
+                } else {
+                    this.stopLogsPolling();
+                }
             },
 
             // The hash names the view and what is open in it, so a location
@@ -5697,6 +6032,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 let hash = '';
                 if (this.view === 'mail') hash = '#mail' + (this.mail.site ? '/' + this.mail.site : '');
                 if (this.view === 'db') hash = '#db' + (this.db.name ? '/' + encodeURIComponent(this.db.name) + (this.db.table ? '/' + encodeURIComponent(this.db.table) : '') : '');
+                if (this.view === 'logs') hash = '#logs' + (this.logs.site ? '/' + this.logs.site + '/' + this.logs.tab : (this.logs.source !== 'errors' ? '/@' + this.logs.source : ''));
                 if ((location.hash || '') !== hash) history.replaceState(null, '', location.pathname + location.search + hash);
             },
 
@@ -5714,6 +6050,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.db.name = name;
                     this.db.table = table;
                     this.setView('db', { force: true });
+                } else if ((m = /^#logs(?:\/(?:@([a-z0-9.-]+)|([a-z0-9-]+)(?:\/(errors|debug|access))?))?$/i.exec(h))) {
+                    if (m[1]) { this.logs.site = null; this.logs.source = m[1].toLowerCase(); }
+                    else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : 'errors'; }
+                    else { this.logs.site = null; this.logs.source = 'errors'; }
+                    this.setView('logs', { force: true });
                 } else if (this.view !== 'sites') {
                     this.setView('sites');
                 }
@@ -6283,7 +6624,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // Keep the outgoing card on screen, out of flow, while it fades;
             // renderView leaves .is-leaving cards alone until the fade ends.
             crossfadeFrom(prev) {
-                const out = $id({ sites: 'sitesCard', mail: 'mailCard', db: 'dbCard' }[prev]);
+                const out = $id({ sites: 'sitesCard', mail: 'mailCard', db: 'dbCard', logs: 'logsCard' }[prev]);
                 if (!out || out.style.display === 'none') return;
                 if (window.scrollY > 0) window.scrollTo({ top: 0, behavior: 'instant' });
                 document.querySelectorAll('.wrap > .card.is-leaving').forEach(el => { el.classList.remove('is-leaving'); el.style.top = ''; el.style.display = 'none'; });
@@ -6301,6 +6642,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 card('sitesCard', this.view === 'sites');
                 card('mailCard', this.view === 'mail');
                 card('dbCard', this.view === 'db');
+                card('logsCard', this.view === 'logs');
                 document.querySelectorAll('.nav-view').forEach(b => {
                     const on = b.dataset.view === this.view;
                     b.classList.toggle('is-active', on);
@@ -7036,6 +7378,421 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 });
             },
 
+            // --- Logs --------------------------------------------------------
+            // The files Cove already writes, parsed in the browser. The shared
+            // PHP error log names the file each entry came from, which is how
+            // it gets scoped to one site; a site also owns a debug.log and a
+            // Caddy access log of its own.
+            get logsSelection() {
+                const l = this.logs;
+                if (l.site) return { source: l.tab === 'debug' ? 'debug' : l.tab === 'access' ? 'access' : 'errors', site: l.site };
+                return { source: l.source, site: '' };
+            },
+
+            async loadLogSources() {
+                const l = this.logs;
+                const res = await this.apiPost('log_sources', {}, { quiet: true, timeoutMs: 20000 });
+                if (!res.success) return;
+                l.system = res.system || [];
+                l.sites = (res.sites || []).sort((a, b) => (b.mtime || 0) - (a.mtime || 0) || a.name.localeCompare(b.name));
+                l.dir = res.dir || '';
+                l.sourcesLoaded = true;
+                this.renderLogsSide();
+            },
+
+            async loadLogs(opts = {}) {
+                const l = this.logs;
+                const seq = ++l.seq;
+                const sel = this.logsSelection;
+                if (!opts.older) { l.entries = []; l.nextBefore = null; l.scanned = 0; l.expanded = {}; l.newIds = {}; }
+                l.loading = true; l.error = null;
+                this.renderLogsList();
+                const res = await this.apiPost('log_read', { source: sel.source, site: sel.site, before: opts.older ? l.nextBefore : null }, { quiet: true, timeoutMs: 60000 });
+                if (seq !== l.seq) return;
+                l.loading = false;
+                if (!res.success) { l.error = res.message || 'Could not read that log.'; this.renderLogsList(); this.renderLogsFooter(); return; }
+                const parsed = (res.entries || []).map(raw => this.parseLogEntry(raw, res.kind)).reverse(); // newest first
+                l.entries = opts.older ? l.entries.concat(parsed) : parsed;
+                if (!opts.older) l.size = res.size || 0;
+                l.nextBefore = res.next_before ?? null;
+                l.scanned += res.scanned || 0;
+                l.path = res.path || ''; l.kind = res.kind || 'php'; l.missing = !!res.missing;
+                this.renderLogsList();
+                this.renderLogsBar();
+                this.renderLogsFooter();
+            },
+
+            // Live tail: only what was appended since the last read.
+            async pollLogs() {
+                const l = this.logs;
+                if (this.view !== 'logs' || !l.live || document.hidden || l.loading) return;
+                const sel = this.logsSelection;
+                const seq = l.seq;
+                const res = await this.apiPost('log_read', { source: sel.source, site: sel.site, since: l.size }, { quiet: true, timeoutMs: 20000 });
+                if (seq !== l.seq || !res.success) return;
+                if ((res.size || 0) < l.size) { this.loadLogs(); return; } // cleared underneath us
+                l.size = res.size || l.size;
+                if (!res.entries || !res.entries.length) return;
+                const fresh = res.entries.map(raw => this.parseLogEntry(raw, res.kind)).reverse();
+                fresh.forEach(e => { l.newIds[e.id] = true; });
+                l.entries = fresh.concat(l.entries);
+                l.missing = false;
+                this.renderLogsList();
+                this.renderLogsFooter();
+                setTimeout(() => { fresh.forEach(e => delete l.newIds[e.id]); }, 1000);
+            },
+
+            startLogsPolling() {
+                if (this.logs.pollTimer) return;
+                this.logs.pollTimer = setInterval(() => this.pollLogs(), 4000);
+            },
+
+            stopLogsPolling() {
+                clearInterval(this.logs.pollTimer);
+                this.logs.pollTimer = null;
+            },
+
+            setLogsSource(key) {
+                const l = this.logs;
+                l.site = null; l.source = key;
+                this.syncHash();
+                this.renderLogsSide();
+                this.loadLogs();
+            },
+
+            setLogsSite(name, tab) {
+                const l = this.logs;
+                l.site = name || null;
+                if (tab) l.tab = tab;
+                if (l.site && !['errors', 'debug', 'access'].includes(l.tab)) l.tab = 'errors';
+                this.syncHash();
+                this.renderLogsChrome();
+                this.renderLogsSide();
+                this.loadLogs();
+            },
+
+            openLogsForSite(name) {
+                this.logs.site = name;
+                this.logs.tab = 'errors';
+                this.setView('logs', { force: true });
+            },
+
+            logsClearFilters() {
+                const l = this.logs;
+                l.query = ''; l.level = 'all';
+                $id('logsSearch').value = '';
+                this.renderLogsChrome();
+                this.renderLogsList();
+                this.renderLogsFooter();
+            },
+
+            async clearLog() {
+                const l = this.logs;
+                if (!l.clearArm) {
+                    l.clearArm = true;
+                    clearTimeout(l.armTimer);
+                    l.armTimer = setTimeout(() => { l.clearArm = false; this.renderLogsChrome(); }, 3500);
+                    this.renderLogsChrome();
+                    return;
+                }
+                l.clearArm = false;
+                clearTimeout(l.armTimer);
+                const sel = this.logsSelection;
+                const res = await this.apiPost('log_clear', { source: sel.source, site: sel.site }, { timeoutMs: 20000 });
+                this.renderLogsChrome();
+                if (!res.success) return;
+                this.showSnack('Log cleared.');
+                this.loadLogs();
+                this.loadLogSources();
+            },
+
+            // One entry → { id, ts, level, msg, file, line, site, detail, raw }.
+            // level ∈ error | warning | deprecated | notice | info | log.
+            parseLogEntry(raw, kind) {
+                const e = { id: '', ts: null, level: 'log', msg: raw, file: '', line: '', site: null, detail: '', raw };
+                const firstNl = raw.indexOf('\n');
+                const head = firstNl === -1 ? raw : raw.slice(0, firstNl);
+                const rest = firstNl === -1 ? '' : raw.slice(firstNl + 1);
+                if (kind === 'caddy') {
+                    try {
+                        const j = JSON.parse(raw);
+                        e.ts = typeof j.ts === 'number' ? j.ts : null;
+                        e.level = { error: 'error', warn: 'warning', info: 'info', debug: 'notice' }[j.level] || 'log';
+                        if (j.request) {
+                            const r = j.request;
+                            const ms = typeof j.duration === 'number' ? Math.round(j.duration * 1000) + ' ms' : '';
+                            e.msg = (r.method || '') + ' ' + (r.uri || '') + ' → ' + (j.status || '') + (ms ? ' · ' + ms : '');
+                            e.file = r.host || '';
+                            if (j.status >= 500) e.level = 'error'; else if (j.status >= 400) e.level = 'warning';
+                            const sm = /^([a-z0-9-]+)\.localhost/i.exec(r.host || '');
+                            if (sm) e.site = sm[1].toLowerCase();
+                        } else {
+                            e.msg = (j.msg || head) + (j.logger ? '' : '');
+                            e.file = j.logger || '';
+                        }
+                        e.detail = JSON.stringify(j, null, 2);
+                    } catch (err) { e.msg = head; e.detail = rest; }
+                } else {
+                    const m = /^\[([^\]]+)\]\s?(.*)$/s.exec(head);
+                    let body = head;
+                    if (m) {
+                        const t = Date.parse(m[1].replace(/^(\d{2})-([A-Za-z]{3})-(\d{4})/, '$1 $2 $3'));
+                        e.ts = isNaN(t) ? null : t / 1000;
+                        body = m[2];
+                    }
+                    const pm = /^PHP (Fatal error|Parse error|Warning|Notice|Deprecated|Recoverable fatal error|Strict Standards|Core Warning|Compile Error|User Error|User Warning|User Notice|User Deprecated):\s+(.*?)(?: in (\S+?)(?::(\d+))?(?: on line (\d+))?)?$/s.exec(body);
+                    if (pm) {
+                        const lv = pm[1].toLowerCase();
+                        e.level = /fatal|parse|compile|user error/.test(lv) ? 'error' : /warning/.test(lv) ? 'warning' : /deprecated/.test(lv) ? 'deprecated' : 'notice';
+                        e.msg = pm[2]; e.file = pm[3] || ''; e.line = pm[5] || pm[4] || '';
+                    } else if (kind === 'plain') {
+                        e.msg = body.replace(/^watchdog:\s*/, '');
+                        e.level = /fail|error|kill|crash/i.test(body) ? 'warning' : 'info';
+                    } else {
+                        // error_log() from application code, or WP's own lines.
+                        const wm = /^(.*?)(?: in (\/\S+?)(?: on line (\d+))?)?$/s.exec(body);
+                        e.msg = wm ? wm[1] : body; e.file = (wm && wm[2]) || ''; e.line = (wm && wm[3]) || '';
+                        e.level = /fatal|uncaught|error/i.test(body) ? 'error' : /warn/i.test(body) ? 'warning' : 'log';
+                    }
+                    e.detail = rest;
+                    const sm = /\/Sites\/([a-z0-9-]+)\.localhost\//i.exec(raw);
+                    if (sm) e.site = sm[1].toLowerCase();
+                }
+                e.id = (e.ts || 0) + '|' + e.level + '|' + e.msg + '|' + e.file + '|' + e.line;
+                return e;
+            },
+
+            logFileLabel(e) {
+                if (!e.file) return '';
+                let f = e.file;
+                const m = /\/Sites\/[a-z0-9-]+\.localhost\/(?:public\/)?(.*)$/i.exec(f);
+                if (m) f = m[1];
+                else if (this.logs.dir && f.startsWith(this.logs.dir)) f = f.slice(this.logs.dir.length + 1);
+                return f + (e.line ? ':' + e.line : '');
+            },
+
+            // Visible entries: level + search applied, then consecutive
+            // duplicates folded into one row with a count.
+            get logsVisible() {
+                const l = this.logs;
+                const q = l.query.trim().toLowerCase();
+                const out = [];
+                for (const e of l.entries) {
+                    if (l.level === 'error' && e.level !== 'error') continue;
+                    if (l.level === 'warning' && e.level !== 'warning') continue;
+                    if (l.level === 'deprecated' && e.level !== 'deprecated' && e.level !== 'notice') continue;
+                    if (q && !(e.msg + ' ' + e.file + ' ' + (e.site || '')).toLowerCase().includes(q)) continue;
+                    const last = out[out.length - 1];
+                    if (last && last.level === e.level && last.msg === e.msg && last.file === e.file && last.line === e.line) { last.count++; continue; }
+                    out.push(Object.assign({ count: 1 }, e));
+                }
+                return out;
+            },
+
+            renderLogs() {
+                if (this.view !== 'logs') return;
+                this.renderLogsChrome();
+                this.renderLogsSide();
+                this.renderLogsBar();
+                this.renderLogsList();
+                this.renderLogsFooter();
+            },
+
+            renderLogsChrome() {
+                const l = this.logs;
+                show($id('logsSiteChip'), !!l.site);
+                if (l.site) $id('logsSiteChipLabel').textContent = l.site;
+                const active = !!(l.query || l.level !== 'all');
+                show($id('logsKbd'), !active);
+                show($id('btnLogsSearchClear'), active);
+                document.querySelectorAll('#logsLevels .log-level').forEach(b => b.classList.toggle('is-active', b.dataset.level === l.level));
+                const clear = $id('btnLogsClear');
+                clear.classList.toggle('armed', l.clearArm);
+                clear.textContent = l.clearArm ? 'sure? clear it' : 'clear log';
+                clear.title = l.site && l.tab === 'errors' ? 'Empties the shared PHP error log — every site\'s entries, not just this one' : 'Empty this log file';
+                clear.disabled = l.missing || (!l.size && !l.entries.length);
+                $id('logsLive').checked = l.live;
+                $id('logsLiveDot').classList.toggle('is-live', l.live);
+                $id('logsLiveDot').title = l.live ? 'Following — new entries appear as they are written' : 'Paused';
+            },
+
+            renderLogsSide() {
+                const l = this.logs;
+                const sys = $id('logsSystem');
+                sys.querySelectorAll('.db-row').forEach(n => n.remove());
+                const tpl = $id('tpl-log-source');
+                for (const s of l.system) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.source = s.key;
+                    row.classList.toggle('is-selected', !l.site && l.source === s.key);
+                    row.classList.toggle('is-quiet', !s.size);
+                    row.querySelector('.db-row-name').textContent = s.label;
+                    row.querySelector('.db-row-meta').textContent = s.size ? this.formatSize(s.size) : '';
+                    row.querySelector('.db-row-meta').title = s.mtime ? 'Last written ' + new Date(s.mtime * 1000).toLocaleString() : '';
+                    sys.appendChild(row);
+                }
+                const list = $id('logsSites');
+                list.querySelectorAll('.db-row').forEach(n => n.remove());
+                show($id('logsSitesLoading'), !l.sourcesLoaded);
+                const q = l.siteFilter.trim().toLowerCase();
+                const rows = l.sites.filter(s => !q || s.name.includes(q));
+                show($id('logsSitesEmpty'), l.sourcesLoaded && rows.length === 0);
+                const anchor = $id('logsSitesLoading');
+                for (const s of rows) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.site = s.name;
+                    row.classList.toggle('is-selected', l.site === s.name);
+                    row.classList.toggle('is-quiet', !s.debug && !s.access);
+                    row.querySelector('.db-row-name').textContent = s.name;
+                    row.querySelector('.db-row-meta').textContent = s.mtime ? this.formatRelative(s.mtime) : '';
+                    row.querySelector('.db-row-meta').title = (s.debug ? 'debug.log ' + this.formatSize(s.debug) : 'no debug.log') + ' · ' + (s.access ? 'access log ' + this.formatSize(s.access) : 'no access log');
+                    list.insertBefore(row, anchor);
+                }
+            },
+
+            renderLogsBar() {
+                const l = this.logs;
+                show($id('logsParts'), !!l.site);
+                if (l.site) {
+                    const meta = l.sites.find(s => s.name === l.site);
+                    document.querySelectorAll('#logsParts .mail-part').forEach(b => {
+                        const t = b.dataset.tab;
+                        b.classList.toggle('is-active', l.tab === t);
+                        b.setAttribute('aria-selected', l.tab === t ? 'true' : 'false');
+                        if (meta && t === 'debug') b.style.opacity = meta.debug ? '' : '0.5';
+                        if (meta && t === 'access') b.style.opacity = meta.access ? '' : '0.5';
+                    });
+                }
+                const p = $id('logsPath');
+                p.textContent = l.path ? l.path.replace(/^\/Users\/[^\/]+|^\/home\/[^\/]+/, '~') : '';
+                p.dataset.path = l.path || '';
+            },
+
+            renderLogsList() {
+                const l = this.logs;
+                const list = $id('logsList');
+                list.querySelectorAll('.log-row').forEach(n => n.remove());
+                const rows = l.loading && !l.entries.length ? [] : this.logsVisible;
+                show($id('logsLoading'), l.loading && !l.entries.length);
+                show($id('logsError'), !l.loading && !!l.error);
+                if (l.error) $id('logsErrorText').textContent = l.error;
+                const empty = !l.loading && !l.error && rows.length === 0;
+                show($id('logsEmpty'), empty);
+                if (empty) {
+                    const filtered = l.entries.length > 0;
+                    $id('logsEmptyText').textContent = l.missing ? 'No log file yet.' : filtered ? 'Nothing matches.' : (l.site && l.tab === 'errors' ? 'No PHP errors mention this site.' : 'Nothing logged.');
+                    $id('logsEmptyHint').textContent = l.missing
+                        ? (l.tab === 'debug' ? 'Set WP_DEBUG and WP_DEBUG_LOG in wp-config.php and WordPress will write one.' : '')
+                        : filtered ? 'Press Esc to clear the filters.' : (l.scanned ? 'Looked through the last ' + this.formatSize(l.scanned) + '.' : '');
+                }
+                const tpl = $id('tpl-log-row');
+                const anchor = $id('logsLoading');
+                const frag = document.createDocumentFragment();
+                for (const e of rows) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.id = e.id;
+                    const open = !!l.expanded[e.id];
+                    row.classList.toggle('is-collapsed', !open);
+                    row.classList.toggle('is-new', !!l.newIds[e.id]);
+                    const t = row.querySelector('.log-time');
+                    t.textContent = e.ts ? this.formatRelative(e.ts) : '—';
+                    t.title = e.ts ? new Date(e.ts * 1000).toLocaleString() : '';
+                    const chip = row.querySelector('.log-level-chip');
+                    chip.textContent = e.level === 'log' ? 'log' : e.level;
+                    chip.classList.add(e.level);
+                    row.querySelector('.log-msg').textContent = e.msg;
+                    const site = row.querySelector('.log-site');
+                    if (e.site && !l.site) { site.textContent = e.site; site.title = 'Only entries for ' + e.site + '.localhost'; }
+                    else site.remove();
+                    const file = row.querySelector('.log-file');
+                    const fl = this.logFileLabel(e);
+                    // An access log scoped to a site names that site's host on
+                    // every row; drop it there.
+                    if (fl && !(l.site && l.kind === 'caddy' && e.file === l.site + '.localhost')) { file.textContent = fl; file.title = e.file + (e.line ? ':' + e.line : ''); } else file.remove();
+                    const count = row.querySelector('.log-count');
+                    if (e.count > 1) { count.textContent = '×' + e.count; count.title = 'Repeated ' + e.count + ' times in a row'; } else count.remove();
+                    const detail = row.querySelector('.log-detail');
+                    const text = e.detail || (e.raw !== e.msg ? e.raw : '');
+                    if (open && text) { detail.textContent = text; show(detail, true); } else detail.remove();
+                    frag.appendChild(row);
+                }
+                list.insertBefore(frag, anchor);
+            },
+
+            renderLogsFooter() {
+                if (this.view !== 'logs') return;
+                const l = this.logs;
+                const shown = this.logsVisible.length;
+                let label = '';
+                if (!l.error) {
+                    label = l.entries.length + ' entr' + (l.entries.length === 1 ? 'y' : 'ies');
+                    const filtered = !!(l.query || l.level !== 'all');
+                    if (filtered) label = shown + ' of ' + label;
+                    else if (shown !== l.entries.length) label += ' · ' + (l.entries.length - shown) + ' repeat' + (l.entries.length - shown === 1 ? '' : 's') + ' folded';
+                    if (l.size) label += ' · ' + (l.scanned && l.scanned < l.size ? 'last ' + this.formatSize(l.scanned) + ' of ' : '') + this.formatSize(l.size);
+                }
+                $id('logsCount').textContent = label;
+                show($id('btnLogsOlder'), !!l.nextBefore && !l.loading);
+            },
+
+            bindLogsEvents() {
+                const search = $id('logsSearch');
+                search.addEventListener('input', () => { this.logs.query = search.value; this.renderLogsChrome(); this.renderLogsList(); this.renderLogsFooter(); });
+                search.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.logs.query = ''; search.value = ''; search.blur(); this.renderLogsChrome(); this.renderLogsList(); this.renderLogsFooter(); }
+                });
+                $id('btnLogsSearchClear').addEventListener('click', () => { this.logsClearFilters(); search.focus(); });
+                $id('logsLevels').addEventListener('click', (e) => {
+                    const b = e.target.closest('.log-level');
+                    if (!b) return;
+                    this.logs.level = b.dataset.level;
+                    this.renderLogsChrome(); this.renderLogsList(); this.renderLogsFooter();
+                });
+                $id('logsSiteChipClear').addEventListener('click', () => this.setLogsSite(null));
+                $id('logsLive').addEventListener('change', (e) => { this.logs.live = e.target.checked; this.renderLogsChrome(); if (this.logs.live) this.pollLogs(); });
+                $id('btnLogsRefresh').addEventListener('click', () => { this.loadLogs(); this.loadLogSources(); });
+                $id('btnLogsClear').addEventListener('click', () => this.clearLog());
+                $id('btnLogsOlder').addEventListener('click', () => this.loadLogs({ older: true }));
+                const siteFilter = $id('logsSiteFilter');
+                siteFilter.addEventListener('input', () => { this.logs.siteFilter = siteFilter.value; this.renderLogsSide(); });
+                siteFilter.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.logs.siteFilter = ''; siteFilter.value = ''; siteFilter.blur(); this.renderLogsSide(); }
+                    if (e.key === 'Enter') {
+                        const q = this.logs.siteFilter.trim().toLowerCase();
+                        const first = this.logs.sites.find(s => !q || s.name.includes(q));
+                        if (first) { e.preventDefault(); this.setLogsSite(first.name); }
+                    }
+                });
+                $id('logsSystem').addEventListener('click', (e) => {
+                    const row = e.target.closest('.db-row');
+                    if (row) this.setLogsSource(row.dataset.source);
+                });
+                $id('logsSites').addEventListener('click', (e) => {
+                    const row = e.target.closest('.db-row');
+                    if (row) this.setLogsSite(row.dataset.site);
+                });
+                $id('logsParts').addEventListener('click', (e) => {
+                    const b = e.target.closest('.mail-part');
+                    if (b) this.setLogsSite(this.logs.site, b.dataset.tab);
+                });
+                $id('logsPath').addEventListener('click', (e) => {
+                    const p = e.currentTarget.dataset.path;
+                    if (!p) return;
+                    navigator.clipboard.writeText(p).then(() => this.showSnack('Path copied.')).catch(() => this.showSnack('Could not copy.', true));
+                });
+                $id('logsList').addEventListener('click', (e) => {
+                    const row = e.target.closest('.log-row');
+                    if (!row) return;
+                    const chip = e.target.closest('.log-site');
+                    if (chip) { this.setLogsSite(chip.textContent, 'errors'); return; }
+                    if (window.getSelection && window.getSelection().toString()) return;
+                    const id = row.dataset.id;
+                    if (this.logs.expanded[id]) delete this.logs.expanded[id]; else this.logs.expanded[id] = true;
+                    this.renderLogsList();
+                });
+                document.addEventListener('visibilitychange', () => { if (!document.hidden && this.view === 'logs') this.pollLogs(); });
+            },
+
             // --- Command palette -------------------------------------------
             // Results mix matching sites with global commands. Sites are ranked
             // by match position so a prefix hit beats a mid-string one.
@@ -7047,6 +7804,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     { key: 'cmd:reload',  kind: 'cmd', label: 'Reload server',       meta: '',  run: () => { this.closePalette(); this.reloadServer(); } },
                     { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
                     { key: 'cmd:db',      kind: 'cmd', label: 'Databases',           meta: '',  run: () => { this.closePalette(); this.setView('db'); } },
+                    { key: 'cmd:logs',    kind: 'cmd', label: 'Logs',                meta: '',  run: () => { this.closePalette(); this.setView('logs'); } },
                     { key: 'cmd:adminer', kind: 'cmd', label: 'Open Adminer',        meta: 'external', run: () => { this.closePalette(); window.open(this.adminerUrl, '_blank', 'noopener'); } },
                     { key: 'cmd:mailview',kind: 'cmd', label: 'Mail',                meta: '',  run: () => { this.closePalette(); this.setView('mail'); } },
                     { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: 'external', run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
@@ -7132,7 +7890,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     (svc.actions || []).forEach(a => {
                         let el;
                         if (a.kind === 'open') { el = document.createElement('a'); el.href = a.href; el.target = '_blank'; el.rel = 'noopener'; }
-                        else { el = document.createElement('button'); el.type = 'button'; el.addEventListener('click', () => { this.setDbModal(false); if (a.kind === 'reload') this.reloadServer(); if (a.kind === 'mail') this.setView('mail'); if (a.kind === 'db') this.setView('db'); }); }
+                        else { el = document.createElement('button'); el.type = 'button'; el.addEventListener('click', () => { this.setDbModal(false); if (a.kind === 'reload') this.reloadServer(); if (a.kind === 'mail') this.setView('mail'); if (a.kind === 'db') this.setView('db'); if (a.kind === 'logs') this.setView('logs'); }); }
                         el.className = 'pill'; el.textContent = a.label;
                         svcActions.insertBefore(el, $id('btnDbClose'));
                     });
