@@ -1,6 +1,6 @@
 # Cove 🏝️
 
-**The calmest way to run local WordPress.**
+**The calm way to run local WordPress.**
 
 Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one-click admin login, zero Docker. It bundles Caddy, FrankenPHP, MariaDB, and Mailpit into one self-contained toolchain for WordPress and plain static sites.
 
