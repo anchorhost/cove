@@ -186,7 +186,7 @@ RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.15"
+COVE_VERSION="1.16"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -200,7 +200,7 @@ MU_PLUGIN_VERSION="0.6.1"
 # time). Bump whenever anything under menubar/ changes — post-upgrade compares
 # this against the installed bundle's CFBundleShortVersionString to decide
 # whether an enabled menu bar needs a rebuild. Opt-in: never auto-installed.
-MENUBAR_VERSION="1.1"
+MENUBAR_VERSION="1.2"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -936,13 +936,13 @@ $display_dir = ($home && str_starts_with($dir, $home)) ? '~' . substr($dir, strl
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title><?= htmlspecialchars($host) ?></title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%2358b293'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='32' r='30' fill='%23009b95'/><g fill='none' stroke='%23ffffff' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'><path d='M 17 27 Q 24.5 20 32 27 T 47 27'/><path d='M 17 40 Q 24.5 33 32 40 T 47 40'/></g></svg>">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
   --bg: #fbfaf7; --bg-elev: #ffffff; --bg-sunk: #f4f2ec;
-  --border: #e8e4da; --text: #1a1c1b; --text-soft: #3a3d3a;
+  --border: #c9c4b6; --text: #1a1c1b; --text-soft: #3a3d3a;
   --muted: #6b6f6a; --dim: #9a9d97;
   /* sRGB fallback first; the oklch override on the next line is ignored by
      browsers without oklch() support (Firefox <113, Chrome <111, Safari <16.4)
@@ -950,14 +950,16 @@ $display_dir = ($home && str_starts_with($dir, $home)) ? '~' . substr($dir, strl
      and --accent would fall back to its initial value (unset). */
   --accent: #3a97a9;       --accent-ink: #1c4c58;
   --accent: oklch(62% 0.11 190); --accent-ink: oklch(35% 0.08 190);
+  --brand: #00746f; --brand: oklch(48% 0.14 190);
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #0f1210; --bg-elev: #161a17; --bg-sunk: #0b0e0c;
-    --border: #252925; --text: #edeee9; --text-soft: #c6c9c1;
+    --border: #3a3f3a; --text: #edeee9; --text-soft: #c6c9c1;
     --muted: #8a8e85; --dim: #5d615a;
     --accent: #4db0c2;       --accent-ink: #83d2e0;
     --accent: oklch(72% 0.12 190); --accent-ink: oklch(82% 0.10 190);
+    --brand: #1dbcb5; --brand: oklch(72% 0.12 190);
   }
 }
 html { background: var(--bg); }
@@ -969,7 +971,7 @@ body {
   font-feature-settings: "ss01", "cv11";
 }
 main { max-width: 560px; text-align: center; }
-.mark { width: 56px; height: 56px; margin: 0 auto 1.75rem; display: block; }
+.mark { width: 56px; height: 56px; margin: 0 auto 1.75rem; display: block; fill: none; stroke: var(--brand); stroke-width: 4; }
 h1 {
   font-family: 'Fraunces', 'Times New Roman', serif;
   font-style: italic; font-weight: 500;
@@ -988,13 +990,13 @@ p { color: var(--text-soft); line-height: 1.55; font-size: 1.02rem; margin-botto
   font-size: 0.82rem;
   padding: 0.45rem 0.8rem;
   background: var(--bg-sunk); border: 1px solid var(--border);
-  border-radius: 7px; color: var(--text-soft);
+  border-radius: 4px; color: var(--text-soft);
   margin: 0.25rem 0 2rem; word-break: break-all;
 }
 .actions { display: inline-flex; gap: 0.5rem; flex-wrap: wrap; justify-content: center; }
 .pill {
   display: inline-flex; align-items: center; gap: 0.45em;
-  padding: 0.55rem 1.05rem; border-radius: 999px;
+  padding: 0.55rem 1.05rem; border-radius: 4px;
   border: 1px solid var(--border);
   background: var(--bg-elev); color: var(--text-soft);
   font-family: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
@@ -1002,8 +1004,8 @@ p { color: var(--text-soft); line-height: 1.55; font-size: 1.02rem; margin-botto
   transition: border-color 120ms, color 120ms, background 120ms;
 }
 .pill:hover { border-color: var(--accent); color: var(--accent-ink); background: var(--bg-sunk); }
-.pill.primary { background: var(--accent); border-color: var(--accent); color: #0a1a1c; }
-.pill.primary:hover { filter: brightness(1.08); background: var(--accent); color: #0a1a1c; }
+.pill.primary { background: var(--brand); border-color: var(--brand); color: #ffffff; }
+.pill.primary:hover { filter: brightness(1.08); background: var(--brand); color: #ffffff; }
 footer {
   margin-top: 3rem;
   font-family: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
@@ -1016,18 +1018,7 @@ footer a:hover { color: var(--text); }
 <body>
 <main>
   <svg class="mark" viewBox="0 0 64 64" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-    <defs><clipPath id="c"><circle cx="32" cy="32" r="28"/></clipPath></defs>
-    <g clip-path="url(#c)">
-      <rect width="64" height="64" fill="#f6f1e8"/>
-      <rect y="32" width="64" height="32" fill="#3a97a9"/>
-      <path d="M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z" fill="#58b293"/>
-      <line x1="2" y1="32" x2="62" y2="32" stroke="#1c4c58" stroke-width="2.5" fill="none"/>
-      <g stroke="#1c4c58" stroke-width="2.6" fill="none">
-        <path d="M 10 42 Q 18 38, 26 42 T 42 42 T 56 42"/>
-        <path d="M 14 50 Q 22 46, 30 50 T 46 50 T 56 50"/>
-      </g>
-    </g>
-    <circle cx="32" cy="32" r="28" stroke="#1c4c58" stroke-width="3" fill="none"/>
+    <circle cx="32" cy="32" r="26"/><path d="M 17 27 Q 24.5 20 32 27 T 47 27"/><path d="M 17 40 Q 24.5 33 32 40 T 47 40"/>
   </svg>
   <h1>Hello.</h1>
   <div class="host"><?= htmlspecialchars($host) ?></div>
@@ -1718,7 +1709,9 @@ if [ ! -x "\$mailpit_bin" ]; then
     exit 127
 fi
 
-exec "\$mailpit_bin" --database "\$db_path"
+# --max 0 lifts Mailpit's default cap of 500 stored messages; local mail is
+# small and the point of catching it is to still have it later.
+exec "\$mailpit_bin" --database "\$db_path" --label Cove --max 0
 EOM
     chmod +x "$script_path"
     echo "$script_path"
@@ -2056,12 +2049,36 @@ function adminer_object() {
             return ['localhost', null, null];
         }
         function login($login, $password) { return true; }
+        // Adminer only signs in from a POSTed login form carrying the session
+        // token, so a bare `?username=` lands on the form. Render that form
+        // pre-filled from ~/Cove/config and submit it automatically; the
+        // token Adminer prints beside it makes the POST valid. If this request
+        // IS that POST and we are back here, sign-in failed: stay put and
+        // show the button so it can never loop.
+        function loginForm() {
+            list($server, $user, $pass) = $this->credentials();
+            if ($user === null) { parent::loginForm(); return; }
+            $failed = isset($_POST['auth']);
+            $h = function ($v) { return htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8'); };
+            $nonce = \Adminer\nonce();
+            echo "<div class='cove-autologin" . ($failed ? " is-failed" : "") . "'>\n";
+            foreach (['driver' => 'server', 'server' => $server, 'username' => $user, 'password' => $pass, 'db' => ($_GET['db'] ?? ''), 'permanent' => '1'] as $k => $v) {
+                echo "<input type='hidden' name='auth[{$k}]' value='" . $h($v) . "'>\n";
+            }
+            echo "<p class='cove-autologin-msg'>" . ($failed
+                ? "Couldn't sign in to MariaDB as <code>" . $h($user) . "</code>. Is it running? Try <code>cove status</code>."
+                : "Signing in to MariaDB as <code>" . $h($user) . "</code>&hellip;") . "</p>\n";
+            echo "<p><input type='submit' value='" . ($failed ? 'Try again' : 'Open databases') . "'></p>\n</div>\n";
+            if (!$failed) {
+                echo "<script{$nonce}>(function(){var d=document.querySelector('.cove-autologin');if(d&&d.closest('form'))d.closest('form').submit();})();</script>\n";
+            }
+        }
         function head($title = null) {
             // Inject the Cove theme toggle. Inline init runs before adminer.css
             // applies so the saved choice (or system preference) is honored
             // without a theme flash on load.
             $nonce = \Adminer\nonce();
-            $init = "(function(){try{var s=localStorage.getItem('cove-adminer-theme');var t=(s==='dark'||s==='light')?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();";
+            $init = "(function(){try{var h=document.documentElement,s=localStorage.getItem('cove-adminer-theme');var p=(s==='dark'||s==='light')?s:'system';var t=p==='system'?(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):p;h.setAttribute('data-theme',t);h.setAttribute('data-theme-pref',p);}catch(e){}})();";
             echo "<script{$nonce}>{$init}</script>\n";
             $v = @filemtime(__DIR__ . '/adminer.js') ?: 1;
             echo "<script src='adminer.js?v={$v}'{$nonce}></script>\n";
@@ -2381,6 +2398,18 @@ db.cove.localhost {
 
 cove.localhost {
     root * "$GUI_DIR"
+    # Mailpit's REST API, same-origin for the dashboard's Mail view:
+    # /mail-api/v1/... -> 127.0.0.1:8025/api/v1/... (the websocket at
+    # /mail-api/events rides the same route). Mailpit answers 403 to any
+    # request whose Origin header is not its own host — even a GET or the
+    # websocket upgrade — so the browser's Origin is dropped on the way in.
+    handle_path /mail-api/* {
+        rewrite * /api{uri}
+        reverse_proxy 127.0.0.1:8025 {
+            header_up -Origin
+            header_up Host {upstream_hostport}
+        }
+    }
     php_server
     tls internal
 }
@@ -2814,6 +2843,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         }
                     }
 
+                    // The database name as WordPress actually uses it — read
+                    // from wp-config.php rather than recomputed, because
+                    // cove_add's `echo … | tr -c` folds echo's newline into a
+                    // trailing underscore (cove_mysite_), which a mimic would
+                    // have to reproduce forever.
+                    $db_name = preg_replace('/[^a-zA-Z0-9_]/', '_', 'cove_' . str_replace('.localhost', '', $item));
+                    $cfg_file = $site_path . '/public/wp-config.php';
+                    if (is_file($cfg_file)) {
+                        $cfg_head = @file_get_contents($cfg_file, false, null, 0, 16384);
+                        if ($cfg_head !== false && preg_match('/define\s*\(\s*[\'"]DB_NAME[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $cfg_head, $m)) $db_name = $m[1];
+                    }
+
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
                         'domain' => 'https://' . $item . $__cove_port_suffix,
@@ -2826,9 +2867,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'full_path' => $site_path,
                         'size_bytes' => isset($size_cache[$item]) ? (int) $size_cache[$item] : null,
                         'modified_at' => $mtime ?: null,
-                        // Mirrors cove_add's `echo "cove_$name" | tr -c '[:alnum:]_' '_'`,
-                        // so the UI can deep-link Adminer straight at this site's schema.
-                        'db_name' => preg_replace('/[^a-zA-Z0-9_]/', '_', 'cove_' . str_replace('.localhost', '', $item)),
+                        'db_name' => $db_name,
                         // Per-site PHP pin (`cove php`); null = Cove's default PHP.
                         'php_version' => is_file($site_path . '/php_version') ? trim((string) @file_get_contents($site_path . '/php_version')) : null,
                     ];
@@ -3082,6 +3121,484 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 escapeshellarg($site_name), escapeshellarg($php_version), escapeshellarg($apply_log)));
             echo json_encode(['success' => true, 'applying' => true, 'installing' => $needs_install]);
             exit;
+        case 'service_info':
+            // One status panel per nav service. Only cheap probes: a socket check
+            // per port and one `--version` call each, so opening the panel never
+            // hangs the dashboard. Caddy is trivially running — it served this request.
+            $__svc_bin = function ($name) use ($user_home) {
+                $dirs = array_merge(explode(':', getenv('PATH') ?: ''), ['/opt/homebrew/bin', '/usr/local/bin', '/home/linuxbrew/.linuxbrew/bin', $user_home . '/.local/bin', '/usr/bin']);
+                foreach ($dirs as $d) { if ($d !== '' && is_executable($d . '/' . $name)) return $d . '/' . $name; }
+                return null;
+            };
+            $__svc_out = function ($cmd) { return trim((string) @shell_exec($cmd . ' 2>/dev/null')); };
+            $__svc_port_open = function ($port) { $sock = @fsockopen('127.0.0.1', (int) $port, $e, $es, 0.3); if ($sock) { fclose($sock); return true; } return false; };
+            $__svc_match = function ($re, $text) { return preg_match($re, $text, $m) ? $m[1] : '—'; };
+            $__svc_cfg = isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : [];
+            $__svc_http_port = (int) ($__svc_cfg['HTTP_PORT'] ?? 80);
+
+            $fp  = $__svc_bin('frankenphp');
+            $mdb = $__svc_bin('mariadb') ?: $__svc_bin('mysql');
+            $mp  = $__svc_bin('mailpit');
+            $fpv  = $fp  ? $__svc_out(escapeshellarg($fp) . ' version') : '';
+            $mdbv = $mdb ? $__svc_out(escapeshellarg($mdb) . ' --version') : '';
+            $mpv  = $mp  ? $__svc_out(escapeshellarg($mp) . ' version') : '';
+            $db_up = $__svc_port_open(3306);
+            $mp_up = $__svc_port_open(8025);
+            $adminer = 'https://db.cove.localhost' . $__cove_port_suffix;
+            $mailui  = 'https://mail.cove.localhost' . $__cove_port_suffix;
+
+            echo json_encode(['success' => true, 'services' => [
+                'caddy' => [
+                    'label' => 'Caddy', 'running' => true,
+                    'status' => 'Running — it served this page.',
+                    'rows' => [
+                        ['caddy', $__svc_match('/Caddy v([0-9][0-9.]*)/', $fpv)],
+                        ['frankenphp', $__svc_match('/FrankenPHP v([0-9][0-9.]*)/', $fpv)],
+                        ['php', $__svc_match('/PHP ([0-9][0-9.]*)/', $fpv)],
+                        ['https', '127.0.0.1:' . $__cove_https_port],
+                        ['http', '127.0.0.1:' . $__svc_http_port],
+                        ['caddyfile', '~/Cove/Caddyfile'],
+                    ],
+                    'note' => 'One binary: Caddy and the PHP runtime share a process.',
+                    'actions' => [['kind' => 'logs', 'label' => 'open logs'], ['kind' => 'reload', 'label' => 'reload caddy']],
+                ],
+                'mariadb' => [
+                    'label' => 'MariaDB', 'running' => $db_up,
+                    'status' => $db_up ? 'Running on 127.0.0.1:3306.' : 'Not answering on 127.0.0.1:3306.',
+                    'rows' => [
+                        ['version', $__svc_match('/([0-9]+\.[0-9]+\.[0-9]+)-MariaDB/', $mdbv)],
+                        ['host', '127.0.0.1:3306'],
+                        ['user', $__svc_cfg['DB_USER'] ?? '—'],
+                        ['password', $__svc_cfg['DB_PASSWORD'] ?? '—'],
+                        ['adminer', $adminer],
+                    ],
+                    'note' => 'Credentials stored in ~/Cove/config. Cove uses them to create new WordPress databases.',
+                    'actions' => [['kind' => 'db', 'label' => 'open databases'], ['kind' => 'open', 'label' => 'adminer ↗', 'href' => $adminer]],
+                ],
+                'mailpit' => [
+                    'label' => 'Mailpit', 'running' => $mp_up,
+                    'status' => $mp_up ? 'Running — catching every message your sites send.' : 'Not answering on 127.0.0.1:8025.',
+                    'rows' => [
+                        ['version', $__svc_match('/v([0-9][0-9.]*)/', $mpv)],
+                        ['smtp', '127.0.0.1:1025'],
+                        ['web ui', $mailui],
+                        ['delivers', 'nowhere — mail never leaves this machine'],
+                    ],
+                    'note' => 'WordPress on every Cove site is pointed at the SMTP port above.',
+                    'actions' => [['kind' => 'mail', 'label' => 'open inbox'], ['kind' => 'open', 'label' => 'mailpit ↗', 'href' => $mailui]],
+                ],
+            ]]);
+            exit;
+        case 'db_list':
+        case 'db_tables':
+        case 'db_rows':
+        case 'db_cell':
+        case 'db_update':
+        case 'db_delete_row':
+        case 'db_structure':
+        case 'db_query':
+            // --- Database view -------------------------------------------
+            // The dashboard talks to MariaDB directly over mysqli (PDO is
+            // missing from some FrankenPHP builds; mysqli is what WordPress
+            // itself needs, so it is always present). Same-origin POST only,
+            // like every action here. This is a local dev box: the SQL console
+            // is deliberately unrestricted, and every identifier is quoted
+            // rather than allow-listed so any schema a site created works.
+            $__db_cfg = isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : [];
+            mysqli_report(MYSQLI_REPORT_OFF);
+            $__db = @new mysqli('127.0.0.1', $__db_cfg['DB_USER'] ?? '', $__db_cfg['DB_PASSWORD'] ?? '', null, 3306);
+            if ($__db->connect_error) {
+                echo json_encode(['success' => false, 'message' => 'MariaDB is not answering: ' . $__db->connect_error]);
+                exit;
+            }
+            $__db->set_charset('utf8mb4');
+            $__q = function ($id) { return '`' . str_replace('`', '``', $id) . '`'; };
+            $__ident = function ($s) { return is_string($s) && $s !== '' && strlen($s) <= 64 && !preg_match('/[\x00-\x1f]/', $s); };
+            $__fail = function ($msg) { echo json_encode(['success' => false, 'message' => $msg]); exit; };
+            $__system = ['information_schema', 'performance_schema', 'mysql', 'sys'];
+            // JSON-safe cell values: strings and NULL pass through; anything
+            // that is not UTF-8 is shown as a hex prefix, and long text is cut
+            // so a 2 MB serialized option doesn't ride along with every page.
+            $__cell = function ($v) {
+                if ($v === null) return null;
+                $v = (string) $v;
+                if (!mb_check_encoding($v, 'UTF-8')) return ['t' => 'bin', 'hex' => bin2hex(substr($v, 0, 48)), 'len' => strlen($v)];
+                if (strlen($v) > 2000) return ['t' => 'long', 'text' => mb_substr($v, 0, 2000), 'len' => strlen($v)];
+                return $v;
+            };
+            $__rows_of = function ($res) use ($__cell) {
+                $out = [];
+                while ($r = $res->fetch_row()) $out[] = array_map($__cell, $r);
+                return $out;
+            };
+            $__db_name = $input['db'] ?? '';
+            $__table = $input['table'] ?? '';
+            if ($action !== 'db_list' && !($action === 'db_query' && $__db_name === '')) {
+                if (!$__ident($__db_name) || in_array($__db_name, $__system, true)) $__fail('Invalid database.');
+                $st = $__db->prepare('SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?');
+                $st->execute([$__db_name]);
+                if (!$st->get_result()->fetch_row()) $__fail('No such database.');
+            }
+            if (in_array($action, ['db_rows', 'db_cell', 'db_update', 'db_delete_row', 'db_structure'], true)) {
+                if (!$__ident($__table)) $__fail('Invalid table.');
+                $st = $__db->prepare('SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?');
+                $st->execute([$__db_name, $__table]);
+                if (!$st->get_result()->fetch_row()) $__fail('No such table.');
+            }
+            // Columns + the key used to address a row: the primary key, else
+            // the first unique index whose columns are all NOT NULL. Without
+            // one the grid is read-only — there is no safe way to say "this
+            // row" in SQL.
+            $__describe = function () use ($__db, $__q, $__db_name, $__table) {
+                $cols = [];
+                $res = $__db->query('SHOW FULL COLUMNS FROM ' . $__q($__db_name) . '.' . $__q($__table));
+                while ($c = $res->fetch_assoc()) {
+                    $cols[] = ['name' => $c['Field'], 'type' => $c['Type'], 'null' => $c['Null'] === 'YES', 'key' => $c['Key'], 'default' => $c['Default'], 'extra' => $c['Extra'], 'collation' => $c['Collation'], 'comment' => $c['Comment']];
+                }
+                $pk = array_values(array_map(fn($c) => $c['name'], array_filter($cols, fn($c) => $c['key'] === 'PRI')));
+                $indexes = [];
+                $res = $__db->query('SHOW INDEX FROM ' . $__q($__db_name) . '.' . $__q($__table));
+                while ($i = $res->fetch_assoc()) {
+                    $k = $i['Key_name'];
+                    if (!isset($indexes[$k])) $indexes[$k] = ['name' => $k, 'unique' => $i['Non_unique'] === '0' || $i['Non_unique'] === 0, 'type' => $i['Index_type'], 'columns' => []];
+                    $indexes[$k]['columns'][] = $i['Column_name'];
+                }
+                $indexes = array_values($indexes);
+                if (!$pk) {
+                    $notnull = array_map(fn($c) => $c['name'], array_filter($cols, fn($c) => !$c['null']));
+                    foreach ($indexes as $ix) {
+                        if ($ix['unique'] && !array_diff($ix['columns'], $notnull)) { $pk = $ix['columns']; break; }
+                    }
+                }
+                return [$cols, $pk, $indexes];
+            };
+            // WHERE for one row from the client's {col: value} key map.
+            $__row_where = function ($cols, $pk) use ($input, $__q, $__fail) {
+                if (!$pk) $__fail('This table has no primary key, so rows cannot be addressed.');
+                $key = $input['pk'] ?? null;
+                if (!is_array($key)) $__fail('Missing row key.');
+                $parts = []; $params = [];
+                foreach ($pk as $c) {
+                    if (!array_key_exists($c, $key)) $__fail('Missing row key.');
+                    if ($key[$c] === null) { $parts[] = $__q($c) . ' IS NULL'; }
+                    else { $parts[] = $__q($c) . ' = ?'; $params[] = (string) $key[$c]; }
+                }
+                return [implode(' AND ', $parts), $params];
+            };
+
+            if ($action === 'db_list') {
+                // Sizes come from information_schema.TABLES, which opens every
+                // table the first time (a few seconds with thousands of them),
+                // so the UI asks for names first ('light') and sizes second.
+                $light = !empty($input['light']);
+                $res = $light
+                    ? $__db->query('SELECT SCHEMA_NAME AS name, NULL AS tables_count, NULL AS bytes FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME')
+                    : $__db->query('SELECT s.SCHEMA_NAME AS name, COUNT(t.TABLE_NAME) AS tables_count, COALESCE(SUM(t.DATA_LENGTH + t.INDEX_LENGTH), 0) AS bytes FROM information_schema.SCHEMATA s LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = s.SCHEMA_NAME GROUP BY s.SCHEMA_NAME ORDER BY s.SCHEMA_NAME');
+                $out = [];
+                while ($r = $res->fetch_assoc()) {
+                    if (in_array($r['name'], $__system, true)) continue;
+                    $out[] = ['name' => $r['name'], 'tables' => $light ? null : (int) $r['tables_count'], 'bytes' => $light ? null : (int) $r['bytes']];
+                }
+                echo json_encode(['success' => true, 'databases' => $out, 'server' => $__db->server_info]);
+                exit;
+            }
+
+            if ($action === 'db_tables') {
+                $st = $__db->prepare('SELECT TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_ROWS, DATA_LENGTH + INDEX_LENGTH AS bytes, TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME');
+                $st->execute([$__db_name]);
+                $tables = []; $names = [];
+                foreach ($st->get_result()->fetch_all(MYSQLI_ASSOC) as $t) {
+                    $names[] = $t['TABLE_NAME'];
+                    $tables[] = ['name' => $t['TABLE_NAME'], 'view' => $t['TABLE_TYPE'] === 'VIEW', 'engine' => $t['ENGINE'], 'rows' => $t['TABLE_ROWS'] === null ? null : (int) $t['TABLE_ROWS'], 'bytes' => (int) $t['bytes'], 'collation' => $t['TABLE_COLLATION']];
+                }
+                // WordPress summary: the shortest prefix that owns both an
+                // options and a posts table (a multisite has wp_2_options too).
+                $wp = null;
+                $prefixes = [];
+                foreach ($names as $n) {
+                    if (preg_match('/^(.*)options$/', $n, $m) && in_array($m[1] . 'posts', $names, true)) $prefixes[] = $m[1];
+                }
+                if ($prefixes) {
+                    usort($prefixes, fn($a, $b) => strlen($a) - strlen($b));
+                    $p = $prefixes[0];
+                    $opt = $__q($__db_name) . '.' . $__q($p . 'options');
+                    $wp = ['prefix' => $p, 'siteurl' => null, 'home' => null, 'options' => 0, 'autoload_bytes' => 0, 'autoload_count' => 0, 'largest' => []];
+                    $res = $__db->query("SELECT option_name, option_value FROM $opt WHERE option_name IN ('siteurl', 'home', 'blogname', 'template', 'stylesheet')");
+                    while ($res && ($r = $res->fetch_assoc())) $wp[$r['option_name']] = $r['option_value'];
+                    $res = $__db->query("SELECT COUNT(*) AS n, COALESCE(SUM(IF(autoload IN ('yes', 'on', 'auto-on', 'auto'), LENGTH(option_value), 0)), 0) AS ab, SUM(autoload IN ('yes', 'on', 'auto-on', 'auto')) AS ac FROM $opt");
+                    if ($res && ($r = $res->fetch_assoc())) { $wp['options'] = (int) $r['n']; $wp['autoload_bytes'] = (int) $r['ab']; $wp['autoload_count'] = (int) $r['ac']; }
+                    $res = $__db->query("SELECT option_name, LENGTH(option_value) AS len FROM $opt WHERE autoload IN ('yes', 'on', 'auto-on', 'auto') ORDER BY len DESC LIMIT 8");
+                    while ($res && ($r = $res->fetch_assoc())) $wp['largest'][] = ['name' => $r['option_name'], 'bytes' => (int) $r['len']];
+                    foreach (['posts', 'users', 'comments'] as $t) {
+                        $res = $__db->query('SELECT COUNT(*) AS n FROM ' . $__q($__db_name) . '.' . $__q($p . $t));
+                        $wp[$t] = ($res && ($r = $res->fetch_assoc())) ? (int) $r['n'] : null;
+                    }
+                }
+                echo json_encode(['success' => true, 'tables' => $tables, 'wp' => $wp]);
+                exit;
+            }
+
+            if ($action === 'db_structure') {
+                [$cols, $pk, $indexes] = $__describe();
+                $res = $__db->query('SHOW CREATE TABLE ' . $__q($__db_name) . '.' . $__q($__table));
+                $create = ($res && ($r = $res->fetch_row())) ? ($r[1] ?? '') : '';
+                echo json_encode(['success' => true, 'columns' => $cols, 'pk' => $pk, 'indexes' => $indexes, 'create' => $create]);
+                exit;
+            }
+
+            if ($action === 'db_rows') {
+                [$cols, $pk] = $__describe();
+                $names = array_map(fn($c) => $c['name'], $cols);
+                $limit = max(10, min(500, (int) ($input['limit'] ?? 100)));
+                $start = max(0, (int) ($input['start'] ?? 0));
+                $where = ''; $params = [];
+                $q = (string) ($input['q'] ?? '');
+                $col = (string) ($input['col'] ?? '');
+                if ($q !== '') {
+                    $like = '%' . $q . '%';
+                    if ($col !== '' && in_array($col, $names, true)) {
+                        $where = ' WHERE ' . $__q($col) . ' LIKE ?'; $params[] = $like;
+                    } else {
+                        $parts = [];
+                        foreach (array_slice($names, 0, 60) as $n) { $parts[] = 'CAST(' . $__q($n) . ' AS CHAR) LIKE ?'; $params[] = $like; }
+                        $where = ' WHERE ' . implode(' OR ', $parts);
+                    }
+                }
+                $order = '';
+                $sort = (string) ($input['sort'] ?? '');
+                $dir = ($input['dir'] ?? 'asc') === 'desc' ? 'DESC' : 'ASC';
+                if ($sort !== '' && in_array($sort, $names, true)) $order = ' ORDER BY ' . $__q($sort) . ' ' . $dir;
+                elseif ($pk) $order = ' ORDER BY ' . implode(', ', array_map($__q, $pk));
+                $from = ' FROM ' . $__q($__db_name) . '.' . $__q($__table);
+                $st = $__db->prepare('SELECT COUNT(*)' . $from . $where);
+                if (!$st) $__fail($__db->error);
+                $st->execute($params);
+                $total = (int) ($st->get_result()->fetch_row()[0] ?? 0);
+                $st = $__db->prepare('SELECT *' . $from . $where . $order . ' LIMIT ' . $start . ', ' . $limit);
+                if (!$st) $__fail($__db->error);
+                if (!$st->execute($params)) $__fail($st->error);
+                $rows = $__rows_of($st->get_result());
+                echo json_encode(['success' => true, 'columns' => $cols, 'pk' => $pk, 'rows' => $rows, 'total' => $total, 'start' => $start, 'limit' => $limit]);
+                exit;
+            }
+
+            if ($action === 'db_cell') {
+                [$cols, $pk] = $__describe();
+                $col = (string) ($input['col'] ?? '');
+                if (!in_array($col, array_map(fn($c) => $c['name'], $cols), true)) $__fail('Unknown column.');
+                [$w, $params] = $__row_where($cols, $pk);
+                $st = $__db->prepare('SELECT ' . $__q($col) . ' FROM ' . $__q($__db_name) . '.' . $__q($__table) . ' WHERE ' . $w . ' LIMIT 1');
+                $st->execute($params);
+                $r = $st->get_result()->fetch_row();
+                if (!$r) $__fail('Row not found.');
+                if ($r[0] !== null && !mb_check_encoding((string) $r[0], 'UTF-8')) $__fail('Binary values cannot be edited here.');
+                echo json_encode(['success' => true, 'value' => $r[0] === null ? null : (string) $r[0]]);
+                exit;
+            }
+
+            if ($action === 'db_update') {
+                [$cols, $pk] = $__describe();
+                $col = (string) ($input['col'] ?? '');
+                if (!in_array($col, array_map(fn($c) => $c['name'], $cols), true)) $__fail('Unknown column.');
+                [$w, $params] = $__row_where($cols, $pk);
+                $isNull = !empty($input['null']);
+                $value = $isNull ? null : (string) ($input['value'] ?? '');
+                $sql = 'UPDATE ' . $__q($__db_name) . '.' . $__q($__table) . ' SET ' . $__q($col) . ' = ' . ($isNull ? 'NULL' : '?') . ' WHERE ' . $w . ' LIMIT 1';
+                $st = $__db->prepare($sql);
+                if (!$st) $__fail($__db->error);
+                if (!$st->execute($isNull ? $params : array_merge([$value], $params))) $__fail($st->error);
+                $affected = $st->affected_rows;
+                // Hand back the row as it now is, keyed the same way the grid
+                // is, so a trigger or a type coercion shows up immediately.
+                $keyMap = $input['pk'];
+                if (!$isNull && in_array($col, $pk, true)) $keyMap[$col] = $value;
+                $parts = []; $p2 = [];
+                foreach ($pk as $c) { if ($keyMap[$c] === null) $parts[] = $__q($c) . ' IS NULL'; else { $parts[] = $__q($c) . ' = ?'; $p2[] = (string) $keyMap[$c]; } }
+                $st = $__db->prepare('SELECT * FROM ' . $__q($__db_name) . '.' . $__q($__table) . ' WHERE ' . implode(' AND ', $parts) . ' LIMIT 1');
+                $st->execute($p2);
+                $row = $st->get_result()->fetch_row();
+                echo json_encode(['success' => true, 'affected' => $affected, 'row' => $row ? array_map($__cell, $row) : null]);
+                exit;
+            }
+
+            if ($action === 'db_delete_row') {
+                [$cols, $pk] = $__describe();
+                [$w, $params] = $__row_where($cols, $pk);
+                $st = $__db->prepare('DELETE FROM ' . $__q($__db_name) . '.' . $__q($__table) . ' WHERE ' . $w . ' LIMIT 1');
+                if (!$st) $__fail($__db->error);
+                if (!$st->execute($params)) $__fail($st->error);
+                echo json_encode(['success' => true, 'affected' => $st->affected_rows]);
+                exit;
+            }
+
+            if ($action === 'db_query') {
+                $sql = (string) ($input['sql'] ?? '');
+                if (trim($sql) === '') $__fail('Nothing to run.');
+                if ($__db_name !== '') $__db->select_db($__db_name);
+                $results = [];
+                $t0 = microtime(true);
+                $cap = 500;
+                if ($__db->multi_query($sql)) {
+                    while (true) {
+                        $res = $__db->store_result();
+                        if ($res) {
+                            $fields = array_map(fn($f) => $f->name, $res->fetch_fields());
+                            $rows = []; $n = 0;
+                            while ($r = $res->fetch_row()) { if ($n++ < $cap) $rows[] = array_map($__cell, $r); }
+                            $results[] = ['type' => 'rows', 'columns' => $fields, 'rows' => $rows, 'total' => $res->num_rows, 'truncated' => $res->num_rows > $cap];
+                            $res->free();
+                        } elseif ($__db->errno) {
+                            $results[] = ['type' => 'error', 'message' => $__db->error];
+                            break;
+                        } else {
+                            $results[] = ['type' => 'ok', 'affected' => $__db->affected_rows, 'insert_id' => $__db->insert_id, 'info' => $__db->info];
+                        }
+                        if (!$__db->more_results()) break;
+                        if (!$__db->next_result()) { $results[] = ['type' => 'error', 'message' => $__db->error]; break; }
+                    }
+                } else {
+                    $results[] = ['type' => 'error', 'message' => $__db->error];
+                }
+                echo json_encode(['success' => true, 'results' => $results, 'ms' => round((microtime(true) - $t0) * 1000, 1)]);
+                exit;
+            }
+            $__fail('Unknown database action.');
+        case 'log_sources':
+        case 'log_read':
+        case 'log_clear':
+            // --- Logs view -------------------------------------------------
+            // Read-only tails of the files Cove already writes: the shared
+            // PHP error log, Caddy's process/reload logs, the watchdog and
+            // Mailpit logs, and per site its WordPress debug.log and Caddy
+            // access log. Files are read backwards in chunks so a 100 MB
+            // error log costs the same as a small one, and the shared error
+            // log can be scoped to one site by the paths in its entries.
+            $__logs_dir = $user_home . '/Cove/Logs';
+            $__log_site = (string) ($input['site'] ?? '');
+            $__log_fail = function ($msg) { echo json_encode(['success' => false, 'message' => $msg]); exit; };
+            if ($__log_site !== '' && !preg_match('/^[a-zA-Z0-9-]+$/', $__log_site)) $__log_fail('Invalid site name.');
+            $__log_resolve = function ($source, $site) use ($__logs_dir, $sitedir) {
+                $site_dir = $site !== '' ? $sitedir . '/' . $site . '.localhost' : null;
+                switch ($source) {
+                    case 'errors':   return [$__logs_dir . '/errors.log', 'php', $site !== '' ? '/Sites/' . $site . '.localhost/' : null];
+                    case 'caddy':    return [$__logs_dir . '/caddy-process.log', 'caddy', null];
+                    case 'reload':   return [$__logs_dir . '/caddy-reload.log', 'caddy', null];
+                    case 'watchdog': return [$__logs_dir . '/watchdog.log', 'plain', null];
+                    case 'mailpit':  return [$__logs_dir . '/mailpit.log', 'plain', null];
+                    case 'debug':    return $site_dir ? [$site_dir . '/public/wp-content/debug.log', 'php', null] : null;
+                    case 'access':   return $site_dir ? [$site_dir . '/logs/caddy.log', 'caddy', null] : null;
+                }
+                if (preg_match('/^fpm-(\d+\.\d+)$/', $source, $m)) return [$__logs_dir . '/php-fpm-' . $m[1] . '.log', 'plain', null];
+                return null;
+            };
+
+            if ($action === 'log_sources') {
+                $system = [];
+                foreach ([['errors', 'php errors'], ['caddy', 'caddy'], ['watchdog', 'watchdog'], ['mailpit', 'mailpit'], ['reload', 'reloads']] as [$key, $label]) {
+                    [$p] = $__log_resolve($key, '');
+                    $system[] = ['key' => $key, 'label' => $label, 'size' => is_file($p) ? filesize($p) : null, 'mtime' => is_file($p) ? filemtime($p) : null];
+                }
+                foreach (glob($__logs_dir . '/php-fpm-*.log') ?: [] as $p) {
+                    if (preg_match('/php-fpm-(\d+\.\d+)\.log$/', $p, $m)) $system[] = ['key' => 'fpm-' . $m[1], 'label' => 'php-fpm ' . $m[1], 'size' => filesize($p), 'mtime' => filemtime($p)];
+                }
+                $sites = [];
+                if (is_dir($sitedir)) {
+                    foreach (scandir($sitedir) as $item) {
+                        if ($item === '.' || $item === '..' || substr($item, -10) !== '.localhost' || !is_dir($sitedir . '/' . $item)) continue;
+                        $name = substr($item, 0, -10);
+                        $dbg = $sitedir . '/' . $item . '/public/wp-content/debug.log';
+                        $acc = $sitedir . '/' . $item . '/logs/caddy.log';
+                        $d = is_file($dbg) ? filesize($dbg) : null; $a = is_file($acc) ? filesize($acc) : null;
+                        $sites[] = ['name' => $name, 'debug' => $d, 'access' => $a, 'mtime' => max($d ? filemtime($dbg) : 0, $a ? filemtime($acc) : 0) ?: null];
+                    }
+                }
+                echo json_encode(['success' => true, 'system' => $system, 'sites' => $sites, 'dir' => $__logs_dir]);
+                exit;
+            }
+
+            $__log_source = (string) ($input['source'] ?? 'errors');
+            $__resolved = $__log_resolve($__log_source, $__log_site);
+            if (!$__resolved) $__log_fail('Unknown log.');
+            [$__log_path, $__log_kind, $__log_needle] = $__resolved;
+
+            if ($action === 'log_clear') {
+                if (is_file($__log_path) && !is_writable($__log_path)) $__log_fail('That log is not writable.');
+                if (is_file($__log_path)) file_put_contents($__log_path, '');
+                echo json_encode(['success' => true]);
+                exit;
+            }
+
+            // log_read. Entries come back as raw strings (newest last) and the
+            // browser parses them; the server only decides where one entry
+            // ends and the next begins, which for PHP logs means a line that
+            // opens with a "[timestamp]" — anything else (stack traces,
+            // wrapped messages) belongs to the entry before it.
+            $__split = function ($text) use ($__log_kind) {
+                $out = [];
+                foreach (explode("\n", $text) as $line) {
+                    if ($line === '' || $line === "\r") continue;
+                    if ($__log_kind === 'php' && $out && $line[0] !== '[') { $out[count($out) - 1] .= "\n" . $line; continue; }
+                    $out[] = $line;
+                }
+                return $out;
+            };
+            $__filter = function ($entries) use ($__log_needle) {
+                if ($__log_needle === null) return $entries;
+                return array_values(array_filter($entries, fn($e) => strpos($e, $__log_needle) !== false));
+            };
+            if (!is_file($__log_path)) {
+                echo json_encode(['success' => true, 'entries' => [], 'size' => 0, 'next_before' => null, 'scanned' => 0, 'path' => $__log_path, 'kind' => $__log_kind, 'missing' => true]);
+                exit;
+            }
+            clearstatcache(true, $__log_path);
+            $size = filesize($__log_path);
+            $fh = fopen($__log_path, 'r');
+            if (!$fh) $__log_fail('Could not open that log.');
+            $limit = max(50, min(1000, (int) ($input['limit'] ?? 300)));
+
+            if (isset($input['since']) && $input['since'] !== null) {
+                // Live tail: everything written after the offset the browser
+                // last saw. A burst larger than 1 MB is trimmed to its tail.
+                $since = max(0, (int) $input['since']);
+                if ($since > $size) $since = 0; // truncated or rotated underneath us
+                $gap = false;
+                if ($size - $since > 1048576) { $since = $size - 1048576; $gap = true; }
+                fseek($fh, $since);
+                $text = $since < $size ? stream_get_contents($fh) : '';
+                if ($gap) { $nl = strpos($text, "\n"); $text = $nl === false ? '' : substr($text, $nl + 1); }
+                fclose($fh);
+                $entries = $__filter($__split($text));
+                echo json_encode(['success' => true, 'entries' => $entries, 'size' => $size, 'gap' => $gap, 'path' => $__log_path, 'kind' => $__log_kind]);
+                exit;
+            }
+
+            $end = isset($input['before']) && $input['before'] !== null ? min((int) $input['before'], $size) : $size;
+            $chunk = 262144;
+            // Scoping the shared error log to one site may mean reading a lot
+            // of other sites' noise to find a few lines; allow more for that.
+            $cap = $__log_needle !== null ? 12 * 1048576 : 2 * 1048576;
+            $collected = []; $scanned = 0;
+            while ($end > 0 && count($collected) < $limit && $scanned < $cap) {
+                $start = max(0, $end - $chunk);
+                fseek($fh, $start);
+                $text = fread($fh, $end - $start);
+                if ($start > 0) {
+                    // Drop the partial entry at the top of the chunk; the next
+                    // (older) chunk will contain it whole.
+                    $pos = $__log_kind === 'php' ? strpos($text, "\n[") : strpos($text, "\n");
+                    if ($pos === false) { $scanned += $end - $start; $end = $start; continue; }
+                    $text = substr($text, $pos + 1);
+                    $start += $pos + 1;
+                }
+                $entries = $__filter($__split($text));
+                $collected = array_merge($entries, $collected);
+                $scanned += $end - $start;
+                $end = $start;
+            }
+            fclose($fh);
+            if (count($collected) > $limit) $collected = array_slice($collected, -$limit);
+            echo json_encode(['success' => true, 'entries' => $collected, 'size' => $size, 'next_before' => $end > 0 ? $end : null, 'scanned' => $scanned, 'path' => $__log_path, 'kind' => $__log_kind]);
+            exit;
         case 'reload_server':
             // This command is run in the background to prevent deadlocking the server.
             // Output is redirected to /dev/null and the '&' backgrounds the process.
@@ -3210,14 +3727,16 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         (function () {
             try {
                 var s = localStorage.getItem('theme');
-                var t = (s === 'dark' || s === 'light')
-                    ? s
+                var pref = (s === 'dark' || s === 'light') ? s : 'system';
+                var t = pref !== 'system'
+                    ? pref
                     : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
                 document.documentElement.setAttribute('data-theme', t);
+                document.documentElement.setAttribute('data-theme-pref', pref);
             } catch (e) {}
         })();
     </script>
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' stroke-linecap='round' stroke-linejoin='round'><defs><clipPath id='c'><circle cx='32' cy='32' r='28'/></clipPath></defs><g clip-path='url(%23c)'><rect width='64' height='64' fill='%23f6f1e8'/><rect y='32' width='64' height='32' fill='%233a97a9'/><path d='M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z' fill='%2358b293'/><line x1='2' y1='32' x2='62' y2='32' stroke='%231c4c58' stroke-width='2.5' fill='none'/><g stroke='%231c4c58' stroke-width='2.6' fill='none'><path d='M 10 42 Q 18 38, 26 42 T 42 42 T 56 42'/><path d='M 14 50 Q 22 46, 30 50 T 46 50 T 56 50'/></g></g><circle cx='32' cy='32' r='28' stroke='%231c4c58' stroke-width='3' fill='none'/></svg>">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='32' r='30' fill='%23009b95'/><g fill='none' stroke='%23ffffff' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'><path d='M 17 27 Q 24.5 20 32 27 T 47 27'/><path d='M 17 40 Q 24.5 33 32 40 T 47 40'/></g></svg>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -3241,8 +3760,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --accent: #3a97a9;
             --accent: oklch(62% 0.11 190);
             --accent-fg: #0a1a1c;
-            --radius-lg: 20px;
-            --radius-md: 10px;
+            /* Inked: hairlines do the work, corners near-square, nothing floats. */
+            --radius-lg: 6px;
+            --radius-md: 4px;
+            --radius-sm: 3px;
             --radius-pill: 999px;
         }
 
@@ -3251,7 +3772,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --bg-sunk: #0b0e0c;
             --panel: #181c19;
             --panel-hover: #1e2320;
-            --panel-border: #252925;
+            --panel-border: #3a3f3a;
+            --panel-border-strong: #565c56;
+            --brand: #1dbcb5;
+            --brand: oklch(72% 0.12 190);
             --text: #edeee9;
             --text-dim: #8a8e85;
             --text-faint: #5d615a;
@@ -3268,7 +3792,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --pill-static-fg: #9a9d94;
             --input-bg: #0b0e0c;
             --danger: #d66a6a;
-            --shadow-lg: 0 28px 60px -24px rgba(0,0,0,0.7), 0 6px 16px -6px rgba(0,0,0,0.4);
+            --shadow-lg: none;
             color-scheme: dark;
         }
 
@@ -3277,7 +3801,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --bg-sunk: #f4f2ec;
             --panel: #ffffff;
             --panel-hover: #f6f4ee;
-            --panel-border: #e8e4da;
+            --panel-border: #c9c4b6;
+            --panel-border-strong: #9a948a;
+            --brand: #00746f;
+            --brand: oklch(48% 0.14 190);
             --text: #1a1c1b;
             --text-dim: #6b6f6a;
             --text-faint: #9a9d97;
@@ -3293,7 +3820,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --pill-static-fg: #8a8781;
             --input-bg: #fbfaf7;
             --danger: #b44848;
-            --shadow-lg: 0 24px 50px -24px rgba(20,28,30,0.18), 0 6px 16px -6px rgba(20,28,30,0.06);
+            --shadow-lg: none;
             color-scheme: light;
         }
 
@@ -3309,9 +3836,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             font-feature-settings: "ss01", "cv11";
         }
 
-        .wrap { max-width: 820px; margin: 0 auto; }
+        /* The page widens for mail and databases; ease the width so a view
+           switch reads as the same page reshaping, not a new one landing. */
+        .wrap { position: relative; max-width: 820px; margin: 0 auto; transition: max-width 280ms cubic-bezier(0.2, 0.7, 0.2, 1); }
 
         /* Top nav */
+        .nav { position: relative; }
         .nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2rem; }
         .logo { display: inline-flex; align-items: center; gap: 12px; color: var(--text); text-decoration: none; font-weight: 600; font-size: 1.05rem; letter-spacing: -0.01em; }
         /* Brand mark: cove/bay silhouette in a circle. Classes are scoped to
@@ -3324,35 +3854,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            var() default makes the whole `fill`/`stroke` declaration invalid
            and SVG falls back to fill:black (which is what produces the
            solid-black disc + missing layers on Firefox <113). */
-        .logo-mark { width: 34px; height: 34px; display: block; flex-shrink: 0; }
-        .logo-mark .disc    { fill: var(--mark-disc, #f6f1e8); fill: var(--mark-disc, oklch(96% 0.015 85)); }
-        .logo-mark .water   { fill: var(--mark-water, #3a97a9); fill: var(--mark-water, oklch(62% 0.11 190)); }
-        .logo-mark .land    { fill: var(--mark-land, #58b293); fill: var(--mark-land, oklch(70% 0.10 168)); }
-        .logo-mark .horizon { stroke: var(--mark-horizon, #1c4c58); stroke: var(--mark-horizon, oklch(35% 0.08 190)); fill: none; }
-        .logo-mark .wave    { stroke: var(--mark-wave, #1c4c58); stroke: var(--mark-wave, oklch(35% 0.08 190)); fill: none; }
-        .logo-mark .ring    { stroke: var(--mark-ring, #1c4c58); stroke: var(--mark-ring, oklch(35% 0.08 190)); fill: none; stroke-width: 3; }
-        html[data-theme="dark"] .logo-mark {
-            --mark-disc:    #2b2925;
-            --mark-disc:    oklch(22% 0.01 85);
-            --mark-land:    #6a9d70;
-            --mark-land:    oklch(64% 0.09 168);
-            --mark-ring:    rgba(237, 238, 233, 0.72);
-            --mark-ring:    color-mix(in oklab, var(--text) 72%, transparent);
-            --mark-horizon: rgba(237, 238, 233, 0.72);
-            --mark-horizon: color-mix(in oklab, var(--text) 72%, transparent);
-            --mark-wave:    rgba(237, 238, 233, 0.65);
-            --mark-wave:    color-mix(in oklab, var(--text) 65%, transparent);
-        }
+        .logo-mark { width: 34px; height: 34px; display: block; flex-shrink: 0; fill: none; stroke: var(--brand); stroke-width: 4; }
         /* Square icon button that cross-fades a moon (light mode) with a sun
            (dark mode). Both SVGs are stacked absolutely so the button size
            stays constant during the transition. */
-        .theme-btn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 7px; border: 1px solid var(--panel-border); color: var(--text-dim); background: var(--panel); cursor: pointer; padding: 0; position: relative; flex: none; transition: border-color 120ms, background 120ms, color 120ms; }
+        .theme-btn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: var(--radius-sm); border: 1px solid var(--panel-border); color: var(--text-dim); background: var(--panel); cursor: pointer; padding: 0; position: relative; flex: none; transition: border-color 120ms, background 120ms, color 120ms; }
         .theme-btn:hover { color: var(--text); background: var(--bg-sunk); }
         .theme-btn svg { width: 15px; height: 15px; position: absolute; transition: opacity 200ms ease, transform 300ms ease; }
-        .theme-btn .icon-sun  { opacity: 0; transform: rotate(-40deg) scale(0.7); }
-        .theme-btn .icon-moon { opacity: 1; transform: rotate(0) scale(1); }
-        html[data-theme="dark"] .theme-btn .icon-sun  { opacity: 1; transform: rotate(0) scale(1); }
-        html[data-theme="dark"] .theme-btn .icon-moon { opacity: 0; transform: rotate(40deg) scale(0.7); }
+        .theme-btn svg { opacity: 0; transform: rotate(-40deg) scale(0.7); }
+        /* The icon shows the PREFERENCE (System = half disc), not just the paint. */
+        html[data-theme-pref="system"] .theme-btn .icon-system,
+        html[data-theme-pref="light"]  .theme-btn .icon-sun,
+        html[data-theme-pref="dark"]   .theme-btn .icon-moon { opacity: 1; transform: rotate(0) scale(1); }
+        .nav .theme-menu { position: absolute; left: auto; right: 0; top: calc(100% + 6px); z-index: 300; min-width: 150px; padding: 0.3rem; background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); }
+        .nav .theme-menu .ctx-item[aria-checked="true"]::after { content: "\2713"; color: var(--accent); font-size: 0.85em; }
 
         /* Card */
         .card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-lg); overflow: hidden; box-shadow: var(--shadow-lg); }
@@ -3361,7 +3876,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .card-actions { display: flex; align-items: center; gap: 0.45rem; }
 
         /* Pills */
-        .pill { display: inline-flex; align-items: center; gap: 0.4em; padding: 0.38rem 0.8rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.8rem; font-weight: 400; border: 1px solid var(--panel-border); background: transparent; color: var(--text-dim); text-decoration: none; cursor: pointer; transition: color 120ms, border-color 120ms, background 120ms; white-space: nowrap; }
+        .pill { display: inline-flex; align-items: center; gap: 0.4em; padding: 0.38rem 0.8rem; border-radius: var(--radius-md); font-family: var(--font-mono); font-size: 0.8rem; font-weight: 400; border: 1px solid var(--panel-border); background: transparent; color: var(--text-dim); text-decoration: none; cursor: pointer; transition: color 120ms, border-color 120ms, background 120ms; white-space: nowrap; }
         .pill:hover { color: var(--text); border-color: var(--text-faint); }
         .pill.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 500; }
         .pill.primary:hover { filter: brightness(1.08); color: var(--accent-fg); border-color: var(--accent); }
@@ -3373,8 +3888,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .filter-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1.5rem; border-bottom: 1px solid var(--panel-border); }
         .filter-input { flex: 1; min-width: 0; background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.88rem; padding: 0.15rem 0; outline: 0; }
         .filter-input::placeholder { color: var(--text-faint); }
-        .filter-kbd { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); border: 1px solid var(--panel-border); border-radius: 4px; padding: 0.1rem 0.35rem; }
-        .filter-clear { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; font-size: 1.05rem; line-height: 1; padding: 0 0.35rem; border-radius: 5px; }
+        .filter-kbd { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 0.1rem 0.35rem; }
+        .filter-clear { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; font-size: 1.05rem; line-height: 1; padding: 0 0.35rem; border-radius: var(--radius-sm); }
         .filter-clear:hover { color: var(--text); background: var(--panel-hover); }
         /* Chip showing an active type-only filter (set by clicking a row pill).
            Separate state from the free-text filter so users can't hand-edit the
@@ -3390,7 +3905,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .new-site-alert-icon { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: var(--accent-fg); flex: none; }
         .new-site-alert-text { flex: 1; min-width: 0; }
         .new-site-alert-text strong { font-family: var(--font-mono); font-weight: 500; }
-        .new-site-alert-close { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; font-size: 1.15rem; line-height: 1; padding: 0.25rem 0.55rem; border-radius: 5px; flex: none; }
+        .new-site-alert-close { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; font-size: 1.15rem; line-height: 1; padding: 0.25rem 0.55rem; border-radius: var(--radius-sm); flex: none; }
         .new-site-alert-close:hover { color: var(--text); background: var(--panel-hover); }
 
         .add-row { position: relative; padding: 0.9rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
@@ -3439,10 +3954,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         /* The one spot on a row that opens the site — everywhere else on the
            row opens the context menu. Always visible (not hover-gated) so a
            site stays one tap away on touch. */
-        .site-open-link { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; color: var(--text-faint); flex: none; }
+        .site-open-link { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: var(--radius-sm); color: var(--text-faint); flex: none; }
         .site-open-link:hover { color: var(--accent); background: var(--panel-border); }
         .site-open-link svg { width: 13px; height: 13px; }
-        .site-domain mark { background: rgba(58, 151, 169, 0.28); background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: 3px; }
+        .site-domain mark { background: rgba(58, 151, 169, 0.28); background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: var(--radius-sm); }
         .site-type { display: inline-flex; justify-content: center; min-width: 64px; padding: 0.2rem 0.55rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.68rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; user-select: none; transition: filter 120ms; }
         .site-type:hover { filter: brightness(1.15); }
         /* One grid child holding the pill plus its version, so adding the
@@ -3469,7 +3984,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            grid-area "stack" collocates them at the same position and size is
            locked by width/height, toggling opacity on .loading can't shift
            any neighbour. */
-        .site-action-btn { display: inline-grid; grid-template-areas: "stack"; place-items: center; box-sizing: border-box; width: 3.5em; height: 1.75em; padding: 0; background: transparent; border: 0; color: var(--text-dim); cursor: pointer; border-radius: 7px; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1; }
+        .site-action-btn { display: inline-grid; grid-template-areas: "stack"; place-items: center; box-sizing: border-box; width: 3.5em; height: 1.75em; padding: 0; background: transparent; border: 0; color: var(--text-dim); cursor: pointer; border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: 0.78rem; line-height: 1; }
         .site-action-btn > * { grid-area: stack; }
         .site-action-btn:hover { background: var(--panel-border); color: var(--text); }
         .site-action-btn.danger:hover { color: var(--danger); }
@@ -3483,7 +3998,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            (notably .site-action-btn.loading, which uses its own state class). */
         .site-list > .empty, .site-list > .loading { grid-column: 1 / -1; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
         .empty-hint { margin-top: 0.35rem; font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-faint); }
-        .empty-hint code { background: var(--panel-hover); padding: 0.1rem 0.4rem; border-radius: 5px; }
+        .empty-hint code { background: var(--panel-hover); padding: 0.1rem 0.4rem; border-radius: var(--radius-sm); }
         .empty-art { display: block; width: 104px; height: 68px; margin: 0 auto 1rem; }
         .empty-art .art-line { stroke: var(--text-dim); stroke-width: 2; fill: none; }
         .empty-art .art-fill { fill: var(--accent); opacity: 0.14; stroke: none; }
@@ -3492,7 +4007,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         /* Column headers — subgrid row mirroring .site-row's columns. */
         .site-head { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); }
         .site-head-btn, .site-head-label { background: transparent; border: 0; padding: 0; font-family: var(--font-mono); font-size: 0.66rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); text-align: left; }
-        .site-head-btn { cursor: pointer; border-radius: 4px; }
+        .site-head-btn { cursor: pointer; border-radius: var(--radius-sm); }
         .site-head-btn:hover { color: var(--text); }
         .site-head-btn.active { color: var(--text-dim); }
         .site-head-label { justify-self: center; }
@@ -3510,7 +4025,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .nav-services { display: flex; align-items: center; gap: 0.85rem; margin-left: auto; margin-right: 0.85rem; font-family: var(--font-mono); font-size: 0.74rem; }
 
         /* Keyboard selection. Distinct from :hover so the two can coexist. */
-        .site-row.is-selected { background: var(--panel-hover); box-shadow: inset 2px 0 0 var(--accent); }
+        /* Selected rows: fill plus a hairline, never an accent stripe. */
+        .site-row.is-selected { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--panel-border-strong); }
         .site-row.is-selected .site-actions { opacity: 1; }
         /* Transient: only while this row's context menu is open. Deliberately
            separate from .is-selected — a mouse action shouldn't leave keyboard
@@ -3522,9 +4038,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-row.is-pinned .site-domain::before { content: '●'; color: var(--accent); font-size: 0.62rem; margin-right: 0.4rem; vertical-align: middle; opacity: 0.9; }
 
         /* Context menu — opened by clicking a row (right- or left-click). */
-        .ctx-menu { position: fixed; z-index: 300; min-width: 190px; padding: 0.3rem; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; box-shadow: 0 12px 34px rgba(0,0,0,0.28); font-size: 0.85rem; }
+        .ctx-menu { position: fixed; z-index: 300; min-width: 190px; padding: 0.3rem; background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); box-shadow: 0 12px 34px rgba(0,0,0,0.28); font-size: 0.85rem; }
         .ctx-title { padding: 0.35rem 0.6rem 0.45rem; font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); border-bottom: 1px solid var(--panel-border); margin-bottom: 0.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .ctx-item { display: flex; align-items: center; justify-content: space-between; gap: 1rem; width: 100%; background: transparent; border: 0; text-align: left; padding: 0.42rem 0.6rem; border-radius: 6px; color: var(--text); cursor: pointer; font: inherit; }
+        .ctx-item { display: flex; align-items: center; justify-content: space-between; gap: 1rem; width: 100%; background: transparent; border: 0; text-align: left; padding: 0.42rem 0.6rem; border-radius: var(--radius-sm); color: var(--text); cursor: pointer; font: inherit; }
         .ctx-item:hover { background: var(--panel-hover); }
         .ctx-item.danger { color: var(--danger); }
         .ctx-item .ctx-key { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
@@ -3534,11 +4050,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            scrolling, so search is the real navigation and deserves to be one
            keystroke away. */
         .palette-backdrop { position: fixed; inset: 0; z-index: 400; background: rgba(0,0,0,0.45); display: flex; align-items: flex-start; justify-content: center; padding: 12vh 1rem 1rem; }
-        .palette { width: 100%; max-width: 560px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px; box-shadow: 0 24px 60px rgba(0,0,0,0.4); overflow: hidden; display: flex; flex-direction: column; max-height: 70vh; }
+        .palette { width: 100%; max-width: 560px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-lg); box-shadow: 0 24px 60px rgba(0,0,0,0.4); overflow: hidden; display: flex; flex-direction: column; max-height: 70vh; }
         .palette-input { width: 100%; background: transparent; border: 0; border-bottom: 1px solid var(--panel-border); padding: 0.95rem 1.1rem; color: var(--text); font-family: var(--font-mono); font-size: 0.95rem; outline: none; }
         .palette-input::placeholder { color: var(--text-faint); }
         .palette-list { list-style: none; margin: 0; padding: 0.35rem; overflow-y: auto; flex: 1; }
-        .palette-item { display: flex; align-items: center; gap: 0.7rem; padding: 0.5rem 0.75rem; border-radius: 8px; cursor: pointer; }
+        .palette-item { display: flex; align-items: center; gap: 0.7rem; padding: 0.5rem 0.75rem; border-radius: var(--radius-md); cursor: pointer; }
         .palette-item.active { background: var(--panel-hover); }
         .palette-item .pi-name { flex: 1; font-family: var(--font-mono); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .palette-item .pi-meta { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
@@ -3554,7 +4070,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .dot.link:hover, .dot[role="button"]:hover { color: var(--text); }
         .dot::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px rgba(58, 151, 169, 0.6); box-shadow: 0 0 6px color-mix(in oklch, var(--accent) 60%, transparent); }
         .totals { display: inline-flex; align-items: center; gap: 0.5rem; }
-        .refresh-btn { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; padding: 0.15rem 0.35rem; font-size: 0.95rem; border-radius: 5px; }
+        .refresh-btn { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; padding: 0.15rem 0.35rem; font-size: 0.95rem; border-radius: var(--radius-sm); }
         .refresh-btn:hover { color: var(--text); background: var(--panel-hover); }
         .refresh-btn.spinning { animation: spin 1s linear infinite; pointer-events: none; }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -3564,6 +4080,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            an element is all it takes to get the fade. */
         @keyframes cove-fade { from { opacity: 0; } }
         .new-site-alert, .filter-chip, .add-row, .modal-backdrop, .ctx-menu, .palette-backdrop, .snackbar { animation: cove-fade 140ms ease; }
+        /* View switch: the incoming card takes the flow at once, while the
+           outgoing one is lifted out of flow, pinned where it was, and faded
+           over it — a crossfade with no frame where the background shows. */
+        @keyframes cove-view-out { to { opacity: 0; } }
+        .wrap > .card.is-leaving { position: absolute; left: 0; right: 0; max-height: 90vh; overflow: hidden; pointer-events: none; z-index: 5; animation: cove-view-out 200ms ease forwards; }
+        @media (prefers-reduced-motion: reduce) {
+            .wrap { transition: none; }
+            .wrap > .card.is-leaving { display: none !important; }
+        }
 
         /* Modal */
         .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: grid; place-items: center; z-index: 80; padding: 1rem; }
@@ -3575,6 +4100,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .db-creds { background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.9rem 1rem; display: flex; flex-direction: column; gap: 0.7rem; }
         .db-cred-row { display: grid; grid-template-columns: 85px 1fr; align-items: baseline; gap: 0.75rem; font-family: var(--font-mono); font-size: 0.82rem; }
         .db-cred-label { color: var(--text-dim); font-weight: 500; }
+        .svc-status::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 0.5rem; background: var(--accent); vertical-align: 1px; }
+        .svc-status.is-down::before { background: var(--danger); }
+        .svc-actions { display: inline-flex; gap: 0.4rem; flex: none; }
+        .db-cred-value a { color: var(--accent); text-decoration: none; }
+        .db-cred-value a:hover { text-decoration: underline; }
         .db-cred-value { color: var(--text); word-break: break-all; background: transparent; padding: 0; }
         .modal .modal-foot { margin-top: 1rem; display: flex; justify-content: space-between; align-items: center; color: var(--text-faint); font-family: var(--font-mono); font-size: 0.75rem; }
 
@@ -3602,10 +4132,227 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         /* Snackbar */
         /* Centered via auto margins + fit-content width — no transform needed,
            so the fade animation can't interfere with positioning. */
-        .snackbar { position: fixed; bottom: 1.5rem; left: 0; right: 0; margin-inline: auto; width: max-content; max-width: 90vw; display: flex; align-items: center; gap: 0.9rem; background: var(--text); color: var(--bg); padding: 0.7rem 1.15rem; border-radius: 10px; font-size: 0.88rem; z-index: 200; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+        .snackbar { position: fixed; bottom: 1.5rem; left: 0; right: 0; margin-inline: auto; width: max-content; max-width: 90vw; display: flex; align-items: center; gap: 0.9rem; background: var(--text); color: var(--bg); padding: 0.7rem 1.15rem; border-radius: var(--radius-md); font-size: 0.88rem; z-index: 200; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
         .snackbar.error { background: var(--danger); color: white; }
         .snackbar-action { background: transparent; border: 0; padding: 0; color: inherit; font: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
         .snackbar-action:hover { opacity: 0.8; }
+
+        /* View switch: sites | mail. Mail is a sibling view rather than a
+           card below the sites — on a real install the list is thousands of
+           pixels tall, so anything under it is unreachable. */
+        .nav-views { display: flex; align-items: center; gap: 0.15rem; margin-left: 1.4rem; }
+        .nav-view { position: relative; display: inline-flex; align-items: center; gap: 0.4rem; background: transparent; border: 0; padding: 0.35rem 0.55rem; font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-dim); cursor: pointer; border-radius: var(--radius-sm); }
+        .nav-view:hover { color: var(--text); background: var(--panel-hover); }
+        .nav-view.is-active { color: var(--text); }
+        .nav-view.is-active::after { content: ''; position: absolute; left: 0.55rem; right: 0.55rem; bottom: -3px; height: 2px; background: var(--brand); }
+        .nav-badge { font-size: 0.64rem; font-weight: 500; line-height: 1; padding: 0.22rem 0.42rem; border-radius: var(--radius-pill); background: var(--accent); color: var(--accent-fg); }
+
+        /* Mail. The reader needs the width an HTML email was designed for,
+           so this view alone widens the page. */
+        body.view-mail .wrap { max-width: 1120px; }
+        .mail-unread-toggle { display: inline-flex; align-items: center; gap: 0.35rem; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); cursor: pointer; white-space: nowrap; user-select: none; }
+        .mail-unread-toggle input { accent-color: var(--accent); margin: 0; }
+        .mail-delete-all.armed { color: white; background: var(--danger); border-color: var(--danger); }
+        .mail-body { display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); height: calc(100vh - 262px); min-height: 460px; }
+        .mail-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; border-right: 1px solid var(--panel-border); }
+        .mail-row { display: grid; grid-template-columns: 10px minmax(0, 1fr); column-gap: 0.55rem; padding: 0.7rem 1rem 0.7rem 0.9rem; border-bottom: 1px solid var(--panel-border); cursor: pointer; transition: background 100ms; }
+        .mail-row:hover { background: var(--panel-hover); }
+        .mail-row.is-selected { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--panel-border-strong); }
+        .mail-dot { width: 7px; height: 7px; border-radius: 50%; margin-top: 0.45rem; background: transparent; }
+        .mail-row.is-unread .mail-dot { background: var(--accent); }
+        .mail-main { min-width: 0; }
+        .mail-line { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+        .mail-from { flex: 1; min-width: 0; font-size: 0.86rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .mail-row.is-unread .mail-from, .mail-row.is-unread .mail-subject { color: var(--text); font-weight: 500; }
+        .mail-age { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); flex: none; }
+        .mail-att { flex: none; width: 12px; height: 12px; color: var(--text-faint); }
+        .mail-subject { font-size: 0.86rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin: 0.1rem 0 0.15rem; }
+        .mail-site { flex: none; font-family: var(--font-mono); font-size: 0.62rem; letter-spacing: 0.04em; padding: 0.06rem 0.45rem; border-radius: var(--radius-pill); background: var(--pill-wp-bg); color: var(--pill-wp-fg); cursor: pointer; white-space: nowrap; }
+        .mail-site:hover { filter: brightness(1.15); }
+        .mail-snippet { flex: 1; min-width: 0; font-size: 0.76rem; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .mail-list > .empty, .mail-list > .loading { padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .mail-reader { overflow-y: auto; min-width: 0; display: flex; flex-direction: column; }
+        .mail-reader-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-dim); padding: 2rem; text-align: center; }
+        .mail-msg-head { padding: 1.1rem 1.5rem 0.9rem; border-bottom: 1px solid var(--panel-border); }
+        .mail-msg-head .loading { color: var(--text-dim); }
+        .mail-msg-error { color: var(--danger); font-size: 0.9rem; }
+        .mail-msg-subject { font-family: var(--font-serif); font-weight: 500; font-size: 1.25rem; margin: 0 0 0.55rem; letter-spacing: -0.01em; line-height: 1.3; overflow-wrap: anywhere; }
+        .mail-meta-row { display: grid; grid-template-columns: 3rem minmax(0, 1fr); gap: 0.5rem; align-items: baseline; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.6; }
+        .mail-meta-k { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.64rem; }
+        .mail-meta-v { color: var(--text-dim); overflow-wrap: anywhere; }
+        /* Links found in the message — most local mail exists to carry one
+           (password reset, login, verification), so they get a front-row seat
+           with a copy button beside each. */
+        .mail-links { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.7rem; }
+        .mail-links:empty { display: none; }
+        .mail-link { display: inline-flex; align-items: stretch; border: 1px solid var(--panel-border); border-radius: var(--radius-md); font-family: var(--font-mono); font-size: 0.74rem; max-width: 100%; overflow: hidden; }
+        .mail-link a { color: var(--accent); text-decoration: none; padding: 0.3rem 0.6rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 440px; }
+        .mail-link a:hover { background: var(--panel-hover); }
+        .mail-link-copy { background: transparent; border: 0; border-left: 1px solid var(--panel-border); color: var(--text-dim); font: inherit; padding: 0 0.55rem; cursor: pointer; }
+        .mail-link-copy:hover { color: var(--text); background: var(--panel-hover); }
+        .mail-msg-bar { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); flex-wrap: wrap; }
+        .mail-parts { display: flex; gap: 0.15rem; }
+        .mail-part { background: transparent; border: 1px solid transparent; padding: 0.28rem 0.55rem; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); cursor: pointer; border-radius: var(--radius-sm); }
+        .mail-part:hover { color: var(--text); background: var(--panel-hover); }
+        .mail-part.is-active { color: var(--text); background: var(--panel); border-color: var(--panel-border); }
+        .mail-bar-note { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .mail-msg-actions { margin-left: auto; display: flex; gap: 0.35rem; }
+        .mail-msg-actions .pill { padding: 0.26rem 0.6rem; font-size: 0.74rem; }
+        .mail-frame { display: block; width: 100%; border: 0; background: #fff; min-height: 240px; color-scheme: light; }
+        .mail-pre { margin: 0; padding: 1.1rem 1.5rem; font-family: var(--font-mono); font-size: 0.82rem; line-height: 1.55; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+        .mail-pre a { color: var(--accent); }
+        .mail-attachments { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.8rem 1.5rem; border-top: 1px solid var(--panel-border); }
+        .mail-back { display: none; margin-bottom: 0.7rem; }
+        .mail-pager { display: flex; align-items: center; gap: 0.35rem; margin-left: auto; }
+        .pager-btn { background: transparent; border: 1px solid var(--panel-border); color: var(--text-dim); width: 26px; height: 24px; border-radius: var(--radius-sm); cursor: pointer; font-size: 0.95rem; line-height: 1; padding: 0; }
+        .pager-btn:hover { color: var(--text); }
+        .pager-btn:disabled { opacity: 0.35; cursor: default; }
+        @media (max-width: 860px) {
+            .mail-body { grid-template-columns: 1fr; height: auto; min-height: 60vh; }
+            .mail-list { border-right: 0; }
+            .mail-body.has-msg .mail-list { display: none; }
+            .mail-body:not(.has-msg) .mail-reader { display: none; }
+            .mail-back { display: inline-flex; }
+            .mail-link a { max-width: 240px; }
+        }
+
+        /* Databases. Wider still: a grid of a dozen columns needs the room. */
+        body.view-db .wrap { max-width: 1280px; }
+        .db-body { display: grid; grid-template-columns: minmax(250px, 330px) minmax(0, 1fr); height: calc(100vh - 262px); min-height: 460px; }
+        .db-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; border-right: 1px solid var(--panel-border); }
+        .db-row { display: flex; flex-direction: column; gap: 0.2rem; padding: 0.55rem 1rem 0.55rem 0.9rem; border-bottom: 1px solid var(--panel-border); cursor: pointer; transition: background 100ms; min-width: 0; }
+        .db-row-line { display: flex; align-items: baseline; gap: 0.6rem; min-width: 0; }
+        .db-row-site { align-self: flex-start; }
+        .db-row:hover { background: var(--panel-hover); }
+        .db-row.is-selected { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--panel-border-strong); }
+        .db-row-name { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 0.82rem; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .db-row.is-view .db-row-name { font-style: italic; color: var(--text-dim); }
+        .db-row-meta { flex: none; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; }
+        .db-list > .empty, .db-list > .loading { padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .db-main { overflow: hidden; min-width: 0; display: flex; flex-direction: column; }
+        .db-main > div { min-height: 0; }
+        #dbTable, #dbSql { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+        .db-bar { flex: none; }
+        .db-rows-search { display: flex; align-items: center; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--input-bg); overflow: hidden; }
+        .db-rows-search select { background: transparent; border: 0; border-right: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.28rem 0.4rem; max-width: 150px; cursor: pointer; }
+        .db-rows-search input { background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.76rem; padding: 0.28rem 0.55rem; width: 180px; outline: 0; }
+        .db-rows-search:focus-within { border-color: var(--accent); }
+        /* Grid: the wrap scrolls both ways, the header sticks, and every
+           cell stays on one line — a 4 KB serialized option gets an ellipsis
+           and shows itself on a double-click. */
+        .db-grid-wrap { flex: 1; overflow: auto; min-height: 0; }
+        .db-grid { border-collapse: separate; border-spacing: 0; font-family: var(--font-mono); font-size: 0.76rem; min-width: 100%; }
+        .db-grid th { position: sticky; top: 0; z-index: 2; background: var(--panel); text-align: left; font-weight: 500; padding: 0.45rem 0.7rem; border-bottom: 1px solid var(--panel-border); border-right: 1px solid var(--panel-border); white-space: nowrap; cursor: pointer; user-select: none; vertical-align: bottom; }
+        .db-grid th:hover { background: var(--panel-hover); }
+        .db-grid th .col-type { display: block; font-size: 0.62rem; font-weight: 400; color: var(--text-faint); letter-spacing: 0.02em; }
+        .db-grid th .col-key { color: var(--accent); margin-right: 0.25rem; }
+        .db-grid th .sort-arrow { color: var(--text-dim); margin-left: 0.3rem; }
+        .db-grid td { padding: 0.32rem 0.7rem; border-bottom: 1px solid var(--panel-border); border-right: 1px solid var(--panel-border); white-space: nowrap; max-width: 360px; overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); vertical-align: top; }
+        .db-grid tr:hover td { background: var(--panel-hover); }
+        .db-grid td.is-null { color: var(--text-faint); font-style: italic; }
+        .db-grid td.is-num { text-align: right; color: var(--text); }
+        .db-grid td.is-bin { color: var(--text-faint); }
+        .db-grid td.is-editable { cursor: text; }
+        .db-grid td.is-editing { padding: 0; max-width: none; overflow: visible; white-space: normal; }
+        .db-edit { display: block; width: 100%; min-width: 260px; min-height: 2.4rem; box-sizing: border-box; background: var(--input-bg); color: var(--text); border: 1px solid var(--accent); border-radius: 0; padding: 0.3rem 0.6rem; font: inherit; line-height: 1.4; resize: vertical; outline: 0; }
+        .db-edit-hint { display: block; padding: 0.15rem 0.6rem 0.25rem; font-size: 0.64rem; color: var(--text-faint); background: var(--input-bg); }
+        .db-grid td.db-row-actions { padding: 0.15rem 0.35rem; border-right: 0; width: 1%; }
+        .db-row-del { visibility: hidden; background: transparent; border: 1px solid transparent; color: var(--text-faint); font: inherit; font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: var(--radius-sm); cursor: pointer; white-space: nowrap; }
+        .db-grid tr:hover .db-row-del, .db-row-del.armed { visibility: visible; }
+        .db-row-del:hover { color: var(--danger); border-color: var(--danger); }
+        .db-row-del.armed { visibility: visible; color: white; background: var(--danger); border-color: var(--danger); }
+        .db-grid-empty { padding: 2.5rem 1.5rem; text-align: center; color: var(--text-dim); font-family: var(--font-sans); }
+        /* Overview of a database: what a WordPress install would tell you
+           first if it could. */
+        .db-overview { padding: 1.25rem 1.5rem; overflow-y: auto; }
+        .db-overview h2 { font-family: var(--font-serif); font-weight: 500; font-size: 1.25rem; margin: 0 0 0.25rem; letter-spacing: -0.01em; }
+        .db-overview .db-ov-sub { color: var(--text-dim); font-size: 0.88rem; margin: 0 0 1rem; }
+        .db-ov-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0.6rem; margin-bottom: 1.1rem; }
+        .db-ov-stat { border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.6rem 0.8rem; min-width: 0; }
+        .db-ov-stat .k { display: block; font-family: var(--font-mono); font-size: 0.64rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint); margin-bottom: 0.2rem; }
+        .db-ov-stat .v { display: block; font-family: var(--font-mono); font-size: 0.86rem; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .db-ov-stat .v a { color: var(--accent); text-decoration: none; }
+        .db-ov-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--panel-border); border-radius: var(--radius-md); overflow: hidden; }
+        .db-ov-list li { display: flex; justify-content: space-between; gap: 1rem; padding: 0.4rem 0.8rem; border-bottom: 1px solid var(--panel-border); font-family: var(--font-mono); font-size: 0.76rem; cursor: pointer; }
+        .db-ov-list li:last-child { border-bottom: 0; }
+        .db-ov-list li:hover { background: var(--panel-hover); }
+        .db-ov-list li span:first-child { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .db-ov-list li span:last-child { color: var(--text-faint); flex: none; }
+        .db-ov-label { font-family: var(--font-mono); font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); margin: 0 0 0.4rem; }
+        /* Structure */
+        .db-structure { flex: 1; overflow: auto; padding: 1rem 1.5rem; }
+        .db-structure table { border-collapse: collapse; font-family: var(--font-mono); font-size: 0.76rem; width: 100%; margin-bottom: 1.2rem; }
+        .db-structure th { text-align: left; font-weight: 500; font-size: 0.64rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint); padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--panel-border); }
+        .db-structure td { padding: 0.32rem 0.6rem; border-bottom: 1px solid var(--panel-border); color: var(--text-dim); vertical-align: top; }
+        .db-structure td:first-child { color: var(--text); }
+        .db-structure pre { margin: 0; padding: 0.9rem 1rem; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--bg-sunk); font-family: var(--font-mono); font-size: 0.74rem; line-height: 1.5; color: var(--text-dim); white-space: pre-wrap; overflow-wrap: anywhere; }
+        /* SQL console */
+        .db-sql-editor { flex: none; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
+        .db-sql-editor textarea { display: block; width: 100%; box-sizing: border-box; background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.84rem; line-height: 1.55; padding: 0.9rem 1.5rem 0.4rem; resize: vertical; outline: 0; min-height: 6.5rem; }
+        .db-sql-editor textarea::placeholder { color: var(--text-faint); }
+        .db-sql-actions { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 1.5rem 0.7rem; }
+        .db-sql-actions .mail-bar-note { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .db-sql-actions select { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.3rem 0.5rem; border-radius: var(--radius-md); max-width: 220px; cursor: pointer; }
+        .db-kbd { opacity: 0.7; font-size: 0.7em; margin-left: 0.2rem; }
+        .db-sql-results { flex: 1; overflow: auto; min-height: 0; }
+        .db-sql-result { border-bottom: 1px solid var(--panel-border); }
+        .db-sql-result-head { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 1.5rem; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); background: var(--panel); border-bottom: 1px solid var(--panel-border); position: sticky; top: 0; }
+        .db-sql-result-head.is-error { color: var(--danger); }
+        .db-sql-result-head.is-ok { color: var(--text); }
+        .db-sql-result .db-grid-wrap { max-height: 60vh; }
+        @media (max-width: 860px) {
+            .db-body { grid-template-columns: 1fr; height: auto; min-height: 60vh; }
+            .db-list { border-right: 0; max-height: 40vh; }
+            .db-main { min-height: 50vh; }
+        }
+
+        /* Logs. Same two-column shape as mail and databases. */
+        body.view-logs .wrap { max-width: 1180px; }
+        .logs-body { display: grid; grid-template-columns: minmax(220px, 260px) minmax(0, 1fr); height: calc(100vh - 262px); min-height: 460px; }
+        .logs-side { overflow-y: auto; border-right: 1px solid var(--panel-border); display: flex; flex-direction: column; }
+        .logs-side .db-list { border-right: 0; overflow: visible; flex: none; }
+        .logs-side .logs-sites { flex: 1; }
+        .logs-group { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.45rem 0.9rem 0.3rem; font-family: var(--font-mono); font-size: 0.64rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
+        .logs-group-sites { border-top: 1px solid var(--panel-border); }
+        .logs-site-filter { width: 90px; background: transparent; border: 0; border-bottom: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.7rem; text-transform: none; letter-spacing: 0; padding: 0.1rem 0; outline: 0; }
+        .logs-site-filter::placeholder { color: var(--text-faint); }
+        .logs-site-filter:focus { border-bottom-color: var(--accent); }
+        .logs-side .db-row { padding: 0.45rem 1rem 0.45rem 0.9rem; }
+        .logs-side .db-row.is-quiet .db-row-name { color: var(--text-dim); }
+        .logs-side .db-row-name { font-size: 0.8rem; }
+        .logs-main { min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+        .logs-bar { flex: none; }
+        .logs-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: copy; }
+        .logs-path:hover { color: var(--text-dim); }
+        .logs-live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
+        .logs-live-dot.is-live { background: var(--accent); animation: php-pulse 2.4s ease-in-out infinite; }
+        .log-levels { display: flex; gap: 0.15rem; }
+        .log-level { background: transparent; border: 1px solid transparent; padding: 0.18rem 0.5rem; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-dim); cursor: pointer; border-radius: var(--radius-sm); }
+        .log-level:hover { color: var(--text); background: var(--panel-hover); }
+        .log-level.is-active { color: var(--text); border-color: var(--panel-border); background: var(--bg-sunk); }
+        .log-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; min-height: 0; }
+        .log-list > .empty, .log-list > .loading { padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .log-row { display: grid; grid-template-columns: 3.4rem auto minmax(0, 1fr); column-gap: 0.7rem; align-items: start; padding: 0.55rem 1.25rem 0.55rem 1rem; border-bottom: 1px solid var(--panel-border); cursor: pointer; }
+        .log-row:hover { background: var(--panel-hover); }
+        .log-row.is-new { animation: cove-fade 400ms ease; }
+        .log-time { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); padding-top: 0.15rem; white-space: nowrap; }
+        .log-level-chip { font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.06em; text-transform: uppercase; padding: 0.12rem 0.45rem; border-radius: var(--radius-pill); border: 1px solid var(--panel-border); color: var(--text-dim); white-space: nowrap; margin-top: 0.1rem; min-width: 4.6rem; text-align: center; }
+        .log-level-chip.error { color: var(--danger); border-color: var(--danger); }
+        .log-level-chip.warning { color: var(--pill-warn-fg, #d08c30); border-color: var(--pill-warn-fg, #d08c30); }
+        .log-level-chip.deprecated, .log-level-chip.notice { color: var(--text-faint); }
+        .log-level-chip.info { color: var(--text-dim); }
+        .log-main { min-width: 0; }
+        .log-msg { font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.45; color: var(--text); overflow-wrap: anywhere; }
+        .log-row.is-collapsed .log-msg { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .log-meta { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.15rem; min-width: 0; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .log-file { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+        .log-count { flex: none; padding: 0.02rem 0.4rem; border-radius: var(--radius-pill); background: var(--panel-border); color: var(--text-dim); font-size: 0.64rem; }
+        .log-detail { margin: 0.5rem 0 0; padding: 0.7rem 0.9rem; background: var(--bg-sunk); border: 1px solid var(--panel-border); border-radius: var(--radius-md); font-family: var(--font-mono); font-size: 0.72rem; line-height: 1.5; color: var(--text-dim); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow: auto; }
+        @media (max-width: 860px) {
+            .logs-body { grid-template-columns: 1fr; height: auto; min-height: 60vh; }
+            .logs-side { border-right: 0; max-height: 36vh; }
+            .log-levels { display: none; }
+        }
 
         /* Responsive */
         @media (max-width: 620px) {
@@ -3626,46 +4373,37 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         <nav class="nav">
             <a class="logo" href="/">
                 <svg class="logo-mark" viewBox="0 0 64 64" aria-hidden="true" focusable="false" stroke-linecap="round" stroke-linejoin="round">
-                    <defs>
-                        <clipPath id="cove-clip"><circle cx="32" cy="32" r="28"/></clipPath>
-                    </defs>
-                    <g clip-path="url(#cove-clip)">
-                        <rect x="0" y="0" width="64" height="64" class="disc"/>
-                        <rect x="0" y="32" width="64" height="32" class="water"/>
-                        <path class="land" d="M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z"/>
-                        <line class="horizon" x1="2" y1="32" x2="62" y2="32" stroke-width="2.5"/>
-                        <g class="wave" stroke-width="2.6">
-                            <path d="M 10 42 Q 18 38, 26 42 T 42 42 T 56 42"/>
-                            <path d="M 14 50 Q 22 46, 30 50 T 46 50 T 56 50"/>
-                        </g>
-                    </g>
-                    <circle cx="32" cy="32" r="28" class="ring"/>
+                    <circle cx="32" cy="32" r="26"/><path d="M 17 27 Q 24.5 20 32 27 T 47 27"/><path d="M 17 40 Q 24.5 33 32 40 T 47 40"/>
                 </svg>
                 <span>Cove</span>
             </a>
-            <div class="nav-services services">
-                <span class="dot" title="Caddy is serving this page — it's running">caddy</span>
-                <button type="button" id="btnDbDot" class="dot link" title="Database credentials">mariadb</button>
-                <a class="dot link" href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Mailpit">mailpit</a>
+            <div class="nav-views" role="tablist" aria-label="View">
+                <button type="button" class="nav-view is-active" role="tab" data-view="sites" aria-selected="true">sites</button>
+                <button type="button" class="nav-view" role="tab" data-view="mail" aria-selected="false">mail<span class="nav-badge" id="mailBadge" style="display: none;"></span></button>
+                <button type="button" class="nav-view" role="tab" data-view="db" aria-selected="false">databases</button>
+                <button type="button" class="nav-view" role="tab" data-view="logs" aria-selected="false">logs</button>
             </div>
-            <button class="theme-btn" id="btnTheme" title="Toggle theme" aria-label="Toggle theme">
+            <div class="nav-services services">
+                <button type="button" class="dot link" data-service="caddy" title="Caddy status">caddy</button>
+                <button type="button" class="dot link" data-service="mariadb" title="MariaDB status and credentials">mariadb</button>
+                <button type="button" class="dot link" data-service="mailpit" title="Mailpit status">mailpit</button>
+            </div>
+            <button class="theme-btn" id="btnTheme" title="Theme" aria-label="Theme" aria-haspopup="menu">
+                <svg class="icon-system" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor" stroke="none"/></svg>
                 <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5a5.75 5.75 0 1 0 6.7 6.7Z"/></svg>
                 <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.8M8 12.7v1.8M2.6 2.6l1.3 1.3M12.1 12.1l1.3 1.3M1.5 8h1.8M12.7 8h1.8M2.6 13.4l1.3-1.3M12.1 3.9l1.3-1.3"/></svg>
             </button>
+            <div class="ctx-menu theme-menu" id="themeMenu" role="menu" style="display: none;">
+                <button class="ctx-item" role="menuitemradio" data-theme-pref="system"><span>System</span></button>
+                <button class="ctx-item" role="menuitemradio" data-theme-pref="light"><span>Light</span></button>
+                <button class="ctx-item" role="menuitemradio" data-theme-pref="dark"><span>Dark</span></button>
+            </div>
         </nav>
 
-        <section class="card">
+        <section class="card" id="sitesCard">
             <header class="card-head">
                 <h1 class="card-title">Sites</h1>
                 <div class="card-actions">
-                    <a class="pill" href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Adminer">
-                        <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5v-9"/><path d="M3 8c0 .83 2.24 1.5 5 1.5s5-.67 5-1.5"/></svg>
-                        db
-                    </a>
-                    <a class="pill" href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Mailpit">
-                        <svg class="pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="12" height="9" rx="1.5"/><path d="M2.5 5 8 9l5.5-4"/></svg>
-                        mail
-                    </a>
                     <button class="pill primary" id="btnToggleAdd">+ add site</button>
                 </div>
             </header>
@@ -3798,25 +4536,400 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </div>
             </footer>
         </section>
+
+        <!-- Mail: a Cove-native inbox over Mailpit's API (proxied same-origin
+             at /mail-api/). Every Cove site receives mail at its own
+             <site>.localhost domain, so the To address is the site — the one
+             filter Mailpit's own UI cannot offer. -->
+        <section class="card mail-card" id="mailCard" style="display: none;">
+            <header class="card-head">
+                <h1 class="card-title">Mail</h1>
+                <div class="card-actions">
+                    <a class="pill" href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Mailpit's own interface">
+                        mailpit
+                        <svg class="pill-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4.5h5v5"/><path d="M11.5 4.5 4.5 11.5"/></svg>
+                    </a>
+                    <button type="button" class="pill" id="btnMailReadAll" title="Mark every listed message as read">mark all read</button>
+                    <button type="button" class="pill mail-delete-all" id="btnMailDeleteAll" title="Delete every message matching the current filter">delete all</button>
+                </div>
+            </header>
+
+            <div class="filter-row">
+                <span class="filter-chip" id="mailSiteChip" aria-label="Active site filter" style="display: none;">
+                    <span id="mailSiteChipLabel"></span>
+                    <button type="button" class="filter-chip-x" id="mailSiteChipClear" aria-label="Remove site filter" title="Remove">×</button>
+                </span>
+                <input
+                    class="filter-input"
+                    id="mailSearch"
+                    type="text"
+                    placeholder="search mail… (from: to: subject: has:attachment)"
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    aria-label="Search mail"
+                >
+                <label class="mail-unread-toggle" title="Only unread messages">
+                    <input type="checkbox" id="mailUnreadOnly">
+                    unread
+                </label>
+                <span class="filter-kbd" id="mailKbd" aria-hidden="true">/</span>
+                <button class="filter-clear" id="btnMailSearchClear" aria-label="Clear search" title="Clear all (Esc)" style="display: none;">×</button>
+            </div>
+
+            <div class="mail-body" id="mailBody">
+                <ul class="mail-list" id="mailList">
+                    <template id="tpl-mail-row">
+                        <li class="mail-row">
+                            <span class="mail-dot" aria-hidden="true"></span>
+                            <div class="mail-main">
+                                <div class="mail-line">
+                                    <span class="mail-from"></span>
+                                    <svg class="mail-att" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 5.5 6 10a1.6 1.6 0 0 0 2.3 2.3l5-5a3 3 0 0 0-4.3-4.3l-5.5 5.5a4.4 4.4 0 0 0 6.2 6.2l4-4"/></svg>
+                                    <span class="mail-age"></span>
+                                </div>
+                                <div class="mail-subject"></div>
+                                <div class="mail-line">
+                                    <span class="mail-site" role="button"></span>
+                                    <span class="mail-snippet"></span>
+                                </div>
+                            </div>
+                        </li>
+                    </template>
+                    <li class="loading" id="mailLoading">Loading mail…</li>
+                    <li class="empty" id="mailError" style="display: none;">
+                        <div>Mailpit isn't answering.</div>
+                        <div class="empty-hint">Check the mailpit dot in the top bar, or run <code>cove status</code>.</div>
+                    </li>
+                    <li class="empty" id="mailEmptyNone" style="display: none;">
+                        <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path class="art-fill" d="M30 18 h44 v30 H30 Z"/>
+                            <path class="art-line" d="M30 18 h44 v30 H30 Z"/>
+                            <path class="art-line" d="M30 18 L52 36 L74 18"/>
+                            <path class="art-wave" d="M8 56 Q 15 52, 22 56 T 36 56 T 50 56 T 64 56 T 78 56 T 92 56"/>
+                            <path class="art-wave" d="M20 62 Q 27 58, 34 62 T 48 62 T 62 62 T 76 62" opacity="0.35"/>
+                        </svg>
+                        <div>No mail yet.</div>
+                        <div class="empty-hint">Everything your sites send lands here instead of the internet.</div>
+                    </li>
+                    <li class="empty" id="mailEmptyFilter" style="display: none;">
+                        <div>Nothing matches <code id="mailEmptyQuery"></code>.</div>
+                        <div class="empty-hint">Press Esc to clear.</div>
+                    </li>
+                </ul>
+
+                <div class="mail-reader" id="mailReader">
+                    <div class="mail-reader-empty" id="mailReaderEmpty">
+                        <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path class="art-line" d="M34 14 h36 v40 H34 Z"/>
+                            <path class="art-line" d="M41 24 h22 M41 32 h22 M41 40 h14"/>
+                            <path class="art-wave" d="M8 60 Q 15 56, 22 60 T 36 60 T 50 60 T 64 60 T 78 60 T 92 60"/>
+                        </svg>
+                        <div>Select a message.</div>
+                        <div class="empty-hint">↑↓ to move · ⌫ to delete · u to toggle unread</div>
+                    </div>
+                    <div id="mailMsg" style="display: none;">
+                        <div class="mail-msg-head">
+                            <button type="button" class="pill mail-back" id="btnMailBack">← inbox</button>
+                            <div class="loading" id="mailMsgLoading">Loading message…</div>
+                            <div class="mail-msg-error" id="mailMsgError" style="display: none;"></div>
+                            <div id="mailMsgHead" style="display: none;">
+                                <h2 class="mail-msg-subject" id="mailMsgSubject"></h2>
+                                <div id="mailMsgMeta"></div>
+                                <div class="mail-links" id="mailMsgLinks"></div>
+                            </div>
+                        </div>
+                        <div id="mailMsgMain" style="display: none;">
+                            <div class="mail-msg-bar">
+                                <div class="mail-parts" id="mailParts" role="tablist">
+                                    <button type="button" class="mail-part" role="tab" data-part="html">html</button>
+                                    <button type="button" class="mail-part" role="tab" data-part="text">text</button>
+                                    <button type="button" class="mail-part" role="tab" data-part="headers">headers</button>
+                                </div>
+                                <span class="mail-bar-note" id="mailRemoteNote" style="display: none;"></span>
+                                <div class="mail-msg-actions">
+                                    <button type="button" class="pill" id="btnMailUnread">mark unread</button>
+                                    <button type="button" class="pill" id="btnMailDelete">delete</button>
+                                    <a class="pill" id="mailOpenInMailpit" target="_blank" rel="noopener" title="Open this message in Mailpit (raw source, spam score, HTML check)">mailpit ↗</a>
+                                </div>
+                            </div>
+                            <div class="mail-msg-body">
+                                <!-- No scripts, no forms, no remote loads: the sandbox denies
+                                     script execution, and the CSP injected into the srcdoc
+                                     limits images to inline parts served via /mail-api/.
+                                     allow-same-origin is what lets the frame be measured
+                                     (and 'self' resolve for those inline parts); with no
+                                     allow-scripts nothing inside can act on that origin.
+                                     Popups escape the sandbox so a reset link opens as a
+                                     normal tab. -->
+                                <iframe class="mail-frame" id="mailFrame" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" title="Message"></iframe>
+                                <pre class="mail-pre" id="mailText"></pre>
+                                <pre class="mail-pre" id="mailHeaders"></pre>
+                            </div>
+                            <div class="mail-attachments" id="mailAttachments" style="display: none;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <footer class="card-foot">
+                <div class="totals">
+                    <span id="mailCount"></span>
+                    <span id="mailDbSize" style="display: none;"></span>
+                </div>
+                <div class="mail-pager" id="mailPager" style="display: none;">
+                    <span id="mailRange"></span>
+                    <button type="button" class="pager-btn" id="btnMailNewer" title="Newer">‹</button>
+                    <button type="button" class="pager-btn" id="btnMailOlder" title="Older">›</button>
+                </div>
+            </footer>
+        </section>
+
+        <!-- Databases: a native browser over MariaDB. Adminer stays a click
+             away for exports, imports and schema work. -->
+        <section class="card db-card" id="dbCard" style="display: none;">
+            <header class="card-head">
+                <h1 class="card-title">Databases</h1>
+                <div class="card-actions">
+                    <a class="pill" id="dbAdminerLink" href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Adminer — exports, imports, schema changes, users">
+                        adminer
+                        <svg class="pill-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4.5h5v5"/><path d="M11.5 4.5 4.5 11.5"/></svg>
+                    </a>
+                    <button type="button" class="pill" id="btnDbSql" title="SQL console (⌘↵ runs)">sql</button>
+                </div>
+            </header>
+
+            <div class="filter-row">
+                <span class="filter-chip" id="dbChip" aria-label="Selected database" style="display: none;">
+                    <span id="dbChipLabel"></span>
+                    <button type="button" class="filter-chip-x" id="dbChipClear" aria-label="Back to all databases" title="All databases">×</button>
+                </span>
+                <input
+                    class="filter-input"
+                    id="dbFilter"
+                    type="text"
+                    placeholder="filter databases…"
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    aria-label="Filter"
+                >
+                <span class="filter-kbd" id="dbKbd" aria-hidden="true">/</span>
+                <button class="filter-clear" id="btnDbFilterClear" aria-label="Clear filter" title="Clear (Esc)" style="display: none;">×</button>
+            </div>
+
+            <div class="db-body" id="dbBody">
+                <ul class="db-list" id="dbList">
+                    <template id="tpl-db-row">
+                        <li class="db-row">
+                            <div class="db-row-line">
+                                <span class="db-row-name"></span>
+                                <span class="db-row-meta"></span>
+                            </div>
+                            <span class="mail-site db-row-site"></span>
+                        </li>
+                    </template>
+                    <li class="loading" id="dbLoading">Loading…</li>
+                    <li class="empty" id="dbError" style="display: none;">
+                        <div>MariaDB isn't answering.</div>
+                        <div class="empty-hint">Check the mariadb dot in the top bar, or run <code>cove status</code>.</div>
+                    </li>
+                    <li class="empty" id="dbEmpty" style="display: none;">
+                        <div>Nothing matches <code id="dbEmptyQuery"></code>.</div>
+                        <div class="empty-hint">Press Esc to clear.</div>
+                    </li>
+                </ul>
+
+                <div class="db-main" id="dbMain">
+                    <div class="mail-reader-empty" id="dbMainEmpty">
+                        <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path class="art-fill" d="M34 18 c0 -4 8 -7 18 -7 s18 3 18 7 v26 c0 4 -8 7 -18 7 s-18 -3 -18 -7 Z"/>
+                            <ellipse class="art-line" cx="52" cy="18" rx="18" ry="7"/>
+                            <path class="art-line" d="M34 18 v26 c0 4 8 7 18 7 s18 -3 18 -7 V18"/>
+                            <path class="art-line" d="M34 31 c0 4 8 7 18 7 s18 -3 18 -7"/>
+                            <path class="art-wave" d="M8 60 Q 15 56, 22 60 T 36 60 T 50 60 T 64 60 T 78 60 T 92 60"/>
+                        </svg>
+                        <div id="dbMainEmptyText">Select a database.</div>
+                        <div class="empty-hint" id="dbMainEmptyHint">Each site has one. Pick a table to browse, or open the SQL console.</div>
+                    </div>
+
+                    <div class="db-overview" id="dbOverview" style="display: none;"></div>
+
+                    <div id="dbTable" style="display: none;">
+                        <div class="mail-msg-bar db-bar">
+                            <div class="mail-parts" id="dbParts" role="tablist">
+                                <button type="button" class="mail-part" role="tab" data-part="rows">rows</button>
+                                <button type="button" class="mail-part" role="tab" data-part="structure">structure</button>
+                            </div>
+                            <div class="db-rows-search" id="dbRowsSearch">
+                                <select id="dbRowsCol" title="Column to search" aria-label="Column to search"><option value="">any column</option></select>
+                                <input type="text" id="dbRowsFilter" placeholder="contains…" spellcheck="false" autocomplete="off" aria-label="Filter rows">
+                            </div>
+                            <span class="mail-bar-note" id="dbRowsNote"></span>
+                            <div class="mail-msg-actions">
+                                <button type="button" class="pill" id="btnDbRowsRefresh" title="Reload rows">refresh</button>
+                            </div>
+                        </div>
+                        <div class="db-grid-wrap" id="dbGridWrap"><table class="db-grid" id="dbGrid"></table></div>
+                        <div class="db-structure" id="dbStructure" style="display: none;"></div>
+                    </div>
+
+                    <div id="dbSql" style="display: none;">
+                        <div class="db-sql-editor">
+                            <textarea id="dbSqlText" spellcheck="false" autocapitalize="off" autocorrect="off" rows="6" placeholder="SELECT option_name, LENGTH(option_value) AS bytes FROM wp_options WHERE autoload = 'yes' ORDER BY bytes DESC LIMIT 20"></textarea>
+                            <div class="db-sql-actions">
+                                <span class="mail-bar-note" id="dbSqlNote"></span>
+                                <select id="dbSqlHistory" title="Previous queries" aria-label="Previous queries"><option value="">history</option></select>
+                                <button type="button" class="pill primary" id="btnDbRun">run <span class="db-kbd">⌘↵</span></button>
+                            </div>
+                        </div>
+                        <div class="db-sql-results" id="dbSqlResults"></div>
+                    </div>
+                </div>
+            </div>
+
+            <footer class="card-foot">
+                <div class="totals">
+                    <span id="dbCount"></span>
+                </div>
+                <div class="mail-pager" id="dbPager" style="display: none;">
+                    <span id="dbRange"></span>
+                    <button type="button" class="pager-btn" id="btnDbNewer" title="Previous page">‹</button>
+                    <button type="button" class="pager-btn" id="btnDbOlder" title="Next page">›</button>
+                </div>
+            </footer>
+        </section>
+
+        <!-- Logs: the files Cove already writes, read backwards in chunks.
+             The shared PHP error log can be scoped to a site by the paths in
+             its entries; each site also has its own debug.log and access log. -->
+        <section class="card logs-card" id="logsCard" style="display: none;">
+            <header class="card-head">
+                <h1 class="card-title">Logs</h1>
+                <div class="card-actions">
+                    <label class="mail-unread-toggle" title="Follow the log as it grows">
+                        <input type="checkbox" id="logsLive" checked>
+                        live
+                    </label>
+                    <button type="button" class="pill" id="btnLogsRefresh" title="Reload from the top">refresh</button>
+                    <button type="button" class="pill mail-delete-all" id="btnLogsClear" title="Empty this log file">clear log</button>
+                </div>
+            </header>
+
+            <div class="filter-row">
+                <span class="filter-chip" id="logsSiteChip" aria-label="Site" style="display: none;">
+                    <span id="logsSiteChipLabel"></span>
+                    <button type="button" class="filter-chip-x" id="logsSiteChipClear" aria-label="Back to system logs" title="System logs">×</button>
+                </span>
+                <input
+                    class="filter-input"
+                    id="logsSearch"
+                    type="text"
+                    placeholder="search entries…"
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    aria-label="Search entries"
+                >
+                <div class="log-levels" id="logsLevels" role="group" aria-label="Level">
+                    <button type="button" class="log-level is-active" data-level="all">all</button>
+                    <button type="button" class="log-level" data-level="error">errors</button>
+                    <button type="button" class="log-level" data-level="warning">warnings</button>
+                    <button type="button" class="log-level" data-level="deprecated">deprecated</button>
+                </div>
+                <span class="filter-kbd" id="logsKbd" aria-hidden="true">/</span>
+                <button class="filter-clear" id="btnLogsSearchClear" aria-label="Clear search" title="Clear (Esc)" style="display: none;">×</button>
+            </div>
+
+            <div class="logs-body" id="logsBody">
+                <div class="logs-side" id="logsSide">
+                    <div class="logs-group">system</div>
+                    <ul class="db-list logs-sources" id="logsSystem">
+                        <template id="tpl-log-source">
+                            <li class="db-row log-source">
+                                <div class="db-row-line">
+                                    <span class="db-row-name"></span>
+                                    <span class="db-row-meta"></span>
+                                </div>
+                            </li>
+                        </template>
+                    </ul>
+                    <div class="logs-group logs-group-sites">
+                        <span>sites</span>
+                        <input type="text" class="logs-site-filter" id="logsSiteFilter" placeholder="filter…" spellcheck="false" autocomplete="off" aria-label="Filter sites">
+                    </div>
+                    <ul class="db-list logs-sites" id="logsSites">
+                        <li class="loading" id="logsSitesLoading">Loading…</li>
+                        <li class="empty" id="logsSitesEmpty" style="display: none;">No sites match.</li>
+                    </ul>
+                </div>
+
+                <div class="logs-main">
+                    <div class="mail-msg-bar logs-bar">
+                        <div class="mail-parts" id="logsParts" role="tablist" style="display: none;">
+                            <button type="button" class="mail-part" role="tab" data-tab="errors" title="Entries from the shared PHP error log that mention this site">php errors</button>
+                            <button type="button" class="mail-part" role="tab" data-tab="debug" title="wp-content/debug.log">debug.log</button>
+                            <button type="button" class="mail-part" role="tab" data-tab="access" title="Caddy access log">access</button>
+                        </div>
+                        <span class="mail-bar-note logs-path" id="logsPath" title="Click to copy the path"></span>
+                        <div class="mail-msg-actions">
+                            <span class="logs-live-dot" id="logsLiveDot" title="Following"></span>
+                        </div>
+                    </div>
+                    <ul class="log-list" id="logsList">
+                        <template id="tpl-log-row">
+                            <li class="log-row">
+                                <span class="log-time"></span>
+                                <span class="log-level-chip"></span>
+                                <div class="log-main">
+                                    <div class="log-msg"></div>
+                                    <div class="log-meta">
+                                        <span class="mail-site log-site" role="button"></span>
+                                        <span class="log-file"></span>
+                                        <span class="log-count"></span>
+                                    </div>
+                                    <pre class="log-detail" style="display: none;"></pre>
+                                </div>
+                            </li>
+                        </template>
+                        <li class="loading" id="logsLoading">Loading…</li>
+                        <li class="empty" id="logsError" style="display: none;"><div id="logsErrorText"></div></li>
+                        <li class="empty" id="logsEmpty" style="display: none;">
+                            <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path class="art-fill" d="M30 12 h44 v42 H30 Z"/>
+                                <path class="art-line" d="M30 12 h44 v42 H30 Z"/>
+                                <path class="art-line" d="M38 24 h28 M38 32 h20 M38 40 h24"/>
+                                <path class="art-wave" d="M8 60 Q 15 56, 22 60 T 36 60 T 50 60 T 64 60 T 78 60 T 92 60"/>
+                            </svg>
+                            <div id="logsEmptyText">Nothing logged.</div>
+                            <div class="empty-hint" id="logsEmptyHint"></div>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+
+            <footer class="card-foot">
+                <div class="totals">
+                    <span id="logsCount"></span>
+                </div>
+                <div class="mail-pager">
+                    <button type="button" class="pill" id="btnLogsOlder" style="display: none;">older</button>
+                </div>
+            </footer>
+        </section>
     </div>
 
     <div class="modal-backdrop" id="dbModal" style="display: none;">
         <div class="modal">
-            <h3>Database credentials</h3>
-            <p class="modal-sub">Cove uses these to create new WordPress databases.</p>
-            <div class="db-creds">
-                <div class="db-cred-row">
-                    <span class="db-cred-label">user</span>
-                    <code class="db-cred-value"><?= htmlspecialchars($config_data['DB_USER'] ?? '—') ?></code>
-                </div>
-                <div class="db-cred-row">
-                    <span class="db-cred-label">password</span>
-                    <code class="db-cred-value"><?= htmlspecialchars($config_data['DB_PASSWORD'] ?? '—') ?></code>
-                </div>
-            </div>
+            <h3 id="svcTitle">Service</h3>
+            <p class="modal-sub svc-status" id="svcStatus"></p>
+            <div class="db-creds" id="svcRows"></div>
             <div class="modal-foot">
-                <span>stored in <?= htmlspecialchars(str_replace(getenv('HOME'), '~', $config_file)) ?></span>
-                <button class="pill" id="btnDbClose">close</button>
+                <span id="svcNote"></span>
+                <span class="svc-actions" id="svcActions"><button class="pill" id="btnDbClose">close</button></span>
             </div>
         </div>
     </div>
@@ -3884,6 +4997,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <button class="ctx-item" id="ctxDb"><span>Open database</span></button>
             <button class="ctx-item" id="ctxPhp"><span>PHP version…</span><span class="ctx-key" id="ctxPhpMeta"></span></button>
             <button class="ctx-item" id="ctxLog"><span>View log</span></button>
+            <button class="ctx-item" id="ctxMail"><span>View mail</span></button>
             <div class="ctx-sep"></div>
             <button class="ctx-item" id="ctxCopy"><span>Copy path</span></button>
             <button class="ctx-item" id="ctxPin"><span>Pin to top</span></button>
@@ -3934,7 +5048,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
         const app = {
             // Respect the OS theme preference on first visit, dark otherwise.
-            theme: localStorage.getItem('theme') || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'),
+            // themePref is what the user chose ('light' | 'dark' | 'system');
+            // theme is the effective mode the tokens paint.
+            themePref: (['light', 'dark'].includes(localStorage.getItem('theme')) ? localStorage.getItem('theme') : 'system'),
+            theme: (['light', 'dark'].includes(localStorage.getItem('theme')) ? localStorage.getItem('theme') : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')),
             sites: [],
             isLoading: true,
             adding: false,
@@ -3982,6 +5099,38 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             deleteQueue: [],
             isProcessingQueue: false,
             _paletteItems: [],
+            // 'sites' | 'mail'. Mail is a sibling view of the sites list,
+            // reachable from the nav, the hash (#mail, #mail/<site>), a
+            // site's row menu, and the palette.
+            view: 'sites',
+            mail: {
+                items: [], total: 0, unread: 0, matched: 0,
+                start: 0, limit: 50,
+                query: '', site: null, unreadOnly: false,
+                loading: false, loaded: false, error: null,
+                selectedId: null, msg: null, msgLoading: false, msgError: null,
+                part: 'html', headers: null, renderedId: null, remoteBlocked: 0,
+                deleteArmed: false, armTimer: null, searchTimer: null, syncTimer: null,
+                seq: 0, ws: null, pollTimer: null, wsRetry: null, info: null,
+            },
+            db: {
+                list: [], tables: [], tablesFor: null, wp: null, server: '',
+                name: null, table: null, part: 'rows', sql: false,
+                filter: '', loading: false, loaded: false, error: null,
+                rows: { columns: [], pk: [], items: [], total: 0, start: 0, limit: 100, sort: '', dir: 'asc', q: '', col: '', loading: false, error: null, seq: 0, timer: null },
+                structure: null,
+                edit: null, // { row, col, value, busy }
+                delArm: null, delTimer: null,
+                console: { text: '', results: null, ms: 0, running: false, history: [] },
+            },
+            logs: {
+                system: [], sites: [], dir: '', sourcesLoaded: false, siteFilter: '',
+                source: 'errors', site: null, tab: 'errors',
+                level: 'all', query: '',
+                entries: [], size: 0, nextBefore: null, scanned: 0, path: '', kind: 'php', missing: false,
+                loading: false, error: null, seq: 0, live: true, pollTimer: null,
+                expanded: {}, clearArm: false, armTimer: null, newIds: {},
+            },
 
             get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
             get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
@@ -4060,6 +5209,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             init() {
                 this.applyTheme();
                 this.bindStaticEvents();
+                this.bindMailEvents();
+                this.bindDbEvents();
+                this.bindLogsEvents();
                 this.render();
 
                 // If the tab closes during an undo window, flush the staged
@@ -4069,7 +5221,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 window.addEventListener('pagehide', () => {
                     if (!this.pendingDelete) return;
                     for (const s of this.pendingDelete.sites) {
-                        fetch('api.php', {
+                        fetch('/api.php', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ action: 'delete_site', site_name: s.name }),
@@ -4098,6 +5250,48 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         // Palette owns its own keys via its input's listeners;
                         // catch Esc here too in case the input lost focus.
                         if (e.key === 'Escape') this.closePalette();
+                        return;
+                    }
+
+                    if (this.view === 'logs') {
+                        if (e.key === 'Escape' && !typing) {
+                            if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                            if (this.showDbModal) { this.setDbModal(false); return; }
+                            if (this.logs.query || this.logs.level !== 'all') { this.logsClearFilters(); return; }
+                            if (this.logs.site) { this.setLogsSite(null); return; }
+                        }
+                        if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey && !typing) {
+                            e.preventDefault();
+                            $id('logsSearch').focus();
+                        }
+                        return;
+                    }
+
+                    if (this.view === 'db') {
+                        if (this.dbKeydown(e, typing)) return;
+                        if (e.key === 'Escape') {
+                            if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                            if (this.showDbModal) { this.setDbModal(false); return; }
+                        }
+                        if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey && !typing) {
+                            e.preventDefault();
+                            $id('dbFilter').focus();
+                        }
+                        return;
+                    }
+
+                    // The mail view has its own keys; the site-list keys below
+                    // would otherwise act on rows the user cannot see.
+                    if (this.view === 'mail') {
+                        if (this.mailKeydown(e, typing)) return;
+                        if (e.key === 'Escape') {
+                            if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                            if (this.showDbModal) { this.setDbModal(false); return; }
+                        }
+                        if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey && !typing) {
+                            e.preventDefault();
+                            $id('mailSearch').focus();
+                        }
                         return;
                     }
 
@@ -4169,14 +5363,31 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         this.refreshSizes();
                     }
                 });
+
+                // Mail: pick the view from the hash, then keep the unread
+                // badge live over Mailpit's websocket (or a poll when the
+                // socket is unavailable).
+                this.readViewFromUrl();
+                this.refreshMailCounts();
+                this.connectMailEvents();
             },
 
             // One-time listeners on elements that are never re-created. Row,
             // alert, palette and menu clicks are delegated from their fixed
             // containers, so rebuilding children never orphans a handler.
             bindStaticEvents() {
-                $id('btnTheme').addEventListener('click', () => this.toggleTheme());
-                $id('btnDbDot').addEventListener('click', () => this.setDbModal(true));
+                $id('btnTheme').addEventListener('click', () => { this.closeThemeMenu(); this.toggleTheme(); });
+                $id('btnTheme').addEventListener('contextmenu', (e) => { e.preventDefault(); this.themeMenuOpen ? this.closeThemeMenu() : this.openThemeMenu(); });
+                $id('themeMenu').addEventListener('click', (e) => {
+                    const b = e.target.closest('[data-theme-pref]');
+                    if (!b) return;
+                    this.setThemePref(b.dataset.themePref);
+                    this.closeThemeMenu();
+                });
+                document.addEventListener('click', (e) => { if (this.themeMenuOpen && !e.target.closest('#themeMenu, #btnTheme')) this.closeThemeMenu(); });
+                document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.themeMenuOpen) this.closeThemeMenu(); });
+                try { window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { if (this.themePref === 'system') { this.applyTheme(); this.renderChrome(); } }); } catch (e) {}
+                document.querySelectorAll('[data-service]').forEach(b => b.addEventListener('click', () => this.openService(b.dataset.service)));
                 $id('btnToggleAdd').addEventListener('click', () => this.toggleAdd());
                 $id('btnRefreshSizes').addEventListener('click', () => this.refreshSizes());
                 $id('btnDbClose').addEventListener('click', () => this.setDbModal(false));
@@ -4272,9 +5483,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('ctxLogin').addEventListener('click', withCtxSite(s => this.getLoginLink(s.name)));
                 $id('ctxRename').addEventListener('click', withCtxSite(s => this.promptRename(s)));
                 $id('ctxReveal').addEventListener('click', withCtxSite(s => this.revealSite(s.name)));
-                $id('ctxDb').addEventListener('click', withCtxSite(s => this.openSiteDb(s)));
+                $id('ctxDb').addEventListener('click', withCtxSite(s => this.openDbForSite(s)));
                 $id('ctxPhp').addEventListener('click', withCtxSite(s => this.openPhpModal(s)));
-                $id('ctxLog').addEventListener('click', withCtxSite(s => this.viewLog(s)));
+                $id('ctxLog').addEventListener('click', withCtxSite(s => this.openLogsForSite(s.name)));
+                $id('ctxMail').addEventListener('click', withCtxSite(s => this.openMailForSite(s.name)));
 
                 // PHP version picker
                 $id('btnPhpClose').addEventListener('click', () => this.closePhpModal());
@@ -4350,6 +5562,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderFooter();
                 this.renderCtxMenu();
                 this.renderModals();
+                this.renderView();
+                // Site chips in the database list and overview come from the
+                // sites list, which usually lands after the first db render.
+                if (this.view === 'db') { this.renderDbList(); if (this.db.name && !this.db.table && !this.db.sql) this.renderDbOverview(); }
                 if (this.palette.open) this.renderPalette();
             },
 
@@ -4382,7 +5598,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('createLabel').textContent = this.newSite.isLoading ? 'creating…' : 'create';
 
                 // Theme button tooltip tracks the mode it would switch to.
-                $id('btnTheme').title = this.theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode';
+                $id('btnTheme').title = 'Theme: ' + ({ system: 'System', light: 'Light', dark: 'Dark' })[this.themePref] + ' (click to switch light and dark, right-click for options)';
             },
 
             renderAlerts() {
@@ -4637,16 +5853,33 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             // --- Behavior --------------------------------------------------
-            applyTheme() {
-                document.documentElement.dataset.theme = this.theme;
+            osTheme() {
+                return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
             },
 
-            toggleTheme() {
-                this.theme = this.theme === 'light' ? 'dark' : 'light';
+            applyTheme() {
+                this.theme = this.themePref === 'system' ? this.osTheme() : this.themePref;
+                document.documentElement.dataset.theme = this.theme;
+                document.documentElement.dataset.themePref = this.themePref;
+                const menu = $id('themeMenu');
+                if (menu) menu.querySelectorAll('[data-theme-pref]').forEach(b => b.setAttribute('aria-checked', String(b.dataset.themePref === this.themePref)));
+            },
+
+            setThemePref(pref) {
+                this.themePref = (pref === 'light' || pref === 'dark') ? pref : 'system';
+                localStorage.setItem('theme', this.themePref);
                 this.applyTheme();
-                localStorage.setItem('theme', this.theme);
                 this.renderChrome();
             },
+
+            // Click flips light and dark (from System, flip whatever the OS shows
+            // and lock it). Right-click opens the System / Light / Dark menu.
+            toggleTheme() {
+                this.setThemePref(this.theme === 'light' ? 'dark' : 'light');
+            },
+
+            openThemeMenu() { const m = $id('themeMenu'); if (m) { m.style.display = ''; this.themeMenuOpen = true; } },
+            closeThemeMenu() { const m = $id('themeMenu'); if (m) { m.style.display = 'none'; this.themeMenuOpen = false; } },
 
             toggleAdd() {
                 this.adding = !this.adding;
@@ -4665,7 +5898,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (this.wpVersionsLoaded) return;
                 this.wpVersionsLoaded = true;
                 try {
-                    const res = await fetch('api.php?action=wp_versions');
+                    const res = await fetch('/api.php?action=wp_versions');
                     const data = await res.json();
                     if (Array.isArray(data)) {
                         this.wpVersions = data;
@@ -4740,6 +5973,1874 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
             },
 
+            // --- Mail ------------------------------------------------------
+            // A Cove-native inbox over Mailpit's REST API, proxied same-origin
+            // at /mail-api/ by the Caddyfile. Mailpit's own UI stays one click
+            // away for what it does better (spam scoring, HTML checks, relay,
+            // raw source); what it cannot do is filter by site — every Cove
+            // site receives mail at its own <site>.localhost, so the To
+            // address is the site.
+            mailApi(path, opts = {}) {
+                const { method = 'GET', body, timeoutMs = 10000 } = opts;
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+                return fetch('/mail-api' + path, {
+                    method,
+                    headers: body ? { 'Content-Type': 'application/json' } : {},
+                    body: body ? JSON.stringify(body) : undefined,
+                    signal: ctrl.signal,
+                }).then(async (r) => {
+                    if (!r.ok) throw new Error('mailpit ' + r.status);
+                    const ct = r.headers.get('content-type') || '';
+                    return ct.includes('json') ? r.json() : r.text();
+                }).finally(() => clearTimeout(timer));
+            },
+
+            setView(view, opts = {}) {
+                view = ['mail', 'db', 'logs'].includes(view) ? view : 'sites';
+                if (view === this.view && !opts.force) return;
+                const prev = this.view;
+                this.view = view;
+                this.closeRowMenu();
+                if (prev !== view) this.crossfadeFrom(prev);
+                document.body.classList.toggle('view-mail', view === 'mail');
+                document.body.classList.toggle('view-db', view === 'db');
+                document.body.classList.toggle('view-logs', view === 'logs');
+                document.title = { mail: 'Cove — mail', db: 'Cove — databases', logs: 'Cove — logs', sites: 'Cove — sites' }[view];
+                this.syncUrl();
+                this.render();
+                if (view === 'mail') {
+                    this.loadMail();
+                    this.loadMailInfo();
+                    if (!this.mail.selectedId) $id('mailSearch').focus();
+                }
+                if (view === 'db') {
+                    if (!this.db.loaded) this.loadDbList();
+                    if (this.db.name && this.db.tablesFor !== this.db.name) this.loadDbTables();
+                    if (this.db.name && this.db.table) this.loadDbRows();
+                }
+                if (view === 'logs') {
+                    // Chrome and sidebar reflect the (possibly new) site right
+                    // away; sizes and last-activity times are refreshed each
+                    // visit, since they are cheap and change constantly.
+                    this.renderLogs();
+                    this.loadLogSources();
+                    this.loadLogs();
+                    this.startLogsPolling();
+                } else {
+                    this.stopLogsPolling();
+                }
+            },
+
+            // The URL is a real path naming the view and what is open in
+            // it, pushed with history.pushState so Back and Forward walk the
+            // views: /, /mail, /mail/<site>, /db, /db/<database>[/<table>],
+            // /logs, /logs/@<source>, /logs/<site>/<tab>. The old #hash form
+            // is still understood on load and rewritten.
+            get viewPath() {
+                if (this.view === 'mail') return '/mail' + (this.mail.site ? '/' + this.mail.site : '');
+                if (this.view === 'db') return '/db' + (this.db.name ? '/' + encodeURIComponent(this.db.name) + (this.db.table ? '/' + encodeURIComponent(this.db.table) : '') : '');
+                if (this.view === 'logs') return '/logs' + (this.logs.site ? '/' + this.logs.site + (this.logs.tab ? '/' + this.logs.tab : '') : (this.logs.source !== 'errors' ? '/@' + this.logs.source : ''));
+                return '/';
+            },
+
+            syncUrl(opts = {}) {
+                const path = this.viewPath;
+                if (location.pathname === path && !location.hash) return;
+                const url = path + location.search;
+                if (opts.replace) history.replaceState({ cove: true }, '', url);
+                else history.pushState({ cove: true }, '', url);
+            },
+
+            readViewFromUrl() {
+                let p = location.pathname.replace(/\/+$/, '') || '/';
+                // Legacy #mail / #db / #logs links: same grammar, hash-prefixed.
+                if (p === '/' && /^#(mail|db|logs)(\/|$)/i.test(location.hash || '')) {
+                    p = '/' + location.hash.slice(1);
+                    history.replaceState({ cove: true }, '', p + location.search);
+                }
+                let m;
+                if ((m = /^\/mail(?:\/([a-z0-9-]+))?$/i.exec(p))) {
+                    this.mail.site = m[1] ? m[1].toLowerCase() : null;
+                    this.setView('mail', { force: true });
+                } else if ((m = /^\/db(?:\/([^\/]+)(?:\/([^\/]+))?)?$/.exec(p))) {
+                    const name = m[1] ? decodeURIComponent(m[1]) : null;
+                    const table = m[2] ? decodeURIComponent(m[2]) : null;
+                    if (name !== this.db.name) { this.db.tables = []; this.db.wp = null; this.db.tablesFor = null; }
+                    if (table !== this.db.table) this.resetDbTable();
+                    this.db.name = name;
+                    this.db.table = table;
+                    this.setView('db', { force: true });
+                } else if ((m = /^\/logs(?:\/(?:@([a-z0-9.-]+)|([a-z0-9-]+)(?:\/(errors|debug|access))?))?$/i.exec(p))) {
+                    if (m[1]) { this.logs.site = null; this.logs.source = m[1].toLowerCase(); }
+                    else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : null; }
+                    else { this.logs.site = null; this.logs.source = 'errors'; }
+                    this.setView('logs', { force: true });
+                } else {
+                    // Unknown path (or /): the sites list, and the address bar
+                    // brought back to a real one.
+                    this.setView('sites', { force: true });
+                    if (p !== '/') history.replaceState({ cove: true }, '', '/' + location.search);
+                }
+            },
+
+            // From a site's row menu: the inbox scoped to that site.
+            openMailForSite(name) {
+                this.mail.site = name;
+                this.mail.query = '';
+                this.mail.start = 0;
+                $id('mailSearch').value = '';
+                this.setView('mail', { force: true });
+            },
+
+            setMailSite(site) {
+                this.mail.site = site || null;
+                this.mail.start = 0;
+                this.syncUrl();
+                this.loadMail();
+            },
+
+            mailClearFilters() {
+                this.mail.query = '';
+                $id('mailSearch').value = '';
+                this.mail.unreadOnly = false;
+                $id('mailUnreadOnly').checked = false;
+                this.setMailSite(null);
+            },
+
+            get mailQuery() {
+                const parts = [];
+                if (this.mail.site) parts.push('to:@' + this.mail.site + '.localhost');
+                if (this.mail.unreadOnly) parts.push('is:unread');
+                if (this.mail.query.trim()) parts.push(this.mail.query.trim());
+                return parts.join(' ');
+            },
+
+            async loadMail(opts = {}) {
+                const m = this.mail;
+                if (!opts.keepStart) m.start = 0;
+                const seq = ++m.seq;
+                // Only the first paint shows the loading row; refreshes keep the
+                // rows in place so a search keystroke doesn't flash the list.
+                m.loading = !m.loaded;
+                const q = this.mailQuery;
+                const qs = 'limit=' + m.limit + '&start=' + m.start;
+                const path = q ? '/v1/search?query=' + encodeURIComponent(q) + '&' + qs : '/v1/messages?' + qs;
+                this.renderMail();
+                try {
+                    const data = await this.mailApi(path);
+                    if (seq !== m.seq) return; // superseded by a newer request
+                    m.items = Array.isArray(data.messages) ? data.messages : [];
+                    m.total = data.total || 0;
+                    m.unread = data.unread || 0;
+                    // messages_count is the filtered total on a search, the
+                    // overall total on a plain listing.
+                    m.matched = typeof data.messages_count === 'number' ? data.messages_count : m.total;
+                    m.error = null;
+                    // A new filter or search that no longer contains the open
+                    // message closes the reader; a refresh or page turn keeps it.
+                    if (!opts.keepStart && m.selectedId && !m.items.some(x => x.ID === m.selectedId)) {
+                        m.selectedId = null; m.msg = null; m.renderedId = null;
+                    }
+                    // Paged past the end (e.g. after deletes): step back.
+                    if (m.start > 0 && m.items.length === 0 && m.matched > 0) {
+                        m.start = Math.max(0, Math.floor((m.matched - 1) / m.limit) * m.limit);
+                        return this.loadMail({ keepStart: true });
+                    }
+                } catch (e) {
+                    if (seq !== m.seq) return;
+                    m.error = 'Mailpit is not answering.';
+                }
+                m.loaded = true;
+                m.loading = false;
+                this.renderMail();
+                this.renderView();
+            },
+
+            mailPage(delta) {
+                const m = this.mail;
+                const next = m.start + delta * m.limit;
+                if (next < 0 || next >= m.matched) return;
+                m.start = next;
+                this.loadMail({ keepStart: true });
+                $id('mailList').scrollTop = 0;
+            },
+
+            async loadMailInfo() {
+                try { this.mail.info = await this.mailApi('/v1/info', { timeoutMs: 4000 }); } catch (e) { this.mail.info = null; }
+                this.renderMailFooter();
+            },
+
+            // Cheap: one row, but the envelope carries the global counts.
+            async refreshMailCounts() {
+                try {
+                    const d = await this.mailApi('/v1/messages?limit=1', { timeoutMs: 4000 });
+                    this.mail.total = d.total || 0;
+                    this.mail.unread = d.unread || 0;
+                } catch (e) { /* badge simply stays put */ }
+                this.renderView();
+                if (this.view === 'mail') this.renderMailFooter();
+            },
+
+            // Mailpit pushes {Type:'new'|'delete'|'update'|'prune'|'truncate', Data}
+            // and {Type:'stats', Data:{Total, Unread}} over a websocket. It is
+            // not a documented contract, so a poll takes over whenever the
+            // socket is unavailable and the socket is retried in the background.
+            connectMailEvents() {
+                const m = this.mail;
+                if (m.ws || !('WebSocket' in window)) { this.startMailPolling(); return; }
+                let ws;
+                try {
+                    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/mail-api/events');
+                } catch (e) { this.startMailPolling(); return; }
+                m.ws = ws;
+                ws.onopen = () => this.stopMailPolling();
+                ws.onmessage = (ev) => {
+                    let evt;
+                    try { evt = JSON.parse(ev.data); } catch (e) { return; }
+                    if (evt.Type === 'stats' && evt.Data) {
+                        m.total = evt.Data.Total || 0;
+                        m.unread = evt.Data.Unread || 0;
+                        this.renderView();
+                        if (this.view === 'mail') this.renderMailFooter();
+                        return;
+                    }
+                    if (this.view === 'mail') {
+                        clearTimeout(m.syncTimer);
+                        m.syncTimer = setTimeout(() => this.loadMail({ keepStart: true }), 300);
+                    }
+                };
+                ws.onclose = () => {
+                    m.ws = null;
+                    this.startMailPolling();
+                    clearTimeout(m.wsRetry);
+                    m.wsRetry = setTimeout(() => this.connectMailEvents(), 15000);
+                };
+                ws.onerror = () => { try { ws.close(); } catch (e) {} };
+            },
+
+            startMailPolling() {
+                if (this.mail.pollTimer) return;
+                this.mail.pollTimer = setInterval(() => {
+                    if (document.hidden) return;
+                    if (this.view === 'mail') this.loadMail({ keepStart: true });
+                    else this.refreshMailCounts();
+                }, 15000);
+            },
+
+            stopMailPolling() {
+                clearInterval(this.mail.pollTimer);
+                this.mail.pollTimer = null;
+            },
+
+            async openMail(id) {
+                const m = this.mail;
+                if (!id) return;
+                m.selectedId = id;
+                m.msg = null; m.msgError = null; m.headers = null; m.msgLoading = true;
+                this.renderMail();
+                try {
+                    const msg = await this.mailApi('/v1/message/' + encodeURIComponent(id));
+                    if (m.selectedId !== id) return;
+                    m.msg = msg;
+                    m.part = msg.HTML ? 'html' : 'text';
+                    // Fetching a message marks it read on Mailpit's side too.
+                    const row = m.items.find(x => x.ID === id);
+                    if (row && !row.Read) { row.Read = true; m.unread = Math.max(0, m.unread - 1); }
+                } catch (e) {
+                    if (m.selectedId !== id) return;
+                    m.msgError = 'Could not load this message. It may have been deleted.';
+                }
+                m.msgLoading = false;
+                this.renderMail();
+                this.renderView();
+            },
+
+            closeMail() {
+                this.mail.selectedId = null;
+                this.mail.msg = null;
+                this.mail.renderedId = null;
+                this.renderMail();
+            },
+
+            mailMove(delta) {
+                const m = this.mail;
+                if (!m.items.length) return;
+                let i = m.items.findIndex(x => x.ID === m.selectedId);
+                i = i === -1 ? (delta > 0 ? 0 : m.items.length - 1) : Math.max(0, Math.min(m.items.length - 1, i + delta));
+                this.openMail(m.items[i].ID);
+                const row = $id('mailList').querySelector('.mail-row[data-id="' + CSS.escape(m.items[i].ID) + '"]');
+                if (row && row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
+            },
+
+            // Returns true when the key was consumed.
+            mailKeydown(e, typing) {
+                const m = this.mail;
+                if (e.metaKey || e.ctrlKey || e.altKey) return false;
+                const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
+                const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
+                if (isDown || isUp) { e.preventDefault(); this.mailMove(isDown ? 1 : -1); return true; }
+                if (typing) return false; // the search box handles its own Esc
+                if (this.showDbModal || this.ctxMenu.open) return false;
+                if ((e.key === 'Backspace' || e.key === 'Delete') && m.selectedId) {
+                    e.preventDefault();
+                    this.mailDelete([m.selectedId]);
+                    return true;
+                }
+                if (e.key === 'u' && m.selectedId) {
+                    const it = m.items.find(x => x.ID === m.selectedId);
+                    if (it) this.mailSetRead([it.ID], !it.Read);
+                    return true;
+                }
+                if (e.key === 'Escape') {
+                    if (m.selectedId) { this.closeMail(); return true; }
+                    if (this.mailQuery) { this.mailClearFilters(); return true; }
+                    return false;
+                }
+                return false;
+            },
+
+            setMailPart(part) {
+                const m = this.mail;
+                m.part = part;
+                if (part === 'headers' && m.msg && m.headers === null) {
+                    const id = m.msg.ID;
+                    m.headers = '';
+                    this.mailApi('/v1/message/' + encodeURIComponent(id) + '/headers').then(h => {
+                        if (!m.msg || m.msg.ID !== id) return;
+                        m.headers = Object.keys(h || {}).sort().map(k => (h[k] || []).map(v => k + ': ' + v).join('\n')).join('\n');
+                        this.renderMailReader();
+                    }).catch(() => {
+                        if (!m.msg || m.msg.ID !== id) return;
+                        m.headers = '(could not load headers)';
+                        this.renderMailReader();
+                    });
+                }
+                this.renderMailReader();
+            },
+
+            async mailSetRead(ids, read) {
+                try {
+                    await this.mailApi('/v1/messages', { method: 'PUT', body: { IDs: ids, Read: read } });
+                } catch (e) {
+                    this.showSnack('Mailpit did not answer.', true);
+                    return false;
+                }
+                // An empty ID list means "everything" to Mailpit.
+                for (const it of this.mail.items) if (!ids.length || ids.includes(it.ID)) it.Read = read;
+                this.refreshMailCounts();
+                this.renderMail();
+                return true;
+            },
+
+            async mailReadAll() {
+                const q = this.mailQuery;
+                let ids = [];
+                if (q) {
+                    // No read-by-search endpoint in Mailpit 1.30, so page the
+                    // search for its IDs. Capped: a filter is rarely huge.
+                    try {
+                        for (let start = 0; start < 5000; start += 200) {
+                            const d = await this.mailApi('/v1/search?query=' + encodeURIComponent(q) + '&limit=200&start=' + start);
+                            const page = Array.isArray(d.messages) ? d.messages : [];
+                            ids.push(...page.map(x => x.ID));
+                            if (page.length < 200) break;
+                        }
+                    } catch (e) { this.showSnack('Mailpit did not answer.', true); return; }
+                    if (!ids.length) return;
+                }
+                if (await this.mailSetRead(ids, true)) this.showSnack(q ? 'Matching mail marked read.' : 'Everything marked read.');
+            },
+
+            async mailDelete(ids) {
+                const m = this.mail;
+                try {
+                    await this.mailApi('/v1/messages', { method: 'DELETE', body: { IDs: ids } });
+                } catch (e) {
+                    this.showSnack('Mailpit did not answer.', true);
+                    return;
+                }
+                const idx = m.items.findIndex(x => x.ID === m.selectedId);
+                m.items = m.items.filter(x => !ids.includes(x.ID));
+                m.matched = Math.max(0, m.matched - ids.length);
+                if (ids.includes(m.selectedId)) {
+                    // Land on the neighbour so triaging a pile is ⌫ ⌫ ⌫.
+                    m.selectedId = null; m.msg = null; m.renderedId = null;
+                    const next = m.items[Math.min(idx, m.items.length - 1)];
+                    if (next) this.openMail(next.ID);
+                }
+                this.showSnack(ids.length === 1 ? 'Message deleted.' : ids.length + ' messages deleted.');
+                this.loadMail({ keepStart: true });
+            },
+
+            // Two clicks, like the sites' bulk delete: the first arms the
+            // button for a few seconds, the second fires.
+            async mailDeleteAll() {
+                const m = this.mail;
+                if (!m.deleteArmed) {
+                    m.deleteArmed = true;
+                    clearTimeout(m.armTimer);
+                    m.armTimer = setTimeout(() => { m.deleteArmed = false; this.renderMailChrome(); }, 3500);
+                    this.renderMailChrome();
+                    return;
+                }
+                m.deleteArmed = false;
+                clearTimeout(m.armTimer);
+                const q = this.mailQuery;
+                try {
+                    if (q) await this.mailApi('/v1/search?query=' + encodeURIComponent(q), { method: 'DELETE' });
+                    else await this.mailApi('/v1/messages', { method: 'DELETE', body: { IDs: [] } });
+                } catch (e) {
+                    this.showSnack('Mailpit did not answer.', true);
+                    this.renderMailChrome();
+                    return;
+                }
+                m.selectedId = null; m.msg = null; m.renderedId = null; m.items = [];
+                this.showSnack(q ? 'Matching mail deleted.' : 'Inbox emptied.');
+                this.loadMail();
+            },
+
+            mailAddrLabel(a) {
+                if (!a) return '';
+                return a.Name || a.Address || '';
+            },
+
+            mailAddrFull(a) {
+                if (!a) return '';
+                return a.Name ? a.Name + ' <' + a.Address + '>' : (a.Address || '');
+            },
+
+            // The site a message belongs to: the first recipient at a
+            // *.localhost domain. Mail from a site to an outside address still
+            // maps by its sender.
+            mailSiteOf(it) {
+                const pick = (list) => {
+                    for (const a of (list || [])) {
+                        const mm = /@([a-z0-9-]+)\.localhost$/i.exec(a.Address || '');
+                        if (mm) return mm[1].toLowerCase();
+                    }
+                    return null;
+                };
+                return pick(it.To) || pick(it.Cc) || pick(it.From ? [it.From] : []);
+            },
+
+            mailLinks(msg) {
+                const out = [], seen = new Set();
+                const push = (u) => {
+                    u = String(u || '').trim().replace(/[)\].,;'"!>]+$/, '');
+                    if (!/^https?:\/\//i.test(u) || seen.has(u)) return;
+                    seen.add(u); out.push(u);
+                };
+                if (msg.HTML) {
+                    const re = /href\s*=\s*["']([^"']+)["']/gi;
+                    let x;
+                    while ((x = re.exec(msg.HTML))) push(this.decodeEntities(x[1]));
+                }
+                if (msg.Text) {
+                    const re = /https?:\/\/[^\s<>"']+/gi;
+                    let x;
+                    while ((x = re.exec(msg.Text))) push(x[0]);
+                }
+                return out.slice(0, 8);
+            },
+
+            decodeEntities(s) {
+                const t = document.createElement('textarea');
+                t.innerHTML = s;
+                return t.value;
+            },
+
+            linkify(text) {
+                return this.escapeHtml(text).replace(/https?:\/\/[^\s<>"']+/g, (u) => {
+                    const clean = u.replace(/[)\].,;'"!]+$/, '');
+                    const tail = u.slice(clean.length);
+                    return '<a href="' + clean + '" target="_blank" rel="noopener noreferrer">' + clean + '</a>' + tail;
+                });
+            },
+
+            // The srcdoc for the sandboxed frame. Mailpit hands back the HTML
+            // untouched with cid: references intact and lists the inline parts
+            // separately, so the references are pointed at the proxied part
+            // URLs here. A CSP inside the document keeps everything else out —
+            // the sandbox already denies scripts and forms; this also stops
+            // remote images, fonts and stylesheets so a message never phones
+            // home when opened.
+            mailHtmlDoc(msg) {
+                let html = msg.HTML || '';
+                for (const p of (msg.Inline || [])) {
+                    if (!p.ContentID) continue;
+                    const url = '/mail-api/v1/message/' + encodeURIComponent(msg.ID) + '/part/' + encodeURIComponent(p.PartID);
+                    html = html.split('cid:' + p.ContentID).join(url);
+                }
+                html = html.replace(/<script[\s\S]*?<\/script\s*>/gi, '').replace(/<meta[^>]+http-equiv[^>]*>/gi, '');
+                const csp = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'none'";
+                const head = '<meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + csp + '"><base target="_blank">'
+                    + '<style>html{color-scheme:light}body{margin:0;padding:16px;background:#fff;color:#1a1c1b;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',system-ui,sans-serif;line-height:1.45}</style>';
+                if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, (t) => t + head);
+                if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, (t) => t + '<head>' + head + '</head>');
+                return '<!doctype html><html><head>' + head + '</head><body>' + html + '</body></html>';
+            },
+
+            renderMail() {
+                if (this.view !== 'mail') return;
+                this.renderMailChrome();
+                this.renderMailList();
+                this.renderMailReader();
+                this.renderMailFooter();
+            },
+
+            renderMailChrome() {
+                const m = this.mail;
+                const chip = $id('mailSiteChip');
+                show(chip, !!m.site);
+                if (m.site) $id('mailSiteChipLabel').textContent = 'site: ' + m.site;
+                const active = !!(m.query || m.site || m.unreadOnly);
+                show($id('mailKbd'), !active);
+                show($id('btnMailSearchClear'), active);
+                const del = $id('btnMailDeleteAll');
+                del.classList.toggle('armed', m.deleteArmed);
+                del.textContent = m.deleteArmed ? ('sure? delete ' + m.matched) : (active ? 'delete matching' : 'delete all');
+                del.disabled = !m.matched;
+                $id('btnMailReadAll').disabled = !m.matched;
+            },
+
+            renderMailList() {
+                const m = this.mail;
+                const list = $id('mailList');
+                list.querySelectorAll('.mail-row').forEach(n => n.remove());
+                show($id('mailLoading'), m.loading);
+                show($id('mailError'), !m.loading && !!m.error);
+                const empty = !m.loading && !m.error && m.items.length === 0;
+                const q = this.mailQuery;
+                show($id('mailEmptyNone'), empty && !q);
+                show($id('mailEmptyFilter'), empty && !!q);
+                if (empty && q) $id('mailEmptyQuery').textContent = q;
+
+                const tpl = $id('tpl-mail-row');
+                const anchor = $id('mailLoading');
+                for (const it of m.items) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.id = it.ID;
+                    row.classList.toggle('is-unread', !it.Read);
+                    row.classList.toggle('is-selected', it.ID === m.selectedId);
+                    const from = row.querySelector('.mail-from');
+                    from.textContent = this.mailAddrLabel(it.From) || '(unknown sender)';
+                    from.title = this.mailAddrFull(it.From);
+                    const age = row.querySelector('.mail-age');
+                    const ts = Date.parse(it.Created) / 1000;
+                    age.textContent = this.formatRelative(ts);
+                    age.title = isNaN(ts) ? '' : new Date(it.Created).toLocaleString();
+                    row.querySelector('.mail-subject').textContent = it.Subject || '(no subject)';
+                    const site = this.mailSiteOf(it);
+                    const chip = row.querySelector('.mail-site');
+                    if (site) { chip.textContent = site; chip.title = 'Only mail for ' + site + '.localhost'; }
+                    else chip.remove();
+                    const att = row.querySelector('.mail-att');
+                    if (it.Attachments) att.setAttribute('title', it.Attachments + ' attachment' + (it.Attachments === 1 ? '' : 's'));
+                    else att.remove();
+                    row.querySelector('.mail-snippet').textContent = it.Snippet || '';
+                    list.insertBefore(row, anchor);
+                }
+            },
+
+            renderMailReader() {
+                const m = this.mail;
+                const has = !!m.selectedId;
+                $id('mailBody').classList.toggle('has-msg', has);
+                show($id('mailReaderEmpty'), !has);
+                show($id('mailMsg'), has);
+                if (!has) return;
+                show($id('mailMsgLoading'), m.msgLoading);
+                show($id('mailMsgError'), !m.msgLoading && !!m.msgError);
+                if (m.msgError) $id('mailMsgError').textContent = m.msgError;
+                const ready = !!m.msg && !m.msgLoading;
+                show($id('mailMsgHead'), ready);
+                show($id('mailMsgMain'), ready);
+                if (!ready) return;
+                const msg = m.msg;
+
+                if (m.renderedId !== msg.ID) {
+                    m.renderedId = msg.ID;
+                    m.remoteBlocked = 0;
+                    $id('mailMsgSubject').textContent = msg.Subject || '(no subject)';
+                    const meta = [['from', this.mailAddrFull(msg.From)], ['to', (msg.To || []).map(a => this.mailAddrFull(a)).join(', ')]];
+                    if (msg.Cc && msg.Cc.length) meta.push(['cc', msg.Cc.map(a => this.mailAddrFull(a)).join(', ')]);
+                    if (msg.Bcc && msg.Bcc.length) meta.push(['bcc', msg.Bcc.map(a => this.mailAddrFull(a)).join(', ')]);
+                    if (msg.ReplyTo && msg.ReplyTo.length) meta.push(['reply', msg.ReplyTo.map(a => this.mailAddrFull(a)).join(', ')]);
+                    const when = Date.parse(msg.Date);
+                    meta.push(['date', isNaN(when) ? (msg.Date || '—') : new Date(when).toLocaleString()]);
+                    $id('mailMsgMeta').innerHTML = meta.map(([k, v]) =>
+                        '<div class="mail-meta-row"><span class="mail-meta-k">' + k + '</span><span class="mail-meta-v">' + this.escapeHtml(v || '—') + '</span></div>').join('');
+                    $id('mailMsgLinks').innerHTML = this.mailLinks(msg).map(u => {
+                        const label = u.replace(/^https?:\/\//i, '');
+                        return '<span class="mail-link"><a href="' + this.escapeHtml(u) + '" target="_blank" rel="noopener noreferrer" title="' + this.escapeHtml(u) + '">' + this.escapeHtml(label) + '</a>'
+                            + '<button type="button" class="mail-link-copy" data-url="' + this.escapeHtml(u) + '" title="Copy link">copy</button></span>';
+                    }).join('');
+
+                    const frame = $id('mailFrame');
+                    frame.style.height = '';
+                    if (msg.HTML) {
+                        frame.onload = () => {
+                            try {
+                                const d = frame.contentDocument;
+                                const h = Math.max(d.documentElement.scrollHeight, d.body ? d.body.scrollHeight : 0);
+                                frame.style.height = Math.min(Math.max(h + 8, 240), 6000) + 'px';
+                                m.remoteBlocked = d.querySelectorAll('img[src^="http"], img[src^="//"]').length;
+                                this.renderMailReader();
+                            } catch (e) {}
+                        };
+                        frame.srcdoc = this.mailHtmlDoc(msg);
+                    } else {
+                        frame.onload = null;
+                        frame.srcdoc = '';
+                    }
+                    $id('mailText').innerHTML = msg.Text ? this.linkify(msg.Text) : '<span style="color: var(--text-faint)">(no text part)</span>';
+
+                    const att = $id('mailAttachments');
+                    const files = msg.Attachments || [];
+                    show(att, files.length > 0);
+                    att.innerHTML = files.map(f =>
+                        '<a class="pill" href="/mail-api/v1/message/' + encodeURIComponent(msg.ID) + '/part/' + encodeURIComponent(f.PartID) + '" target="_blank" rel="noopener" download="' + this.escapeHtml(f.FileName || 'attachment') + '">'
+                        + this.escapeHtml(f.FileName || 'attachment') + ' <span style="color: var(--text-faint)">' + this.formatSize(f.Size) + '</span></a>').join('');
+                    $id('mailOpenInMailpit').href = this.mailpitUrl + '/view/' + encodeURIComponent(msg.ID);
+                }
+
+                const row = m.items.find(x => x.ID === msg.ID);
+                $id('btnMailUnread').textContent = (row && !row.Read) ? 'mark read' : 'mark unread';
+                document.querySelectorAll('#mailParts .mail-part').forEach(b => {
+                    const part = b.dataset.part;
+                    show(b, part !== 'html' || !!msg.HTML);
+                    b.classList.toggle('is-active', m.part === part);
+                    b.setAttribute('aria-selected', m.part === part ? 'true' : 'false');
+                });
+                show($id('mailFrame'), m.part === 'html');
+                show($id('mailText'), m.part === 'text');
+                show($id('mailHeaders'), m.part === 'headers');
+                if (m.part === 'headers') $id('mailHeaders').textContent = m.headers === '' ? 'Loading…' : (m.headers || '');
+                const note = $id('mailRemoteNote');
+                show(note, m.part === 'html' && m.remoteBlocked > 0);
+                note.textContent = m.remoteBlocked + ' remote image' + (m.remoteBlocked === 1 ? '' : 's') + ' blocked';
+            },
+
+            renderMailFooter() {
+                if (this.view !== 'mail') return;
+                const m = this.mail;
+                const total = m.total, unread = m.unread;
+                const q = this.mailQuery;
+                let label;
+                if (m.error && !m.loaded) label = '';
+                else if (q) label = m.matched + ' of ' + total + ' message' + (total === 1 ? '' : 's');
+                else label = total + ' message' + (total === 1 ? '' : 's') + (unread ? ' · ' + unread + ' unread' : '');
+                $id('mailCount').textContent = label;
+                const db = $id('mailDbSize');
+                show(db, !!(m.info && m.info.DatabaseSize));
+                if (m.info && m.info.DatabaseSize) { db.textContent = '· ' + this.formatSize(m.info.DatabaseSize) + ' on disk'; db.title = m.info.Database || ''; }
+                const pager = $id('mailPager');
+                show(pager, m.matched > m.limit);
+                if (m.matched > m.limit) {
+                    $id('mailRange').textContent = (m.start + 1) + '–' + Math.min(m.start + m.limit, m.matched);
+                    $id('btnMailNewer').disabled = m.start === 0;
+                    $id('btnMailOlder').disabled = m.start + m.limit >= m.matched;
+                }
+            },
+
+            // Keep the outgoing card on screen, out of flow, while it fades;
+            // renderView leaves .is-leaving cards alone until the fade ends.
+            crossfadeFrom(prev) {
+                const out = $id({ sites: 'sitesCard', mail: 'mailCard', db: 'dbCard', logs: 'logsCard' }[prev]);
+                if (!out || out.style.display === 'none') return;
+                if (window.scrollY > 0) window.scrollTo({ top: 0, behavior: 'instant' });
+                document.querySelectorAll('.wrap > .card.is-leaving').forEach(el => { el.classList.remove('is-leaving'); el.style.top = ''; el.style.display = 'none'; });
+                out.style.top = out.offsetTop + 'px';
+                out.classList.add('is-leaving');
+                setTimeout(() => {
+                    out.classList.remove('is-leaving');
+                    out.style.top = '';
+                    this.renderView();
+                }, 220);
+            },
+
+            renderView() {
+                const card = (id, on) => { const el = $id(id); if (!el.classList.contains('is-leaving')) show(el, on); };
+                card('sitesCard', this.view === 'sites');
+                card('mailCard', this.view === 'mail');
+                card('dbCard', this.view === 'db');
+                card('logsCard', this.view === 'logs');
+                document.querySelectorAll('.nav-view').forEach(b => {
+                    const on = b.dataset.view === this.view;
+                    b.classList.toggle('is-active', on);
+                    b.setAttribute('aria-selected', on ? 'true' : 'false');
+                });
+                const badge = $id('mailBadge');
+                const n = this.mail.unread;
+                show(badge, n > 0);
+                badge.textContent = n > 99 ? '99+' : String(n);
+                document.querySelector('.nav-view[data-view="mail"]').title = n ? (n + ' unread message' + (n === 1 ? '' : 's')) : 'Mail';
+            },
+
+            bindMailEvents() {
+                document.querySelectorAll('.nav-view').forEach(b => b.addEventListener('click', () => this.setView(b.dataset.view)));
+                // The wordmark is "home": the sites view, in place. Plain
+                // left-clicks only, so ⌘-click and middle-click still open a
+                // fresh tab like any link.
+                document.querySelector('.nav .logo').addEventListener('click', (e) => {
+                    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+                    e.preventDefault();
+                    if (this.view !== 'sites') { this.setView('sites'); return; }
+                    if (window.scrollY > 0) window.scrollTo({ top: 0, behavior: 'smooth' });
+                });
+                window.addEventListener('popstate', () => this.readViewFromUrl());
+
+                const search = $id('mailSearch');
+                search.addEventListener('input', () => {
+                    this.mail.query = search.value;
+                    clearTimeout(this.mail.searchTimer);
+                    this.mail.searchTimer = setTimeout(() => this.loadMail(), 250);
+                    this.renderMailChrome();
+                });
+                search.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); clearTimeout(this.mail.searchTimer); this.loadMail(); }
+                    if (e.key === 'Escape') {
+                        e.preventDefault(); e.stopPropagation();
+                        this.mail.query = ''; search.value = ''; search.blur();
+                        this.loadMail();
+                    }
+                });
+                $id('btnMailSearchClear').addEventListener('click', () => { this.mailClearFilters(); search.focus(); });
+                $id('mailSiteChipClear').addEventListener('click', () => { this.setMailSite(null); search.focus(); });
+                $id('mailUnreadOnly').addEventListener('change', (e) => { this.mail.unreadOnly = e.target.checked; this.loadMail(); });
+                $id('btnMailReadAll').addEventListener('click', () => this.mailReadAll());
+                $id('btnMailDeleteAll').addEventListener('click', () => this.mailDeleteAll());
+                $id('btnMailNewer').addEventListener('click', () => this.mailPage(-1));
+                $id('btnMailOlder').addEventListener('click', () => this.mailPage(1));
+
+                $id('mailList').addEventListener('click', (e) => {
+                    const row = e.target.closest('.mail-row');
+                    if (!row) return;
+                    const chip = e.target.closest('.mail-site');
+                    if (chip) { this.setMailSite(chip.textContent); return; }
+                    this.openMail(row.dataset.id);
+                });
+                $id('mailParts').addEventListener('click', (e) => {
+                    const b = e.target.closest('.mail-part');
+                    if (b) this.setMailPart(b.dataset.part);
+                });
+                $id('btnMailUnread').addEventListener('click', () => {
+                    const it = this.mail.items.find(x => x.ID === this.mail.selectedId);
+                    if (it) this.mailSetRead([it.ID], !it.Read);
+                    else if (this.mail.selectedId) this.mailSetRead([this.mail.selectedId], false);
+                });
+                $id('btnMailDelete').addEventListener('click', () => { if (this.mail.selectedId) this.mailDelete([this.mail.selectedId]); });
+                $id('btnMailBack').addEventListener('click', () => this.closeMail());
+                $id('mailMsgLinks').addEventListener('click', (e) => {
+                    const b = e.target.closest('.mail-link-copy');
+                    if (!b) return;
+                    navigator.clipboard.writeText(b.dataset.url)
+                        .then(() => this.showSnack('Link copied.'))
+                        .catch(() => this.showSnack('Could not copy.', true));
+                });
+                document.addEventListener('visibilitychange', () => {
+                    if (!document.hidden && this.view === 'mail') this.loadMail({ keepStart: true });
+                });
+            },
+
+            // --- Databases -------------------------------------------------
+            // A native browser over MariaDB via api.php's db_* actions. Every
+            // Cove site owns one database (its name is in wp-config.php), so
+            // the list maps databases back to sites the way the inbox maps
+            // recipients. Adminer remains the tool for exports, imports and
+            // schema changes; this covers looking, fixing a value, and asking
+            // the database a question.
+            dbSiteOf(name) {
+                const s = this.sites.find(x => x.db_name === name);
+                return s ? s.name : null;
+            },
+
+            get dbVisibleList() {
+                const q = this.db.filter.trim().toLowerCase();
+                if (this.db.name) {
+                    return this.db.tables.filter(t => !q || t.name.toLowerCase().includes(q));
+                }
+                return this.db.list.filter(d => !q || d.name.toLowerCase().includes(q) || (this.dbSiteOf(d.name) || '').includes(q));
+            },
+
+            resetDbTable() {
+                const r = this.db.rows;
+                Object.assign(r, { columns: [], pk: [], items: [], total: 0, start: 0, sort: '', dir: 'asc', q: '', col: '', loading: false, error: null });
+                this.db.structure = null;
+                this.db.edit = null;
+                this.db.delArm = null;
+                this.db.part = 'rows';
+                const f = $id('dbRowsFilter'); if (f) f.value = '';
+            },
+
+            async loadDbList() {
+                const d = this.db;
+                d.loading = !d.loaded;
+                this.renderDb();
+                // Names first (instant), then a second pass for table counts
+                // and sizes, which can take seconds on a box with thousands
+                // of tables.
+                const res = await this.apiPost('db_list', { light: true }, { quiet: true, timeoutMs: 15000 });
+                if (res.success) { d.list = res.databases || []; d.server = res.server || ''; d.error = null; }
+                else d.error = res.message || 'MariaDB is not answering.';
+                d.loaded = true;
+                d.loading = false;
+                this.renderDb();
+                if (!res.success) return;
+                const full = await this.apiPost('db_list', {}, { quiet: true, timeoutMs: 60000 });
+                if (full.success) { d.list = full.databases || d.list; this.renderDbList(); this.renderDbFooter(); if (d.name && !d.table && !d.sql) this.renderDbOverview(); }
+            },
+
+            async loadDbTables() {
+                const d = this.db;
+                const name = d.name;
+                if (!name) return;
+                this.renderDb();
+                const res = await this.apiPost('db_tables', { db: name }, { quiet: true, timeoutMs: 20000 });
+                if (d.name !== name) return;
+                if (res.success) { d.tables = res.tables || []; d.wp = res.wp || null; d.error = null; }
+                else { d.error = res.message || 'Could not read that database.'; d.tables = []; }
+                d.tablesFor = name;
+                this.renderDb();
+            },
+
+            openDb(name) {
+                if (name === this.db.name) return;
+                this.db.name = name;
+                this.db.tables = [];
+                this.db.tablesFor = null;
+                this.db.wp = null;
+                this.db.filter = '';
+                $id('dbFilter').value = '';
+                this.resetDbTable();
+                this.db.table = null;
+                this.syncUrl();
+                this.renderDb();
+                this.loadDbTables();
+            },
+
+            closeDb() {
+                this.db.name = null;
+                this.db.table = null;
+                this.db.tables = [];
+                this.db.tablesFor = null;
+                this.db.wp = null;
+                this.db.filter = '';
+                $id('dbFilter').value = '';
+                this.resetDbTable();
+                this.syncUrl();
+                this.renderDb();
+                if (!this.db.list.length) this.loadDbList();
+            },
+
+            openDbTable(table, opts = {}) {
+                if (table === this.db.table && !opts.force) { this.db.sql = false; this.renderDb(); return; }
+                this.resetDbTable();
+                this.db.table = table;
+                this.db.sql = false;
+                if (opts.q) { this.db.rows.q = opts.q; this.db.rows.col = opts.col || ''; $id('dbRowsFilter').value = opts.q; }
+                this.syncUrl();
+                this.renderDb();
+                this.loadDbRows();
+            },
+
+            closeDbTable() {
+                this.db.table = null;
+                this.resetDbTable();
+                this.syncUrl();
+                this.renderDb();
+            },
+
+            // From a site's row menu or the palette: straight to its schema.
+            openDbForSite(site) {
+                const name = site.db_name || ('cove_' + site.name).replace(/[^a-zA-Z0-9_]/g, '_');
+                if (name !== this.db.name) { this.db.tables = []; this.db.tablesFor = null; this.db.wp = null; this.resetDbTable(); this.db.table = null; }
+                this.db.name = name;
+                this.db.filter = '';
+                $id('dbFilter').value = '';
+                this.setView('db', { force: true });
+            },
+
+            async loadDbRows() {
+                const d = this.db, r = d.rows;
+                if (!d.name || !d.table) return;
+                const seq = ++r.seq;
+                r.loading = r.items.length === 0;
+                r.error = null;
+                this.renderDbTable();
+                const res = await this.apiPost('db_rows', { db: d.name, table: d.table, start: r.start, limit: r.limit, sort: r.sort, dir: r.dir, q: r.q, col: r.col }, { quiet: true, timeoutMs: 30000 });
+                if (seq !== r.seq) return;
+                if (res.success) {
+                    r.columns = res.columns || []; r.pk = res.pk || []; r.items = res.rows || []; r.total = res.total || 0;
+                    if (r.start > 0 && r.items.length === 0 && r.total > 0) {
+                        r.start = Math.max(0, Math.floor((r.total - 1) / r.limit) * r.limit);
+                        return this.loadDbRows();
+                    }
+                } else {
+                    r.error = res.message || 'Could not read rows.';
+                    r.items = []; r.total = 0;
+                }
+                r.loading = false;
+                this.renderDbTable();
+                this.renderDbFooter();
+            },
+
+            dbPage(delta) {
+                const r = this.db.rows;
+                const next = r.start + delta * r.limit;
+                if (next < 0 || next >= r.total) return;
+                r.start = next;
+                this.loadDbRows();
+                $id('dbGridWrap').scrollTop = 0;
+            },
+
+            dbSort(col) {
+                const r = this.db.rows;
+                if (r.sort === col) r.dir = r.dir === 'asc' ? 'desc' : 'asc';
+                else { r.sort = col; r.dir = 'asc'; }
+                r.start = 0;
+                this.loadDbRows();
+            },
+
+            setDbPart(part) {
+                this.db.part = part;
+                this.db.edit = null;
+                if (part === 'structure' && this.db.structure === null) {
+                    const d = this.db, name = d.name, table = d.table;
+                    d.structure = { loading: true };
+                    this.apiPost('db_structure', { db: name, table }, { quiet: true, timeoutMs: 20000 }).then(res => {
+                        if (d.name !== name || d.table !== table) return;
+                        d.structure = res.success ? res : { error: res.message || 'Could not read the structure.' };
+                        this.renderDbTable();
+                    });
+                }
+                this.renderDbTable();
+            },
+
+            toggleDbSql(on) {
+                this.db.sql = typeof on === 'boolean' ? on : !this.db.sql;
+                this.db.edit = null;
+                this.renderDb();
+                if (this.db.sql) $id('dbSqlText').focus();
+            },
+
+            // Returns true when the key was consumed.
+            dbKeydown(e, typing) {
+                const d = this.db;
+                const el = document.activeElement;
+                if (el && el.id === 'dbSqlText') {
+                    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); this.runDbSql(); return true; }
+                    if (e.key === 'Escape') { e.preventDefault(); el.blur(); return true; }
+                    return false;
+                }
+                if (el && el.classList && el.classList.contains('db-edit')) return false; // the editor owns its keys
+                if (typing) return false;
+                if (e.metaKey || e.ctrlKey || e.altKey) return false;
+                if (e.key === 'Escape') {
+                    if (this.showDbModal || this.ctxMenu.open) return false;
+                    if (d.edit) { this.cancelDbEdit(); return true; }
+                    if (d.sql) { this.toggleDbSql(false); return true; }
+                    if (d.filter) { d.filter = ''; $id('dbFilter').value = ''; this.renderDb(); return true; }
+                    if (d.table) { this.closeDbTable(); return true; }
+                    if (d.name) { this.closeDb(); return true; }
+                    return false;
+                }
+                return false;
+            },
+
+            // --- Editing a cell. Double-click; ↵ saves, Esc cancels,
+            // ⌘⌫ writes NULL. Long values are fetched in full first.
+            async startDbEdit(rowIdx, colIdx) {
+                const d = this.db, r = d.rows;
+                if (!r.pk.length || d.part !== 'rows') return;
+                const col = r.columns[colIdx];
+                if (!col) return;
+                let value = r.items[rowIdx] ? r.items[rowIdx][colIdx] : undefined;
+                if (value === undefined) return;
+                if (value && typeof value === 'object') {
+                    if (value.t === 'bin') { this.showSnack('Binary values cannot be edited here.', true); return; }
+                    const res = await this.apiPost('db_cell', { db: d.name, table: d.table, pk: this.dbRowKey(rowIdx), col: col.name }, { timeoutMs: 20000 });
+                    if (!res.success) return;
+                    value = res.value;
+                }
+                d.edit = { row: rowIdx, col: colIdx, value: value === null ? '' : String(value), isNull: value === null, busy: false };
+                this.renderDbGrid();
+                const ta = $id('dbGrid').querySelector('.db-edit');
+                if (ta) { ta.focus(); ta.select(); }
+            },
+
+            cancelDbEdit() {
+                this.db.edit = null;
+                this.renderDbGrid();
+            },
+
+            dbRowKey(rowIdx) {
+                const r = this.db.rows;
+                const row = r.items[rowIdx];
+                const key = {};
+                for (const c of r.pk) {
+                    const i = r.columns.findIndex(x => x.name === c);
+                    const v = row[i];
+                    key[c] = (v && typeof v === 'object') ? null : v;
+                }
+                return key;
+            },
+
+            async saveDbEdit(asNull = false) {
+                const d = this.db, r = d.rows, ed = d.edit;
+                if (!ed || ed.busy) return;
+                const col = r.columns[ed.col];
+                const original = r.items[ed.row][ed.col];
+                const unchanged = asNull ? original === null : (original !== null && typeof original !== 'object' && String(original) === ed.value);
+                if (unchanged) { this.cancelDbEdit(); return; }
+                ed.busy = true;
+                const res = await this.apiPost('db_update', { db: d.name, table: d.table, pk: this.dbRowKey(ed.row), col: col.name, value: ed.value, null: asNull }, { timeoutMs: 20000 });
+                if (!res.success) { ed.busy = false; this.renderDbGrid(); return; }
+                if (res.row) r.items[ed.row] = res.row;
+                else r.items[ed.row][ed.col] = asNull ? null : ed.value;
+                d.edit = null;
+                this.renderDbGrid();
+                this.showSnack(res.affected ? 'Saved.' : 'No change.');
+            },
+
+            async deleteDbRow(rowIdx) {
+                const d = this.db, r = d.rows;
+                if (d.delArm !== rowIdx) {
+                    d.delArm = rowIdx;
+                    clearTimeout(d.delTimer);
+                    d.delTimer = setTimeout(() => { d.delArm = null; this.renderDbGrid(); }, 3500);
+                    this.renderDbGrid();
+                    return;
+                }
+                d.delArm = null;
+                clearTimeout(d.delTimer);
+                const res = await this.apiPost('db_delete_row', { db: d.name, table: d.table, pk: this.dbRowKey(rowIdx) }, { timeoutMs: 20000 });
+                if (!res.success) { this.renderDbGrid(); return; }
+                r.items.splice(rowIdx, 1);
+                r.total = Math.max(0, r.total - 1);
+                this.showSnack('Row deleted.');
+                this.renderDbGrid();
+                this.renderDbFooter();
+                if (r.items.length === 0 && r.total > 0) this.loadDbRows();
+            },
+
+            // --- SQL console ------------------------------------------------
+            async runDbSql() {
+                const c = this.db.console;
+                const sql = $id('dbSqlText').value;
+                c.text = sql;
+                if (!sql.trim() || c.running) return;
+                c.running = true;
+                this.renderDbSql();
+                const res = await this.apiPost('db_query', { db: this.db.name || '', sql }, { quiet: true, timeoutMs: 120000 });
+                c.running = false;
+                if (!res.success) {
+                    c.results = [{ type: 'error', message: res.message || (res.transport ? 'The dashboard did not answer.' : 'Query failed.') }];
+                } else {
+                    c.results = res.results || [];
+                    c.ms = res.ms || 0;
+                    this.pushDbHistory(sql);
+                    // Data-changing statements: freshen whatever is open behind the console.
+                    if (c.results.some(x => x.type === 'ok')) {
+                        if (this.db.table) this.loadDbRows();
+                        if (this.db.name) this.loadDbTables();
+                    }
+                }
+                this.renderDbSql();
+            },
+
+            get dbHistory() {
+                try { return JSON.parse(localStorage.getItem('cove-sql-history') || '[]'); } catch (e) { return []; }
+            },
+
+            pushDbHistory(sql) {
+                const h = this.dbHistory.filter(x => x !== sql);
+                h.unshift(sql);
+                try { localStorage.setItem('cove-sql-history', JSON.stringify(h.slice(0, 40))); } catch (e) {}
+            },
+
+            // --- Rendering ---------------------------------------------------
+            renderDb() {
+                if (this.view !== 'db') return;
+                this.renderDbChrome();
+                this.renderDbList();
+                this.renderDbMain();
+                this.renderDbFooter();
+            },
+
+            renderDbChrome() {
+                const d = this.db;
+                const chip = $id('dbChip');
+                show(chip, !!d.name);
+                if (d.name) $id('dbChipLabel').textContent = d.name;
+                $id('dbFilter').placeholder = d.name ? 'filter tables…' : 'filter databases…';
+                show($id('dbKbd'), !d.filter);
+                show($id('btnDbFilterClear'), !!d.filter);
+                $id('btnDbSql').classList.toggle('primary', d.sql);
+                const site = d.name ? this.dbSiteOf(d.name) : null;
+                const adminer = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) + (d.name ? '&db=' + encodeURIComponent(d.name) + (d.table ? '&select=' + encodeURIComponent(d.table) : '') : '');
+                $id('dbAdminerLink').href = adminer;
+                $id('dbAdminerLink').title = 'Open ' + (d.table ? d.table + ' in Adminer' : d.name ? d.name + ' in Adminer' : 'Adminer') + (site ? ' (' + site + '.localhost)' : '') + ' — exports, imports, schema changes, users';
+            },
+
+            renderDbList() {
+                const d = this.db;
+                const list = $id('dbList');
+                list.querySelectorAll('.db-row').forEach(n => n.remove());
+                const loading = d.name ? d.tablesFor !== d.name : d.loading;
+                show($id('dbLoading'), loading);
+                show($id('dbError'), !loading && !!d.error);
+                const rows = loading ? [] : this.dbVisibleList;
+                const empty = !loading && !d.error && rows.length === 0;
+                show($id('dbEmpty'), empty);
+                if (empty) $id('dbEmptyQuery').textContent = d.filter || (d.name ? '(no tables)' : '(no databases)');
+                const tpl = $id('tpl-db-row');
+                const anchor = $id('dbLoading');
+                for (const it of rows) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.name = it.name;
+                    row.querySelector('.db-row-name').textContent = it.name;
+                    row.querySelector('.db-row-name').title = it.name;
+                    const chip = row.querySelector('.db-row-site');
+                    if (d.name) {
+                        chip.remove();
+                        row.classList.toggle('is-view', !!it.view);
+                        row.classList.toggle('is-selected', it.name === d.table);
+                        row.querySelector('.db-row-meta').textContent = it.view ? 'view' : ((it.rows === null ? '' : '~' + this.formatCount(it.rows)) + (it.bytes ? ' · ' + this.formatSize(it.bytes) : ''));
+                        row.querySelector('.db-row-meta').title = it.view ? 'View' : (it.engine || '') + (it.collation ? ' · ' + it.collation : '') + ' · row count is the engine\'s estimate';
+                    } else {
+                        const site = this.dbSiteOf(it.name);
+                        if (site) { chip.textContent = site; chip.title = site + '.localhost'; chip.setAttribute('role', 'presentation'); }
+                        else chip.remove();
+                        row.classList.toggle('is-selected', it.name === d.name);
+                        row.querySelector('.db-row-meta').textContent = it.tables === null ? '' : it.tables + ' table' + (it.tables === 1 ? '' : 's') + (it.bytes ? ' · ' + this.formatSize(it.bytes) : '');
+                    }
+                    list.insertBefore(row, anchor);
+                }
+            },
+
+            renderDbMain() {
+                const d = this.db;
+                const mode = d.sql ? 'sql' : d.table ? 'table' : d.name ? 'overview' : 'empty';
+                show($id('dbMainEmpty'), mode === 'empty');
+                show($id('dbOverview'), mode === 'overview');
+                show($id('dbTable'), mode === 'table');
+                show($id('dbSql'), mode === 'sql');
+                if (mode === 'overview') this.renderDbOverview();
+                if (mode === 'table') this.renderDbTable();
+                if (mode === 'sql') this.renderDbSql();
+            },
+
+            renderDbOverview() {
+                const d = this.db, esc = (s) => this.escapeHtml(s == null ? '—' : String(s));
+                const box = $id('dbOverview');
+                const meta = d.list.find(x => x.name === d.name);
+                const site = this.dbSiteOf(d.name);
+                let html = '<h2>' + esc(d.name) + '</h2>';
+                const sub = [];
+                if (site) sub.push('<a href="https://' + esc(site) + '.localhost' + PORT_SUFFIX + '" target="_blank" rel="noopener" style="color: var(--accent); text-decoration: none;">' + esc(site) + '.localhost</a>');
+                if (meta && meta.tables !== null) sub.push(meta.tables + ' table' + (meta.tables === 1 ? '' : 's') + ' · ' + this.formatSize(meta.bytes));
+                if (d.server) sub.push('MariaDB ' + esc(d.server.replace(/-MariaDB.*$/, '')));
+                html += '<p class="db-ov-sub">' + sub.join(' · ') + '</p>';
+                if (d.tablesFor !== d.name) { html += '<div class="loading">Loading…</div>'; box.innerHTML = html; return; }
+                if (d.error) { html += '<div class="mail-msg-error">' + esc(d.error) + '</div>'; box.innerHTML = html; return; }
+                const wp = d.wp;
+                if (wp) {
+                    const stat = (k, v, title) => '<div class="db-ov-stat"' + (title ? ' title="' + esc(title) + '"' : '') + '><span class="k">' + k + '</span><span class="v">' + v + '</span></div>';
+                    html += '<div class="db-ov-grid">'
+                        + stat('site url', wp.siteurl ? '<a href="' + esc(wp.siteurl) + '" target="_blank" rel="noopener">' + esc(wp.siteurl.replace(/^https?:\/\//, '')) + '</a>' : '—', wp.siteurl)
+                        + stat('home', wp.home ? '<a href="' + esc(wp.home) + '" target="_blank" rel="noopener">' + esc(wp.home.replace(/^https?:\/\//, '')) + '</a>' : '—', wp.home)
+                        + stat('prefix', esc(wp.prefix))
+                        + stat('theme', esc(wp.stylesheet || wp.template || '—'))
+                        + stat('posts · users · comments', esc(this.formatCount(wp.posts)) + ' · ' + esc(this.formatCount(wp.users)) + ' · ' + esc(this.formatCount(wp.comments)))
+                        + stat('options', esc(this.formatCount(wp.options)) + ' · ' + this.formatSize(wp.autoload_bytes) + ' autoloaded', wp.autoload_count + ' autoloaded options are read on every request')
+                        + '</div>';
+                    if (wp.largest && wp.largest.length) {
+                        html += '<p class="db-ov-label">largest autoloaded options</p><ul class="db-ov-list" id="dbOvLargest">'
+                            + wp.largest.map(o => '<li data-option="' + esc(o.name) + '" title="Open in ' + esc(wp.prefix) + 'options"><span>' + esc(o.name) + '</span><span>' + this.formatSize(o.bytes) + '</span></li>').join('')
+                            + '</ul>';
+                    }
+                } else if (d.tables.length) {
+                    html += '<p class="db-ov-sub">Not a WordPress database — pick a table on the left, or open the SQL console.</p>';
+                } else {
+                    html += '<p class="db-ov-sub">Empty database. The SQL console is the place to start.</p>';
+                }
+                box.innerHTML = html;
+            },
+
+            renderDbTable() {
+                const d = this.db, r = d.rows;
+                if (this.view !== 'db' || !d.table || d.sql) return;
+                document.querySelectorAll('#dbParts .mail-part').forEach(b => {
+                    b.classList.toggle('is-active', d.part === b.dataset.part);
+                    b.setAttribute('aria-selected', d.part === b.dataset.part ? 'true' : 'false');
+                });
+                show($id('dbRowsSearch'), d.part === 'rows');
+                show($id('btnDbRowsRefresh'), d.part === 'rows');
+                show($id('dbGridWrap'), d.part === 'rows');
+                show($id('dbStructure'), d.part === 'structure');
+                // Column picker for the filter
+                const sel = $id('dbRowsCol');
+                const want = ['<option value="">any column</option>'].concat(r.columns.map(c => '<option value="' + this.escapeHtml(c.name) + '"' + (r.col === c.name ? ' selected' : '') + '>' + this.escapeHtml(c.name) + '</option>')).join('');
+                if (sel.innerHTML !== want) sel.innerHTML = want;
+                const note = $id('dbRowsNote');
+                if (d.part === 'rows') {
+                    note.textContent = r.error ? r.error : (!r.pk.length && r.columns.length ? 'read-only — no primary key' : (r.columns.length ? 'double-click a cell to edit' : ''));
+                    note.style.color = r.error ? 'var(--danger)' : '';
+                } else note.textContent = '';
+                if (d.part === 'rows') this.renderDbGrid();
+                else this.renderDbStructure();
+            },
+
+            dbCellHtml(v, col) {
+                if (v === null) return { cls: 'is-null', text: 'NULL', title: '' };
+                if (typeof v === 'object') {
+                    if (v.t === 'bin') return { cls: 'is-bin', text: '0x' + v.hex + (v.len > 48 ? '…' : '') + ' (' + this.formatSize(v.len) + ')', title: 'Binary, ' + v.len + ' bytes' };
+                    return { cls: '', text: v.text, title: this.formatSize(v.len) + ' — double-click to see it all' };
+                }
+                const num = col && /^(tiny|small|medium|big)?int|^(decimal|float|double|numeric|bit)/i.test(col.type || '');
+                return { cls: num ? 'is-num' : '', text: String(v), title: String(v).length > 60 ? String(v).slice(0, 400) : '' };
+            },
+
+            renderDbGrid() {
+                const d = this.db, r = d.rows, esc = (s) => this.escapeHtml(s);
+                const grid = $id('dbGrid');
+                if (r.loading) { grid.innerHTML = '<tbody><tr><td class="db-grid-empty">Loading rows…</td></tr></tbody>'; return; }
+                if (!r.columns.length) { grid.innerHTML = r.error ? '' : '<tbody><tr><td class="db-grid-empty">No columns.</td></tr></tbody>'; return; }
+                const editable = r.pk.length > 0;
+                let html = '<thead><tr>' + r.columns.map(c =>
+                    '<th data-col="' + esc(c.name) + '" title="' + esc(c.type + (c.null ? ', nullable' : '') + (c.extra ? ', ' + c.extra : '') + ' — click to sort') + '">'
+                    + (r.pk.includes(c.name) ? '<span class="col-key" title="key">⚿</span>' : '') + esc(c.name)
+                    + (r.sort === c.name ? '<span class="sort-arrow">' + (r.dir === 'asc' ? '↑' : '↓') + '</span>' : '')
+                    + '<span class="col-type">' + esc(c.type) + '</span></th>').join('')
+                    + (editable ? '<th class="db-row-actions" aria-hidden="true"></th>' : '') + '</tr></thead><tbody>';
+                if (!r.items.length) {
+                    html += '<tr><td class="db-grid-empty" colspan="' + (r.columns.length + 1) + '">' + (r.q ? 'No rows contain “' + esc(r.q) + '”.' : 'No rows.') + '</td></tr>';
+                }
+                r.items.forEach((row, ri) => {
+                    html += '<tr data-row="' + ri + '">';
+                    row.forEach((v, ci) => {
+                        const ed = d.edit && d.edit.row === ri && d.edit.col === ci ? d.edit : null;
+                        if (ed) {
+                            html += '<td class="is-editing" data-row="' + ri + '" data-col="' + ci + '"><textarea class="db-edit" rows="' + Math.min(12, Math.max(1, (ed.value.match(/\n/g) || []).length + 1)) + '"' + (ed.busy ? ' disabled' : '') + '>' + esc(ed.value) + '</textarea><span class="db-edit-hint">↵ save · shift+↵ newline · esc cancel · ⌘⌫ NULL</span></td>';
+                            return;
+                        }
+                        const cell = this.dbCellHtml(v, r.columns[ci]);
+                        html += '<td class="' + cell.cls + (editable ? ' is-editable' : '') + '" data-row="' + ri + '" data-col="' + ci + '"' + (cell.title ? ' title="' + esc(cell.title) + '"' : '') + '>' + esc(cell.text) + '</td>';
+                    });
+                    if (editable) html += '<td class="db-row-actions"><button type="button" class="db-row-del' + (d.delArm === ri ? ' armed' : '') + '" data-row="' + ri + '" title="Delete this row">' + (d.delArm === ri ? 'sure?' : '×') + '</button></td>';
+                    html += '</tr>';
+                });
+                grid.innerHTML = html + '</tbody>';
+            },
+
+            renderDbStructure() {
+                const d = this.db, s = d.structure, esc = (s) => this.escapeHtml(s == null ? '' : String(s));
+                const box = $id('dbStructure');
+                if (!s || s.loading) { box.innerHTML = '<div class="loading">Loading structure…</div>'; return; }
+                if (s.error) { box.innerHTML = '<div class="mail-msg-error">' + esc(s.error) + '</div>'; return; }
+                let html = '<p class="db-ov-label">columns</p><table><thead><tr><th>name</th><th>type</th><th>null</th><th>key</th><th>default</th><th>extra</th><th>collation</th></tr></thead><tbody>';
+                html += s.columns.map(c => '<tr><td>' + esc(c.name) + '</td><td>' + esc(c.type) + '</td><td>' + (c.null ? 'yes' : 'no') + '</td><td>' + esc(c.key) + '</td><td>' + (c.default === null ? '<span style="color: var(--text-faint); font-style: italic;">NULL</span>' : esc(c.default)) + '</td><td>' + esc(c.extra) + '</td><td>' + esc(c.collation) + '</td></tr>').join('');
+                html += '</tbody></table>';
+                if (s.indexes && s.indexes.length) {
+                    html += '<p class="db-ov-label">indexes</p><table><thead><tr><th>name</th><th>columns</th><th>type</th></tr></thead><tbody>';
+                    html += s.indexes.map(i => '<tr><td>' + esc(i.name) + '</td><td>' + esc(i.columns.join(', ')) + '</td><td>' + (i.unique ? 'unique · ' : '') + esc(i.type) + '</td></tr>').join('');
+                    html += '</tbody></table>';
+                }
+                if (s.create) html += '<p class="db-ov-label">create table</p><pre>' + esc(s.create) + '</pre>';
+                box.innerHTML = html;
+            },
+
+            renderDbSql() {
+                const d = this.db, c = d.console, esc = (s) => this.escapeHtml(s == null ? '' : String(s));
+                if (this.view !== 'db' || !d.sql) return;
+                $id('dbSqlNote').textContent = d.name ? 'runs against ' + d.name : 'no database selected — qualify tables as database.table';
+                const hist = this.dbHistory;
+                const sel = $id('dbSqlHistory');
+                sel.innerHTML = '<option value="">history</option>' + hist.map((h, i) => '<option value="' + i + '">' + esc(h.replace(/\s+/g, ' ').slice(0, 60)) + '</option>').join('');
+                sel.disabled = hist.length === 0;
+                const run = $id('btnDbRun');
+                run.disabled = c.running;
+                run.innerHTML = c.running ? 'running…' : 'run <span class="db-kbd">⌘↵</span>';
+                const out = $id('dbSqlResults');
+                if (!c.results) { out.innerHTML = ''; return; }
+                let html = '';
+                c.results.forEach((res, i) => {
+                    if (res.type === 'error') {
+                        html += '<div class="db-sql-result"><div class="db-sql-result-head is-error">' + esc(res.message) + '</div></div>';
+                    } else if (res.type === 'ok') {
+                        html += '<div class="db-sql-result"><div class="db-sql-result-head is-ok">' + res.affected + ' row' + (res.affected === 1 ? '' : 's') + ' affected' + (res.insert_id ? ' · insert id ' + res.insert_id : '') + (res.info ? ' · ' + esc(res.info) : '') + (i === c.results.length - 1 ? ' · ' + c.ms + ' ms' : '') + '</div></div>';
+                    } else {
+                        html += '<div class="db-sql-result"><div class="db-sql-result-head">' + res.total + ' row' + (res.total === 1 ? '' : 's') + (res.truncated ? ' · showing the first ' + res.rows.length : '') + (i === c.results.length - 1 ? ' · ' + c.ms + ' ms' : '') + '</div>';
+                        html += '<div class="db-grid-wrap"><table class="db-grid"><thead><tr>' + res.columns.map(col => '<th style="cursor: default;">' + esc(col) + '</th>').join('') + '</tr></thead><tbody>';
+                        if (!res.rows.length) html += '<tr><td class="db-grid-empty" colspan="' + res.columns.length + '">Empty result.</td></tr>';
+                        for (const row of res.rows) {
+                            html += '<tr>' + row.map(v => { const cell = this.dbCellHtml(v, null); return '<td class="' + cell.cls + '"' + (cell.title ? ' title="' + esc(cell.title) + '"' : '') + '>' + esc(cell.text) + '</td>'; }).join('') + '</tr>';
+                        }
+                        html += '</tbody></table></div></div>';
+                    }
+                });
+                out.innerHTML = html;
+            },
+
+            renderDbFooter() {
+                if (this.view !== 'db') return;
+                const d = this.db, r = d.rows;
+                let label = '';
+                if (d.table && !d.sql) {
+                    label = d.table + ' · ' + this.formatCount(r.total) + ' row' + (r.total === 1 ? '' : 's') + (r.q ? ' matching' : '');
+                } else if (d.name) {
+                    label = d.tablesFor === d.name ? d.tables.length + ' table' + (d.tables.length === 1 ? '' : 's') : '';
+                } else {
+                    label = d.list.length + ' database' + (d.list.length === 1 ? '' : 's') + (d.server ? ' · MariaDB ' + d.server.replace(/-MariaDB.*$/, '') : '');
+                }
+                $id('dbCount').textContent = label;
+                const pager = $id('dbPager');
+                const paged = !!d.table && !d.sql && r.total > r.limit;
+                show(pager, paged);
+                if (paged) {
+                    $id('dbRange').textContent = (r.start + 1) + '–' + Math.min(r.start + r.limit, r.total);
+                    $id('btnDbNewer').disabled = r.start === 0;
+                    $id('btnDbOlder').disabled = r.start + r.limit >= r.total;
+                }
+            },
+
+            formatCount(n) {
+                if (n === null || n === undefined) return '—';
+                return Number(n).toLocaleString();
+            },
+
+            bindDbEvents() {
+                const filter = $id('dbFilter');
+                filter.addEventListener('input', () => { this.db.filter = filter.value; this.renderDbChrome(); this.renderDbList(); });
+                filter.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.db.filter = ''; filter.value = ''; filter.blur(); this.renderDbChrome(); this.renderDbList(); }
+                    if (e.key === 'Enter') {
+                        const first = this.dbVisibleList[0];
+                        if (!first) return;
+                        e.preventDefault();
+                        if (this.db.name) this.openDbTable(first.name); else this.openDb(first.name);
+                    }
+                });
+                $id('btnDbFilterClear').addEventListener('click', () => { this.db.filter = ''; filter.value = ''; this.renderDbChrome(); this.renderDbList(); filter.focus(); });
+                $id('dbChipClear').addEventListener('click', () => this.closeDb());
+                $id('btnDbSql').addEventListener('click', () => this.toggleDbSql());
+                $id('dbList').addEventListener('click', (e) => {
+                    const row = e.target.closest('.db-row');
+                    if (!row) return;
+                    if (this.db.name) this.openDbTable(row.dataset.name); else this.openDb(row.dataset.name);
+                });
+                $id('dbOverview').addEventListener('click', (e) => {
+                    const li = e.target.closest('#dbOvLargest li');
+                    if (!li || !this.db.wp) return;
+                    this.openDbTable(this.db.wp.prefix + 'options', { q: li.dataset.option, col: 'option_name', force: true });
+                });
+                $id('dbParts').addEventListener('click', (e) => {
+                    const b = e.target.closest('.mail-part');
+                    if (b) this.setDbPart(b.dataset.part);
+                });
+                const rowsFilter = $id('dbRowsFilter');
+                rowsFilter.addEventListener('input', () => {
+                    const r = this.db.rows;
+                    r.q = rowsFilter.value; r.start = 0;
+                    clearTimeout(r.timer);
+                    r.timer = setTimeout(() => this.loadDbRows(), 300);
+                });
+                rowsFilter.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); clearTimeout(this.db.rows.timer); this.loadDbRows(); }
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.db.rows.q = ''; rowsFilter.value = ''; rowsFilter.blur(); this.db.rows.start = 0; this.loadDbRows(); }
+                });
+                $id('dbRowsCol').addEventListener('change', (e) => { this.db.rows.col = e.target.value; if (this.db.rows.q) { this.db.rows.start = 0; this.loadDbRows(); } });
+                $id('btnDbRowsRefresh').addEventListener('click', () => { this.db.structure = null; this.loadDbRows(); });
+                $id('btnDbNewer').addEventListener('click', () => this.dbPage(-1));
+                $id('btnDbOlder').addEventListener('click', () => this.dbPage(1));
+
+                const grid = $id('dbGrid');
+                grid.addEventListener('click', (e) => {
+                    const th = e.target.closest('th[data-col]');
+                    if (th) { this.dbSort(th.dataset.col); return; }
+                    const del = e.target.closest('.db-row-del');
+                    if (del) { this.deleteDbRow(Number(del.dataset.row)); return; }
+                });
+                grid.addEventListener('dblclick', (e) => {
+                    const td = e.target.closest('td.is-editable');
+                    if (!td) return;
+                    e.preventDefault();
+                    this.startDbEdit(Number(td.dataset.row), Number(td.dataset.col));
+                });
+                grid.addEventListener('keydown', (e) => {
+                    const ta = e.target.closest('.db-edit');
+                    if (!ta) return;
+                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.db.edit.value = ta.value; this.saveDbEdit(false); }
+                    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.cancelDbEdit(); }
+                    else if ((e.metaKey || e.ctrlKey) && e.key === 'Backspace') { e.preventDefault(); this.saveDbEdit(true); }
+                });
+                grid.addEventListener('input', (e) => { const ta = e.target.closest('.db-edit'); if (ta && this.db.edit) this.db.edit.value = ta.value; });
+                grid.addEventListener('focusout', (e) => {
+                    // Clicking away saves, the way a spreadsheet does. Esc and
+                    // ↵ have already cleared or marked the edit by the time
+                    // this fires, so they are not double-handled.
+                    const ta = e.target.closest && e.target.closest('.db-edit');
+                    if (!ta) return;
+                    setTimeout(() => {
+                        const ed = this.db.edit;
+                        if (!ed || ed.busy || document.activeElement === ta) return;
+                        ed.value = ta.value;
+                        this.saveDbEdit(false);
+                    }, 0);
+                });
+
+                $id('btnDbRun').addEventListener('click', () => this.runDbSql());
+                $id('dbSqlText').addEventListener('input', (e) => { this.db.console.text = e.target.value; });
+                $id('dbSqlHistory').addEventListener('change', (e) => {
+                    const h = this.dbHistory[Number(e.target.value)];
+                    if (h !== undefined) { $id('dbSqlText').value = h; this.db.console.text = h; }
+                    e.target.value = '';
+                    $id('dbSqlText').focus();
+                });
+            },
+
+            // --- Logs --------------------------------------------------------
+            // The files Cove already writes, parsed in the browser. The shared
+            // PHP error log names the file each entry came from, which is how
+            // it gets scoped to one site; a site also owns a debug.log and a
+            // Caddy access log of its own.
+            get logsSelection() {
+                const l = this.logs;
+                if (l.site) return { source: l.tab === 'debug' ? 'debug' : l.tab === 'access' ? 'access' : 'errors', site: l.site };
+                return { source: l.source, site: '' };
+            },
+
+            loadLogSources() {
+                const l = this.logs;
+                if (l.sourcesPromise) return l.sourcesPromise;
+                l.sourcesPromise = this.apiPost('log_sources', {}, { quiet: true, timeoutMs: 20000 }).then(res => {
+                    l.sourcesPromise = null;
+                    if (!res.success) return;
+                    l.system = res.system || [];
+                    l.sites = (res.sites || []).sort((a, b) => (b.mtime || 0) - (a.mtime || 0) || a.name.localeCompare(b.name));
+                    l.dir = res.dir || '';
+                    l.sourcesLoaded = true;
+                    this.renderLogsSide();
+                });
+                return l.sourcesPromise;
+            },
+
+            // A site's PHP errors live in its own debug.log when WordPress
+            // has WP_DEBUG_LOG on (PHP's error_log is pointed there), and in
+            // the shared error log otherwise. With no tab asked for, open
+            // whichever one this site actually writes to.
+            async pickLogsTab() {
+                const l = this.logs;
+                if (!l.site || l.tab) return;
+                if (!l.sourcesLoaded) await this.loadLogSources();
+                const meta = l.sites.find(x => x.name === l.site);
+                l.tab = meta && meta.debug ? 'debug' : 'errors';
+                this.syncUrl({ replace: true });
+                this.renderLogsBar();
+            },
+
+            async loadLogs(opts = {}) {
+                const l = this.logs;
+                const seq = ++l.seq;
+                if (l.site && !l.tab) { await this.pickLogsTab(); if (seq !== l.seq) return; }
+                const sel = this.logsSelection;
+                if (!opts.older) { l.entries = []; l.nextBefore = null; l.scanned = 0; l.expanded = {}; l.newIds = {}; }
+                l.loading = true; l.error = null;
+                this.renderLogsList();
+                const res = await this.apiPost('log_read', { source: sel.source, site: sel.site, before: opts.older ? l.nextBefore : null }, { quiet: true, timeoutMs: 60000 });
+                if (seq !== l.seq) return;
+                l.loading = false;
+                if (!res.success) { l.error = res.message || 'Could not read that log.'; this.renderLogsList(); this.renderLogsFooter(); return; }
+                const parsed = (res.entries || []).map(raw => this.parseLogEntry(raw, res.kind)).reverse(); // newest first
+                l.entries = opts.older ? l.entries.concat(parsed) : parsed;
+                if (!opts.older) l.size = res.size || 0;
+                l.nextBefore = res.next_before ?? null;
+                l.scanned += res.scanned || 0;
+                l.path = res.path || ''; l.kind = res.kind || 'php'; l.missing = !!res.missing;
+                this.renderLogsList();
+                this.renderLogsBar();
+                this.renderLogsFooter();
+            },
+
+            // Live tail: only what was appended since the last read.
+            async pollLogs() {
+                const l = this.logs;
+                if (this.view !== 'logs' || !l.live || document.hidden || l.loading) return;
+                const sel = this.logsSelection;
+                const seq = l.seq;
+                const res = await this.apiPost('log_read', { source: sel.source, site: sel.site, since: l.size }, { quiet: true, timeoutMs: 20000 });
+                if (seq !== l.seq || !res.success) return;
+                if ((res.size || 0) < l.size) { this.loadLogs(); return; } // cleared underneath us
+                l.size = res.size || l.size;
+                if (!res.entries || !res.entries.length) return;
+                const fresh = res.entries.map(raw => this.parseLogEntry(raw, res.kind)).reverse();
+                fresh.forEach(e => { l.newIds[e.id] = true; });
+                l.entries = fresh.concat(l.entries);
+                l.missing = false;
+                this.renderLogsList();
+                this.renderLogsFooter();
+                setTimeout(() => { fresh.forEach(e => delete l.newIds[e.id]); }, 1000);
+            },
+
+            startLogsPolling() {
+                if (this.logs.pollTimer) return;
+                this.logs.pollTimer = setInterval(() => this.pollLogs(), 4000);
+            },
+
+            stopLogsPolling() {
+                clearInterval(this.logs.pollTimer);
+                this.logs.pollTimer = null;
+            },
+
+            setLogsSource(key) {
+                const l = this.logs;
+                l.site = null; l.source = key;
+                this.syncUrl();
+                this.renderLogsSide();
+                this.loadLogs();
+            },
+
+            setLogsSite(name, tab) {
+                const l = this.logs;
+                l.site = name || null;
+                l.tab = tab && ['errors', 'debug', 'access'].includes(tab) ? tab : null;
+                this.syncUrl();
+                this.renderLogsChrome();
+                this.renderLogsSide();
+                this.loadLogs();
+            },
+
+            openLogsForSite(name) {
+                this.logs.site = name;
+                this.logs.tab = null;
+                this.setView('logs', { force: true });
+            },
+
+            logsClearFilters() {
+                const l = this.logs;
+                l.query = ''; l.level = 'all';
+                $id('logsSearch').value = '';
+                this.renderLogsChrome();
+                this.renderLogsList();
+                this.renderLogsFooter();
+            },
+
+            async clearLog() {
+                const l = this.logs;
+                if (!l.clearArm) {
+                    l.clearArm = true;
+                    clearTimeout(l.armTimer);
+                    l.armTimer = setTimeout(() => { l.clearArm = false; this.renderLogsChrome(); }, 3500);
+                    this.renderLogsChrome();
+                    return;
+                }
+                l.clearArm = false;
+                clearTimeout(l.armTimer);
+                const sel = this.logsSelection;
+                const res = await this.apiPost('log_clear', { source: sel.source, site: sel.site }, { timeoutMs: 20000 });
+                this.renderLogsChrome();
+                if (!res.success) return;
+                this.showSnack('Log cleared.');
+                this.loadLogs();
+                this.loadLogSources();
+            },
+
+            // One entry → { id, ts, level, msg, file, line, site, detail, raw }.
+            // level ∈ error | warning | deprecated | notice | info | log.
+            parseLogEntry(raw, kind) {
+                const e = { id: '', ts: null, level: 'log', msg: raw, file: '', line: '', site: null, detail: '', raw };
+                const firstNl = raw.indexOf('\n');
+                const head = firstNl === -1 ? raw : raw.slice(0, firstNl);
+                const rest = firstNl === -1 ? '' : raw.slice(firstNl + 1);
+                if (kind === 'caddy') {
+                    try {
+                        const j = JSON.parse(raw);
+                        e.ts = typeof j.ts === 'number' ? j.ts : null;
+                        e.level = { error: 'error', warn: 'warning', info: 'info', debug: 'notice' }[j.level] || 'log';
+                        if (j.request) {
+                            const r = j.request;
+                            const ms = typeof j.duration === 'number' ? Math.round(j.duration * 1000) + ' ms' : '';
+                            e.msg = (r.method || '') + ' ' + (r.uri || '') + ' → ' + (j.status || '') + (ms ? ' · ' + ms : '');
+                            e.file = r.host || '';
+                            if (j.status >= 500) e.level = 'error'; else if (j.status >= 400) e.level = 'warning';
+                            const sm = /^([a-z0-9-]+)\.localhost/i.exec(r.host || '');
+                            if (sm) e.site = sm[1].toLowerCase();
+                        } else {
+                            e.msg = (j.msg || head) + (j.logger ? '' : '');
+                            e.file = j.logger || '';
+                        }
+                        e.detail = JSON.stringify(j, null, 2);
+                    } catch (err) { e.msg = head; e.detail = rest; }
+                } else {
+                    const m = /^\[([^\]]+)\]\s?(.*)$/s.exec(head);
+                    let body = head;
+                    if (m) {
+                        const t = Date.parse(m[1].replace(/^(\d{2})-([A-Za-z]{3})-(\d{4})/, '$1 $2 $3'));
+                        e.ts = isNaN(t) ? null : t / 1000;
+                        body = m[2];
+                    }
+                    const pm = /^PHP (Fatal error|Parse error|Warning|Notice|Deprecated|Recoverable fatal error|Strict Standards|Core Warning|Compile Error|User Error|User Warning|User Notice|User Deprecated):\s+(.*?)(?: in (\S+?)(?::(\d+))?(?: on line (\d+))?)?$/s.exec(body);
+                    if (pm) {
+                        const lv = pm[1].toLowerCase();
+                        e.level = /fatal|parse|compile|user error/.test(lv) ? 'error' : /warning/.test(lv) ? 'warning' : /deprecated/.test(lv) ? 'deprecated' : 'notice';
+                        e.msg = pm[2]; e.file = pm[3] || ''; e.line = pm[5] || pm[4] || '';
+                    } else if (kind === 'plain') {
+                        e.msg = body.replace(/^watchdog:\s*/, '');
+                        e.level = /fail|error|kill|crash/i.test(body) ? 'warning' : 'info';
+                    } else {
+                        // error_log() from application code, or WP's own lines.
+                        const wm = /^(.*?)(?: in (\/\S+?)(?: on line (\d+))?)?$/s.exec(body);
+                        e.msg = wm ? wm[1] : body; e.file = (wm && wm[2]) || ''; e.line = (wm && wm[3]) || '';
+                        e.level = /fatal|uncaught|error/i.test(body) ? 'error' : /warn/i.test(body) ? 'warning' : 'log';
+                    }
+                    e.detail = rest;
+                    const sm = /\/Sites\/([a-z0-9-]+)\.localhost\//i.exec(raw);
+                    if (sm) e.site = sm[1].toLowerCase();
+                }
+                e.id = (e.ts || 0) + '|' + e.level + '|' + e.msg + '|' + e.file + '|' + e.line;
+                return e;
+            },
+
+            logFileLabel(e) {
+                if (!e.file) return '';
+                let f = e.file;
+                const m = /\/Sites\/[a-z0-9-]+\.localhost\/(?:public\/)?(.*)$/i.exec(f);
+                if (m) f = m[1];
+                else if (this.logs.dir && f.startsWith(this.logs.dir)) f = f.slice(this.logs.dir.length + 1);
+                return f + (e.line ? ':' + e.line : '');
+            },
+
+            // Visible entries: level + search applied, then consecutive
+            // duplicates folded into one row with a count.
+            get logsVisible() {
+                const l = this.logs;
+                const q = l.query.trim().toLowerCase();
+                const out = [];
+                for (const e of l.entries) {
+                    if (l.level === 'error' && e.level !== 'error') continue;
+                    if (l.level === 'warning' && e.level !== 'warning') continue;
+                    if (l.level === 'deprecated' && e.level !== 'deprecated' && e.level !== 'notice') continue;
+                    if (q && !(e.msg + ' ' + e.file + ' ' + (e.site || '')).toLowerCase().includes(q)) continue;
+                    const last = out[out.length - 1];
+                    if (last && last.level === e.level && last.msg === e.msg && last.file === e.file && last.line === e.line) { last.count++; continue; }
+                    out.push(Object.assign({ count: 1 }, e));
+                }
+                return out;
+            },
+
+            renderLogs() {
+                if (this.view !== 'logs') return;
+                this.renderLogsChrome();
+                this.renderLogsSide();
+                this.renderLogsBar();
+                this.renderLogsList();
+                this.renderLogsFooter();
+            },
+
+            renderLogsChrome() {
+                const l = this.logs;
+                show($id('logsSiteChip'), !!l.site);
+                if (l.site) $id('logsSiteChipLabel').textContent = l.site;
+                const active = !!(l.query || l.level !== 'all');
+                show($id('logsKbd'), !active);
+                show($id('btnLogsSearchClear'), active);
+                document.querySelectorAll('#logsLevels .log-level').forEach(b => b.classList.toggle('is-active', b.dataset.level === l.level));
+                const clear = $id('btnLogsClear');
+                clear.classList.toggle('armed', l.clearArm);
+                clear.textContent = l.clearArm ? 'sure? clear it' : 'clear log';
+                clear.title = l.site && l.tab === 'errors' ? 'Empties the shared PHP error log — every site\'s entries, not just this one' : 'Empty this log file';
+                clear.disabled = l.missing || (!l.size && !l.entries.length);
+                $id('logsLive').checked = l.live;
+                $id('logsLiveDot').classList.toggle('is-live', l.live);
+                $id('logsLiveDot').title = l.live ? 'Following — new entries appear as they are written' : 'Paused';
+            },
+
+            renderLogsSide() {
+                const l = this.logs;
+                const sys = $id('logsSystem');
+                sys.querySelectorAll('.db-row').forEach(n => n.remove());
+                const tpl = $id('tpl-log-source');
+                for (const s of l.system) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.source = s.key;
+                    row.classList.toggle('is-selected', !l.site && l.source === s.key);
+                    row.classList.toggle('is-quiet', !s.size);
+                    row.querySelector('.db-row-name').textContent = s.label;
+                    row.querySelector('.db-row-meta').textContent = s.size ? this.formatSize(s.size) : '';
+                    row.querySelector('.db-row-meta').title = s.mtime ? 'Last written ' + new Date(s.mtime * 1000).toLocaleString() : '';
+                    sys.appendChild(row);
+                }
+                const list = $id('logsSites');
+                list.querySelectorAll('.db-row').forEach(n => n.remove());
+                show($id('logsSitesLoading'), !l.sourcesLoaded);
+                const q = l.siteFilter.trim().toLowerCase();
+                const rows = l.sites.filter(s => !q || s.name.includes(q));
+                show($id('logsSitesEmpty'), l.sourcesLoaded && rows.length === 0);
+                const anchor = $id('logsSitesLoading');
+                for (const s of rows) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.site = s.name;
+                    row.classList.toggle('is-selected', l.site === s.name);
+                    row.classList.toggle('is-quiet', !s.debug && !s.access);
+                    row.querySelector('.db-row-name').textContent = s.name;
+                    row.querySelector('.db-row-meta').textContent = s.mtime ? this.formatRelative(s.mtime) : '';
+                    row.querySelector('.db-row-meta').title = (s.debug ? 'debug.log ' + this.formatSize(s.debug) : 'no debug.log') + ' · ' + (s.access ? 'access log ' + this.formatSize(s.access) : 'no access log');
+                    list.insertBefore(row, anchor);
+                }
+                if (l.site && l.scrolledFor !== l.site) {
+                    const sel = list.querySelector('.db-row.is-selected');
+                    if (sel) { l.scrolledFor = l.site; sel.scrollIntoView({ block: 'nearest' }); }
+                }
+            },
+
+            renderLogsBar() {
+                const l = this.logs;
+                show($id('logsParts'), !!l.site);
+                if (l.site) {
+                    const meta = l.sites.find(s => s.name === l.site);
+                    document.querySelectorAll('#logsParts .mail-part').forEach(b => {
+                        const t = b.dataset.tab;
+                        b.classList.toggle('is-active', l.tab === t);
+                        b.setAttribute('aria-selected', l.tab === t ? 'true' : 'false');
+                        if (meta && t === 'debug') b.style.opacity = meta.debug ? '' : '0.5';
+                        if (meta && t === 'access') b.style.opacity = meta.access ? '' : '0.5';
+                    });
+                }
+                const p = $id('logsPath');
+                p.textContent = l.path ? l.path.replace(/^\/Users\/[^\/]+|^\/home\/[^\/]+/, '~') : '';
+                p.dataset.path = l.path || '';
+            },
+
+            renderLogsList() {
+                const l = this.logs;
+                const list = $id('logsList');
+                list.querySelectorAll('.log-row').forEach(n => n.remove());
+                const rows = l.loading && !l.entries.length ? [] : this.logsVisible;
+                show($id('logsLoading'), l.loading && !l.entries.length);
+                show($id('logsError'), !l.loading && !!l.error);
+                if (l.error) $id('logsErrorText').textContent = l.error;
+                const empty = !l.loading && !l.error && rows.length === 0;
+                show($id('logsEmpty'), empty);
+                if (empty) {
+                    const filtered = l.entries.length > 0;
+                    $id('logsEmptyText').textContent = l.missing ? 'No log file yet.' : filtered ? 'Nothing matches.' : (l.site && l.tab === 'errors' ? 'No PHP errors mention this site.' : 'Nothing logged.');
+                    const meta = l.site ? l.sites.find(x => x.name === l.site) : null;
+                    $id('logsEmptyHint').textContent = l.missing
+                        ? (l.tab === 'debug' ? 'Set WP_DEBUG and WP_DEBUG_LOG in wp-config.php and WordPress will write one.' : '')
+                        : filtered ? 'Press Esc to clear the filters.'
+                        : (l.site && l.tab === 'errors' && meta && meta.debug) ? 'This site keeps its PHP errors in its own debug.log — see the debug.log tab.'
+                        : (l.scanned ? 'Looked through the last ' + this.formatSize(l.scanned) + '.' : '');
+                }
+                const tpl = $id('tpl-log-row');
+                const anchor = $id('logsLoading');
+                const frag = document.createDocumentFragment();
+                for (const e of rows) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.id = e.id;
+                    const open = !!l.expanded[e.id];
+                    row.classList.toggle('is-collapsed', !open);
+                    row.classList.toggle('is-new', !!l.newIds[e.id]);
+                    const t = row.querySelector('.log-time');
+                    t.textContent = e.ts ? this.formatRelative(e.ts) : '—';
+                    t.title = e.ts ? new Date(e.ts * 1000).toLocaleString() : '';
+                    const chip = row.querySelector('.log-level-chip');
+                    chip.textContent = e.level === 'log' ? 'log' : e.level;
+                    chip.classList.add(e.level);
+                    row.querySelector('.log-msg').textContent = e.msg;
+                    const site = row.querySelector('.log-site');
+                    if (e.site && !l.site) { site.textContent = e.site; site.title = 'Only entries for ' + e.site + '.localhost'; }
+                    else site.remove();
+                    const file = row.querySelector('.log-file');
+                    const fl = this.logFileLabel(e);
+                    // An access log scoped to a site names that site's host on
+                    // every row; drop it there.
+                    if (fl && !(l.site && l.kind === 'caddy' && e.file === l.site + '.localhost')) { file.textContent = fl; file.title = e.file + (e.line ? ':' + e.line : ''); } else file.remove();
+                    const count = row.querySelector('.log-count');
+                    if (e.count > 1) { count.textContent = '×' + e.count; count.title = 'Repeated ' + e.count + ' times in a row'; } else count.remove();
+                    const detail = row.querySelector('.log-detail');
+                    const text = e.detail || (e.raw !== e.msg ? e.raw : '');
+                    if (open && text) { detail.textContent = text; show(detail, true); } else detail.remove();
+                    frag.appendChild(row);
+                }
+                list.insertBefore(frag, anchor);
+            },
+
+            renderLogsFooter() {
+                if (this.view !== 'logs') return;
+                const l = this.logs;
+                const shown = this.logsVisible.length;
+                let label = '';
+                if (!l.error) {
+                    label = l.entries.length + ' entr' + (l.entries.length === 1 ? 'y' : 'ies');
+                    const filtered = !!(l.query || l.level !== 'all');
+                    if (filtered) label = shown + ' of ' + label;
+                    else if (shown !== l.entries.length) label += ' · ' + (l.entries.length - shown) + ' repeat' + (l.entries.length - shown === 1 ? '' : 's') + ' folded';
+                    if (l.size) label += ' · ' + (l.scanned && l.scanned < l.size ? 'last ' + this.formatSize(l.scanned) + ' of ' : '') + this.formatSize(l.size);
+                }
+                $id('logsCount').textContent = label;
+                show($id('btnLogsOlder'), !!l.nextBefore && !l.loading);
+            },
+
+            bindLogsEvents() {
+                const search = $id('logsSearch');
+                search.addEventListener('input', () => { this.logs.query = search.value; this.renderLogsChrome(); this.renderLogsList(); this.renderLogsFooter(); });
+                search.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.logs.query = ''; search.value = ''; search.blur(); this.renderLogsChrome(); this.renderLogsList(); this.renderLogsFooter(); }
+                });
+                $id('btnLogsSearchClear').addEventListener('click', () => { this.logsClearFilters(); search.focus(); });
+                $id('logsLevels').addEventListener('click', (e) => {
+                    const b = e.target.closest('.log-level');
+                    if (!b) return;
+                    this.logs.level = b.dataset.level;
+                    this.renderLogsChrome(); this.renderLogsList(); this.renderLogsFooter();
+                });
+                $id('logsSiteChipClear').addEventListener('click', () => this.setLogsSite(null));
+                $id('logsLive').addEventListener('change', (e) => { this.logs.live = e.target.checked; this.renderLogsChrome(); if (this.logs.live) this.pollLogs(); });
+                $id('btnLogsRefresh').addEventListener('click', () => { this.loadLogs(); this.loadLogSources(); });
+                $id('btnLogsClear').addEventListener('click', () => this.clearLog());
+                $id('btnLogsOlder').addEventListener('click', () => this.loadLogs({ older: true }));
+                const siteFilter = $id('logsSiteFilter');
+                siteFilter.addEventListener('input', () => { this.logs.siteFilter = siteFilter.value; this.renderLogsSide(); });
+                siteFilter.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.logs.siteFilter = ''; siteFilter.value = ''; siteFilter.blur(); this.renderLogsSide(); }
+                    if (e.key === 'Enter') {
+                        const q = this.logs.siteFilter.trim().toLowerCase();
+                        const first = this.logs.sites.find(s => !q || s.name.includes(q));
+                        if (first) { e.preventDefault(); this.setLogsSite(first.name); }
+                    }
+                });
+                $id('logsSystem').addEventListener('click', (e) => {
+                    const row = e.target.closest('.db-row');
+                    if (row) this.setLogsSource(row.dataset.source);
+                });
+                $id('logsSites').addEventListener('click', (e) => {
+                    const row = e.target.closest('.db-row');
+                    if (row) this.setLogsSite(row.dataset.site);
+                });
+                $id('logsParts').addEventListener('click', (e) => {
+                    const b = e.target.closest('.mail-part');
+                    if (b) this.setLogsSite(this.logs.site, b.dataset.tab);
+                });
+                $id('logsPath').addEventListener('click', (e) => {
+                    const p = e.currentTarget.dataset.path;
+                    if (!p) return;
+                    navigator.clipboard.writeText(p).then(() => this.showSnack('Path copied.')).catch(() => this.showSnack('Could not copy.', true));
+                });
+                $id('logsList').addEventListener('click', (e) => {
+                    const row = e.target.closest('.log-row');
+                    if (!row) return;
+                    const chip = e.target.closest('.log-site');
+                    if (chip) { this.setLogsSite(chip.textContent, 'errors'); return; }
+                    if (window.getSelection && window.getSelection().toString()) return;
+                    const id = row.dataset.id;
+                    if (this.logs.expanded[id]) delete this.logs.expanded[id]; else this.logs.expanded[id] = true;
+                    this.renderLogsList();
+                });
+                document.addEventListener('visibilitychange', () => { if (!document.hidden && this.view === 'logs') this.pollLogs(); });
+            },
+
             // --- Command palette -------------------------------------------
             // Results mix matching sites with global commands. Sites are ranked
             // by match position so a prefix hit beats a mid-string one.
@@ -4750,8 +7851,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     { key: 'cmd:add',     kind: 'cmd', label: 'Add site',            meta: '',  run: () => { this.closePalette(); this.toggleAdd(); } },
                     { key: 'cmd:reload',  kind: 'cmd', label: 'Reload server',       meta: '',  run: () => { this.closePalette(); this.reloadServer(); } },
                     { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
-                    { key: 'cmd:db',      kind: 'cmd', label: 'Open database',       meta: '',  run: () => { this.closePalette(); window.open('https://db.cove.localhost' + PORT_SUFFIX, '_blank', 'noopener'); } },
-                    { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: '',  run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
+                    { key: 'cmd:db',      kind: 'cmd', label: 'Databases',           meta: '',  run: () => { this.closePalette(); this.setView('db'); } },
+                    { key: 'cmd:logs',    kind: 'cmd', label: 'Logs',                meta: '',  run: () => { this.closePalette(); this.setView('logs'); } },
+                    { key: 'cmd:adminer', kind: 'cmd', label: 'Open Adminer',        meta: 'external', run: () => { this.closePalette(); window.open(this.adminerUrl, '_blank', 'noopener'); } },
+                    { key: 'cmd:mailview',kind: 'cmd', label: 'Mail',                meta: '',  run: () => { this.closePalette(); this.setView('mail'); } },
+                    { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: 'external', run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
                     { key: 'cmd:creds',   kind: 'cmd', label: 'Database credentials',meta: '',  run: () => { this.closePalette(); this.setDbModal(true); } },
                     { key: 'cmd:theme',   kind: 'cmd', label: 'Toggle theme',        meta: '',  run: () => { this.closePalette(); this.toggleTheme(); } },
                 ];
@@ -4798,8 +7902,49 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             setDbModal(on) {
-                this.showDbModal = on;
-                show($id('dbModal'), on);
+                if (on) { this.openService('mariadb'); return; }
+                this.showDbModal = false;
+                show($id('dbModal'), false);
+            },
+
+            // One panel for every nav service. The probe is cached briefly so
+            // flipping between caddy / mariadb / mailpit is instant.
+            async openService(name) {
+                const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+                this.showDbModal = true;
+                show($id('dbModal'), true);
+                const svcTitle = $id('svcTitle'), svcStatus = $id('svcStatus'), svcRows = $id('svcRows'), svcNote = $id('svcNote'), svcActions = $id('svcActions');
+                svcTitle.textContent = { caddy: 'Caddy', mariadb: 'MariaDB', mailpit: 'Mailpit' }[name] || name;
+                svcStatus.textContent = 'Checking…'; svcStatus.classList.remove('is-down');
+                svcRows.innerHTML = ''; svcNote.textContent = '';
+                svcActions.innerHTML = '<button class="pill" id="btnDbClose">close</button>';
+                $id('btnDbClose').addEventListener('click', () => this.setDbModal(false));
+                try {
+                    if (!this.serviceInfo || (Date.now() - this.serviceInfo.at) > 20000) {
+                        const data = await this.apiPost('service_info', {}, { quiet: true, timeoutMs: 8000 });
+                        if (!data.success) throw new Error(data.message || 'probe failed');
+                        this.serviceInfo = { at: Date.now(), data };
+                    }
+                    const svc = this.serviceInfo.data.services[name];
+                    if (!svc) throw new Error('unknown service');
+                    svcStatus.textContent = svc.status;
+                    svcStatus.classList.toggle('is-down', !svc.running);
+                    svcRows.innerHTML = svc.rows.map(([k, v]) => {
+                        const isUrl = /^https?:\/\//.test(v);
+                        const val = isUrl ? '<a href="' + esc(v) + '" target="_blank" rel="noopener">' + esc(v.replace(/^https?:\/\//, '')) + '</a>' : esc(v);
+                        return '<div class="db-cred-row"><span class="db-cred-label">' + esc(k) + '</span><code class="db-cred-value">' + val + '</code></div>';
+                    }).join('');
+                    svcNote.textContent = svc.note || '';
+                    (svc.actions || []).forEach(a => {
+                        let el;
+                        if (a.kind === 'open') { el = document.createElement('a'); el.href = a.href; el.target = '_blank'; el.rel = 'noopener'; }
+                        else { el = document.createElement('button'); el.type = 'button'; el.addEventListener('click', () => { this.setDbModal(false); if (a.kind === 'reload') this.reloadServer(); if (a.kind === 'mail') this.setView('mail'); if (a.kind === 'db') this.setView('db'); if (a.kind === 'logs') this.setView('logs'); }); }
+                        el.className = 'pill'; el.textContent = a.label;
+                        svcActions.insertBefore(el, $id('btnDbClose'));
+                    });
+                } catch (e) {
+                    svcStatus.textContent = 'Could not read service status.'; svcStatus.classList.add('is-down');
+                }
             },
 
             promptRename(site) {
@@ -4861,7 +8006,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // --- Per-site PHP version ---------------------------------------
             loadPhpInfo(force = false) {
                 if (this.phpInfo && !force) return Promise.resolve(this.phpInfo);
-                return fetch('api.php?action=php_info')
+                return fetch('/api.php?action=php_info')
                     .then(r => r.json())
                     .then(d => { this.phpInfo = d; return d; })
                     .catch(() => null); // offline/mid-reload — the modal shows Loading… until retried
@@ -4921,7 +8066,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const wantPin = version === 'default' ? null : version;
                 this.phpInstallPoll = setInterval(async () => {
                     try {
-                        const r = await fetch('api.php?action=list_sites');
+                        const r = await fetch('/api.php?action=list_sites');
                         const data = await r.json();
                         const site = data.find(s => s.name === name);
                         if (site && (site.php_version || null) === wantPin) {
@@ -5125,7 +8270,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const ctrl = timeoutMs ? new AbortController() : null;
                 const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
                 try {
-                    const res = await fetch('api.php', {
+                    const res = await fetch('/api.php', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ action, ...payload }),
@@ -5162,7 +8307,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.isLoading = true;
                 this.render();
                 try {
-                    const r = await fetch('api.php?action=list_sites');
+                    const r = await fetch('/api.php?action=list_sites');
                     const data = await r.json();
                     // Sites staged for deletion are still on disk (nothing
                     // is sent to the backend until the undo window closes),
@@ -5985,6 +9130,25 @@ display_command_help() {
 
 # --- Main Command Router ---
 main() {
+
+    # --- Drop root when invoked through sudo ---
+    # People run `sudo cove …` — for years `cove upgrade` even asked for it,
+    # since the binary in /usr/local/bin is root-owned. Debian-family sudo
+    # resets HOME=/root, and Cove derives everything from $HOME, so a root-run
+    # Cove targeted /root/Cove: a parallel tree the user never sees. A root-run
+    # `post-upgrade` regenerated a Caddyfile full of /root paths and pushed it
+    # into a FrankenPHP running as the user, 403-ing every site until the next
+    # reload; a root-run `upgrade` looked for Adminer under /root and silently
+    # skipped updating it. Cove is designed to run as the user and escalate
+    # through $SUDO_CMD only where needed (package installs, the binary swap in
+    # upgrade, systemd units), so hand control straight back to whoever typed
+    # sudo — their sudo ticket is still fresh for the few steps that need it.
+    # A genuine root login (WSL, containers) has no SUDO_USER and is left alone.
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        local self="$0"
+        [ -x "$self" ] || self=$(command -v cove)
+        exec sudo -u "$SUDO_USER" -H -- "$self" "$@"
+    fi
 
     # Determine the path to the cove command
     local COVE_CMD
@@ -12992,14 +16156,23 @@ cove_upgrade() {
         # 6. Perform the Cove upgrade
         echo "🚀 Upgrading Cove to version $new_version..."
 
-        if [ ! -w "$(dirname "$install_path")" ]; then
-            echo "❌ Error: No write permissions for '$(dirname "$install_path")'."
-            echo "   Please try running with sudo: 'sudo cove upgrade'"
+        # The install dir is root-owned on Linux. Escalate for just this copy
+        # rather than asking the user to run the whole upgrade under sudo — a
+        # root-run upgrade lands in /root/Cove (see the guard at the top of
+        # main). cp over the existing file keeps its root ownership; mv would
+        # hand the binary to whoever downloaded it.
+        local replaced=false
+        if [ -w "$(dirname "$install_path")" ] && [ -w "$install_path" ]; then
+            mv "$temp_script" "$install_path" && replaced=true
+        elif [ -n "$SUDO_CMD" ]; then
+            echo "   - Replacing $install_path (requires sudo — you may be prompted)..."
+            if $SUDO_CMD cp "$temp_script" "$install_path" && $SUDO_CMD chmod 755 "$install_path"; then
+                replaced=true
+            fi
             rm -f "$temp_script" 2>/dev/null
-            return 1
         fi
 
-        if ! mv "$temp_script" "$install_path"; then
+        if [ "$replaced" != true ]; then
             echo "❌ Error: Failed to replace the old script at '$install_path'."
             rm -f "$temp_script" 2>/dev/null
         else
@@ -14704,21 +17877,15 @@ COVE_MENUBAR_PLIST_EOF
 
 emit_menubar_icon_svg() {
 cat <<'COVE_MENUBAR_ICON_EOF'
-<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" stroke-linecap="round" stroke-linejoin="round">
-    <defs>
-        <clipPath id="cove-clip"><circle cx="32" cy="32" r="28"/></clipPath>
-    </defs>
-    <g clip-path="url(#cove-clip)">
-        <rect x="0" y="0" width="64" height="64" fill="#f6f1e8"/>
-        <rect x="0" y="32" width="64" height="32" fill="#3a97a9"/>
-        <path fill="#58b293" d="M 4 32 C 4 22, 12 12, 22 12 C 30 12, 34 18, 42 16 C 50 14, 58 18, 60 24 L 60 32 Z"/>
-        <line x1="2" y1="32" x2="62" y2="32" stroke="#1c4c58" fill="none" stroke-width="2.5"/>
-        <g stroke="#1c4c58" fill="none" stroke-width="2.6">
-            <path d="M 10 42 Q 18 38, 26 42 T 42 42 T 56 42"/>
-            <path d="M 14 50 Q 22 46, 30 50 T 46 50 T 56 50"/>
-        </g>
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+    <!-- The Cove mark in its filled form: the ring becomes a solid disc so the
+         icon reads as a coin at 18px in the menu bar and fills the app-icon
+         slots. Same two waves as the brand mark (assets/brand on cove.run). -->
+    <circle cx="32" cy="32" r="30" fill="#009b95"/>
+    <g fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M 17 27 Q 24.5 20 32 27 T 47 27"/>
+        <path d="M 17 40 Q 24.5 33 32 40 T 47 40"/>
     </g>
-    <circle cx="32" cy="32" r="28" stroke="#1c4c58" fill="none" stroke-width="3"/>
 </svg>
 COVE_MENUBAR_ICON_EOF
 }
