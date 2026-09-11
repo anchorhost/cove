@@ -2866,8 +2866,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         if ($cfg_head !== false && preg_match('/define\s*\(\s*[\'"]DB_NAME[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $cfg_head, $m)) $db_name = $m[1];
                     }
 
+                    // Extra hostnames from `cove mappings` (one per line) and
+                    // the multisite marker — together they decide which
+                    // addresses the site's Caddy block answers on.
+                    $mappings_list = [];
+                    if (is_file($site_path . '/mappings')) {
+                        foreach (file($site_path . '/mappings', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $m_line) {
+                            $m_line = trim($m_line);
+                            if ($m_line !== '') $mappings_list[] = $m_line;
+                        }
+                    }
+                    $multisite_mode = is_file($site_path . '/multisite') ? trim((string) @file_get_contents($site_path . '/multisite')) : '';
+
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
+                        'mappings' => $mappings_list,
+                        'multisite' => $multisite_mode !== '' ? $multisite_mode : null,
                         'domain' => 'https://' . $item . $__cove_port_suffix,
                         'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
                         'wp_version' => $wp_version,
@@ -4185,6 +4199,21 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .php-option.uninstalled .php-option-name { color: var(--text-faint); }
         .php-option .php-option-meta { font-size: 0.72rem; color: var(--text-faint); }
         .php-option:disabled { opacity: 0.65; cursor: default; }
+        /* Domains modal: one row per hostname the site answers on. The primary
+           and multisite-implied rows are informational, so their × is hidden. */
+        .dom-list { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.8rem; }
+        .dom-row { display: flex; align-items: center; gap: 0.7rem; background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.45rem 0.5rem 0.45rem 0.9rem; font-family: var(--font-mono); font-size: 0.85rem; }
+        .dom-row .dom-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .dom-row.primary .dom-name, .dom-row.implied .dom-name { color: var(--text-dim); }
+        .dom-row .dom-meta { font-size: 0.72rem; color: var(--text-faint); white-space: nowrap; }
+        .dom-row .dom-remove { background: none; border: 0; color: var(--text-faint); font-size: 1.05rem; line-height: 1; cursor: pointer; padding: 0.1rem 0.35rem; border-radius: var(--radius-sm); }
+        .dom-row .dom-remove:hover { color: var(--danger); }
+        .dom-row .dom-remove:disabled { opacity: 0.4; cursor: default; }
+        .dom-row.primary .dom-remove, .dom-row.implied .dom-remove { visibility: hidden; }
+        .dom-form { display: flex; gap: 0.5rem; align-items: stretch; }
+        .dom-form .modal-input { flex: 1; }
+        .modal-hint a { color: var(--accent); text-decoration: none; cursor: pointer; }
+        .modal-hint a:hover { text-decoration: underline; }
 
         /* Wider variant for log output, which is unreadable at 540px. */
         .modal-wide { max-width: min(900px, 92vw); width: 900px; }
@@ -5036,6 +5065,31 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         </div>
     </div>
 
+    <!-- Domains: the dashboard face of `cove mappings` -->
+    <div class="modal-backdrop" id="domainsModal" style="display: none;">
+        <div class="modal">
+            <h3>Domains <span class="modal-title-dim" id="domainsModalSite"></span></h3>
+            <p class="modal-sub">Extra hostnames this site answers on. Caddy issues a local certificate for each; a leading *. covers every subdomain.</p>
+            <div class="dom-list" id="domainsList"></div>
+            <template id="tpl-dom-row">
+                <div class="dom-row">
+                    <span class="dom-name"></span>
+                    <span class="dom-meta"></span>
+                    <button type="button" class="dom-remove" title="Remove">×</button>
+                </div>
+            </template>
+            <form id="domainsForm" class="dom-form">
+                <input class="modal-input" type="text" id="domainsInput" spellcheck="false" autocomplete="off" placeholder="shop.example.localhost">
+                <button type="submit" class="pill primary" id="btnDomainsAdd">add</button>
+            </form>
+            <div class="modal-hint" id="domainsHint"></div>
+            <div class="modal-foot">
+                <span id="domainsFoot"></span>
+                <button type="button" class="pill" id="btnDomainsClose">close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Site log -->
     <div class="modal-backdrop" id="logModal" style="display: none;">
         <div class="modal modal-wide">
@@ -5063,6 +5117,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <button class="ctx-item" id="ctxReveal"><span>Open folder</span></button>
             <button class="ctx-item" id="ctxDb"><span>Open database</span></button>
             <button class="ctx-item" id="ctxPhp"><span>PHP version…</span><span class="ctx-key" id="ctxPhpMeta"></span></button>
+            <button class="ctx-item" id="ctxDomains"><span>Domains…</span><span class="ctx-key" id="ctxDomainsMeta"></span></button>
             <button class="ctx-item" id="ctxLog"><span>View log</span></button>
             <button class="ctx-item" id="ctxMail"><span>View mail</span></button>
             <div class="ctx-sep"></div>
@@ -5138,6 +5193,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             rename: { open: false, site: null, value: '', busy: false },
             logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
             phpModal: { open: false, site: null },
+            domainsModal: { open: false, site: null, busy: false, pending: null },
             // { supported, default, versions: [{version, installed}] } — fetched
             // lazily; null until loaded, refreshed after any pin change.
             phpInfo: null,
@@ -5393,6 +5449,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (e.key === 'Escape') {
                         if (this.ctxMenu.open) { this.closeRowMenu(); return; }
                         if (this.phpModal.open) { this.closePhpModal(); return; }
+                        if (this.domainsModal.open) { this.closeDomainsModal(); return; }
                         if (this.rename.open) { this.closeRename(); return; }
                         if (this.logView.open) { this.closeLog(); return; }
                         if (this.showDbModal) { this.setDbModal(false); return; }
@@ -5563,6 +5620,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (btn && !btn.disabled) this.choosePhp(btn.dataset.version);
                 });
                 $id('ctxCopy').addEventListener('click', withCtxSite(s => this.copyPath(s.full_path)));
+
+                // Domains (cove mappings)
+                $id('ctxDomains').addEventListener('click', withCtxSite(s => this.openDomainsModal(s)));
+                $id('btnDomainsClose').addEventListener('click', () => this.closeDomainsModal());
+                $id('domainsModal').addEventListener('click', (e) => { if (e.target === $id('domainsModal')) this.closeDomainsModal(); });
+                $id('domainsForm').addEventListener('submit', (e) => { e.preventDefault(); this.addDomain($id('domainsInput').value); });
+                $id('domainsList').addEventListener('click', (e) => {
+                    const btn = e.target.closest('.dom-remove');
+                    if (btn && !btn.disabled) this.removeDomain(btn.dataset.domain);
+                });
+                $id('domainsHint').addEventListener('click', (e) => {
+                    const a = e.target.closest('a[data-domain]');
+                    if (a) { e.preventDefault(); this.addDomain(a.dataset.domain); }
+                });
                 $id('ctxPin').addEventListener('click', withCtxSite(s => this.togglePin(s.name)));
                 $id('ctxDelete').addEventListener('click', withCtxSite(s => this.deleteSite(s.name)));
 
@@ -5797,6 +5868,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 show($id('ctxPhp'), !this.phpInfo || this.phpInfo.supported !== false);
                 const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
                 $id('ctxPhpMeta').textContent = effPhp ? 'php ' + effPhp : '';
+                // Extra addresses beyond <site>.localhost: explicit mappings
+                // plus the wildcard a subdomain multisite gets for free.
+                const extraDomains = (site.mappings || []).length + (site.multisite === 'subdomain' ? 1 : 0);
+                $id('ctxDomainsMeta').textContent = extraDomains ? '+' + extraDomains : '';
             },
 
             renderPhpModal() {
@@ -5862,6 +5937,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 show($id('logModal'), this.logView.open);
                 this.renderLog();
                 this.renderPhpModal();
+                this.renderDomainsModal();
             },
 
             renderRename() {
@@ -8068,6 +8144,105 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const url = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) +
                             '&db=' + encodeURIComponent(site.db_name || ('cove_' + site.name).replace(/[^a-zA-Z0-9_]/g, '_'));
                 window.open(url, '_blank', 'noopener');
+            },
+
+            // --- Domains (cove mappings) --------------------------------------
+            openDomainsModal(site) {
+                this.domainsModal = { open: true, site, busy: false, pending: null };
+                $id('domainsInput').value = '';
+                this.renderDomainsModal();
+                $id('domainsInput').focus();
+            },
+
+            closeDomainsModal() {
+                this.domainsModal.open = false;
+                show($id('domainsModal'), false);
+            },
+
+            renderDomainsModal() {
+                const m = this.domainsModal;
+                show($id('domainsModal'), m.open);
+                if (!m.open) return;
+                // Read the live site entry: an add/remove refreshes the list
+                // and the entry captured at open time would be stale.
+                const site = this.sites.find(s => s.name === m.site.name) || m.site;
+                const host = site.name + '.localhost';
+                const wild = '*.' + host;
+                $id('domainsModalSite').textContent = host;
+                const rows = [{ name: host, meta: 'primary', kind: 'primary' }];
+                if (site.multisite === 'subdomain') rows.push({ name: wild, meta: 'multisite', kind: 'implied' });
+                for (const d of (site.mappings || [])) {
+                    rows.push({
+                        name: d,
+                        meta: d.startsWith('*.') ? 'wildcard' : (/\.localhost$/i.test(d) ? '' : '/etc/hosts'),
+                        kind: 'mapping',
+                    });
+                }
+                const list = $id('domainsList');
+                list.textContent = '';
+                const tpl = $id('tpl-dom-row');
+                for (const r of rows) {
+                    const el = tpl.content.firstElementChild.cloneNode(true);
+                    el.classList.add(r.kind);
+                    el.querySelector('.dom-name').textContent = r.name;
+                    el.querySelector('.dom-meta').textContent = r.meta;
+                    const rm = el.querySelector('.dom-remove');
+                    rm.dataset.domain = r.name;
+                    rm.disabled = m.busy;
+                    list.appendChild(el);
+                }
+                // The common ask — every subdomain of the site — as one click,
+                // until it is covered (explicitly or by a subdomain multisite).
+                const hasWild = site.multisite === 'subdomain' || (site.mappings || []).includes(wild);
+                const hint = $id('domainsHint');
+                hint.textContent = '';
+                if (!hasWild && !m.busy) {
+                    hint.append('Accept any subdomain: ');
+                    const a = document.createElement('a');
+                    a.href = '#';
+                    a.dataset.domain = wild;
+                    a.textContent = 'add ' + wild;
+                    hint.appendChild(a);
+                }
+                $id('domainsInput').disabled = m.busy;
+                const add = $id('btnDomainsAdd');
+                add.disabled = m.busy;
+                add.textContent = m.busy && m.pending === 'add' ? 'adding…' : 'add';
+                $id('domainsFoot').textContent = m.busy ? 'Reloading Caddy…' : 'cove mappings ' + site.name;
+            },
+
+            addDomain(raw) { return this.changeDomain('add_mapping', (raw || '').trim().toLowerCase()); },
+            removeDomain(domain) { return this.changeDomain('remove_mapping', domain); },
+
+            async changeDomain(action, domain) {
+                const m = this.domainsModal;
+                const site = m.site;
+                if (!site || !domain || m.busy) return;
+                if (!/^(\*\.)?[a-z0-9_]([a-z0-9._-]*[a-z0-9_])?$/i.test(domain) || domain.length > 253) {
+                    this.showSnack('Use a hostname: letters, numbers, dots and hyphens, with an optional leading *.', true);
+                    return;
+                }
+                m.busy = true;
+                m.pending = action === 'add_mapping' ? 'add' : 'remove';
+                this.renderDomainsModal();
+                // Both directions rewrite the Caddyfile and reload the Caddy
+                // serving this page — same dropped-response retry as rename.
+                // Five attempts, not three: with a hundred-odd sites the adapt
+                // alone runs past the default retry window.
+                const res = await this.apiPostRetry(action, { site_name: site.name, domain }, 5);
+                m.busy = false;
+                m.pending = null;
+                if (!res.success) { this.renderDomainsModal(); return; } // apiPost surfaced the reason
+                const live = this.sites.find(s => s.name === site.name);
+                if (live) live.mappings = res.mappings || [];
+                if (action === 'add_mapping') $id('domainsInput').value = '';
+                this.renderDomainsModal();
+                if (res.hosts_pending) {
+                    this.showSnack(res.message + ' Run cove reload in a terminal to add it to /etc/hosts.', false, { duration: 12000 });
+                } else {
+                    this.showSnack(res.message);
+                }
+                this.getSites();
             },
 
             // --- Per-site PHP version ---------------------------------------
