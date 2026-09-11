@@ -1244,8 +1244,11 @@ update_etc_hosts() {
                 # Check for additional mappings
                 if [ -f "$site_path/mappings" ]; then
                     while IFS= read -r mapping || [ -n "$mapping" ]; do
-                        # Skip empty lines
-                        if [ -n "$mapping" ]; then
+                        # Skip empty lines and wildcards: /etc/hosts has no
+                        # wildcard syntax and *.localhost already resolves to
+                        # loopback natively, so a "*.name" line would be inert
+                        # — and would prompt for sudo on every reload.
+                        if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]]; then
                             required_hosts+=("$mapping")
                         fi
                     done < "$site_path/mappings"
@@ -1263,6 +1266,12 @@ update_etc_hosts() {
     done
 
     if [ ${#missing_hosts[@]} -gt 0 ]; then
+        # No terminal to ask for a password on (the dashboard's shell_exec,
+        # a cron job): say what is missing instead of failing inside tee.
+        if [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
+            echo "   - ⚠️  Cannot prompt for sudo here — run 'cove reload' in a terminal to add to /etc/hosts: ${missing_hosts[*]}"
+            return 0
+        fi
         echo "   - Adding missing entries to /etc/hosts (requires sudo)..."
         # printf '%s\n' (not echo -e) so a backslash sequence in a host value
         # can never expand into an extra root-written line. Defense-in-depth
@@ -3087,6 +3096,62 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             echo json_encode($response);
             exit; // Exit immediately
+        case 'add_mapping':
+        case 'remove_mapping':
+            // Extra hostnames for a site (`cove mappings`). The CLI owns the
+            // file format and the Caddyfile/hosts regeneration; this gates
+            // the inputs and shells out. Same wildcard-tolerant hostname rule
+            // as validate_hostname in the CLI.
+            $domain = strtolower(trim((string) ($input['domain'] ?? '')));
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            $bare_domain = preg_replace('/^\*\./', '', $domain);
+            if ($domain === '' || strlen($domain) > 253 || !preg_match('/^[a-z0-9_]([a-z0-9._-]*[a-z0-9_])?$/', $bare_domain)) {
+                $response['message'] = 'Invalid domain. Use letters, numbers, dots, hyphens and underscores, with an optional leading *. wildcard.';
+                break;
+            }
+            $mapping_site_dir = $sitedir . '/' . $site_name . '.localhost';
+            if (!is_dir($mapping_site_dir)) {
+                $response['message'] = 'Site not found.';
+                break;
+            }
+            if ($domain === $site_name . '.localhost') {
+                $response['message'] = 'That is already the site\'s own address.';
+                break;
+            }
+            $mapping_verb = $action === 'add_mapping' ? 'add' : 'remove';
+            // Either direction regenerates the Caddyfile and reloads the Caddy
+            // serving this dashboard, so the response can be dropped and the
+            // UI retries. The CLI is idempotent on both sides ("already
+            // mapped" and "not found" both exit 0), which makes that safe.
+            exec(sprintf('HOME=%s %s mappings %s %s %s 2>&1',
+                escapeshellarg($user_home), escapeshellarg($cove_path),
+                escapeshellarg($site_name), $mapping_verb, escapeshellarg($domain)), $map_out, $map_rc);
+            $map_text = implode("\n", $map_out);
+            if ($map_rc !== 0) {
+                $msg = $mapping_verb === 'add' ? 'Could not add domain.' : 'Could not remove domain.';
+                if (stripos($map_text, 'Invalid domain') !== false) $msg = 'Invalid domain.';
+                echo json_encode(['success' => false, 'message' => $msg, 'output' => $map_text]);
+                exit;
+            }
+            $mappings_now = [];
+            if (is_file($mapping_site_dir . '/mappings')) {
+                foreach (file($mapping_site_dir . '/mappings', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $m_line) {
+                    $m_line = trim($m_line);
+                    if ($m_line !== '') $mappings_now[] = $m_line;
+                }
+            }
+            echo json_encode([
+                'success' => true,
+                'message' => ($mapping_verb === 'add' ? 'Added ' : 'Removed ') . $domain . '.',
+                'mappings' => $mappings_now,
+                // A non-.localhost name needs an /etc/hosts line, which needs
+                // sudo — impossible from here, so the CLI leaves it and says so.
+                'hosts_pending' => stripos($map_text, 'Cannot prompt for sudo') !== false,
+            ]);
+            exit;
         case 'set_php':
             // Pin a site to an older PHP (native php-fpm) or back to the
             // default. Charset gates mirror add/delete; the version must be a
