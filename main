@@ -3288,6 +3288,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             echo json_encode(['success' => false, 'message' => 'Unknown site action.']);
             exit;
+        case 'site_snapshots':
+        case 'site_snapshot_create':
+        case 'site_snapshot_restore':
+        case 'site_snapshot_delete':
+            // --- Snapshots: `cove snapshot` with --format=json ---------------
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) { echo json_encode(['success' => false, 'message' => 'Invalid site name.']); exit; }
+            $__snap = function (array $args) use ($user_home, $cove_path, $site_name) {
+                $cmd = 'HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path) . ' snapshot ' . escapeshellarg($site_name);
+                foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string) $a);
+                $t0 = microtime(true);
+                exec($cmd . ' --format=json 2>&1', $lines, $code);
+                $out = preg_replace('/\x1b\[[0-9;]*m/', '', implode("\n", $lines));
+                $data = null;
+                foreach (array_reverse(explode("\n", trim($out))) as $line) { $try = json_decode(trim($line), true); if (is_array($try)) { $data = $try; break; } }
+                return [$data, (int) $code, trim($out), round((microtime(true) - $t0) * 1000)];
+            };
+            $__snap_id = function ($id) { return is_string($id) && preg_match('/^\d{8}-\d{6}(?:-\d+)?$/', $id); };
+            $__snap_fail = function ($out, $fallback) { $lines = array_values(array_filter(array_map('trim', explode("\n", $out)))); echo json_encode(['success' => false, 'message' => $lines ? preg_replace('/^[^\w]*(Error: )?/u', '', end($lines)) : $fallback]); exit; };
+            if ($action === 'site_snapshots') {
+                [$data, $code, $out, $ms] = $__snap(['list']);
+                if ($code !== 0 || !is_array($data)) $__snap_fail($out, 'Could not list snapshots.');
+                echo json_encode(['success' => true, 'items' => $data, 'ms' => $ms, 'dir' => $user_home . '/Cove/Snapshots/' . $site_name]);
+                exit;
+            }
+            if ($action === 'site_snapshot_create') {
+                $note = trim((string) ($input['note'] ?? ''));
+                if (strlen($note) > 120 || preg_match('/[\x00-\x1f]/', $note)) { echo json_encode(['success' => false, 'message' => 'Keep the note short and on one line.']); exit; }
+                set_time_limit(0);
+                [$data, $code, $out, $ms] = $__snap($note !== '' ? ['create', '--note=' . $note] : ['create']);
+                if ($code !== 0 || !is_array($data)) $__snap_fail($out, 'The snapshot failed.');
+                echo json_encode(['success' => true, 'snapshot' => $data, 'ms' => $ms]);
+                exit;
+            }
+            $id = $input['id'] ?? '';
+            if (!$__snap_id($id)) { echo json_encode(['success' => false, 'message' => 'Invalid snapshot id.']); exit; }
+            if ($action === 'site_snapshot_restore') {
+                set_time_limit(0);
+                [$data, $code, $out, $ms] = $__snap(['restore', $id]);
+                if ($code !== 0 || !is_array($data)) $__snap_fail($out, 'The restore failed.');
+                echo json_encode(['success' => true, 'restored' => $data['restored'] ?? $id, 'safety' => $data['safety'] ?? null, 'ms' => $ms]);
+                exit;
+            }
+            [$data, $code, $out, $ms] = $__snap(['delete', $id]);
+            if ($code !== 0) $__snap_fail($out, 'Could not delete that snapshot.');
+            echo json_encode(['success' => true]);
+            exit;
         case 'network_sites':
             // The sites on a multisite network, via `cove network`, which
             // runs one wp-cli eval inside the install.
@@ -5010,6 +5056,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .st-del { color: var(--text-faint); }
         .st-del.armed { color: white; background: var(--danger); border-color: var(--danger); }
         .st-busy { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
+        .st-snapshots { grid-template-columns: minmax(0, 1fr) auto auto minmax(10rem, auto); }
+        .st-snapshots .st-title { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 500; }
+        .st-snapshots.is-auto .st-title { font-weight: 400; color: var(--text-dim); }
+        .st-toolbar .st-note { flex: 1; min-width: 200px; }
+        .st-foot { padding: 0.6rem 1.5rem; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); border-top: 1px solid var(--panel-border); }
+        .st-foot:empty { display: none; }
+        .st-restore.armed { color: white; background: var(--danger); border-color: var(--danger); }
         .site-cli { padding: 1rem 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 0.6rem; }
         .st-cli-line { display: flex; align-items: center; gap: 0.5rem; background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.35rem 0.5rem 0.35rem 0.8rem; }
         .st-cli-line:focus-within { border-color: var(--accent); }
@@ -5703,6 +5756,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     <button type="button" class="mail-part" role="tab" data-tab="themes">themes</button>
                     <button type="button" class="mail-part" role="tab" data-tab="users">users</button>
                     <button type="button" class="mail-part" role="tab" data-tab="cron">cron</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="snapshots">snapshots</button>
                     <button type="button" class="mail-part" role="tab" data-tab="cli">wp-cli</button>
                 </div>
             </div>
@@ -5797,6 +5851,16 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     <button type="button" class="pill st-refresh" title="Re-read the schedule">refresh</button>
                 </div>
                 <ul class="st-list"><li class="loading st-loading">Reading the schedule…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel" id="sitePanel-snapshots" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-note" id="snapNote" type="text" placeholder="note for this snapshot (optional)…" maxlength="120" spellcheck="false" autocomplete="off" aria-label="Snapshot note">
+                    <button type="button" class="pill primary" id="btnSnapCreate" title="Copy the site's files and database as they are now">take snapshot</button>
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill st-refresh" title="Re-read the list">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading snapshots…</li><li class="empty st-error" style="display: none;"></li></ul>
+                <div class="st-foot" id="snapFoot"></div>
             </div>
             <div class="site-panel site-cli" id="sitePanel-cli" style="display: none;">
                 <div class="st-cli-line">
@@ -7237,7 +7301,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : null; }
                     else { this.logs.site = null; this.logs.source = 'errors'; }
                     this.setView('logs', { force: true });
-                } else if ((m = /^\/site\/([a-z0-9-]+)(?:\/(plugins|themes|users|cron|cli))?$/i.exec(p))) {
+                } else if ((m = /^\/site\/([a-z0-9-]+)(?:\/(plugins|themes|users|cron|snapshots|cli))?$/i.exec(p))) {
                     this.sitePage.name = m[1].toLowerCase();
                     this.sitePage.tab = m[2] ? m[2].toLowerCase() : 'overview';
                     this.setView('site', { force: true });
@@ -9078,9 +9142,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('spReveal').querySelector('.pill-label').textContent = this.revealLabel.toLowerCase();
                 $id('spPin').querySelector('.pill-label').textContent = this.isPinned(site.name) ? 'unpin' : 'pin to top';
                 // Tabs: WordPress only; a static site has just the overview.
-                if (!isWp && p.tab !== 'overview') { p.tab = 'overview'; this.syncUrl({ replace: true }); }
-                show($id('siteTabs'), isWp);
-                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
+                if (!isWp && p.tab !== 'overview' && p.tab !== 'snapshots') { p.tab = 'overview'; this.syncUrl({ replace: true }); }
+                show($id('siteTabs'), true);
+                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); show(b, isWp || b.dataset.tab === 'overview' || b.dataset.tab === 'snapshots'); });
                 for (const tb of this.siteTabs) show($id('sitePanel-' + tb), p.tab === tb);
                 this.renderSiteTab();
             },
@@ -9197,13 +9261,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // --- Site page tabs: plugins, themes, users, cron, wp-cli --------
             // Each tab is a WP-CLI listing fetched when first shown and kept
             // per site; row actions run one command and refetch.
-            get siteTabs() { return ['overview', 'plugins', 'themes', 'users', 'cron', 'cli']; },
+            get siteTabs() { return ['overview', 'plugins', 'themes', 'users', 'cron', 'snapshots', 'cli']; },
 
             setSiteTab(tab) {
                 const p = this.sitePage;
                 tab = this.siteTabs.includes(tab) ? tab : 'overview';
                 const site = this.pageSite;
-                if (site && site.type !== 'WordPress') tab = 'overview';
+                if (site && site.type !== 'WordPress' && tab !== 'snapshots') tab = 'overview';
                 p.tab = tab;
                 this.syncUrl();
                 this.renderSitePage();
@@ -9221,13 +9285,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const p = this.sitePage;
                 const tab = p.tab;
                 const site = this.pageSite;
-                if (!site || site.type !== 'WordPress' || !['plugins', 'themes', 'users', 'cron'].includes(tab)) return;
+                if (!site || !['plugins', 'themes', 'users', 'cron', 'snapshots'].includes(tab)) return;
+                if (site.type !== 'WordPress' && tab !== 'snapshots') return;
                 const t = this.siteTabState(tab);
                 if (t.loadedFor === site.name && !opts.force) return;
                 if (t.loadedFor !== site.name) { t.items = []; t.loadedFor = null; t.filter = ''; t.status = 'all'; t.arm = null; }
                 t.loading = true; t.error = null;
                 this.renderSiteTab();
-                const action = { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron' }[tab];
+                const action = { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron', snapshots: 'site_snapshots' }[tab];
                 const res = await this.apiPost(action, { site_name: site.name, check: !!opts.check }, { quiet: true, timeoutMs: opts.check ? 180000 : 90000 });
                 if (this.sitePage.name !== site.name) return;
                 t.loading = false;
@@ -9271,6 +9336,50 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (this.sitePage.name !== site.name) return;
                 const last = (res.message || '').split('\n').filter(Boolean).pop() || '';
                 this.showSnack(last.replace(/^(Success|Error|Warning): /, '') || (res.success ? 'Ran.' : 'Failed.'), !res.success);
+                this.loadSiteTab({ force: true });
+            },
+
+            // Snapshots: take, restore (two clicks — it replaces the live
+            // files and database, though the CLI snapshots those first), delete.
+            async snapshotCreate() {
+                const site = this.pageSite;
+                const t = this.siteTabState('snapshots');
+                if (!site || t.busy['+']) return;
+                const note = $id('snapNote').value.trim();
+                t.busy['+'] = 'create';
+                this.renderSiteTab();
+                const res = await this.apiPost('site_snapshot_create', { site_name: site.name, note }, { quiet: true, timeoutMs: 1800000 });
+                delete t.busy['+'];
+                if (this.sitePage.name !== site.name) return;
+                if (!res.success) { this.showSnack(res.message || 'The snapshot failed.', true); this.renderSiteTab(); return; }
+                $id('snapNote').value = '';
+                this.showSnack('Snapshot ' + (res.snapshot && res.snapshot.id ? res.snapshot.id : '') + ' saved.');
+                this.loadSiteTab({ force: true });
+            },
+
+            async snapshotOp(id, op) {
+                const site = this.pageSite;
+                const t = this.siteTabState('snapshots');
+                if (!site || t.busy[id] || t.busy['+']) return;
+                if (t.arm !== op + ':' + id) {
+                    t.arm = op + ':' + id;
+                    clearTimeout(t.armTimer);
+                    t.armTimer = setTimeout(() => { t.arm = null; this.renderSiteTab(); }, 4000);
+                    this.renderSiteTab();
+                    return;
+                }
+                t.arm = null;
+                t.busy[id] = op;
+                this.renderSiteTab();
+                const res = await this.apiPost(op === 'restore' ? 'site_snapshot_restore' : 'site_snapshot_delete', { site_name: site.name, id }, { quiet: true, timeoutMs: 1800000 });
+                delete t.busy[id];
+                if (this.sitePage.name !== site.name) return;
+                if (!res.success) { this.showSnack(res.message || 'Failed.', true); this.renderSiteTab(); return; }
+                if (op === 'restore') {
+                    this.showSnack('Restored ' + id + '.' + (res.safety ? ' The state from just before is snapshot ' + res.safety + '.' : ''));
+                    for (const tab of ['plugins', 'themes', 'users', 'cron']) { const x = this.sitePage.tabs[tab]; if (x) x.loadedFor = null; }
+                    this.getSites();
+                } else this.showSnack('Deleted snapshot ' + id + '.');
                 this.loadSiteTab({ force: true });
             },
 
@@ -9331,7 +9440,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const p = this.sitePage;
                 const tab = p.tab;
                 if (tab === 'cli') { this.renderSiteCli(); return; }
-                if (!['plugins', 'themes', 'users', 'cron'].includes(tab)) return;
+                if (!['plugins', 'themes', 'users', 'cron', 'snapshots'].includes(tab)) return;
                 const site = this.pageSite;
                 const t = this.siteTabState(tab);
                 const panel = $id('sitePanel-' + tab);
@@ -9343,7 +9452,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 show(err, !t.loading && !!t.error);
                 if (t.error) err.textContent = t.error;
                 const filter = panel.querySelector('.st-filter');
-                if (filter.value !== t.filter) filter.value = t.filter;
+                if (filter && filter.value !== t.filter) filter.value = t.filter;
+                const take = panel.querySelector('#btnSnapCreate');
+                if (take) { take.disabled = !!t.busy['+']; take.textContent = t.busy['+'] ? 'snapshotting…' : 'take snapshot'; }
                 panel.querySelectorAll('.st-status').forEach(b => b.classList.toggle('is-active', b.dataset.status === t.status));
                 const refresh = panel.querySelector('.st-refresh');
                 if (refresh) refresh.disabled = t.loading;
@@ -9354,7 +9465,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const count = panel.querySelector('.st-count');
                 if (!loaded) { count.textContent = ''; return; }
                 const rows = this.siteTabVisible(tab);
-                const label = { plugins: 'plugin', themes: 'theme', users: 'user', cron: 'event' }[tab];
+                const label = { plugins: 'plugin', themes: 'theme', users: 'user', cron: 'event', snapshots: 'snapshot' }[tab];
                 const updates = (tab === 'plugins' || tab === 'themes') ? t.items.filter(i => i.update === 'available').length : 0;
                 count.textContent = (rows.length === t.items.length ? t.items.length : rows.length + ' of ' + t.items.length) + ' ' + label + (t.items.length === 1 ? '' : 's')
                     + (updates ? ' · ' + updates + ' update' + (updates === 1 ? '' : 's') : '')
@@ -9416,6 +9527,18 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             + '<span class="st-roles">' + (chips.length ? chips.join('') : '<span class="st-chip st-none">no role</span>') + '</span>'
                             + '<span class="st-ver" title="' + esc(it.registered || '') + '">' + esc(it.registered ? String(it.registered).slice(0, 10) : '') + '</span>'
                             + '<span class="st-actions"><button type="button" class="pill primary st-login"' + (busy ? ' disabled' : '') + ' title="One-time login as ' + esc(it.user_login) + (loginUrl ? ' on ' + esc(loginUrl) : '') + '">' + (busy ? 'opening…' : 'log in') + '</button></span>';
+                    } else if (tab === 'snapshots') {
+                        const busy = t.busy[it.id];
+                        const armR = t.arm === 'restore:' + it.id, armD = t.arm === 'delete:' + it.id;
+                        li.dataset.id = it.id;
+                        li.classList.toggle('is-auto', !!it.auto);
+                        const when = it.created ? this.formatRelative(it.created) + ' ago' : '';
+                        li.innerHTML = '<div class="st-main"><span class="st-title" title="' + esc(it.created ? new Date(it.created * 1000).toLocaleString() : '') + '">' + esc(it.id) + (it.auto ? ' <span class="st-chip st-none">auto</span>' : '') + '</span><span class="st-sub">' + esc(it.note || (it.auto ? '' : 'no note')) + (it.wp ? ' · wp ' + esc(it.wp) : '') + '</span></div>'
+                            + '<span class="st-ver">' + esc(when) + '</span>'
+                            + '<span class="st-ver" title="Files' + (it.has_db ? ' + database' : '') + '">' + this.formatSize(it.files_bytes) + (it.has_db ? ' + ' + this.formatSize(it.db_bytes) + ' db' : '') + '</span>'
+                            + '<span class="st-actions">' + (busy ? '<span class="st-busy">' + (busy === 'restore' ? 'restoring…' : 'deleting…') + '</span>'
+                                : '<button type="button" class="pill st-restore' + (armR ? ' armed' : '') + '" data-op="restore" title="Put these files and this database back in place (the current state is snapshotted first)">' + (armR ? 'sure? restore' : 'restore') + '</button>'
+                                + '<button type="button" class="pill st-del' + (armD ? ' armed' : '') + '" data-op="delete" title="Delete this snapshot">' + (armD ? 'sure? delete' : '×') + '</button>') + '</span>';
                     } else if (tab === 'cron') {
                         const busy = t.busy[it.hook];
                         const gmt = it.next_run_gmt ? Date.parse(it.next_run_gmt.replace(' ', 'T') + 'Z') : 0;
@@ -9430,6 +9553,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     frag.appendChild(li);
                 }
                 list.appendChild(frag);
+                if (tab === 'snapshots') {
+                    const total = t.items.reduce((s, i) => s + (i.files_bytes || 0) + (i.db_bytes || 0), 0);
+                    const dir = (t.extra && t.extra.dir ? t.extra.dir : '').replace(/^\/Users\/[^\/]+|^\/home\/[^\/]+/, '~');
+                    $id('snapFoot').textContent = t.items.length ? dir + ' · ' + this.formatSize(total) + ' as reported by du; copy-on-write clones share unchanged blocks with the site, so the real footprint is smaller' : (dir ? 'Snapshots are kept under ' + dir + '. A restore snapshots the current state first, so it can be undone.' : '');
+                }
             },
 
             renderSiteCli() {
@@ -9454,12 +9582,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     const b = e.target.closest('.mail-part');
                     if (b) this.setSiteTab(b.dataset.tab);
                 });
-                for (const tab of ['plugins', 'themes', 'users', 'cron']) {
+                for (const tab of ['plugins', 'themes', 'users', 'cron', 'snapshots']) {
                     const panel = $id('sitePanel-' + tab);
                     const t = () => this.siteTabState(tab);
                     const filter = panel.querySelector('.st-filter');
-                    filter.addEventListener('input', () => { t().filter = filter.value; this.renderSiteTab(); });
-                    filter.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); t().filter = ''; filter.value = ''; filter.blur(); this.renderSiteTab(); } });
+                    if (filter) {
+                        filter.addEventListener('input', () => { t().filter = filter.value; this.renderSiteTab(); });
+                        filter.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); t().filter = ''; filter.value = ''; filter.blur(); this.renderSiteTab(); } });
+                    }
                     panel.querySelectorAll('.st-status').forEach(b => b.addEventListener('click', () => { t().status = b.dataset.status; this.renderSiteTab(); }));
                     const refresh = panel.querySelector('.st-refresh');
                     if (refresh) refresh.addEventListener('click', () => this.loadSiteTab({ force: true }));
@@ -9476,8 +9606,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         if (auto) { this.siteItemOp(tab, row.dataset.slug, auto.dataset.op); return; }
                         if (e.target.closest('.st-login')) { this.siteUserLogin(row.dataset.login, row.dataset.loginUrl || ''); return; }
                         if (e.target.closest('.st-run')) { this.siteCronRun(row.dataset.hook); return; }
+                        const snap = e.target.closest('.st-restore, .st-snapshots .st-del');
+                        if (snap && row.dataset.id) { this.snapshotOp(row.dataset.id, snap.dataset.op); return; }
                     });
                 }
+                $id('btnSnapCreate').addEventListener('click', () => this.snapshotCreate());
+                $id('snapNote').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this.snapshotCreate(); } if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.target.blur(); } });
                 const input = $id('siteCliInput');
                 input.addEventListener('keydown', (e) => {
                     const c = p.cli;
@@ -11523,6 +11657,7 @@ show_general_help() {
     echo "  login            Generates a one-time login link for a WordPress site."
     echo "  network          Lists the sites on a multisite network."
     echo "  wp               Runs WP-CLI inside a site from anywhere."
+    echo "  snapshot         Take, list, restore, or delete snapshots of a site."
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
     echo "  pull             Pulls a remote WordPress site into Cove via SSH."
@@ -11835,6 +11970,9 @@ display_command_help() {
             ;;
         wp)
             cove_wp --help
+            ;;
+        snapshot)
+            cove_snapshot --help
             ;;
         network)
             echo "Usage: cove network <site> [--format=json]"
@@ -12169,6 +12307,10 @@ main() {
         wp)
             check_dependencies
             cove_wp "$@"
+            ;;
+        snapshot)
+            check_dependencies
+            cove_snapshot "$@"
             ;;
         enable)
             check_dependencies

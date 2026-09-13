@@ -1,0 +1,293 @@
+# Snapshots: a point-in-time copy of a site's public/ tree and its database
+# under ~/Cove/Snapshots/<site>/<id>/, restorable in place. The tree is a
+# copy-on-write clone where the filesystem allows (APFS, btrfs, xfs), so
+# taking one costs seconds and only the blocks that later change take room.
+# A restore first takes a snapshot of its own, so it can itself be undone.
+
+SNAPSHOTS_DIR="${SNAPSHOTS_DIR:-$COVE_DIR/Snapshots}"
+
+snapshot_dump_cmd() {
+    if command -v mariadb-dump >/dev/null 2>&1; then echo "mariadb-dump"; elif command -v mysqldump >/dev/null 2>&1; then echo "mysqldump"; else return 1; fi
+}
+
+snapshot_client_cmd() {
+    if command -v mariadb >/dev/null 2>&1; then echo "mariadb"; elif command -v mysql >/dev/null 2>&1; then echo "mysql"; else return 1; fi
+}
+
+# Bytes used by a path (du -sk, portable across macOS and Linux).
+snapshot_size_bytes() {
+    local kb
+    kb=$(du -sk "$1" 2>/dev/null | cut -f1)
+    echo $(( ${kb:-0} * 1024 ))
+}
+
+snapshot_json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | tr -d '\n\r'
+}
+
+# meta.json for one snapshot directory, on one line.
+snapshot_meta_json() {
+    local dir="$1"
+    local id created note auto wp files_bytes db_bytes
+    id=$(basename "$dir")
+    created=$(sed -n 's/^created=//p' "$dir/meta" 2>/dev/null)
+    note=$(sed -n 's/^note=//p' "$dir/meta" 2>/dev/null)
+    auto=$(sed -n 's/^auto=//p' "$dir/meta" 2>/dev/null)
+    wp=$(sed -n 's/^wp=//p' "$dir/meta" 2>/dev/null)
+    files_bytes=$(snapshot_size_bytes "$dir/public")
+    db_bytes=0
+    [ -f "$dir/db.sql" ] && db_bytes=$(stat -f%z "$dir/db.sql" 2>/dev/null || stat -c%s "$dir/db.sql" 2>/dev/null || echo 0)
+    printf '{"id":"%s","created":%s,"note":"%s","auto":%s,"wp":"%s","files_bytes":%s,"db_bytes":%s,"has_db":%s}' \
+        "$id" "${created:-0}" "$(snapshot_json_escape "$note")" "$([ "$auto" == "1" ] && echo true || echo false)" \
+        "$(snapshot_json_escape "$wp")" "$files_bytes" "$db_bytes" "$([ -f "$dir/db.sql" ] && echo true || echo false)"
+}
+
+# snapshot_create <site> <note> <auto:0|1>  → prints the new id on stdout (last line)
+snapshot_create() {
+    local site_name="$1" note="$2" auto="${3:-0}"
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    local public_dir="$site_dir/public"
+    local id
+    id=$(date +%Y%m%d-%H%M%S)
+    local dest="$SNAPSHOTS_DIR/$site_name/$id"
+    # Two in the same second: bump the id rather than merge into one.
+    local n=1
+    while [ -e "$dest" ]; do dest="$SNAPSHOTS_DIR/$site_name/$id-$n"; n=$((n + 1)); done
+    id=$(basename "$dest")
+    mkdir -p "$dest"
+
+    local wp_version=""
+    if [ -f "$public_dir/wp-config.php" ]; then
+        local dump_cmd
+        if ! dump_cmd=$(snapshot_dump_cmd); then
+            rm -rf "$dest"
+            gum style --foreground red "❌ Error: Neither mariadb-dump nor mysqldump could be found." >&2
+            return 1
+        fi
+        local wp_cmd db_name db_user db_pass
+        wp_cmd=$(get_wp_cmd "$site_dir")
+        db_name=$( (cd "$public_dir" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        db_user=$( (cd "$public_dir" && $wp_cmd config get DB_USER --skip-plugins --skip-themes 2>/dev/null) )
+        db_pass=$( (cd "$public_dir" && $wp_cmd config get DB_PASSWORD --skip-plugins --skip-themes 2>/dev/null) )
+        if [ -z "$db_name" ] || [ -z "$db_user" ]; then
+            rm -rf "$dest"
+            gum style --foreground red "❌ Error: Could not read the database credentials from wp-config.php." >&2
+            return 1
+        fi
+        echo "   Dumping database '$db_name'…" >&2
+        if ! "$dump_cmd" -u"$db_user" -p"$db_pass" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "$db_name" > "$dest/db.sql" 2>"$dest/.dump-err"; then
+            local err; err=$(tail -n 2 "$dest/.dump-err")
+            rm -rf "$dest"
+            gum style --foreground red "❌ Error: The database dump failed." "$err" >&2
+            return 1
+        fi
+        rm -f "$dest/.dump-err"
+        chmod 600 "$dest/db.sql"
+        wp_version=$(sed -n "s/^\$wp_version = '\([^']*\)';/\1/p" "$public_dir/wp-includes/version.php" 2>/dev/null | head -n 1)
+    fi
+
+    echo "   Copying files…" >&2
+    if ! cove_copy_tree "$public_dir" "$dest/public"; then
+        rm -rf "$dest"
+        gum style --foreground red "❌ Error: Could not copy the site's files." >&2
+        return 1
+    fi
+    {
+        echo "created=$(date +%s)"
+        echo "note=$note"
+        echo "auto=$auto"
+        echo "wp=$wp_version"
+    } > "$dest/meta"
+    echo "$id"
+}
+
+# snapshot_restore <site> <id>
+snapshot_restore() {
+    local site_name="$1" id="$2"
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    local public_dir="$site_dir/public"
+    local src="$SNAPSHOTS_DIR/$site_name/$id"
+    if [ ! -d "$src/public" ]; then
+        gum style --foreground red "❌ Error: Snapshot '$id' not found for '$site_name.localhost'." >&2
+        return 1
+    fi
+
+    # The way back: today's state, taken before anything is touched.
+    echo "📸 Taking a snapshot of the current state first…" >&2
+    local safety
+    safety=$(snapshot_create "$site_name" "before restoring $id" 1) || return 1
+    safety="${safety##*$'\n'}"
+    echo "   Saved as $safety." >&2
+
+    if [ -f "$src/db.sql" ]; then
+        local client wp_cmd db_name
+        if ! client=$(snapshot_client_cmd); then
+            gum style --foreground red "❌ Error: Neither mariadb nor mysql could be found." >&2
+            return 1
+        fi
+        source_config
+        wp_cmd=$(get_wp_cmd "$site_dir")
+        db_name=$( (cd "$public_dir" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        if [ -z "$db_name" ]; then
+            gum style --foreground red "❌ Error: Could not read DB_NAME from wp-config.php." >&2
+            return 1
+        fi
+        # The dump carries DROP TABLE for what it holds; tables born after
+        # the snapshot would otherwise linger, so the database is recreated.
+        echo "   Restoring database '$db_name'…" >&2
+        if ! "$client" -u"$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null; then
+            gum style --foreground red "❌ Error: Could not recreate the database." >&2
+            return 1
+        fi
+        if ! "$client" -u"$DB_USER" -p"$DB_PASSWORD" --max_allowed_packet=512M "$db_name" < "$src/db.sql"; then
+            gum style --foreground red "❌ Error: The database import failed. The files were not touched; snapshot $safety holds the state from before." >&2
+            return 1
+        fi
+    fi
+
+    echo "   Restoring files…" >&2
+    local staging="$site_dir/.public.restoring"
+    rm -rf "$staging"
+    if ! cove_copy_tree "$src/public" "$staging"; then
+        rm -rf "$staging"
+        gum style --foreground red "❌ Error: Could not copy the snapshot's files." >&2
+        return 1
+    fi
+    local old="$site_dir/.public.replaced"
+    rm -rf "$old"
+    mv "$public_dir" "$old" && mv "$staging" "$public_dir"
+    rm -rf "$old"
+    if [ -f "$public_dir/wp-config.php" ]; then
+        (cd "$public_dir" && $wp_cmd cache flush --skip-plugins --skip-themes >/dev/null 2>&1) || true
+    fi
+    echo "$safety"
+}
+
+cove_snapshot() {
+    local site_name="" sub="" id="" note="" format="table"
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --note=*)   note="${arg#*=}" ;;
+            --format=*) format="${arg#*=}" ;;
+            --json)     format="json" ;;
+            -h|--help)
+                echo "Usage: cove snapshot <site> [create] [--note=\"…\"]"
+                echo "       cove snapshot <site> list [--format=json]"
+                echo "       cove snapshot <site> restore <id>"
+                echo "       cove snapshot <site> delete <id>"
+                echo ""
+                echo "Point-in-time copies of a site's files and database, kept under"
+                echo "~/Cove/Snapshots/<site>/. Restore puts one back in place — after"
+                echo "taking a snapshot of the current state, so a restore can be undone."
+                return
+                ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                exit 1
+                ;;
+            *)
+                if [ -z "$site_name" ]; then site_name="$arg"
+                elif [ -z "$sub" ]; then sub="$arg"
+                elif [ -z "$id" ]; then id="$arg"
+                fi
+                ;;
+        esac
+    done
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove snapshot <site> [create|list|restore <id>|delete <id>]"
+        exit 1
+    fi
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if [ ! -d "$site_dir/public" ]; then
+        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
+        exit 1
+    fi
+    [ -z "$sub" ] && sub="create"
+    if [ -n "$id" ] && ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]]; then
+        gum style --foreground red "❌ Error: '$id' is not a snapshot id."
+        exit 1
+    fi
+
+    case "$sub" in
+        create)
+            echo "📸 Snapshotting '$site_name.localhost'…"
+            local new_id
+            new_id=$(snapshot_create "$site_name" "$note" 0) || exit 1
+            new_id="${new_id##*$'\n'}"
+            if [ "$format" == "json" ]; then snapshot_meta_json "$SNAPSHOTS_DIR/$site_name/$new_id"; echo; else
+                gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Snapshot $new_id saved" "$SNAPSHOTS_DIR/$site_name/$new_id" "Restore with: cove snapshot $site_name restore $new_id"
+            fi
+            ;;
+        list)
+            local dirs=()
+            if [ -d "$SNAPSHOTS_DIR/$site_name" ]; then
+                while IFS= read -r d; do dirs+=("$d"); done < <(ls -1d "$SNAPSHOTS_DIR/$site_name"/*/ 2>/dev/null | sort -r)
+            fi
+            if [ "$format" == "json" ]; then
+                printf '['
+                local first=1 d
+                for d in "${dirs[@]}"; do
+                    d="${d%/}"
+                    [ -d "$d/public" ] || continue
+                    [ $first -eq 1 ] || printf ','
+                    first=0
+                    snapshot_meta_json "$d"
+                done
+                printf ']\n'
+                return
+            fi
+            if [ ${#dirs[@]} -eq 0 ]; then
+                echo "ℹ️  No snapshots for '$site_name.localhost' yet. Take one with: cove snapshot $site_name"
+                return
+            fi
+            printf "  %-22s  %-19s  %-9s  %s\n" "ID" "TAKEN" "SIZE" "NOTE"
+            local d
+            for d in "${dirs[@]}"; do
+                d="${d%/}"
+                [ -d "$d/public" ] || continue
+                local created note auto bytes
+                created=$(sed -n 's/^created=//p' "$d/meta" 2>/dev/null)
+                note=$(sed -n 's/^note=//p' "$d/meta" 2>/dev/null)
+                auto=$(sed -n 's/^auto=//p' "$d/meta" 2>/dev/null)
+                bytes=$(( $(snapshot_size_bytes "$d/public") + $( [ -f "$d/db.sql" ] && (stat -f%z "$d/db.sql" 2>/dev/null || stat -c%s "$d/db.sql") || echo 0 ) ))
+                printf "  %-22s  %-19s  %-9s  %s%s\n" "$(basename "$d")" "$(date -r "${created:-0}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@${created:-0}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$(awk -v b="$bytes" 'BEGIN{ s="B"; if (b>=1073741824){b/=1073741824; s="GB"} else if (b>=1048576){b/=1048576; s="MB"} else if (b>=1024){b/=1024; s="KB"}; printf (b>=10||s=="B") ? "%d %s" : "%.1f %s", b, s }')" "$note" "$([ "$auto" == "1" ] && echo ' (auto)')"
+            done
+            ;;
+        restore)
+            if [ -z "$id" ]; then
+                gum style --foreground red "❌ Error: Which snapshot? cove snapshot $site_name restore <id>"
+                exit 1
+            fi
+            echo "⏪ Restoring '$site_name.localhost' to $id…"
+            local safety
+            safety=$(snapshot_restore "$site_name" "$id") || exit 1
+            safety="${safety##*$'\n'}"
+            if [ "$format" == "json" ]; then printf '{"restored":"%s","safety":"%s"}\n' "$id" "$safety"; else
+                gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Restored $id" "The state from just before is snapshot $safety — restore it to undo."
+            fi
+            ;;
+        delete)
+            if [ -z "$id" ]; then
+                gum style --foreground red "❌ Error: Which snapshot? cove snapshot $site_name delete <id>"
+                exit 1
+            fi
+            if [ ! -d "$SNAPSHOTS_DIR/$site_name/$id" ]; then
+                gum style --foreground red "❌ Error: Snapshot '$id' not found."
+                exit 1
+            fi
+            rm -rf "$SNAPSHOTS_DIR/$site_name/$id"
+            if [ "$format" == "json" ]; then printf '{"deleted":"%s"}\n' "$id"; else echo "🗑️  Deleted snapshot $id."; fi
+            ;;
+        *)
+            gum style --foreground red "❌ Error: Unknown subcommand '$sub'."
+            echo "Usage: cove snapshot <site> [create|list|restore <id>|delete <id>]"
+            exit 1
+            ;;
+    esac
+}
