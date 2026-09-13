@@ -3114,15 +3114,43 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             fclose($fh);
             echo json_encode(['success' => true, 'log' => $log, 'truncated' => $size > $max]);
             exit;
+        case 'network_sites':
+            // The sites on a multisite network, via `cove network`, which
+            // runs one wp-cli eval inside the install.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                echo json_encode(['success' => false, 'message' => 'Invalid site name.']);
+                exit;
+            }
+            exec(sprintf('HOME=%s %s network %s --format=json 2>/dev/null', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name)), $net_lines, $net_code);
+            $net_json = trim(implode("\n", $net_lines));
+            $net = $net_json !== '' ? json_decode($net_json, true) : null;
+            if (!is_array($net) || isset($net['error'])) {
+                echo json_encode(['success' => false, 'message' => is_array($net) && isset($net['error']) ? $net['error'] : 'Could not read the network.']);
+                exit;
+            }
+            echo json_encode(['success' => true, 'sites' => $net]);
+            exit;
         case 'get_login_link':
             $response = ['success' => false, 'message' => 'An unknown error occurred.'];
             if (!empty($site_name)) {
                 // Delegate to the 'cove login' command which has the self-healing logic.
+                // An optional `url` names a subsite of a multisite network; the
+                // command checks it against the network before minting anything.
+                $login_url_arg = '';
+                $sub = (string) ($input['url'] ?? '');
+                if ($sub !== '') {
+                    if (!preg_match('#^https?://[a-z0-9.-]+(?::\d+)?/[a-z0-9._~/-]*$#i', $sub)) {
+                        echo json_encode(['success' => false, 'message' => 'Invalid subsite URL.']);
+                        exit;
+                    }
+                    $login_url_arg = ' ' . escapeshellarg('--url=' . $sub);
+                }
                 $command = sprintf(
-                    'HOME=%s %s login %s 2>&1',
+                    'HOME=%s %s login %s%s 2>&1',
                     escapeshellarg($user_home),
                     escapeshellarg($cove_path),
-                    escapeshellarg($site_name)
+                    escapeshellarg($site_name),
+                    $login_url_arg
                 );
 
                 exec($command, $output_lines, $return_code);
@@ -4724,6 +4752,53 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             .log-levels { display: none; }
         }
 
+        /* Site page. One site: facts, its views, its network, its actions. */
+        body.view-site .wrap { max-width: 1040px; }
+        .site-head { align-items: flex-start; }
+        .site-head-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.45rem; }
+        .site-back { align-self: flex-start; background: transparent; border: 0; padding: 0; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); cursor: pointer; }
+        .site-back:hover { color: var(--text); }
+        .site-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.85rem; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); min-width: 0; }
+        .site-facts .fact { white-space: nowrap; }
+        .site-facts .fact-type { min-width: 0; }
+        .site-facts .fact-ver.insecure::after { content: "●"; margin-left: 0.25rem; color: var(--pill-warn-fg, #d08c30); font-size: 0.6em; vertical-align: middle; }
+        .site-facts .fact-path { cursor: copy; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+        .site-facts .fact-path:hover { color: var(--text); }
+        .site-body { padding: 1.25rem 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 1.25rem; }
+        .site-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0.75rem; }
+        .site-tile { text-align: left; background: var(--bg-sunk); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.85rem 1rem; cursor: pointer; display: flex; flex-direction: column; gap: 0.3rem; color: var(--text); font: inherit; transition: border-color 120ms, background 120ms; }
+        .site-tile:hover { border-color: var(--text-faint); background: var(--panel-hover); }
+        .site-tile-name { font-family: var(--font-mono); font-size: 0.86rem; color: var(--text); }
+        .site-tile-name::after { content: " →"; color: var(--text-faint); }
+        .site-tile-desc { font-size: 0.78rem; color: var(--text-dim); line-height: 1.4; }
+        .site-section { border: 1px solid var(--panel-border); border-radius: var(--radius-md); overflow: hidden; }
+        .site-section-head { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0.9rem; font-family: var(--font-mono); font-size: 0.64rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); background: var(--bg-sunk); border-bottom: 1px solid var(--panel-border); }
+        .site-section-head .sec-meta { text-transform: none; letter-spacing: 0; color: var(--text-dim); }
+        .site-section-head .pill { margin-left: auto; padding: 0.2rem 0.55rem; font-size: 0.7rem; text-transform: none; letter-spacing: 0; }
+        .site-net-list { list-style: none; margin: 0; padding: 0; max-height: 52vh; overflow-y: auto; }
+        .site-net-list > .loading, .site-net-list > .empty { padding: 2rem 1rem; text-align: center; color: var(--text-dim); }
+        .net-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; align-items: center; column-gap: 0.9rem; padding: 0.55rem 0.9rem; border-bottom: 1px solid var(--panel-border); cursor: pointer; }
+        .net-row:last-of-type { border-bottom: 0; }
+        .net-row:hover { background: var(--panel-hover); }
+        .net-row.is-off .net-name { color: var(--text-dim); }
+        .net-main { min-width: 0; display: flex; flex-direction: column; gap: 0.1rem; }
+        .net-name { font-size: 0.88rem; color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .net-main-chip { font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.04em; padding: 0.06rem 0.45rem; border-radius: var(--radius-pill); background: var(--pill-wp-bg); color: var(--pill-wp-fg); margin-left: 0.5rem; font-weight: 400; vertical-align: middle; }
+        .net-main-chip.net-status { background: transparent; border: 1px solid var(--panel-border); color: var(--text-faint); }
+        .net-url { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .net-url:hover { color: var(--accent); }
+        .net-updated { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); white-space: nowrap; }
+        .net-row .pill { padding: 0.26rem 0.6rem; font-size: 0.74rem; }
+        .site-manage { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.9rem; }
+        .site-manage .pill.danger { color: var(--danger); border-color: color-mix(in oklch, var(--danger) 45%, transparent); }
+        .site-manage .pill.danger:hover { color: white; background: var(--danger); border-color: var(--danger); }
+        .pill .pill-meta { color: var(--text-faint); font-size: 0.7rem; }
+        .pill .pill-meta:empty { display: none; }
+        @media (max-width: 620px) {
+            .net-row { grid-template-columns: minmax(0, 1fr) auto; }
+            .net-updated, .net-row .net-open { display: none; }
+        }
+
         /* Files. A file manager over each site's directory: sites on the
            left, a breadcrumb bar and listing (or the open file) on the right. */
         body.view-files .wrap { max-width: 1280px; }
@@ -5379,6 +5454,64 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </footer>
         </section>
 
+        <section class="card site-card" id="siteCard" style="display: none;">
+            <header class="card-head site-head">
+                <div class="site-head-main">
+                    <button type="button" class="site-back" id="btnSiteBack" title="Back to the sites list (Esc)">← sites</button>
+                    <h1 class="card-title" id="siteTitle"></h1>
+                    <div class="site-facts" id="siteFacts"></div>
+                </div>
+                <div class="card-actions">
+                    <a class="pill" id="siteOpenLink" href="#" target="_blank" rel="noopener" title="Open the site in a new tab">open ↗</a>
+                    <button type="button" class="pill primary" id="btnSiteLogin" title="One-time admin login (⌘↵)"><span class="btn-label">log in to admin</span></button>
+                </div>
+            </header>
+            <div class="site-body">
+                <div class="site-tiles" id="siteTiles">
+                    <button type="button" class="site-tile" data-go="files"><span class="site-tile-name">files</span><span class="site-tile-desc">Browse and edit the site's directory, upload, tidy up.</span></button>
+                    <button type="button" class="site-tile" data-go="db" id="tileDb"><span class="site-tile-name">database</span><span class="site-tile-desc">Tables, rows in place, a SQL console.</span></button>
+                    <button type="button" class="site-tile" data-go="mail"><span class="site-tile-name">mail</span><span class="site-tile-desc">Everything this site has sent, links lifted out.</span></button>
+                    <button type="button" class="site-tile" data-go="logs"><span class="site-tile-name">logs</span><span class="site-tile-desc">PHP errors, debug.log, and the access log, live.</span></button>
+                </div>
+
+                <section class="site-section" id="siteNetwork" style="display: none;">
+                    <div class="site-section-head">
+                        <span>network sites</span>
+                        <span class="sec-meta" id="siteNetworkMeta"></span>
+                        <button type="button" class="pill" id="btnSiteNetworkRefresh" title="Re-read the network">refresh</button>
+                    </div>
+                    <ul class="site-net-list" id="siteNetList">
+                        <template id="tpl-net-row">
+                            <li class="net-row">
+                                <div class="net-main">
+                                    <span class="net-name"></span>
+                                    <a class="net-url" target="_blank" rel="noopener"></a>
+                                </div>
+                                <span class="net-updated"></span>
+                                <a class="pill net-open" target="_blank" rel="noopener" title="Open in a new tab">open ↗</a>
+                                <button type="button" class="pill primary net-login">log in</button>
+                            </li>
+                        </template>
+                        <li class="loading" id="siteNetLoading">Reading the network…</li>
+                        <li class="empty" id="siteNetError" style="display: none;"><div id="siteNetErrorText"></div></li>
+                    </ul>
+                </section>
+
+                <section class="site-section" id="siteManage">
+                    <div class="site-section-head"><span>manage</span></div>
+                    <div class="site-manage" id="siteManageRow">
+                        <button type="button" class="pill" id="spDomains"><span class="pill-label">domains…</span><span class="pill-meta" id="spDomainsMeta"></span></button>
+                        <button type="button" class="pill" id="spPhp"><span class="pill-label">php version…</span><span class="pill-meta" id="spPhpMeta"></span></button>
+                        <button type="button" class="pill" id="spRename"><span class="pill-label">rename…</span></button>
+                        <button type="button" class="pill" id="spReveal"><span class="pill-label">reveal</span></button>
+                        <button type="button" class="pill" id="spCopy"><span class="pill-label">copy path</span></button>
+                        <button type="button" class="pill" id="spPin"><span class="pill-label">pin to top</span></button>
+                        <button type="button" class="pill danger" id="spDelete"><span class="pill-label">delete site…</span></button>
+                    </div>
+                </section>
+            </div>
+        </section>
+
         <section class="card files-card" id="filesCard" style="display: none;">
             <header class="card-head">
                 <h1 class="card-title">Files</h1>
@@ -5623,7 +5756,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <div class="ctx-menu" id="ctxMenu" style="display: none;">
         <div>
             <div class="ctx-title" id="ctxTitle"></div>
-            <button class="ctx-item" id="ctxOpen"><span>Open site</span><span class="ctx-key">↵</span></button>
+            <button class="ctx-item" id="ctxManage"><span>Manage site</span><span class="ctx-key">↵</span></button>
+            <button class="ctx-item" id="ctxOpen"><span>Open site</span><span class="ctx-key">↗</span></button>
             <button class="ctx-item" id="ctxLogin"><span>Log in to admin</span><span class="ctx-key">⌘↵</span></button>
             <div class="ctx-sep"></div>
             <button class="ctx-item" id="ctxRename"><span>Rename…</span></button>
@@ -5704,6 +5838,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             selectedName: null,
             ctxMenu: { open: false, site: null, x: 0, y: 0, openedAt: 0 },
             fileCtx: { open: false, target: null, x: 0, y: 0, openedAt: 0 },
+            sitePage: { name: null, net: { items: [], loading: false, error: null, loadedFor: null }, busy: null },
             siteDeleteConfirm: null,
             palette: { open: false, query: '', index: 0 },
             rename: { open: false, site: null, value: '', busy: false },
@@ -5860,6 +5995,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.bindDbEvents();
                 this.bindLogsEvents();
                 this.bindFilesEvents();
+                this.bindSiteEvents();
                 this.render();
 
                 // If the tab closes during an undo window, flush the staged
@@ -5903,6 +6039,23 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
                     if (this.view === 'files') {
                         this.filesKeydown(e, typing);
+                        return;
+                    }
+
+                    if (this.view === 'site') {
+                        if (e.key === 'Escape') {
+                            if (this.siteDeleteConfirm) { this.closeSiteDeleteConfirm(); return; }
+                            if (this.phpModal.open) { this.closePhpModal(); return; }
+                            if (this.domainsModal.open) { this.closeDomainsModal(); return; }
+                            if (this.rename.open) { this.closeRename(); return; }
+                            if (this.showDbModal) { this.setDbModal(false); return; }
+                            if (!typing) this.setView('sites');
+                            return;
+                        }
+                        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !typing) {
+                            const s = this.pageSite;
+                            if (s && s.type === 'WordPress') { e.preventDefault(); this.getLoginLink(s.name); }
+                        }
                         return;
                     }
 
@@ -5965,7 +6118,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         if ((e.metaKey || e.ctrlKey) && site.type === 'WordPress') {
                             this.getLoginLink(site.name);
                         } else {
-                            this.openSite(site);
+                            this.openSitePage(site.name);
                         }
                         return;
                     }
@@ -6092,7 +6245,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 // Site rows: one delegated listener instead of per-row handlers.
                 // The ↗ icon is the only thing that opens the site; the type
                 // pill filters and the login button logs in; a click anywhere
-                // else on the row opens the context menu.
+                // else on the row opens the site's page (right-click: the menu).
                 const list = $id('siteList');
                 list.addEventListener('click', (e) => {
                     const row = e.target.closest('.site-row');
@@ -6102,10 +6255,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (e.target.closest('.site-open-link')) return; // plain link — let it navigate
                     if (e.target.closest('.site-type')) { this.setTypeFilter(site.type); return; }
                     if (e.target.closest('.site-login-btn')) { this.getLoginLink(site.name); return; }
-                    // Don't pop the menu when the click ends a drag-to-select —
+                    // Don't open the page when the click ends a drag-to-select —
                     // users still grab the domain/size text to copy it.
                     if (window.getSelection && window.getSelection().toString()) return;
-                    this.openRowMenu(site, e);
+                    this.openSitePage(site.name);
                 });
                 list.addEventListener('contextmenu', (e) => {
                     const row = e.target.closest('.site-row');
@@ -6133,6 +6286,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.closeRowMenu();
                     if (site) fn(site);
                 };
+                $id('ctxManage').addEventListener('click', withCtxSite(s => this.openSitePage(s.name)));
                 $id('ctxOpen').addEventListener('click', withCtxSite(s => this.openSite(s)));
                 $id('ctxLogin').addEventListener('click', withCtxSite(s => this.getLoginLink(s.name)));
                 $id('ctxRename').addEventListener('click', withCtxSite(s => this.promptRename(s)));
@@ -6236,6 +6390,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 // sites list, which usually lands after the first db render.
                 if (this.view === 'db') { this.renderDbList(); if (this.db.name && !this.db.table && !this.db.sql) this.renderDbOverview(); }
                 if (this.view === 'files') this.renderFilesSide();
+                if (this.view === 'site') this.renderSitePage();
                 if (this.palette.open) this.renderPalette();
             },
 
@@ -6672,7 +6827,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             setView(view, opts = {}) {
-                view = ['mail', 'db', 'logs', 'files'].includes(view) ? view : 'sites';
+                view = ['mail', 'db', 'logs', 'files', 'site'].includes(view) ? view : 'sites';
                 if (view === this.view && !opts.force) return;
                 const prev = this.view;
                 this.view = view;
@@ -6682,7 +6837,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 document.body.classList.toggle('view-db', view === 'db');
                 document.body.classList.toggle('view-logs', view === 'logs');
                 document.body.classList.toggle('view-files', view === 'files');
-                document.title = { mail: 'Cove — mail', db: 'Cove — databases', logs: 'Cove — logs', files: 'Cove — files', sites: 'Cove — sites' }[view];
+                document.body.classList.toggle('view-site', view === 'site');
+                document.title = view === 'site' ? 'Cove — ' + (this.sitePage.name || 'site') : { mail: 'Cove — mail', db: 'Cove — databases', logs: 'Cove — logs', files: 'Cove — files', sites: 'Cove — sites' }[view];
                 this.syncUrl();
                 this.render();
                 if (view === 'mail') {
@@ -6706,6 +6862,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 } else {
                     this.stopLogsPolling();
                 }
+                if (view === 'site') {
+                    this.renderSitePage();
+                    this.loadSiteNetwork();
+                }
                 if (view === 'files') {
                     // A URL names a path that may be a folder or a file; the
                     // server settles it. Otherwise the listing is refreshed
@@ -6728,6 +6888,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             get viewPath() {
                 if (this.view === 'mail') return '/mail' + (this.mail.site ? '/' + this.mail.site : '');
                 if (this.view === 'db') return '/db' + (this.db.name ? '/' + encodeURIComponent(this.db.name) + (this.db.table ? '/' + encodeURIComponent(this.db.table) : '') : '');
+                if (this.view === 'site') return '/site/' + (this.sitePage.name || '');
                 if (this.view === 'files') return '/files' + (this.files.site ? '/' + this.files.site + this.filesEncode(this.files.file ? this.files.file.path : this.files.path) : '');
                 if (this.view === 'logs') return '/logs' + (this.logs.site ? '/' + this.logs.site + (this.logs.tab ? '/' + this.logs.tab : '') : (this.logs.source !== 'errors' ? '/@' + this.logs.source : ''));
                 return '/';
@@ -6765,6 +6926,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : null; }
                     else { this.logs.site = null; this.logs.source = 'errors'; }
                     this.setView('logs', { force: true });
+                } else if ((m = /^\/site\/([a-z0-9-]+)$/i.exec(p))) {
+                    this.sitePage.name = m[1].toLowerCase();
+                    this.setView('site', { force: true });
                 } else if ((m = /^\/files(?:\/([a-z0-9-]+)(?:\/(.+))?)?$/i.exec(p))) {
                     const site = m[1] ? m[1].toLowerCase() : null;
                     const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
@@ -7344,7 +7508,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // Keep the outgoing card on screen, out of flow, while it fades;
             // renderView leaves .is-leaving cards alone until the fade ends.
             crossfadeFrom(prev) {
-                const out = $id({ sites: 'sitesCard', mail: 'mailCard', db: 'dbCard', logs: 'logsCard', files: 'filesCard' }[prev]);
+                const out = $id({ sites: 'sitesCard', mail: 'mailCard', db: 'dbCard', logs: 'logsCard', files: 'filesCard', site: 'siteCard' }[prev]);
                 if (!out || out.style.display === 'none') return;
                 if (window.scrollY > 0) window.scrollTo({ top: 0, behavior: 'instant' });
                 document.querySelectorAll('.wrap > .card.is-leaving').forEach(el => { el.classList.remove('is-leaving'); el.style.top = ''; el.style.display = 'none'; });
@@ -7364,8 +7528,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 card('dbCard', this.view === 'db');
                 card('logsCard', this.view === 'logs');
                 card('filesCard', this.view === 'files');
+                card('siteCard', this.view === 'site');
                 document.querySelectorAll('.nav-view').forEach(b => {
-                    const on = b.dataset.view === this.view;
+                    // A site's page lives under the sites tab.
+                    const on = b.dataset.view === this.view || (this.view === 'site' && b.dataset.view === 'sites');
                     b.classList.toggle('is-active', on);
                     b.setAttribute('aria-selected', on ? 'true' : 'false');
                 });
@@ -8539,6 +8705,176 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 document.addEventListener('visibilitychange', () => { if (!document.hidden && this.view === 'logs') this.pollLogs(); });
             },
 
+            // --- Site page ---------------------------------------------------
+            // One site, on its own page: what it is, where its views are,
+            // the sites on its network (with a login per subsite), and the
+            // management actions the row menu offers. Reached by clicking a
+            // row; /site/<name> is its address.
+            get pageSite() { return this.sites.find(s => s.name === this.sitePage.name) || null; },
+
+            openSitePage(name) {
+                this.sitePage.name = name;
+                this.setView('site', { force: true });
+            },
+
+            renderSitePage() {
+                if (this.view !== 'site') return;
+                const p = this.sitePage;
+                const site = this.pageSite;
+                $id('siteTitle').textContent = (p.name || '') + '.localhost';
+                if (!site) {
+                    // Renamed or deleted out from under the page, or the list
+                    // has not landed yet.
+                    if (!this.isLoading && this.sites.length) { this.setView('sites'); return; }
+                    $id('siteFacts').textContent = '';
+                    return;
+                }
+                const isWp = site.type === 'WordPress';
+                const facts = $id('siteFacts');
+                facts.innerHTML = '';
+                const fact = (text, cls, title) => { const s = document.createElement('span'); s.className = 'fact' + (cls ? ' ' + cls : ''); s.textContent = text; if (title) s.title = title; facts.appendChild(s); return s; };
+                const type = fact(isWp ? 'wordpress' : 'static', 'fact-type site-type ' + (isWp ? 'wp' : 'static'));
+                type.dataset.type = site.type;
+                if (isWp && site.wp_version) fact(site.wp_version, 'fact-ver' + (site.wp_status === 'insecure' ? ' insecure' : ''), site.wp_status === 'insecure' ? 'wp.org marks this version insecure' : (site.wp_status === 'outdated' ? 'A newer WordPress is available' : ''));
+                if (site.multisite) fact('multisite · ' + site.multisite, 'fact-ms');
+                const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
+                if (isWp && effPhp) fact('php ' + effPhp, '', site.php_version ? 'Pinned with cove php' : 'Cove\'s default PHP');
+                if (site.size_bytes) fact(this.formatSize(site.size_bytes), '', 'On disk');
+                if (site.modified_at) fact('modified ' + this.formatRelative(site.modified_at) + ' ago', '', new Date(site.modified_at * 1000).toLocaleString());
+                const path = fact(site.display_path, 'fact-path', 'Click to copy the path');
+                path.dataset.path = site.full_path;
+                $id('siteOpenLink').href = site.domain;
+                const login = $id('btnSiteLogin');
+                show(login, isWp);
+                login.disabled = !!site.isLoggingIn;
+                login.querySelector('.btn-label').textContent = site.isLoggingIn ? 'opening…' : 'log in to admin';
+                show($id('tileDb'), isWp);
+                show($id('siteNetwork'), !!site.multisite);
+                if (site.multisite) {
+                    // A deep link renders before the sites list lands; fetch
+                    // the network once the site is known.
+                    if (p.net.loadedFor !== site.name && !p.net.loading) this.loadSiteNetwork();
+                    const n = p.net.loadedFor === site.name ? p.net.items.length : 0;
+                    $id('siteNetworkMeta').textContent = site.multisite + (n ? ' · ' + n + ' site' + (n === 1 ? '' : 's') : '');
+                    this.renderSiteNetwork();
+                }
+                const domains = (site.mappings || []).length + (site.multisite === 'subdomain' ? 1 : 0);
+                $id('spDomainsMeta').textContent = domains ? String(domains) : '';
+                show($id('spPhp'), isWp && (!this.phpInfo || this.phpInfo.supported !== false));
+                $id('spPhpMeta').textContent = effPhp ? effPhp : '';
+                $id('spReveal').querySelector('.pill-label').textContent = this.revealLabel.toLowerCase();
+                $id('spPin').querySelector('.pill-label').textContent = this.isPinned(site.name) ? 'unpin' : 'pin to top';
+            },
+
+            renderSiteNetwork() {
+                const p = this.sitePage;
+                const list = $id('siteNetList');
+                list.querySelectorAll('.net-row').forEach(n => n.remove());
+                const loaded = p.net.loadedFor === p.name;
+                show($id('siteNetLoading'), p.net.loading && !loaded);
+                show($id('siteNetError'), !p.net.loading && !!p.net.error);
+                if (p.net.error) $id('siteNetErrorText').textContent = p.net.error;
+                $id('btnSiteNetworkRefresh').disabled = p.net.loading;
+                if (!loaded) return;
+                const tpl = $id('tpl-net-row');
+                const anchor = $id('siteNetLoading');
+                const frag = document.createDocumentFragment();
+                for (const s of p.net.items) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.url = s.url;
+                    row.classList.toggle('is-off', s.status !== 'public' && s.status !== 'private');
+                    const name = row.querySelector('.net-name');
+                    name.textContent = s.name || s.url;
+                    if (s.main) { const c = document.createElement('span'); c.className = 'net-main-chip'; c.textContent = 'main'; name.appendChild(c); }
+                    if (s.status !== 'public') { const c = document.createElement('span'); c.className = 'net-main-chip net-status'; c.textContent = s.status; name.appendChild(c); }
+                    const url = row.querySelector('.net-url');
+                    url.textContent = s.url.replace(/^https?:\/\//, '');
+                    url.href = s.url;
+                    const upd = row.querySelector('.net-updated');
+                    const ts = s.updated ? Date.parse(s.updated.replace(' ', 'T') + 'Z') / 1000 : 0;
+                    upd.textContent = ts ? this.formatRelative(ts) : '';
+                    upd.title = ts ? 'Last updated ' + new Date(ts * 1000).toLocaleString() : 'Never updated';
+                    row.querySelector('.net-open').href = s.url;
+                    const btn = row.querySelector('.net-login');
+                    btn.disabled = !!p.busy;
+                    btn.textContent = p.busy === s.url ? 'opening…' : 'log in';
+                    btn.title = 'One-time admin login to ' + s.url;
+                    frag.appendChild(row);
+                }
+                list.insertBefore(frag, anchor);
+                if (!p.net.items.length) { const li = document.createElement('li'); li.className = 'empty net-row'; li.textContent = 'No sites on this network.'; list.insertBefore(li, anchor); }
+            },
+
+            async loadSiteNetwork(force) {
+                const p = this.sitePage;
+                const name = p.name;
+                const site = this.pageSite;
+                if (!name || !site || !site.multisite) return;
+                if (p.net.loadedFor === name && !force) return;
+                if (p.net.loadedFor !== name) { p.net.items = []; p.net.loadedFor = null; }
+                p.net.loading = true; p.net.error = null;
+                this.renderSiteNetwork();
+                const res = await this.apiPost('network_sites', { site_name: name }, { quiet: true, timeoutMs: 60000 });
+                if (this.sitePage.name !== name) return;
+                p.net.loading = false;
+                if (!res.success) p.net.error = res.message || 'Could not read the network.';
+                else { p.net.items = res.sites || []; p.net.loadedFor = name; }
+                this.renderSitePage();
+            },
+
+            async loginToSubsite(url) {
+                const p = this.sitePage;
+                const name = p.name;
+                if (!name || p.busy) return;
+                p.busy = url;
+                this.renderSiteNetwork();
+                const res = await this.apiPost('get_login_link', { site_name: name, url });
+                if (res.success && res.url) {
+                    window.open(res.url, '_blank');
+                    this.showSnack('Login link opened in a new tab.');
+                }
+                p.busy = null;
+                if (this.sitePage.name === name) this.renderSiteNetwork();
+            },
+
+            bindSiteEvents() {
+                $id('btnSiteBack').addEventListener('click', () => this.setView('sites'));
+                $id('btnSiteLogin').addEventListener('click', () => { const s = this.pageSite; if (s) this.getLoginLink(s.name); });
+                $id('siteFacts').addEventListener('click', (e) => {
+                    const path = e.target.closest('.fact-path');
+                    if (path) { this.copyPath(path.dataset.path); return; }
+                    const type = e.target.closest('.fact-type');
+                    if (type) { this.setTypeFilter(type.dataset.type); this.setView('sites'); }
+                });
+                $id('siteTiles').addEventListener('click', (e) => {
+                    const t = e.target.closest('.site-tile');
+                    const s = this.pageSite;
+                    if (!t || !s) return;
+                    if (t.dataset.go === 'files') this.openFilesForSite(s.name);
+                    if (t.dataset.go === 'db') this.openDbForSite(s);
+                    if (t.dataset.go === 'mail') this.openMailForSite(s.name);
+                    if (t.dataset.go === 'logs') this.openLogsForSite(s.name);
+                });
+                $id('btnSiteNetworkRefresh').addEventListener('click', () => this.loadSiteNetwork(true));
+                $id('siteNetList').addEventListener('click', (e) => {
+                    const row = e.target.closest('.net-row');
+                    if (!row || !row.dataset.url) return;
+                    if (e.target.closest('.net-login')) { this.loginToSubsite(row.dataset.url); return; }
+                    if (e.target.closest('a')) return;
+                    // The row itself opens the subsite, like the ↗ on a sites row.
+                    if (window.getSelection && window.getSelection().toString()) return;
+                    window.open(row.dataset.url, '_blank', 'noopener');
+                });
+                const withSite = (fn) => () => { const s = this.pageSite; if (s) fn(s); };
+                $id('spDomains').addEventListener('click', withSite(s => this.openDomainsModal(s)));
+                $id('spPhp').addEventListener('click', withSite(s => this.openPhpModal(s)));
+                $id('spRename').addEventListener('click', withSite(s => this.promptRename(s)));
+                $id('spReveal').addEventListener('click', withSite(s => this.revealSite(s.name)));
+                $id('spCopy').addEventListener('click', withSite(s => this.copyPath(s.full_path)));
+                $id('spPin').addEventListener('click', withSite(s => { this.togglePin(s.name); this.renderSitePage(); }));
+                $id('spDelete').addEventListener('click', withSite(s => this.openSiteDeleteConfirm(s.name)));
+            },
+
             // --- Syntax highlighting ---------------------------------------
             // A small tokenizer of Cove's own — no library, nothing fetched.
             // Each language is a list of [class, pattern] pairs compiled into
@@ -8851,6 +9187,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const f = this.files;
                 f.dirty = false;
                 if (f.site === name) this.setFilesSite(null);
+                if (this.view === 'site' && this.sitePage.name === name) this.setView('sites');
                 this.deleteSite(name);
             },
 
@@ -10476,6 +10813,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (!site) return;
                 site.isLoggingIn = true;
                 this.renderList();
+                this.renderSitePage();
                 const res = await this.apiPost('get_login_link', { site_name: name });
                 if (res.success && res.url) {
                     window.open(res.url, '_blank');
@@ -10483,6 +10821,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 }
                 site.isLoggingIn = false;
                 this.renderList();
+                this.renderSitePage();
             },
 
             async copyPath(path) {
@@ -10562,6 +10901,7 @@ show_general_help() {
     echo "  core             Report or update the WordPress version of your sites."
     echo "  delete           Deletes a site's directory and associated database."
     echo "  login            Generates a one-time login link for a WordPress site."
+    echo "  network          Lists the sites on a multisite network."
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
     echo "  pull             Pulls a remote WordPress site into Cove via SSH."
@@ -10861,7 +11201,7 @@ display_command_help() {
             echo "Usage: cove db fix-collation <site> | --all [--dry-run]"
             ;;
         login)
-            echo "Usage: cove login <site> [<user>]"
+            echo "Usage: cove login <site> [<user>] [--url=<subsite-url>]"
             echo ""
             echo "Generates a one-time login link for a WordPress site."
             echo "If no user is specified, it defaults to the first available administrator."
@@ -10869,6 +11209,14 @@ display_command_help() {
             echo "Arguments:"
             echo "  <site>         The name of the WordPress site."
             echo "  <user>         (Optional) The user ID, email, or login of the admin to use."
+            echo "  --url=<url>    (Optional) On a multisite network, the subsite to log in to,"
+            echo "                 e.g. --url=https://mysite.localhost/store/ — see 'cove network'."
+            ;;
+        network)
+            echo "Usage: cove network <site> [--format=json]"
+            echo ""
+            echo "Lists the sites on a multisite network: name, URL, and ID."
+            echo "Pair with 'cove login <site> --url=<subsite-url>' to log in to one."
             ;;
         mappings)
             echo "Usage: cove mappings <site> [add|remove] [domain]"
@@ -11189,6 +11537,10 @@ main() {
         login)
             check_dependencies
             cove_login "$@"
+            ;;
+        network)
+            check_dependencies
+            cove_network "$@"
             ;;
         enable)
             check_dependencies

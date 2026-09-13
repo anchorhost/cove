@@ -1,0 +1,88 @@
+cove_network() {
+    local site_name=""
+    local format="table"
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --format=*) format="${arg#*=}" ;;
+            --json)     format="json" ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                echo "Usage: cove network <site> [--format=json]"
+                exit 1
+                ;;
+            *) site_name="$arg" ;;
+        esac
+    done
+
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove network <site> [--format=json]"
+        exit 1
+    fi
+
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    local public_dir="$site_dir/public"
+    if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
+        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    local wp_cmd
+    wp_cmd=$(get_wp_cmd "$site_dir")
+
+    # One round trip for the whole network: get_sites() plus each site's
+    # name, which `wp site list` does not carry. Sites that WordPress has
+    # marked archived, spam or deleted are reported with a status so the
+    # dashboard can dim them rather than hide them.
+    local json
+    json=$( (cd "$public_dir" && $wp_cmd eval '
+        if ( ! is_multisite() ) { echo "[]"; return; }
+        $out = [];
+        foreach ( get_sites( [ "number" => 500, "orderby" => "id" ] ) as $s ) {
+            switch_to_blog( $s->blog_id );
+            $status = $s->deleted ? "deleted" : ( $s->archived ? "archived" : ( $s->spam ? "spam" : ( $s->public ? "public" : "private" ) ) );
+            $out[] = [
+                "id"      => (int) $s->blog_id,
+                "url"     => home_url( "/" ),
+                "name"    => get_bloginfo( "name" ),
+                "updated" => $s->last_updated === "0000-00-00 00:00:00" ? null : $s->last_updated,
+                "status"  => $status,
+                "main"    => (int) $s->blog_id === (int) get_main_site_id(),
+            ];
+            restore_current_blog();
+        }
+        echo json_encode( $out );
+    ' --skip-plugins --skip-themes 2>/dev/null) )
+
+    if [ -z "$json" ]; then
+        if [ "$format" == "json" ]; then echo '{"error":"Could not read the network."}'; else gum style --foreground red "❌ Error: Could not read the network for '$site_name.localhost'."; fi
+        exit 1
+    fi
+
+    if [ "$format" == "json" ]; then
+        echo "$json"
+        return
+    fi
+
+    if [ "$json" == "[]" ]; then
+        echo "ℹ️  '$site_name.localhost' is not a multisite network."
+        return
+    fi
+
+    echo "$json" | frankenphp php-cli -r '
+        $sites = json_decode( stream_get_contents( STDIN ), true ) ?: [];
+        $w = [ 4, 4, 3 ];
+        foreach ( $sites as $s ) { $w[0] = max( $w[0], strlen( $s["name"] ) ); $w[1] = max( $w[1], strlen( $s["url"] ) ); }
+        printf( "  %-" . $w[0] . "s  %-" . $w[1] . "s  %s\n", "NAME", "URL", "ID" );
+        foreach ( $sites as $s ) {
+            $flag = $s["status"] === "public" ? "" : " (" . $s["status"] . ")";
+            printf( "  %-" . $w[0] . "s  %-" . $w[1] . "s  %d%s\n", $s["name"], $s["url"], $s["id"], $flag );
+        }
+    ' 2>/dev/null || echo "$json"
+}

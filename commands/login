@@ -1,11 +1,26 @@
 cove_login() {
-    local site_name="$1"
-    local user_identifier="$2" # Optional second argument for the user
+    local site_name=""
+    local user_identifier="" # Optional: the user to log in as
+    local subsite_url=""     # Optional: a subsite of a multisite network
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --url=*) subsite_url="${arg#*=}" ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                echo "Usage: cove login <site> [<user>] [--url=<subsite-url>]"
+                exit 1
+                ;;
+            *)
+                if [ -z "$site_name" ]; then site_name="$arg"; elif [ -z "$user_identifier" ]; then user_identifier="$arg"; fi
+                ;;
+        esac
+    done
 
     # 1. Validate that a site name was provided.
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove login <site> [<user>]"
+        echo "Usage: cove login <site> [<user>] [--url=<subsite-url>]"
         exit 1
     fi
 
@@ -31,18 +46,41 @@ cove_login() {
         exit 1
     fi
 
+    # --url picks a subsite of a multisite network: wp-cli then runs in that
+    # site's context, so the minted link lands on ITS wp-login.php and its
+    # admin list is consulted. The URL must be one the network actually
+    # serves, so a typo cannot quietly mint a link for the main site.
+    local url_flag=()
+    local label="$site_name.localhost"
+    if [ -n "$subsite_url" ]; then
+        local wanted="${subsite_url%/}/"
+        local known
+        known=$( (cd "$public_dir" && $wp_cmd site list --field=url --skip-plugins --skip-themes 2>/dev/null) )
+        if [ -z "$known" ]; then
+            gum style --foreground red "❌ Error: '$site_name.localhost' is not a multisite network, so --url does not apply."
+            exit 1
+        fi
+        if ! printf '%s\n' "$known" | grep -Fxq "$wanted"; then
+            gum style --foreground red "❌ Error: '$subsite_url' is not a site on the '$site_name.localhost' network." "Run 'cove network $site_name' to list its sites."
+            exit 1
+        fi
+        url_flag=(--url="$wanted")
+        label="$wanted"
+    fi
+
     local admin_to_login
     if [ -n "$user_identifier" ]; then
-        echo "🔎 Verifying user '$user_identifier' for '$site_name.localhost'..."
+        echo "🔎 Verifying user '$user_identifier' for '$label'..."
         local user_roles
-        user_roles=$( (cd "$public_dir" && $wp_cmd user get "$user_identifier" --field=roles --format=json --skip-plugins --skip-themes 2>/dev/null) )
+        user_roles=$( (cd "$public_dir" && $wp_cmd user get "$user_identifier" --field=roles --format=json "${url_flag[@]}" --skip-plugins --skip-themes 2>/dev/null) )
 
         if [ -z "$user_roles" ]; then
             gum style --foreground red "❌ Error: User '$user_identifier' not found on this site."
             exit 1
         fi
 
-        if ! echo "$user_roles" | grep -q "administrator"; then
+        # On a network a super admin may hold no role on the subsite itself.
+        if ! echo "$user_roles" | grep -q "administrator" && ! (cd "$public_dir" && $wp_cmd super-admin list --skip-plugins --skip-themes 2>/dev/null | grep -Fxq "$user_identifier"); then
             gum style --foreground red "❌ Error: User '$user_identifier' is not an administrator."
             exit 1
         fi
@@ -50,8 +88,13 @@ cove_login() {
         admin_to_login="$user_identifier"
         echo "✅ User '$admin_to_login' verified."
     else
-        echo "🔎 Finding an administrator for '$site_name.localhost'..."
-        admin_to_login=$( (cd "$public_dir" && $wp_cmd user list --role=administrator --field=user_login --format=csv --skip-plugins --skip-themes | head -n 1) )
+        echo "🔎 Finding an administrator for '$label'..."
+        admin_to_login=$( (cd "$public_dir" && $wp_cmd user list --role=administrator --field=user_login --format=csv "${url_flag[@]}" --skip-plugins --skip-themes | head -n 1) )
+        # A subsite with no administrator of its own still has the network's
+        # super admins.
+        if [ -z "$admin_to_login" ] && [ -n "$subsite_url" ]; then
+            admin_to_login=$( (cd "$public_dir" && $wp_cmd super-admin list --skip-plugins --skip-themes 2>/dev/null | head -n 1) )
+        fi
 
         if [ -z "$admin_to_login" ]; then
             gum style --foreground red "❌ Error: Could not find any administrator users for this site."
@@ -69,7 +112,7 @@ cove_login() {
     # 4. Generate the login URL.
     echo "   Generating login link..."
     local login_url
-    login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" --skip-plugins --skip-themes) )
+    login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" "${url_flag[@]}" --skip-plugins --skip-themes) )
 
     # 5. Display the final URL or an error message.
     if [ -n "$login_url" ]; then
