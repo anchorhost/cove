@@ -9532,7 +9532,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         const armR = t.arm === 'restore:' + it.id, armD = t.arm === 'delete:' + it.id;
                         li.dataset.id = it.id;
                         li.classList.toggle('is-auto', !!it.auto);
-                        const when = it.created ? this.formatRelative(it.created) + ' ago' : '';
+                        const rel = it.created ? this.formatRelative(it.created) : '';
+                        const when = rel === 'now' ? 'just now' : (rel ? rel + ' ago' : '');
                         li.innerHTML = '<div class="st-main"><span class="st-title" title="' + esc(it.created ? new Date(it.created * 1000).toLocaleString() : '') + '">' + esc(it.id) + (it.auto ? ' <span class="st-chip st-none">auto</span>' : '') + '</span><span class="st-sub">' + esc(it.note || (it.auto ? '' : 'no note')) + (it.wp ? ' · wp ' + esc(it.wp) : '') + '</span></div>'
                             + '<span class="st-ver">' + esc(when) + '</span>'
                             + '<span class="st-ver" title="Files' + (it.has_db ? ' + database' : '') + '">' + this.formatSize(it.files_bytes) + (it.has_db ? ' + ' + this.formatSize(it.db_bytes) + ' db' : '') + '</span>'
