@@ -2909,6 +2909,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         echo json_encode($sites_info);
         exit;
     }
+    if ($action === 'file_raw') {
+        // Streams one file out of a site directory, for the Files view's
+        // image previews and downloads. Images are served inline; anything
+        // else is an attachment. Every response is sandboxed by CSP so an
+        // HTML or SVG file served from here runs in an opaque origin, never
+        // as the dashboard itself (whose POST API trusts a same-origin
+        // Referer), and nosniff keeps the browser from second-guessing the
+        // type.
+        $site = (string) ($_GET['site'] ?? '');
+        $rel = str_replace('\\', '/', trim((string) ($_GET['path'] ?? ''), '/'));
+        $bad = $site === '' || !preg_match('/^[a-zA-Z0-9-]+$/', $site) || $rel === '';
+        if (!$bad) {
+            foreach (explode('/', $rel) as $seg) {
+                if ($seg === '' || $seg === '.' || $seg === '..' || strpos($seg, "\0") !== false) { $bad = true; break; }
+            }
+        }
+        $abs = $bad ? '' : $sitedir . '/' . $site . '.localhost/' . $rel;
+        if ($bad || !is_file($abs) || !is_readable($abs)) {
+            http_response_code(404);
+            echo json_encode(['success' => false, 'message' => 'Not found.']);
+            exit;
+        }
+        $images = ['png' => 'image/png', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp', 'avif' => 'image/avif', 'bmp' => 'image/bmp', 'ico' => 'image/x-icon', 'svg' => 'image/svg+xml'];
+        $ext = strtolower(pathinfo($abs, PATHINFO_EXTENSION));
+        $inline = isset($images[$ext]) && empty($_GET['dl']);
+        $name = rawurlencode(basename($abs));
+        header('Content-Type: ' . ($inline ? $images[$ext] : 'application/octet-stream'));
+        header('Content-Length: ' . filesize($abs));
+        header('X-Content-Type-Options: nosniff');
+        header('Content-Security-Policy: sandbox');
+        header('Cache-Control: no-store');
+        header('Content-Disposition: ' . ($inline ? 'inline' : 'attachment') . '; filename="' . $name . '"; filename*=UTF-8\'\'' . $name);
+        readfile($abs);
+        exit;
+    }
     if ($action === 'wp_versions') {
         echo json_encode(cove_wp_versions($__cove_wpver_cache));
         exit;
@@ -2955,7 +2990,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
-    $input = json_decode(file_get_contents('php://input'), true);
+    // Uploads from the Files view arrive as multipart/form-data (the files
+    // ride in $_FILES); everything else is a JSON body.
+    $input = (!empty($_FILES) || stripos((string) ($_SERVER['CONTENT_TYPE'] ?? ''), 'multipart/form-data') === 0)
+        ? $_POST
+        : json_decode(file_get_contents('php://input'), true);
     $action = $input['action'] ?? '';
     $response = ['success' => false, 'message' => 'Invalid request.'];
     $command = '';
@@ -3680,6 +3719,238 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (count($collected) > $limit) $collected = array_slice($collected, -$limit);
             echo json_encode(['success' => true, 'entries' => $collected, 'size' => $size, 'next_before' => $end > 0 ? $end : null, 'scanned' => $scanned, 'path' => $__log_path, 'kind' => $__log_kind]);
             exit;
+        case 'file_list':
+        case 'file_read':
+        case 'file_write':
+        case 'file_mkdir':
+        case 'file_create':
+        case 'file_rename':
+        case 'file_delete':
+        case 'file_upload':
+        case 'file_reveal':
+            // --- Files view ------------------------------------------------
+            // A file manager over ~/Cove/Sites/<site>.localhost. Every path
+            // the browser sends is relative to that directory and is checked
+            // segment by segment (no '.', '..', empty or NUL parts) before it
+            // is joined onto the site root, so the API cannot name anything
+            // outside a site. Symlinks are followed on purpose — a plugin
+            // under development is often symlinked into wp-content — but a
+            // delete never recurses through one; it removes the link itself.
+            $__f_fail = function ($msg) { echo json_encode(['success' => false, 'message' => $msg]); exit; };
+            $__f_site = (string) ($input['site'] ?? '');
+            if ($__f_site === '' || !preg_match('/^[a-zA-Z0-9-]+$/', $__f_site)) $__f_fail('Invalid site name.');
+            $__f_root = $sitedir . '/' . $__f_site . '.localhost';
+            if (!is_dir($__f_root)) $__f_fail('Site directory not found.');
+            // Relative path -> normalised relative path, or null when a
+            // segment is unacceptable. '' is the site root.
+            $__f_try = function ($rel) {
+                $rel = trim(str_replace('\\', '/', (string) $rel), '/');
+                if ($rel === '') return '';
+                $parts = [];
+                foreach (explode('/', $rel) as $seg) {
+                    if ($seg === '' || $seg === '.' || $seg === '..' || strpos($seg, "\0") !== false || strlen($seg) > 255) return null;
+                    $parts[] = $seg;
+                }
+                return implode('/', $parts);
+            };
+            $__f_clean = function ($rel) use ($__f_try, $__f_fail) {
+                $out = $__f_try($rel);
+                if ($out === null) $__f_fail('Invalid path.');
+                return $out;
+            };
+            $__f_rel = $__f_clean($input['path'] ?? '');
+            $__f_abs = $__f_rel === '' ? $__f_root : $__f_root . '/' . $__f_rel;
+            $__f_stat = function ($abs, $name) {
+                $link = is_link($abs);
+                $target = $link ? @readlink($abs) : null;
+                $exists = $link ? file_exists($abs) : true;
+                $isdir = $exists && is_dir($abs); // through the link
+                return [
+                    'name' => $name,
+                    'type' => $isdir ? 'dir' : 'file',
+                    'link' => $link ? ($target !== false && $target !== null ? $target : true) : false,
+                    'broken' => $link && !$exists,
+                    'size' => (!$isdir && $exists) ? (@filesize($abs) ?: 0) : null,
+                    'mtime' => $exists ? (@filemtime($abs) ?: null) : null,
+                    'writable' => $exists && is_writable($abs),
+                ];
+            };
+            // Text = no NUL byte in the first 8 KB and valid UTF-8 there
+            // (allowing for a multibyte character cut at the chunk edge).
+            $__f_is_text = function ($abs) {
+                $fh = @fopen($abs, 'rb');
+                if (!$fh) return false;
+                $head = fread($fh, 8192);
+                fclose($fh);
+                if ($head === '' || $head === false) return true;
+                if (strpos($head, "\0") !== false) return false;
+                for ($i = 0; $i < 4; $i++) {
+                    if (preg_match('//u', $head)) return true;
+                    $head = substr($head, 0, -1);
+                }
+                return false;
+            };
+            $__f_image = ['png' => 'image/png', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp', 'avif' => 'image/avif', 'bmp' => 'image/bmp', 'ico' => 'image/x-icon'];
+
+            if ($action === 'file_list') {
+                if (!file_exists($__f_abs)) $__f_fail('Not found.');
+                if (!is_dir($__f_abs)) {
+                    echo json_encode(['success' => true, 'kind' => 'file', 'path' => $__f_rel, 'entry' => $__f_stat($__f_abs, basename($__f_abs))]);
+                    exit;
+                }
+                $items = @scandir($__f_abs);
+                if ($items === false) $__f_fail('Could not read that directory.');
+                $entries = [];
+                foreach ($items as $name) {
+                    if ($name === '.' || $name === '..') continue;
+                    $entries[] = $__f_stat($__f_abs . '/' . $name, $name);
+                }
+                echo json_encode(['success' => true, 'kind' => 'dir', 'path' => $__f_rel, 'root' => $__f_root, 'entries' => $entries, 'writable' => is_writable($__f_abs)]);
+                exit;
+            }
+
+            if ($action === 'file_read') {
+                if (!is_file($__f_abs)) $__f_fail('Not a file.');
+                if (!is_readable($__f_abs)) $__f_fail('That file is not readable.');
+                clearstatcache(true, $__f_abs);
+                $size = filesize($__f_abs);
+                $ext = strtolower(pathinfo($__f_abs, PATHINFO_EXTENSION));
+                $out = ['success' => true, 'path' => $__f_rel, 'size' => $size, 'mtime' => filemtime($__f_abs), 'writable' => is_writable($__f_abs)];
+                if (isset($__f_image[$ext])) {
+                    $out['kind'] = 'image';
+                    $out['mime'] = $__f_image[$ext];
+                    $dim = @getimagesize($__f_abs);
+                    if ($dim) { $out['width'] = $dim[0]; $out['height'] = $dim[1]; }
+                } elseif ($size > 2 * 1048576) {
+                    $out['kind'] = 'large';
+                } elseif (!$__f_is_text($__f_abs)) {
+                    $out['kind'] = 'binary';
+                } else {
+                    $text = file_get_contents($__f_abs);
+                    if ($text === false) $__f_fail('Could not read that file.');
+                    $out['kind'] = 'text';
+                    // JSON needs valid UTF-8. A Latin-1 file still opens, with
+                    // its stray bytes replaced — and is marked so the editor
+                    // will not write the replacement back over the original.
+                    if (!preg_match('//u', $text)) {
+                        $text = function_exists('mb_convert_encoding') ? mb_convert_encoding($text, 'UTF-8', 'UTF-8') : preg_replace('/[\x80-\xFF]+/', '?', $text);
+                        $out['lossy'] = true;
+                    }
+                    $out['content'] = $text;
+                }
+                echo json_encode($out);
+                exit;
+            }
+
+            if ($action === 'file_write') {
+                if ($__f_rel === '') $__f_fail('Invalid path.');
+                if (file_exists($__f_abs) && !is_file($__f_abs)) $__f_fail('Not a file.');
+                $content = (string) ($input['content'] ?? '');
+                // Save only over the version the editor loaded, unless told
+                // to overwrite — an outside editor may have touched it since.
+                clearstatcache(true, $__f_abs);
+                $expect = isset($input['mtime']) && $input['mtime'] !== null ? (int) $input['mtime'] : null;
+                if ($expect !== null && is_file($__f_abs) && filemtime($__f_abs) !== $expect && empty($input['force'])) {
+                    echo json_encode(['success' => false, 'conflict' => true, 'mtime' => filemtime($__f_abs), 'message' => 'This file changed on disk since it was opened.']);
+                    exit;
+                }
+                if (@file_put_contents($__f_abs, $content, LOCK_EX) === false) $__f_fail('Could not write that file.');
+                clearstatcache(true, $__f_abs);
+                echo json_encode(['success' => true, 'size' => filesize($__f_abs), 'mtime' => filemtime($__f_abs)]);
+                exit;
+            }
+
+            if ($action === 'file_mkdir' || $action === 'file_create') {
+                if (!is_dir($__f_abs)) $__f_fail('Not a directory.');
+                // The name may carry slashes ("wp-content/mu-plugins/x.php"):
+                // missing parents are created on the way.
+                $name = $__f_clean($input['name'] ?? '');
+                if ($name === '') $__f_fail('Invalid name.');
+                $target = $__f_abs . '/' . $name;
+                if (file_exists($target) || is_link($target)) $__f_fail('Something with that name already exists.');
+                $parent = dirname($target);
+                if (!is_dir($parent) && !@mkdir($parent, 0755, true)) $__f_fail('Could not create the parent folders.');
+                $ok = $action === 'file_mkdir' ? @mkdir($target, 0755) : (@file_put_contents($target, '') !== false);
+                if (!$ok) $__f_fail('Could not create that.');
+                echo json_encode(['success' => true, 'path' => ($__f_rel === '' ? '' : $__f_rel . '/') . $name]);
+                exit;
+            }
+
+            if ($action === 'file_rename') {
+                if ($__f_rel === '' || (!file_exists($__f_abs) && !is_link($__f_abs))) $__f_fail('Not found.');
+                // `to` is the new path relative to the site root, so a name
+                // with slashes moves the entry as well as renaming it.
+                $to = $__f_clean($input['to'] ?? '');
+                if ($to === '') $__f_fail('Invalid name.');
+                if ($to === $__f_rel) { echo json_encode(['success' => true, 'path' => $to]); exit; }
+                $dest = $__f_root . '/' . $to;
+                if (file_exists($dest) || is_link($dest)) $__f_fail('Something with that name already exists.');
+                if (strpos($to . '/', $__f_rel . '/') === 0) $__f_fail('A folder cannot be moved into itself.');
+                $parent = dirname($dest);
+                if (!is_dir($parent) && !@mkdir($parent, 0755, true)) $__f_fail('Could not create the parent folders.');
+                if (!@rename($__f_abs, $dest)) $__f_fail('Could not rename that.');
+                echo json_encode(['success' => true, 'path' => $to]);
+                exit;
+            }
+
+            if ($action === 'file_delete') {
+                if ($__f_rel === '') $__f_fail('The site itself is deleted from the sites list.');
+                if ($__f_rel === 'public') $__f_fail('public/ is the site — delete the site instead.');
+                if (!file_exists($__f_abs) && !is_link($__f_abs)) $__f_fail('Not found.');
+                $rm = function ($p) use (&$rm) {
+                    if (is_link($p) || !is_dir($p)) return @unlink($p);
+                    $items = @scandir($p);
+                    if ($items === false) return false;
+                    foreach ($items as $c) {
+                        if ($c === '.' || $c === '..') continue;
+                        if (!$rm($p . '/' . $c)) return false;
+                    }
+                    return @rmdir($p);
+                };
+                if (!$rm($__f_abs)) $__f_fail('Could not delete that — check its permissions.');
+                echo json_encode(['success' => true]);
+                exit;
+            }
+
+            if ($action === 'file_upload') {
+                if (!is_dir($__f_abs)) $__f_fail('Not a directory.');
+                if (empty($_FILES['files'])) {
+                    $len = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+                    $__f_fail($len > 0 && empty($_POST) ? 'The upload was larger than post_max_size (' . ini_get('post_max_size') . ').' : 'No files received.');
+                }
+                $f = $_FILES['files'];
+                $names = is_array($f['name']) ? $f['name'] : [$f['name']];
+                $tmps = is_array($f['tmp_name']) ? $f['tmp_name'] : [$f['tmp_name']];
+                $errs = is_array($f['error']) ? $f['error'] : [$f['error']];
+                // A dropped folder arrives as files plus their paths inside
+                // it, sent alongside so the tree is recreated here.
+                $paths = $_POST['paths'] ?? [];
+                if (!is_array($paths)) $paths = [];
+                $saved = 0; $replaced = 0; $failed = [];
+                foreach ($names as $i => $n) {
+                    $rel = $__f_try(isset($paths[$i]) && $paths[$i] !== '' ? $paths[$i] : $n);
+                    if ($rel === null || $rel === '' || ($errs[$i] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) { $failed[] = (string) $n; continue; }
+                    $dest = $__f_abs . '/' . $rel;
+                    $parent = dirname($dest);
+                    if (!is_dir($parent) && !@mkdir($parent, 0755, true)) { $failed[] = $rel; continue; }
+                    if (is_dir($dest)) { $failed[] = $rel; continue; }
+                    $existed = file_exists($dest);
+                    if (!@move_uploaded_file($tmps[$i], $dest)) { $failed[] = $rel; continue; }
+                    if ($existed) $replaced++; else $saved++;
+                }
+                echo json_encode(['success' => true, 'saved' => $saved, 'replaced' => $replaced, 'failed' => $failed]);
+                exit;
+            }
+
+            if ($action === 'file_reveal') {
+                if (!file_exists($__f_abs)) $__f_fail('Not found.');
+                if (PHP_OS_FAMILY === 'Darwin') $cmd = (is_dir($__f_abs) ? 'open ' : 'open -R ') . escapeshellarg($__f_abs);
+                else $cmd = 'xdg-open ' . escapeshellarg(is_dir($__f_abs) ? $__f_abs : dirname($__f_abs));
+                exec($cmd . ' > /dev/null 2>&1 &');
+                echo json_encode(['success' => true]);
+                exit;
+            }
+            $__f_fail('Unknown file action.');
         case 'reload_server':
             // This command is run in the background to prevent deadlocking the server.
             // Output is redirected to /dev/null and the '&' backgrounds the process.
@@ -4450,6 +4721,76 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             .log-levels { display: none; }
         }
 
+        /* Files. A file manager over each site's directory: sites on the
+           left, a breadcrumb bar and listing (or the open file) on the right. */
+        body.view-files .wrap { max-width: 1280px; }
+        .files-body { display: grid; grid-template-columns: minmax(220px, 260px) minmax(0, 1fr); height: calc(100vh - 262px); min-height: 460px; }
+        .files-side { overflow-y: auto; border-right: 1px solid var(--panel-border); display: flex; flex-direction: column; }
+        .files-side .db-list { border-right: 0; overflow: visible; flex: 1; }
+        .files-side .db-row { padding: 0.45rem 1rem 0.45rem 0.9rem; }
+        .files-side .db-row-name { font-size: 0.8rem; }
+        .files-main { min-width: 0; display: flex; flex-direction: column; overflow: hidden; position: relative; }
+        .files-bar { flex: none; flex-wrap: nowrap; }
+        .files-crumbs { flex: 1; min-width: 0; display: flex; align-items: center; gap: 0.1rem; font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-dim); overflow: hidden; white-space: nowrap; }
+        .files-crumb { background: transparent; border: 0; padding: 0.2rem 0.35rem; border-radius: var(--radius-sm); font: inherit; color: var(--text-dim); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 16rem; }
+        .files-crumb:hover { color: var(--text); background: var(--panel-hover); }
+        .files-crumb.is-current { color: var(--text); cursor: default; }
+        .files-crumb.is-current:hover { background: transparent; }
+        .files-crumb-sep { color: var(--text-faint); flex: none; }
+        .files-crumbs .files-crumb:first-child { flex: none; }
+        .files-dirty { font-family: var(--font-mono); font-size: 0.66rem; color: var(--pill-warn-fg, #d08c30); border: 1px solid currentColor; border-radius: var(--radius-pill); padding: 0.05rem 0.45rem; margin-left: 0.4rem; flex: none; }
+        .files-actions { flex: none; }
+        .files-actions .pill.armed, .files-row-del.armed { color: white; background: var(--danger); border-color: var(--danger); }
+
+        .file-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; min-height: 0; }
+        .file-list > .empty, .file-list > .loading { padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .file-head, .file-row { display: grid; grid-template-columns: 1.1rem minmax(0, 1fr) 5.5rem 4.2rem 3.6rem; column-gap: 0.7rem; align-items: center; padding: 0 1.25rem 0 1rem; }
+        .file-head { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--panel-border); font-family: var(--font-mono); font-size: 0.64rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); }
+        .file-head button { background: transparent; border: 0; padding: 0.45rem 0; font: inherit; color: inherit; text-align: left; cursor: pointer; letter-spacing: inherit; text-transform: inherit; }
+        .file-head button:hover, .file-head button.is-sorted { color: var(--text-dim); }
+        .file-head .file-size, .file-head .file-time { text-align: right; }
+        .file-row { padding-top: 0.42rem; padding-bottom: 0.42rem; border-bottom: 1px solid var(--panel-border); cursor: pointer; min-height: 2.1rem; }
+        .file-row:hover { background: var(--panel-hover); }
+        .file-row.is-selected { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--panel-border-strong); }
+        .file-row.is-hidden .file-name, .file-row.is-hidden .file-icon { opacity: 0.55; }
+        .file-row.is-broken .file-name { color: var(--danger); text-decoration: line-through; }
+        .file-icon { width: 15px; height: 15px; color: var(--text-faint); display: block; }
+        .file-row.is-dir .file-icon { color: var(--accent); }
+        .file-name { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; display: flex; align-items: center; gap: 0.5rem; }
+        .file-row.is-dir .file-name { font-weight: 500; }
+        .file-link { font-family: var(--font-mono); font-size: 0.64rem; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+        .file-link::before { content: '→ '; }
+        .file-size, .file-time { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); text-align: right; white-space: nowrap; }
+        .file-row-actions { display: flex; justify-content: flex-end; gap: 0.15rem; visibility: hidden; }
+        .file-row:hover .file-row-actions, .file-row.is-selected .file-row-actions, .file-row-actions:has(.armed) { visibility: visible; }
+        .file-row-btn { background: transparent; border: 1px solid transparent; color: var(--text-faint); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-sm); cursor: pointer; line-height: 1.2; }
+        .file-row-btn:hover { color: var(--text); background: var(--panel); border-color: var(--panel-border); }
+        .file-row-btn.armed { color: white; background: var(--danger); border-color: var(--danger); }
+        .file-row.is-editing { cursor: default; }
+        .file-name-input { width: 100%; background: var(--input-bg); border: 1px solid var(--accent); border-radius: var(--radius-sm); color: var(--text); font-family: var(--font-mono); font-size: 0.8rem; padding: 0.15rem 0.4rem; outline: 0; }
+        .file-list .file-row.is-up .file-name { color: var(--text-dim); }
+
+        .files-drop { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: color-mix(in oklch, var(--accent) 12%, var(--panel)); border: 2px dashed var(--accent); z-index: 5; font-family: var(--font-mono); font-size: 0.85rem; color: var(--text); pointer-events: none; }
+        .files-main.is-dragging .files-drop { display: flex; }
+
+        .files-editor { flex: 1; min-height: 0; display: none; flex-direction: column; }
+        .files-main.has-file .file-list, .files-main.has-file .file-head { display: none; }
+        .files-main.has-file .files-editor { display: flex; }
+        .files-editor textarea { flex: 1; min-height: 0; width: 100%; box-sizing: border-box; background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.55; padding: 0.9rem 1.25rem; resize: none; outline: 0; white-space: pre; overflow: auto; tab-size: 4; }
+        .files-editor textarea:disabled { color: var(--text-dim); }
+        .files-editor textarea.is-wrapped { white-space: pre-wrap; overflow-wrap: anywhere; }
+        .files-preview { flex: 1; min-height: 0; overflow: auto; display: flex; align-items: center; justify-content: center; padding: 1.5rem; background: var(--bg-sunk); background-image: linear-gradient(45deg, var(--panel-border) 25%, transparent 25%, transparent 75%, var(--panel-border) 75%), linear-gradient(45deg, var(--panel-border) 25%, transparent 25%, transparent 75%, var(--panel-border) 75%); background-size: 16px 16px; background-position: 0 0, 8px 8px; }
+        .files-preview img { max-width: 100%; max-height: 100%; box-shadow: 0 2px 12px rgba(0,0,0,0.25); background: white; }
+        .files-note { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.4rem; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .files-note .empty-hint { color: var(--text-faint); }
+        .files-note .pill { margin-top: 0.6rem; }
+        @media (max-width: 860px) {
+            .files-body { grid-template-columns: 1fr; height: auto; min-height: 60vh; }
+            .files-side { border-right: 0; max-height: 36vh; }
+            .file-head, .file-row { grid-template-columns: 1.1rem minmax(0, 1fr) 5.5rem 3.6rem; }
+            .file-time { display: none; }
+        }
+
         /* Responsive */
         @media (max-width: 620px) {
             body { padding: 1.25rem 0.75rem 3rem; }
@@ -4478,6 +4819,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 <button type="button" class="nav-view" role="tab" data-view="mail" aria-selected="false">mail<span class="nav-badge" id="mailBadge" style="display: none;"></span></button>
                 <button type="button" class="nav-view" role="tab" data-view="db" aria-selected="false">databases</button>
                 <button type="button" class="nav-view" role="tab" data-view="logs" aria-selected="false">logs</button>
+                <button type="button" class="nav-view" role="tab" data-view="files" aria-selected="false">files</button>
             </div>
             <div class="nav-services services">
                 <button type="button" class="dot link" data-service="caddy" title="Caddy status">caddy</button>
@@ -5016,6 +5358,122 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </div>
             </footer>
         </section>
+
+        <section class="card files-card" id="filesCard" style="display: none;">
+            <header class="card-head">
+                <h1 class="card-title">Files</h1>
+                <div class="card-actions">
+                    <label class="mail-unread-toggle" title="Show dotfiles and dotfolders">
+                        <input type="checkbox" id="filesHidden" checked>
+                        hidden
+                    </label>
+                    <button type="button" class="pill" id="btnFilesNewFile" title="New file in this folder (a name with slashes creates the folders on the way)">+ file</button>
+                    <button type="button" class="pill" id="btnFilesNewFolder" title="New folder in this folder">+ folder</button>
+                    <button type="button" class="pill" id="btnFilesUpload" title="Upload files into this folder — or drop them onto the listing">upload</button>
+                    <button type="button" class="pill" id="btnFilesReveal" title="Show in the desktop file manager">reveal</button>
+                    <button type="button" class="pill" id="btnFilesRefresh" title="Reload the listing">refresh</button>
+                    <input type="file" id="filesUploadInput" multiple style="display: none;">
+                </div>
+            </header>
+
+            <div class="filter-row">
+                <span class="filter-chip" id="filesSiteChip" aria-label="Site" style="display: none;">
+                    <span id="filesSiteChipLabel"></span>
+                    <button type="button" class="filter-chip-x" id="filesSiteChipClear" aria-label="Choose another site" title="Choose another site">×</button>
+                </span>
+                <input
+                    class="filter-input"
+                    id="filesFilter"
+                    type="text"
+                    placeholder="filter this folder…"
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    aria-label="Filter this folder"
+                >
+                <span class="filter-kbd" id="filesKbd" aria-hidden="true">/</span>
+                <button class="filter-clear" id="btnFilesFilterClear" aria-label="Clear filter" title="Clear (Esc)" style="display: none;">×</button>
+            </div>
+
+            <div class="files-body" id="filesBody">
+                <div class="files-side" id="filesSide">
+                    <div class="logs-group logs-group-sites" style="border-top: 0;">
+                        <span>sites</span>
+                        <input type="text" class="logs-site-filter" id="filesSiteFilter" placeholder="filter…" spellcheck="false" autocomplete="off" aria-label="Filter sites">
+                    </div>
+                    <ul class="db-list" id="filesSites">
+                        <li class="loading" id="filesSitesLoading">Loading…</li>
+                        <li class="empty" id="filesSitesEmpty" style="display: none;">No sites match.</li>
+                    </ul>
+                </div>
+
+                <div class="files-main" id="filesMain">
+                    <div class="mail-msg-bar files-bar">
+                        <div class="files-crumbs" id="filesCrumbs"></div>
+                        <div class="mail-msg-actions files-actions" id="filesFileActions" style="display: none;">
+                            <button type="button" class="pill" id="btnFileWrap" title="Soft-wrap long lines">wrap</button>
+                            <a class="pill" id="btnFileDownload" href="#" download title="Download this file">download</a>
+                            <button type="button" class="pill mail-delete-all" id="btnFileDelete" title="Delete this file">delete</button>
+                            <button type="button" class="pill" id="btnFileRevert" title="Throw away the unsaved changes" style="display: none;">discard</button>
+                            <button type="button" class="pill primary" id="btnFileSave" title="Save (⌘S)">save</button>
+                        </div>
+                    </div>
+                    <div class="file-head" id="filesHead">
+                        <span></span>
+                        <button type="button" data-sort="name">name</button>
+                        <button type="button" data-sort="size" class="file-size">size</button>
+                        <button type="button" data-sort="mtime" class="file-time">modified</button>
+                        <span></span>
+                    </div>
+                    <ul class="file-list" id="filesList">
+                        <template id="tpl-file-row">
+                            <li class="file-row">
+                                <span class="file-icon"></span>
+                                <span class="file-name"><span class="file-name-text"></span><span class="file-link"></span></span>
+                                <span class="file-size"></span>
+                                <span class="file-time"></span>
+                                <span class="file-row-actions">
+                                    <button type="button" class="file-row-btn file-row-rename" title="Rename">✎</button>
+                                    <button type="button" class="file-row-btn file-row-del" title="Delete">×</button>
+                                </span>
+                            </li>
+                        </template>
+                        <li class="loading" id="filesLoading">Loading…</li>
+                        <li class="empty" id="filesError" style="display: none;"><div id="filesErrorText"></div></li>
+                        <li class="empty" id="filesEmpty" style="display: none;">
+                            <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path class="art-fill" d="M20 14 h22 l6 6 h36 v34 H20 Z"/>
+                                <path class="art-line" d="M20 14 h22 l6 6 h36 v34 H20 Z"/>
+                                <path class="art-line" d="M20 26 h64"/>
+                                <path class="art-wave" d="M8 60 Q 15 56, 22 60 T 36 60 T 50 60 T 64 60 T 78 60 T 92 60"/>
+                            </svg>
+                            <div id="filesEmptyText">Pick a site.</div>
+                            <div class="empty-hint" id="filesEmptyHint"></div>
+                        </li>
+                    </ul>
+                    <div class="files-editor" id="filesEditor">
+                        <textarea id="filesText" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" aria-label="File contents"></textarea>
+                        <div class="files-preview" id="filesPreview" style="display: none;"><img id="filesPreviewImg" alt=""></div>
+                        <div class="files-note" id="filesNote" style="display: none;">
+                            <div id="filesNoteText"></div>
+                            <div class="empty-hint" id="filesNoteHint"></div>
+                            <a class="pill" id="filesNoteDownload" href="#" download>download</a>
+                        </div>
+                    </div>
+                    <div class="files-drop" aria-hidden="true">drop to upload here</div>
+                </div>
+            </div>
+
+            <footer class="card-foot">
+                <div class="totals">
+                    <span id="filesCount"></span>
+                </div>
+                <div class="mail-pager">
+                    <span class="mail-bar-note" id="filesHint"></span>
+                </div>
+            </footer>
+        </section>
     </div>
 
     <div class="modal-backdrop" id="dbModal" style="display: none;">
@@ -5115,6 +5573,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <div class="ctx-sep"></div>
             <button class="ctx-item" id="ctxRename"><span>Rename…</span></button>
             <button class="ctx-item" id="ctxReveal"><span>Open folder</span></button>
+            <button class="ctx-item" id="ctxFiles"><span>Browse files</span></button>
             <button class="ctx-item" id="ctxDb"><span>Open database</span></button>
             <button class="ctx-item" id="ctxPhp"><span>PHP version…</span><span class="ctx-key" id="ctxPhpMeta"></span></button>
             <button class="ctx-item" id="ctxDomains"><span>Domains…</span><span class="ctx-key" id="ctxDomainsMeta"></span></button>
@@ -5254,6 +5713,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 loading: false, error: null, seq: 0, live: true, pollTimer: null,
                 expanded: {}, clearArm: false, armTimer: null, newIds: {},
             },
+            files: {
+                site: null, path: '', file: null, target: null,
+                entries: [], root: '', writable: true, loadedFor: null,
+                loading: false, error: null, seq: 0, fileSeq: 0,
+                filter: '', siteFilter: '', sort: 'name', dir: 'asc', hidden: true, wrap: false, selected: null, scrolledFor: null,
+                dirty: false, saving: false, conflict: false, renderedPath: null,
+                edit: null, delArm: null, armTimer: null, drag: 0, uploading: null,
+            },
 
             get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
             get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
@@ -5335,6 +5802,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.bindMailEvents();
                 this.bindDbEvents();
                 this.bindLogsEvents();
+                this.bindFilesEvents();
                 this.render();
 
                 // If the tab closes during an undo window, flush the staged
@@ -5373,6 +5841,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         // Palette owns its own keys via its input's listeners;
                         // catch Esc here too in case the input lost focus.
                         if (e.key === 'Escape') this.closePalette();
+                        return;
+                    }
+
+                    if (this.view === 'files') {
+                        this.filesKeydown(e, typing);
                         return;
                     }
 
@@ -5611,6 +6084,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('ctxPhp').addEventListener('click', withCtxSite(s => this.openPhpModal(s)));
                 $id('ctxLog').addEventListener('click', withCtxSite(s => this.openLogsForSite(s.name)));
                 $id('ctxMail').addEventListener('click', withCtxSite(s => this.openMailForSite(s.name)));
+                $id('ctxFiles').addEventListener('click', withCtxSite(s => this.openFilesForSite(s.name)));
 
                 // PHP version picker
                 $id('btnPhpClose').addEventListener('click', () => this.closePhpModal());
@@ -5704,6 +6178,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 // Site chips in the database list and overview come from the
                 // sites list, which usually lands after the first db render.
                 if (this.view === 'db') { this.renderDbList(); if (this.db.name && !this.db.table && !this.db.sql) this.renderDbOverview(); }
+                if (this.view === 'files') this.renderFilesSide();
                 if (this.palette.open) this.renderPalette();
             },
 
@@ -6140,7 +6615,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             setView(view, opts = {}) {
-                view = ['mail', 'db', 'logs'].includes(view) ? view : 'sites';
+                view = ['mail', 'db', 'logs', 'files'].includes(view) ? view : 'sites';
                 if (view === this.view && !opts.force) return;
                 const prev = this.view;
                 this.view = view;
@@ -6149,7 +6624,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 document.body.classList.toggle('view-mail', view === 'mail');
                 document.body.classList.toggle('view-db', view === 'db');
                 document.body.classList.toggle('view-logs', view === 'logs');
-                document.title = { mail: 'Cove — mail', db: 'Cove — databases', logs: 'Cove — logs', sites: 'Cove — sites' }[view];
+                document.body.classList.toggle('view-files', view === 'files');
+                document.title = { mail: 'Cove — mail', db: 'Cove — databases', logs: 'Cove — logs', files: 'Cove — files', sites: 'Cove — sites' }[view];
                 this.syncUrl();
                 this.render();
                 if (view === 'mail') {
@@ -6173,6 +6649,18 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 } else {
                     this.stopLogsPolling();
                 }
+                if (view === 'files') {
+                    // A URL names a path that may be a folder or a file; the
+                    // server settles it. Otherwise the listing is refreshed
+                    // on every visit, since it is cheap and files change
+                    // under the dashboard all the time.
+                    const f = this.files;
+                    this.renderFiles();
+                    if (f.site) {
+                        if (f.target !== null) { const t = f.target; f.target = null; this.filesNavigate(t, t === '' ? 'dir' : null); }
+                        else { this.loadFilesDir(); if (f.file && !f.dirty) this.loadFile(); }
+                    }
+                }
             },
 
             // The URL is a real path naming the view and what is open in
@@ -6183,6 +6671,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             get viewPath() {
                 if (this.view === 'mail') return '/mail' + (this.mail.site ? '/' + this.mail.site : '');
                 if (this.view === 'db') return '/db' + (this.db.name ? '/' + encodeURIComponent(this.db.name) + (this.db.table ? '/' + encodeURIComponent(this.db.table) : '') : '');
+                if (this.view === 'files') return '/files' + (this.files.site ? '/' + this.files.site + this.filesEncode(this.files.file ? this.files.file.path : this.files.path) : '');
                 if (this.view === 'logs') return '/logs' + (this.logs.site ? '/' + this.logs.site + (this.logs.tab ? '/' + this.logs.tab : '') : (this.logs.source !== 'errors' ? '/@' + this.logs.source : ''));
                 return '/';
             },
@@ -6198,7 +6687,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             readViewFromUrl() {
                 let p = location.pathname.replace(/\/+$/, '') || '/';
                 // Legacy #mail / #db / #logs links: same grammar, hash-prefixed.
-                if (p === '/' && /^#(mail|db|logs)(\/|$)/i.test(location.hash || '')) {
+                if (p === '/' && /^#(mail|db|logs|files)(\/|$)/i.test(location.hash || '')) {
                     p = '/' + location.hash.slice(1);
                     history.replaceState({ cove: true }, '', p + location.search);
                 }
@@ -6219,6 +6708,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : null; }
                     else { this.logs.site = null; this.logs.source = 'errors'; }
                     this.setView('logs', { force: true });
+                } else if ((m = /^\/files(?:\/([a-z0-9-]+)(?:\/(.+))?)?$/i.exec(p))) {
+                    const site = m[1] ? m[1].toLowerCase() : null;
+                    const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
+                    const target = m[2] ? m[2].split('/').map(dec).filter(s => s !== '' && s !== '.' && s !== '..').join('/') : '';
+                    if (site !== this.files.site) { this.files.entries = []; this.files.loadedFor = null; this.files.file = null; this.files.path = ''; }
+                    this.files.site = site;
+                    this.files.target = site ? target : null;
+                    this.setView('files', { force: true });
                 } else {
                     // Unknown path (or /): the sites list, and the address bar
                     // brought back to a real one.
@@ -6790,7 +7287,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // Keep the outgoing card on screen, out of flow, while it fades;
             // renderView leaves .is-leaving cards alone until the fade ends.
             crossfadeFrom(prev) {
-                const out = $id({ sites: 'sitesCard', mail: 'mailCard', db: 'dbCard', logs: 'logsCard' }[prev]);
+                const out = $id({ sites: 'sitesCard', mail: 'mailCard', db: 'dbCard', logs: 'logsCard', files: 'filesCard' }[prev]);
                 if (!out || out.style.display === 'none') return;
                 if (window.scrollY > 0) window.scrollTo({ top: 0, behavior: 'instant' });
                 document.querySelectorAll('.wrap > .card.is-leaving').forEach(el => { el.classList.remove('is-leaving'); el.style.top = ''; el.style.display = 'none'; });
@@ -6809,6 +7306,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 card('mailCard', this.view === 'mail');
                 card('dbCard', this.view === 'db');
                 card('logsCard', this.view === 'logs');
+                card('filesCard', this.view === 'files');
                 document.querySelectorAll('.nav-view').forEach(b => {
                     const on = b.dataset.view === this.view;
                     b.classList.toggle('is-active', on);
@@ -7984,6 +8482,812 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 document.addEventListener('visibilitychange', () => { if (!document.hidden && this.view === 'logs') this.pollLogs(); });
             },
 
+            // --- Files -----------------------------------------------------
+            // A file manager over each site's directory. `path` is the
+            // folder on screen, `file` the one open in the editor (its parent
+            // is `path`), both relative to ~/Cove/Sites/<site>.localhost.
+            // The URL names whichever is deeper: /files/<site>/<path>.
+            get filesVisible() {
+                const f = this.files;
+                const q = f.filter.trim().toLowerCase();
+                let rows = f.entries.filter(e => (f.hidden || e.name[0] !== '.') && (!q || e.name.toLowerCase().includes(q)));
+                const dir = f.dir === 'desc' ? -1 : 1;
+                const cmp = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+                rows.sort((a, b) => {
+                    if ((a.type === 'dir') !== (b.type === 'dir')) return a.type === 'dir' ? -1 : 1;
+                    let r = 0;
+                    if (f.sort === 'size') r = (a.size || 0) - (b.size || 0);
+                    else if (f.sort === 'mtime') r = (a.mtime || 0) - (b.mtime || 0);
+                    if (r) return r * dir;
+                    const n = cmp.compare(a.name, b.name);
+                    return f.sort === 'name' ? n * dir : n;
+                });
+                return rows;
+            },
+
+            get filesRoot() { return this.files.site ? this.files.site + '.localhost' : ''; },
+
+            filesJoin(dir, name) { return dir ? dir + '/' + name : name; },
+            filesParent(path) { const i = path.lastIndexOf('/'); return i === -1 ? '' : path.slice(0, i); },
+            filesBase(path) { const i = path.lastIndexOf('/'); return i === -1 ? path : path.slice(i + 1); },
+            filesEncode(path) { return path ? '/' + path.split('/').map(encodeURIComponent).join('/') : ''; },
+            filesRawUrl(path, dl) {
+                return '/api.php?action=file_raw&site=' + encodeURIComponent(this.files.site) + '&path=' + encodeURIComponent(path) + (dl ? '&dl=1' : '');
+            },
+
+            // From a site's row menu or the sidebar: that site's root.
+            openFilesForSite(name) {
+                const f = this.files;
+                if (!this.filesGuardDirty()) return;
+                f.site = name; f.path = ''; f.file = null; f.target = null; f.entries = []; f.selected = null; f.filter = '';
+                $id('filesFilter').value = '';
+                this.setView('files', { force: true });
+            },
+
+            setFilesSite(name) {
+                if (name === this.files.site) return;
+                if (!this.filesGuardDirty()) return;
+                const f = this.files;
+                f.site = name || null; f.path = ''; f.file = null; f.target = null; f.entries = []; f.selected = null; f.error = null; f.filter = '';
+                $id('filesFilter').value = '';
+                this.syncUrl();
+                this.renderFiles();
+                if (f.site) this.loadFilesDir();
+            },
+
+            // An unsaved edit blocks navigation rather than being dropped.
+            filesGuardDirty() {
+                if (!this.files.dirty) return true;
+                this.showSnack('Unsaved changes — save or discard them first.', true);
+                $id('filesText').focus();
+                return false;
+            },
+
+            // Open whatever `path` is. With a hint the round trip that asks is
+            // skipped; without one (a URL typed by hand) the server says.
+            async filesNavigate(path, hint) {
+                const f = this.files;
+                if (!f.site) return;
+                if (!this.filesGuardDirty()) return;
+                path = (path || '').replace(/^\/+|\/+$/g, '');
+                let kind = hint || null;
+                if (!kind) {
+                    const seq = ++f.seq;
+                    f.loading = true; f.error = null;
+                    this.renderFilesList();
+                    const res = await this.apiPost('file_list', { site: f.site, path }, { quiet: true, timeoutMs: 20000 });
+                    if (seq !== f.seq) return;
+                    if (!res.success) { f.loading = false; f.error = res.message || 'Not found.'; f.path = path; f.file = null; this.syncUrl({ replace: true }); this.renderFiles(); return; }
+                    if (res.kind === 'dir') { this.applyFilesDir(path, res); this.syncUrl({ replace: true }); this.renderFiles(); return; }
+                    kind = 'file';
+                }
+                if (kind === 'dir') {
+                    f.selected = null;
+                    f.path = path; f.file = null; f.filter = ''; $id('filesFilter').value = '';
+                    this.syncUrl();
+                    this.renderFiles();
+                    this.loadFilesDir();
+                    return;
+                }
+                const parent = this.filesParent(path);
+                const sameDir = parent === f.path && f.loadedFor === f.site + '\0' + parent;
+                f.path = parent;
+                f.file = { path, kind: null, loading: true };
+                f.selected = this.filesBase(path);
+                this.syncUrl();
+                this.renderFiles();
+                if (!sameDir) this.loadFilesDir();
+                this.loadFile();
+            },
+
+            filesUp() {
+                const f = this.files;
+                if (f.file) { this.closeFile(); return; }
+                if (!f.path) return;
+                const from = this.filesBase(f.path);
+                this.filesNavigate(this.filesParent(f.path), 'dir').then(() => { f.selected = from; this.renderFilesList(); });
+            },
+
+            closeFile() {
+                const f = this.files;
+                if (!f.file) return;
+                if (!this.filesGuardDirty()) return;
+                f.selected = this.filesBase(f.file.path);
+                f.file = null; f.conflict = false; f.renderedPath = null;
+                this.syncUrl();
+                this.renderFiles();
+                if (f.loadedFor !== f.site + '\0' + f.path) this.loadFilesDir();
+            },
+
+            applyFilesDir(path, res) {
+                const f = this.files;
+                f.loading = false; f.error = null;
+                f.path = path;
+                f.entries = res.entries || [];
+                f.root = res.root || '';
+                f.writable = res.writable !== false;
+                f.loadedFor = f.site + '\0' + path;
+                if (f.selected && !f.entries.some(e => e.name === f.selected)) f.selected = null;
+            },
+
+            async loadFilesDir() {
+                const f = this.files;
+                if (!f.site) return;
+                const seq = ++f.seq;
+                const path = f.path;
+                f.loading = true; f.error = null;
+                this.renderFilesList();
+                this.renderFilesFooter();
+                const res = await this.apiPost('file_list', { site: f.site, path }, { quiet: true, timeoutMs: 20000 });
+                if (seq !== f.seq) return;
+                f.loading = false;
+                if (!res.success) { f.error = res.message || 'Could not read that folder.'; f.entries = []; }
+                else if (res.kind !== 'dir') { f.error = 'Not a folder.'; f.entries = []; }
+                else this.applyFilesDir(path, res);
+                this.renderFilesList();
+                this.renderFilesBar();
+                this.renderFilesFooter();
+                this.renderFilesChrome();
+            },
+
+            async loadFile() {
+                const f = this.files;
+                if (!f.site || !f.file) return;
+                const path = f.file.path;
+                const seq = ++f.fileSeq;
+                f.dirty = false; f.conflict = false;
+                this.renderFilesEditor();
+                const res = await this.apiPost('file_read', { site: f.site, path }, { quiet: true, timeoutMs: 30000 });
+                if (seq !== f.fileSeq || !f.file || f.file.path !== path) return;
+                if (!res.success) { f.file = { path, kind: 'error', error: res.message || 'Could not read that file.', loading: false }; }
+                else f.file = Object.assign({ loading: false }, res);
+                f.renderedPath = null;
+                this.renderFilesEditor();
+                this.renderFilesBar();
+                this.renderFilesFooter();
+            },
+
+            async saveFile(force) {
+                const f = this.files;
+                const file = f.file;
+                if (!file || file.kind !== 'text' || f.saving) return;
+                if (!f.dirty && !f.conflict) return;
+                const content = $id('filesText').value;
+                f.saving = true;
+                this.renderFilesBar();
+                // After a conflict the button reads "overwrite?" and the next
+                // click sends force.
+                const res = await this.apiPost('file_write', { site: f.site, path: file.path, content, mtime: file.mtime, force: !!force || !!f.conflict }, { quiet: true, timeoutMs: 30000 });
+                f.saving = false;
+                if (!f.file || f.file.path !== file.path) return;
+                if (!res.success) {
+                    if (res.conflict) { f.conflict = true; f.dirty = true; this.showSnack('Changed on disk since it was opened — click again to overwrite.', true); }
+                    else this.showSnack(res.message || 'Could not save.', true);
+                    this.renderFilesBar(); this.renderFilesFooter();
+                    return;
+                }
+                file.content = content; file.size = res.size; file.mtime = res.mtime;
+                f.dirty = false; f.conflict = false;
+                this.showSnack('Saved ' + this.filesBase(file.path) + '.');
+                this.renderFilesBar(); this.renderFilesFooter();
+                // The listing behind the editor shows this file's size and time.
+                const e = f.entries.find(x => x.name === this.filesBase(file.path));
+                if (e) { e.size = res.size; e.mtime = res.mtime; }
+            },
+
+            revertFile() {
+                const f = this.files;
+                if (!f.file || f.file.kind !== 'text') return;
+                $id('filesText').value = f.file.content;
+                f.dirty = false; f.conflict = false;
+                this.renderFilesBar(); this.renderFilesFooter();
+                $id('filesText').focus();
+            },
+
+            // A phantom row at the top of the listing takes the new name.
+            startFilesCreate(type) {
+                const f = this.files;
+                if (!f.site || f.file) return;
+                f.edit = { mode: 'create', type, value: '' };
+                f.delArm = null;
+                this.renderFilesList();
+                const input = $id('filesList').querySelector('.file-name-input');
+                if (input) input.focus();
+            },
+
+            startFilesRename(name) {
+                const f = this.files;
+                f.edit = { mode: 'rename', name, value: name };
+                f.delArm = null;
+                this.renderFilesList();
+                const input = $id('filesList').querySelector('.file-name-input');
+                if (input) { input.focus(); const dot = name.lastIndexOf('.'); input.setSelectionRange(0, dot > 0 ? dot : name.length); }
+            },
+
+            cancelFilesEdit() {
+                if (!this.files.edit) return;
+                this.files.edit = null;
+                this.renderFilesList();
+            },
+
+            async commitFilesEdit() {
+                const f = this.files;
+                const ed = f.edit;
+                if (!ed) return;
+                const value = ed.value.trim().replace(/^\/+|\/+$/g, '');
+                if (!value) { this.cancelFilesEdit(); return; }
+                f.edit = null;
+                if (ed.mode === 'create') {
+                    const res = await this.apiPost(ed.type === 'dir' ? 'file_mkdir' : 'file_create', { site: f.site, path: f.path, name: value }, { timeoutMs: 20000 });
+                    if (!res.success) { this.renderFilesList(); return; }
+                    f.selected = value.split('/')[0];
+                    await this.loadFilesDir();
+                    if (ed.type === 'file') this.filesNavigate(res.path, 'file');
+                    return;
+                }
+                if (value === ed.name) { this.renderFilesList(); return; }
+                const res = await this.apiPost('file_rename', { site: f.site, path: this.filesJoin(f.path, ed.name), to: this.filesJoin(f.path, value) }, { timeoutMs: 20000 });
+                if (!res.success) { this.renderFilesList(); return; }
+                f.selected = value.includes('/') ? null : value;
+                this.showSnack('Renamed to ' + value + '.');
+                this.loadFilesDir();
+            },
+
+            async deleteFilesEntry(name) {
+                const f = this.files;
+                if (f.delArm !== name) {
+                    f.delArm = name;
+                    clearTimeout(f.armTimer);
+                    f.armTimer = setTimeout(() => { f.delArm = null; this.renderFilesList(); }, 3500);
+                    this.renderFilesList();
+                    return;
+                }
+                f.delArm = null;
+                clearTimeout(f.armTimer);
+                const res = await this.apiPost('file_delete', { site: f.site, path: this.filesJoin(f.path, name) }, { timeoutMs: 60000 });
+                if (!res.success) { this.renderFilesList(); return; }
+                if (f.file && this.filesBase(f.file.path) === name) { f.file = null; f.dirty = false; this.syncUrl({ replace: true }); }
+                if (f.selected === name) f.selected = null;
+                this.showSnack('Deleted ' + name + '.');
+                this.loadFilesDir();
+                this.renderFilesEditor();
+            },
+
+            async deleteOpenFile() {
+                const f = this.files;
+                if (!f.file) return;
+                const name = this.filesBase(f.file.path);
+                if (f.delArm !== name) {
+                    f.delArm = name;
+                    clearTimeout(f.armTimer);
+                    f.armTimer = setTimeout(() => { f.delArm = null; this.renderFilesBar(); }, 3500);
+                    this.renderFilesBar();
+                    return;
+                }
+                f.delArm = null; clearTimeout(f.armTimer);
+                const res = await this.apiPost('file_delete', { site: f.site, path: f.file.path }, { timeoutMs: 60000 });
+                if (!res.success) { this.renderFilesBar(); return; }
+                f.file = null; f.dirty = false; f.conflict = false;
+                this.syncUrl();
+                this.showSnack('Deleted ' + name + '.');
+                this.renderFiles();
+                this.loadFilesDir();
+            },
+
+            async revealFiles() {
+                const f = this.files;
+                if (!f.site) return;
+                const res = await this.apiPost('file_reveal', { site: f.site, path: f.file ? f.file.path : f.path }, { timeoutMs: 10000 });
+                if (res.success) this.showSnack('Opened in the file manager.');
+            },
+
+            // Dropped folders arrive as entries to walk; the paths inside them
+            // ride along so the tree is recreated on the other side.
+            collectDropped(dt) {
+                const items = dt.items ? Array.from(dt.items) : [];
+                const entries = items.map(i => i.webkitGetAsEntry ? i.webkitGetAsEntry() : null).filter(Boolean);
+                if (!entries.length || !entries.some(e => e.isDirectory)) {
+                    return Promise.resolve(Array.from(dt.files || []).map(file => ({ file, path: file.name })));
+                }
+                const out = [];
+                const walk = (entry, prefix) => new Promise(resolve => {
+                    if (entry.isFile) { entry.file(file => { out.push({ file, path: prefix + entry.name }); resolve(); }, () => resolve()); return; }
+                    if (!entry.isDirectory) { resolve(); return; }
+                    const reader = entry.createReader();
+                    const all = [];
+                    const read = () => reader.readEntries(async (batch) => {
+                        if (!batch.length) { for (const e of all) await walk(e, prefix + entry.name + '/'); resolve(); return; }
+                        all.push(...batch);
+                        read();
+                    }, () => resolve());
+                    read();
+                });
+                return (async () => { for (const e of entries) await walk(e, ''); return out; })();
+            },
+
+            // PHP's max_file_uploads (20) caps the parts in one request, so a
+            // dropped plugin folder goes up in batches.
+            async uploadFiles(list) {
+                const f = this.files;
+                if (!f.site || !list.length) return;
+                const dir = f.path;
+                const batches = [];
+                for (let i = 0; i < list.length; i += 20) batches.push(list.slice(i, i + 20));
+                let saved = 0, replaced = 0, failed = [];
+                f.uploading = { done: 0, total: list.length, pct: 0 };
+                this.renderFilesFooter();
+                for (const batch of batches) {
+                    const fd = new FormData();
+                    fd.append('action', 'file_upload');
+                    fd.append('site', f.site);
+                    fd.append('path', dir);
+                    for (const it of batch) { fd.append('files[]', it.file, it.file.name); fd.append('paths[]', it.path); }
+                    const res = await new Promise(resolve => {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open('POST', '/api.php');
+                        xhr.upload.onprogress = (e) => { if (e.lengthComputable) { f.uploading.pct = Math.round(e.loaded / e.total * 100); this.renderFilesFooter(); } };
+                        xhr.onload = () => { try { resolve(JSON.parse(xhr.responseText)); } catch (e) { resolve({ success: false, message: 'Upload failed (' + xhr.status + ').' }); } };
+                        xhr.onerror = () => resolve({ success: false, message: 'Network error.' });
+                        xhr.send(fd);
+                    });
+                    if (!res.success) { failed = failed.concat(batch.map(b => b.path)); this.showSnack(res.message || 'Upload failed.', true); }
+                    else { saved += res.saved || 0; replaced += res.replaced || 0; failed = failed.concat(res.failed || []); }
+                    f.uploading.done += batch.length; f.uploading.pct = 0;
+                    this.renderFilesFooter();
+                }
+                f.uploading = null;
+                const parts = [];
+                if (saved) parts.push(saved + ' added');
+                if (replaced) parts.push(replaced + ' replaced');
+                if (failed.length) parts.push(failed.length + ' failed');
+                this.showSnack('Uploaded: ' + (parts.join(', ') || 'nothing') + '.', failed.length > 0 && !saved && !replaced);
+                if (f.path === dir) this.loadFilesDir(); else this.renderFilesFooter();
+            },
+
+            renderFiles() {
+                if (this.view !== 'files') return;
+                this.renderFilesChrome();
+                this.renderFilesSide();
+                this.renderFilesBar();
+                this.renderFilesList();
+                this.renderFilesEditor();
+                this.renderFilesFooter();
+            },
+
+            renderFilesChrome() {
+                const f = this.files;
+                show($id('filesSiteChip'), !!f.site);
+                if (f.site) $id('filesSiteChipLabel').textContent = f.site;
+                const active = !!f.filter;
+                show($id('filesKbd'), !active);
+                show($id('btnFilesFilterClear'), active);
+                $id('filesHidden').checked = f.hidden;
+                const inDir = !!f.site && !f.file;
+                $id('btnFilesNewFile').disabled = !inDir || !f.writable;
+                $id('btnFilesNewFolder').disabled = !inDir || !f.writable;
+                $id('btnFilesUpload').disabled = !inDir || !f.writable;
+                $id('btnFilesReveal').disabled = !f.site;
+                $id('btnFilesRefresh').disabled = !f.site;
+                $id('filesFilter').disabled = !inDir;
+            },
+
+            renderFilesSide() {
+                const f = this.files;
+                const list = $id('filesSites');
+                list.querySelectorAll('.db-row').forEach(n => n.remove());
+                const loaded = !this.isLoading || this.sites.length > 0;
+                show($id('filesSitesLoading'), !loaded);
+                const q = f.siteFilter.trim().toLowerCase();
+                const rows = [...this.sites].filter(s => !q || s.name.toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name));
+                show($id('filesSitesEmpty'), loaded && rows.length === 0);
+                const tpl = $id('tpl-log-source');
+                const anchor = $id('filesSitesLoading');
+                for (const s of rows) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.site = s.name;
+                    row.classList.toggle('is-selected', f.site === s.name);
+                    row.querySelector('.db-row-name').textContent = s.name;
+                    row.querySelector('.db-row-meta').textContent = s.type === 'WordPress' ? 'wp' : 'static';
+                    row.querySelector('.db-row-meta').title = s.size_bytes ? this.formatSize(s.size_bytes) + ' on disk' : '';
+                    list.insertBefore(row, anchor);
+                }
+                if (f.site && f.scrolledFor !== f.site) {
+                    const sel = list.querySelector('.db-row.is-selected');
+                    if (sel) { f.scrolledFor = f.site; sel.scrollIntoView({ block: 'nearest' }); }
+                }
+            },
+
+            renderFilesBar() {
+                const f = this.files;
+                const crumbs = $id('filesCrumbs');
+                crumbs.innerHTML = '';
+                const add = (label, path, current, title) => {
+                    const b = document.createElement('button');
+                    b.type = 'button';
+                    b.className = 'files-crumb' + (current ? ' is-current' : '');
+                    b.textContent = label;
+                    b.dataset.path = path;
+                    if (title) b.title = title;
+                    crumbs.appendChild(b);
+                    return b;
+                };
+                const sep = () => { const s = document.createElement('span'); s.className = 'files-crumb-sep'; s.textContent = '/'; crumbs.appendChild(s); };
+                if (!f.site) {
+                    add('~/Cove/Sites', '', true, '');
+                } else {
+                    const full = f.file ? f.file.path : f.path;
+                    const segs = full ? full.split('/') : [];
+                    const abs = (f.root || '~/Cove/Sites/' + this.filesRoot) + (full ? '/' + full : '');
+                    add(this.filesRoot, '', segs.length === 0, segs.length === 0 ? 'Click to copy the path' : 'Site root');
+                    segs.forEach((s, i) => {
+                        sep();
+                        const p = segs.slice(0, i + 1).join('/');
+                        const last = i === segs.length - 1;
+                        add(s, p, last, last ? 'Click to copy the path' : p);
+                    });
+                    crumbs.lastElementChild.dataset.abs = abs.replace(/^\/Users\/[^\/]+|^\/home\/[^\/]+/, '~');
+                    crumbs.lastElementChild.dataset.absFull = abs;
+                    if (f.file && f.dirty) { const d = document.createElement('span'); d.className = 'files-dirty'; d.textContent = f.conflict ? 'changed on disk' : 'unsaved'; crumbs.appendChild(d); }
+                }
+                const file = f.file;
+                show($id('filesFileActions'), !!file && !file.loading);
+                if (file && !file.loading) {
+                    const text = file.kind === 'text';
+                    show($id('btnFileWrap'), text);
+                    $id('btnFileWrap').classList.toggle('is-on', f.wrap);
+                    $id('btnFileWrap').style.color = f.wrap ? 'var(--text)' : '';
+                    const dl = $id('btnFileDownload');
+                    dl.href = this.filesRawUrl(file.path, true);
+                    dl.setAttribute('download', this.filesBase(file.path));
+                    const save = $id('btnFileSave');
+                    show(save, text);
+                    show($id('btnFileRevert'), text && f.dirty);
+                    if (text) {
+                        const ro = file.writable === false || file.lossy;
+                        save.disabled = f.saving || ro || (!f.dirty && !f.conflict);
+                        save.classList.toggle('armed', !!f.conflict);
+                        save.textContent = f.saving ? 'saving…' : f.conflict ? 'overwrite?' : 'save';
+                        save.title = ro ? (file.lossy ? 'Read-only: the file is not valid UTF-8, so saving would alter it' : 'Read-only: this file is not writable') : f.conflict ? 'The file changed on disk since it was opened — click to overwrite anyway' : 'Save (⌘S)';
+                    }
+                    const del = $id('btnFileDelete');
+                    const armed = f.delArm === this.filesBase(file.path);
+                    show(del, file.kind !== 'error');
+                    del.classList.toggle('armed', armed);
+                    del.textContent = armed ? 'sure? delete' : 'delete';
+                }
+            },
+
+            filesIcon(e) {
+                if (e.type === 'dir') return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M1.5 4.5a1 1 0 0 1 1-1h3.6l1.6 1.6h5.8a1 1 0 0 1 1 1v6.4a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z"/></svg>';
+                return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/></svg>';
+            },
+
+            renderFilesList() {
+                const f = this.files;
+                const list = $id('filesList');
+                list.querySelectorAll('.file-row').forEach(n => n.remove());
+                document.querySelectorAll('#filesHead button').forEach(b => {
+                    b.classList.toggle('is-sorted', b.dataset.sort === f.sort);
+                    b.textContent = b.dataset.sort.replace('mtime', 'modified') + (b.dataset.sort === f.sort ? (f.dir === 'asc' ? ' ↑' : ' ↓') : '');
+                });
+                const rows = f.site && !f.loading && !f.error ? this.filesVisible : [];
+                show($id('filesLoading'), !!f.site && f.loading && !f.entries.length);
+                show($id('filesError'), !!f.site && !f.loading && !!f.error);
+                if (f.error) $id('filesErrorText').textContent = f.error;
+                const empty = !f.site || (!f.loading && !f.error && rows.length === 0 && !f.edit);
+                show($id('filesEmpty'), empty);
+                show($id('filesHead'), !!f.site && !empty);
+                if (empty) {
+                    const filtered = !!f.filter && f.entries.length > 0;
+                    const hiddenOnly = !f.hidden && f.entries.length > 0 && f.entries.every(e => e.name[0] === '.');
+                    $id('filesEmptyText').textContent = !f.site ? 'Pick a site.' : filtered ? 'Nothing matches.' : hiddenOnly ? 'Only hidden files here.' : 'Empty folder.';
+                    $id('filesEmptyHint').textContent = !f.site ? 'Its files open here — browse, edit, upload, and tidy up without leaving the dashboard.' : filtered ? 'Press Esc to clear the filter.' : hiddenOnly ? 'Turn on "hidden" to see them.' : (f.writable ? 'Drop files here to upload them, or use + file and + folder.' : 'This folder is not writable.');
+                }
+                const tpl = $id('tpl-file-row');
+                const anchor = $id('filesLoading');
+                const frag = document.createDocumentFragment();
+                const mkInput = (row, value) => {
+                    row.classList.add('is-editing');
+                    const nameEl = row.querySelector('.file-name');
+                    nameEl.innerHTML = '';
+                    const input = document.createElement('input');
+                    input.type = 'text'; input.className = 'file-name-input'; input.value = value; input.spellcheck = false; input.autocomplete = 'off';
+                    input.setAttribute('autocapitalize', 'off');
+                    nameEl.appendChild(input);
+                    row.querySelector('.file-row-actions').remove();
+                };
+                if (f.site && f.path && !f.filter) {
+                    const up = tpl.content.firstElementChild.cloneNode(true);
+                    up.classList.add('is-up', 'is-dir');
+                    up.dataset.up = '1';
+                    up.querySelector('.file-icon').innerHTML = this.filesIcon({ type: 'dir' });
+                    up.querySelector('.file-name-text').textContent = '..';
+                    up.querySelector('.file-link').remove();
+                    up.querySelector('.file-row-actions').remove();
+                    up.title = 'Up to ' + (this.filesParent(f.path) || this.filesRoot);
+                    frag.appendChild(up);
+                }
+                if (f.edit && f.edit.mode === 'create') {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.classList.toggle('is-dir', f.edit.type === 'dir');
+                    row.dataset.edit = 'create';
+                    row.querySelector('.file-icon').innerHTML = this.filesIcon({ type: f.edit.type });
+                    mkInput(row, f.edit.value);
+                    row.querySelector('.file-name-input').placeholder = f.edit.type === 'dir' ? 'folder name' : 'file name';
+                    frag.appendChild(row);
+                }
+                for (const e of rows) {
+                    const row = tpl.content.firstElementChild.cloneNode(true);
+                    row.dataset.name = e.name;
+                    row.dataset.type = e.type;
+                    row.classList.toggle('is-dir', e.type === 'dir');
+                    row.classList.toggle('is-hidden', e.name[0] === '.');
+                    row.classList.toggle('is-broken', !!e.broken);
+                    row.classList.toggle('is-selected', f.selected === e.name);
+                    row.querySelector('.file-icon').innerHTML = this.filesIcon(e);
+                    if (f.edit && f.edit.mode === 'rename' && f.edit.name === e.name) {
+                        mkInput(row, f.edit.value);
+                    } else {
+                        row.querySelector('.file-name-text').textContent = e.name;
+                        const link = row.querySelector('.file-link');
+                        if (e.link) { link.textContent = typeof e.link === 'string' ? e.link : 'symlink'; link.title = e.broken ? 'Broken symlink' : 'Symlink to ' + link.textContent; } else link.remove();
+                        const del = row.querySelector('.file-row-del');
+                        const armed = f.delArm === e.name;
+                        del.classList.toggle('armed', armed);
+                        del.textContent = armed ? 'sure?' : '×';
+                        del.title = armed ? 'Click again to delete' + (e.type === 'dir' && !e.link ? ' the folder and everything in it' : '') : 'Delete';
+                        if (e.name === 'public' && !f.path) del.remove();
+                        if (!f.writable) row.querySelector('.file-row-actions').remove();
+                    }
+                    row.querySelector('.file-size').textContent = e.type === 'dir' ? '' : (e.broken ? '' : this.formatSize(e.size));
+                    const t = row.querySelector('.file-time');
+                    t.textContent = e.mtime ? this.formatRelative(e.mtime) : '';
+                    t.title = e.mtime ? new Date(e.mtime * 1000).toLocaleString() : '';
+                    frag.appendChild(row);
+                }
+                list.insertBefore(frag, anchor);
+                if (f.selected) {
+                    const sel = list.querySelector('.file-row.is-selected');
+                    if (sel) sel.scrollIntoView({ block: 'nearest' });
+                }
+            },
+
+            renderFilesEditor() {
+                const f = this.files;
+                const main = $id('filesMain');
+                const file = f.file;
+                main.classList.toggle('has-file', !!file);
+                const ta = $id('filesText');
+                const prev = $id('filesPreview');
+                const note = $id('filesNote');
+                if (!file) { show(ta, false); show(prev, false); show(note, false); f.renderedPath = null; return; }
+                const kind = file.loading ? 'loading' : file.kind;
+                show(ta, kind === 'text');
+                show(prev, kind === 'image');
+                show(note, kind !== 'text' && kind !== 'image');
+                ta.classList.toggle('is-wrapped', f.wrap);
+                if (kind === 'text') {
+                    if (f.renderedPath !== file.path) {
+                        ta.value = file.content;
+                        ta.scrollTop = 0;
+                        f.renderedPath = file.path;
+                        f.dirty = false;
+                    }
+                    ta.disabled = file.writable === false || !!file.lossy;
+                    ta.readOnly = false;
+                } else if (kind === 'image') {
+                    const img = $id('filesPreviewImg');
+                    const url = this.filesRawUrl(file.path) + '&v=' + (file.mtime || 0);
+                    if (img.getAttribute('src') !== url) img.src = url;
+                    img.alt = this.filesBase(file.path);
+                } else {
+                    const text = $id('filesNoteText'), hint = $id('filesNoteHint'), dl = $id('filesNoteDownload');
+                    if (kind === 'loading') { text.textContent = 'Loading…'; hint.textContent = ''; show(dl, false); }
+                    else if (kind === 'error') { text.textContent = file.error || 'Could not open that file.'; hint.textContent = ''; show(dl, false); }
+                    else if (kind === 'large') { text.textContent = 'Too large to edit here.'; hint.textContent = this.formatSize(file.size) + ' — the editor opens files up to 2 MB.'; show(dl, true); }
+                    else { text.textContent = 'Binary file.'; hint.textContent = this.formatSize(file.size) + ' — nothing to show as text.'; show(dl, true); }
+                    dl.href = this.filesRawUrl(file.path, true);
+                    dl.setAttribute('download', this.filesBase(file.path));
+                }
+            },
+
+            renderFilesFooter() {
+                if (this.view !== 'files') return;
+                const f = this.files;
+                let label = '', hint = '';
+                if (f.uploading) {
+                    hint = 'uploading ' + Math.min(f.uploading.done + 1, f.uploading.total) + ' of ' + f.uploading.total + (f.uploading.pct ? ' · ' + f.uploading.pct + '%' : '');
+                }
+                if (f.file && !f.file.loading) {
+                    const file = f.file;
+                    const parts = [];
+                    if (file.kind === 'text') { const v = $id('filesText').value; parts.push((v ? v.split('\n').length : 0).toLocaleString() + ' lines'); }
+                    if (file.kind === 'image' && file.width) parts.push(file.width + '×' + file.height);
+                    if (file.size !== undefined) parts.push(this.formatSize(file.size));
+                    if (file.mtime) { const rel = this.formatRelative(file.mtime); parts.push(rel === 'now' ? 'modified just now' : 'modified ' + rel + ' ago'); }
+                    if (file.lossy) parts.push('not UTF-8 · read-only');
+                    else if (file.writable === false) parts.push('read-only');
+                    label = parts.join(' · ');
+                    if (!hint && file.kind === 'text' && !$id('filesText').disabled) hint = f.dirty ? '⌘S to save' : 'Esc to close';
+                } else if (f.site && !f.loading && !f.error) {
+                    const rows = this.filesVisible;
+                    const dirs = rows.filter(e => e.type === 'dir').length;
+                    const files = rows.length - dirs;
+                    const bytes = rows.reduce((t, e) => t + (e.type === 'dir' ? 0 : (e.size || 0)), 0);
+                    const parts = [];
+                    if (dirs) parts.push(dirs + ' folder' + (dirs === 1 ? '' : 's'));
+                    if (files) parts.push(files + ' file' + (files === 1 ? '' : 's'));
+                    if (bytes) parts.push(this.formatSize(bytes));
+                    const hiddenN = f.hidden ? 0 : f.entries.filter(e => e.name[0] === '.').length;
+                    if (hiddenN) parts.push(hiddenN + ' hidden');
+                    label = parts.join(' · ');
+                    if (!hint && rows.length) hint = '↑↓ move · ↵ open · ⌫ up';
+                }
+                $id('filesCount').textContent = label;
+                $id('filesHint').textContent = hint;
+            },
+
+            filesKeydown(e, typing) {
+                const f = this.files;
+                const ta = $id('filesText');
+                const inEditor = document.activeElement === ta;
+                if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 's') {
+                    if (f.file && f.file.kind === 'text') { e.preventDefault(); this.saveFile(); return true; }
+                    return false;
+                }
+                if (inEditor) {
+                    if (e.key === 'Escape') { e.preventDefault(); ta.blur(); return true; }
+                    if (e.key === 'Tab' && !e.shiftKey && !ta.disabled) {
+                        e.preventDefault();
+                        const s = ta.selectionStart, end = ta.selectionEnd;
+                        ta.setRangeText('\t', s, end, 'end');
+                        f.dirty = true; this.renderFilesBar(); this.renderFilesFooter();
+                        return true;
+                    }
+                    return false;
+                }
+                if (typing) return false;
+                if (e.key === 'Escape') {
+                    if (this.ctxMenu.open) { this.closeRowMenu(); return true; }
+                    if (this.showDbModal) { this.setDbModal(false); return true; }
+                    if (f.edit) { this.cancelFilesEdit(); return true; }
+                    if (f.delArm) { f.delArm = null; this.renderFilesList(); this.renderFilesBar(); return true; }
+                    if (f.file) { this.closeFile(); return true; }
+                    if (f.filter) { f.filter = ''; $id('filesFilter').value = ''; this.renderFilesChrome(); this.renderFilesList(); this.renderFilesFooter(); return true; }
+                    if (f.path) { this.filesUp(); return true; }
+                    return true;
+                }
+                if (e.ctrlKey || e.metaKey || e.altKey) return false;
+                if (e.key === '/') { e.preventDefault(); if (!f.file) $id('filesFilter').focus(); return true; }
+                if (e.key === 'Backspace') { e.preventDefault(); this.filesUp(); return true; }
+                if (f.file || !f.site) return false;
+                const rows = this.filesVisible;
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'j' || e.key === 'k') {
+                    e.preventDefault();
+                    if (!rows.length) return true;
+                    const i = rows.findIndex(r => r.name === f.selected);
+                    const next = (e.key === 'ArrowDown' || e.key === 'j') ? Math.min(rows.length - 1, i + 1) : Math.max(0, i - 1);
+                    f.selected = rows[next].name;
+                    this.renderFilesList();
+                    return true;
+                }
+                if (e.key === 'Enter' && f.selected) {
+                    const sel = rows.find(r => r.name === f.selected);
+                    if (sel && !sel.broken) { e.preventDefault(); this.filesNavigate(this.filesJoin(f.path, sel.name), sel.type); }
+                    return true;
+                }
+                if (e.key === 'Delete' && f.selected && f.writable) { e.preventDefault(); this.deleteFilesEntry(f.selected); return true; }
+                if (e.key === 'F2' && f.selected && f.writable) { e.preventDefault(); this.startFilesRename(f.selected); return true; }
+                return false;
+            },
+
+            bindFilesEvents() {
+                const f = this.files;
+                try { f.hidden = localStorage.getItem('files.hidden') !== '0'; f.wrap = localStorage.getItem('files.wrap') === '1'; } catch (e) { /* private mode */ }
+                const filter = $id('filesFilter');
+                filter.addEventListener('input', () => { f.filter = filter.value; f.selected = null; this.renderFilesChrome(); this.renderFilesList(); this.renderFilesFooter(); });
+                filter.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); f.filter = ''; filter.value = ''; filter.blur(); this.renderFilesChrome(); this.renderFilesList(); this.renderFilesFooter(); }
+                    if (e.key === 'Enter') { const first = this.filesVisible[0]; if (first && !first.broken) { e.preventDefault(); filter.blur(); this.filesNavigate(this.filesJoin(f.path, first.name), first.type); } }
+                });
+                $id('btnFilesFilterClear').addEventListener('click', () => { f.filter = ''; filter.value = ''; this.renderFilesChrome(); this.renderFilesList(); this.renderFilesFooter(); filter.focus(); });
+                $id('filesSiteChipClear').addEventListener('click', () => this.setFilesSite(null));
+                $id('filesHidden').addEventListener('change', (e) => { f.hidden = e.target.checked; try { localStorage.setItem('files.hidden', f.hidden ? '1' : '0'); } catch (err) {} this.renderFilesList(); this.renderFilesFooter(); });
+                $id('btnFilesNewFile').addEventListener('click', () => this.startFilesCreate('file'));
+                $id('btnFilesNewFolder').addEventListener('click', () => this.startFilesCreate('dir'));
+                $id('btnFilesUpload').addEventListener('click', () => $id('filesUploadInput').click());
+                $id('filesUploadInput').addEventListener('change', (e) => {
+                    const list = Array.from(e.target.files || []).map(file => ({ file, path: file.name }));
+                    e.target.value = '';
+                    this.uploadFiles(list);
+                });
+                $id('btnFilesReveal').addEventListener('click', () => this.revealFiles());
+                $id('btnFilesRefresh').addEventListener('click', () => { this.loadFilesDir(); if (f.file && !f.dirty) this.loadFile(); });
+                const siteFilter = $id('filesSiteFilter');
+                siteFilter.addEventListener('input', () => { f.siteFilter = siteFilter.value; this.renderFilesSide(); });
+                siteFilter.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); f.siteFilter = ''; siteFilter.value = ''; siteFilter.blur(); this.renderFilesSide(); }
+                    if (e.key === 'Enter') {
+                        const q = f.siteFilter.trim().toLowerCase();
+                        const first = [...this.sites].sort((a, b) => a.name.localeCompare(b.name)).find(s => !q || s.name.toLowerCase().includes(q));
+                        if (first) { e.preventDefault(); this.setFilesSite(first.name); }
+                    }
+                });
+                $id('filesSites').addEventListener('click', (e) => {
+                    const row = e.target.closest('.db-row');
+                    if (row) this.setFilesSite(row.dataset.site);
+                });
+                $id('filesCrumbs').addEventListener('click', (e) => {
+                    const b = e.target.closest('.files-crumb');
+                    if (!b) return;
+                    if (b.classList.contains('is-current')) {
+                        const p = b.dataset.absFull;
+                        if (!p) return;
+                        navigator.clipboard.writeText(p).then(() => this.showSnack('Path copied.')).catch(() => this.showSnack('Could not copy.', true));
+                        return;
+                    }
+                    this.filesNavigate(b.dataset.path, 'dir');
+                });
+                $id('filesHead').addEventListener('click', (e) => {
+                    const b = e.target.closest('button[data-sort]');
+                    if (!b) return;
+                    if (f.sort === b.dataset.sort) f.dir = f.dir === 'asc' ? 'desc' : 'asc';
+                    else { f.sort = b.dataset.sort; f.dir = b.dataset.sort === 'name' ? 'asc' : 'desc'; }
+                    this.renderFilesList();
+                });
+                const list = $id('filesList');
+                list.addEventListener('click', (e) => {
+                    const row = e.target.closest('.file-row');
+                    if (!row || row.classList.contains('is-editing')) return;
+                    if (row.dataset.up) { this.filesUp(); return; }
+                    if (e.target.closest('.file-row-rename')) { e.stopPropagation(); this.startFilesRename(row.dataset.name); return; }
+                    if (e.target.closest('.file-row-del')) { e.stopPropagation(); this.deleteFilesEntry(row.dataset.name); return; }
+                    const entry = f.entries.find(x => x.name === row.dataset.name);
+                    if (!entry) return;
+                    f.selected = entry.name;
+                    if (entry.broken) { this.showSnack('That symlink points nowhere.', true); this.renderFilesList(); return; }
+                    this.filesNavigate(this.filesJoin(f.path, entry.name), entry.type);
+                });
+                list.addEventListener('keydown', (e) => {
+                    const input = e.target.closest('.file-name-input');
+                    if (!input) return;
+                    if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); f.edit.value = input.value; this.commitFilesEdit(); }
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.cancelFilesEdit(); }
+                });
+                list.addEventListener('input', (e) => { const input = e.target.closest('.file-name-input'); if (input && f.edit) f.edit.value = input.value; });
+                list.addEventListener('focusout', (e) => {
+                    const input = e.target.closest && e.target.closest('.file-name-input');
+                    if (!input || !f.edit) return;
+                    // Clicking away commits a rename with a real change and drops an empty new-item row.
+                    setTimeout(() => { if (f.edit && !list.contains(document.activeElement)) { if (f.edit.value.trim() && f.edit.value !== f.edit.name) this.commitFilesEdit(); else this.cancelFilesEdit(); } }, 0);
+                });
+                // Drag and drop onto the listing (not the editor).
+                const main = $id('filesMain');
+                main.addEventListener('dragenter', (e) => { if (!f.site || f.file || !f.writable || !e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return; e.preventDefault(); f.drag++; main.classList.add('is-dragging'); });
+                main.addEventListener('dragover', (e) => { if (!main.classList.contains('is-dragging')) return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+                main.addEventListener('dragleave', () => { if (!main.classList.contains('is-dragging')) return; f.drag = Math.max(0, f.drag - 1); if (!f.drag) main.classList.remove('is-dragging'); });
+                main.addEventListener('drop', async (e) => {
+                    if (!main.classList.contains('is-dragging')) return;
+                    e.preventDefault();
+                    f.drag = 0; main.classList.remove('is-dragging');
+                    const list = await this.collectDropped(e.dataTransfer);
+                    this.uploadFiles(list);
+                });
+                // Editor.
+                const ta = $id('filesText');
+                ta.addEventListener('input', () => {
+                    const was = f.dirty;
+                    f.dirty = f.file && f.file.kind === 'text' ? ta.value !== f.file.content : false;
+                    if (was !== f.dirty) this.renderFilesBar();
+                    this.renderFilesFooter();
+                });
+                $id('btnFileSave').addEventListener('click', () => this.saveFile());
+                $id('btnFileRevert').addEventListener('click', () => this.revertFile());
+                $id('btnFileDelete').addEventListener('click', () => this.deleteOpenFile());
+                $id('btnFileWrap').addEventListener('click', () => { f.wrap = !f.wrap; try { localStorage.setItem('files.wrap', f.wrap ? '1' : '0'); } catch (err) {} this.renderFilesEditor(); this.renderFilesBar(); });
+                window.addEventListener('beforeunload', (e) => { if (f.dirty) { e.preventDefault(); e.returnValue = ''; } });
+            },
+
             // --- Command palette -------------------------------------------
             // Results mix matching sites with global commands. Sites are ranked
             // by match position so a prefix hit beats a mid-string one.
@@ -7996,6 +9300,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     { key: 'cmd:sizes',   kind: 'cmd', label: 'Refresh disk sizes',  meta: '',  run: () => { this.closePalette(); this.refreshSizes(); } },
                     { key: 'cmd:db',      kind: 'cmd', label: 'Databases',           meta: '',  run: () => { this.closePalette(); this.setView('db'); } },
                     { key: 'cmd:logs',    kind: 'cmd', label: 'Logs',                meta: '',  run: () => { this.closePalette(); this.setView('logs'); } },
+                    { key: 'cmd:files',   kind: 'cmd', label: 'Files',               meta: '',  run: () => { this.closePalette(); this.setView('files'); } },
                     { key: 'cmd:adminer', kind: 'cmd', label: 'Open Adminer',        meta: 'external', run: () => { this.closePalette(); window.open(this.adminerUrl, '_blank', 'noopener'); } },
                     { key: 'cmd:mailview',kind: 'cmd', label: 'Mail',                meta: '',  run: () => { this.closePalette(); this.setView('mail'); } },
                     { key: 'cmd:mail',    kind: 'cmd', label: 'Open Mailpit',        meta: 'external', run: () => { this.closePalette(); window.open(this.mailpitUrl, '_blank', 'noopener'); } },
