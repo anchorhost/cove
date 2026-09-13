@@ -3212,7 +3212,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // Listing skips loading plugins/themes: a heavy plugin can
                 // cost twenty seconds to boot and the list needs none of it.
                 // `check` asks wp.org for updates (slow, on demand).
-                $args = [$kind, 'list', '--fields=name,title,status,version,update,update_version,auto_update', '--format=json', '--skip-plugins', '--skip-themes'];
+                // `file` names the main file: 'dir/main.php' for a folder plugin,
+                // 'name.php' for a single-file one (Hello Dolly) or a must-use
+                // plugin, which lives in mu-plugins/ — Browse files uses it.
+                $args = [$kind, 'list', '--fields=name,title,status,version,update,update_version,auto_update' . ($kind === 'plugin' ? ',file' : ''), '--format=json', '--skip-plugins', '--skip-themes'];
                 if (empty($input['check'])) $args[] = '--skip-update-check';
                 [$items, $ms] = $__wp_json($args);
                 echo json_encode(['success' => true, 'items' => array_values($items), 'ms' => $ms, 'multisite' => $__multisite, 'checked' => !empty($input['check'])]);
@@ -9650,7 +9653,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const items = [];
                 if (tab === 'plugins' || tab === 'themes') {
                     const slug = it.name;
-                    const dir = 'public/wp-content/' + (tab === 'plugins' ? 'plugins/' : 'themes/') + slug;
+                    let dir = 'public/wp-content/themes/' + slug;
+                    if (tab === 'plugins') {
+                        const file = it.file || '';
+                        const base = it.status === 'must-use' ? 'public/wp-content/mu-plugins/' : 'public/wp-content/plugins/';
+                        // A folder plugin opens on its folder; a single file opens the file.
+                        dir = file.includes('/') ? base + file.slice(0, file.indexOf('/')) : base + (file || slug);
+                    }
                     if (tab === 'plugins') {
                         if (it.status === 'inactive') { items.push({ label: 'Activate', run: () => this.siteItemOp(tab, slug, 'activate') }); if (ms) items.push({ label: 'Network activate', run: () => this.siteItemOp(tab, slug, 'activate', true) }); }
                         else if (it.status === 'active') items.push({ label: 'Deactivate', run: () => this.siteItemOp(tab, slug, 'deactivate') });
@@ -9659,7 +9668,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (it.update === 'available') items.push({ label: 'Update', meta: '→ ' + it.update_version, run: () => this.siteItemOp(tab, slug, 'update') });
                     if (it.status !== 'must-use') items.push({ label: it.auto_update === 'on' ? 'Turn auto-updates off' : 'Turn auto-updates on', run: () => this.siteItemOp(tab, slug, it.auto_update === 'on' ? 'auto-off' : 'auto-on') });
                     if (items.length) items.push({ sep: true });
-                    items.push({ label: 'Browse files', run: () => this.openFilesAt(site.name, dir) });
+                    items.push({ label: tab === 'plugins' && !(it.file || '').includes('/') ? 'Open file' : 'Browse files', run: () => this.openFilesAt(site.name, dir) });
                     items.push({ label: 'Copy slug', run: () => this.copyText(slug, 'Slug copied') });
                     if (it.status !== 'must-use' && it.status !== 'active' && it.status !== 'active-network' && it.status !== 'parent') {
                         items.push({ sep: true });
