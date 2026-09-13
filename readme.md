@@ -84,6 +84,7 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove login <site> [<user>] [--url=<subsite-url>]` | Generates a one-time login link for a WordPress site. On a multisite network, `--url` picks the subsite to log in to. |
 | `cove network <site> [--format=json]` | Lists the sites on a multisite network: name, URL, and ID. |
 | `cove snapshot <site> [create\|list\|restore <id>\|delete <id>]` | Point-in-time copies of a site's files and database under `~/Cove/Snapshots/<site>/`, restorable in place; a restore snapshots the current state first so it can be undone. `--note="…"` labels one. |
+| `cove screenshot <site> [--out=<file.png>]` | Captures the site's front page with a headless Chromium-family browser; the dashboard shows the capture on the site's page. |
 | `cove wp <site> <args…>` | Runs WP-CLI inside a site from anywhere, on the PHP the site is pinned to: `cove wp mysite plugin list`. |
 | `cove path <name>` | Outputs the full system path to a site's public directory. |
 | `cove url <name>` | Prints the full HTTPS URL for a site (including the port suffix when on alternative ports). |
@@ -233,7 +234,7 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
 
 ### Site — `/site/<name>`
 
-  * One site on its own page: type, WordPress and PHP versions, size, last change, and path, with **open** and **log in to admin** beside them. Tiles lead to the site's files, database, mail, and logs; a **manage** row carries domains, PHP version, rename, reveal, copy path, pin, and delete.
+  * One site on its own page: type, WordPress and PHP versions, size, last change, and path, with **open** and **log in to admin** beside them. A capture of the front page sits beside the tiles, taken by an installed Chrome, Chromium, Brave, Edge, Arc, or Vivaldi and refreshed when the site changes. Tiles lead to the site's files, database, mail, and logs; a **manage** row carries domains, PHP version, rename, reveal, copy path, pin, and delete.
   * On a multisite network the page lists every site on it with its own **open** and **log in** — a one-time link minted for that subsite, so it lands on the subsite's `wp-admin`. The same is available from the terminal as `cove network <site>` and `cove login <site> --url=<subsite-url>`.
   * Tabs, each with its own URL: **plugins** and **themes** (status, version, waiting updates, auto-update; activate, deactivate, update, delete — network-wide on a multisite; **check for updates** asks wp.org on demand), **users** (roles, email, registered, and a one-time **log in** as any user, whatever the role; network-wide on a multisite, landing subsite-only users on a site they belong to), **cron** (every event with next run and recurrence, **run now**, **run all due**), **snapshots** (take one with a note; restore or delete any — a restore keeps a snapshot of the state it replaced), and **wp-cli** (a console: type, `↵`, output with exit code and timing, history on `↑`/`↓`).
   * `Esc` returns to the list, `⌘↵` logs in.
