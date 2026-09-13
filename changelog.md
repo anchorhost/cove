@@ -15,6 +15,7 @@
 
 ### 🛠️ Improvements & Changes
 
+* **`WP_ENVIRONMENT_TYPE` on New Sites:** `cove add` now writes `define( 'WP_ENVIRONMENT_TYPE', 'local' );` into every new site's `wp-config.php`, next to the debug constants it already set. WordPress has recognised this constant since 5.5 and `wp_get_environment_type()` is how core and plugins tell a sandbox from a live site: core's automatic updates stand down, WooCommerce hides its live payment gateways, and plugins that phone home, send tracking, or check licenses generally skip it on `local`. Existing sites are not touched; add it to one with `wp config set WP_ENVIRONMENT_TYPE local --type=constant` from the site's `public/` directory.
 * **Menu Bar Wording:** The macOS menu's "Open Cove Dashboard" is now "Open Dashboard", matching its Adminer and Mailpit neighbours and the new Linux tray.
 
 ## [1.16] - 2026-09-07

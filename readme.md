@@ -71,7 +71,7 @@ Cove provides a simple set of commands to manage your local environment.
 
 | Command | Description |
 | --- | --- |
-| `cove add <name> [flavor]` | Creates a new WordPress site (`<name>.localhost`). The optional flavor says what goes inside it: a version (`6.4.3`, `6.9-RC1`), `nightly`, `latest` (the default), or `plain` for a static site with no database. `--multisite` builds a subdirectory network, `--multisite=subdomain` a subdomain one (subsites get HTTPS automatically); `--php=<ver>` pins the PHP version. |
+| `cove add <name> [flavor]` | Creates a new WordPress site (`<name>.localhost`). The optional flavor says what goes inside it: a version (`6.4.3`, `6.9-RC1`), `nightly`, `latest` (the default), or `plain` for a static site with no database. `--multisite` builds a subdirectory network, `--multisite=subdomain` a subdomain one (subsites get HTTPS automatically); `--php=<ver>` pins the PHP version. Every WordPress site is created with `WP_ENVIRONMENT_TYPE` set to `local` (so core and plugins that check `wp_get_environment_type()` treat it as a sandbox) and `WP_DEBUG_LOG` on, writing to `wp-content/debug.log`. |
 | `cove clone <source> <new-name>` | Copies a site — files, database, and custom Caddy rules — under a new name, rewriting stored URLs to the new domain. Uses a copy-on-write clone on APFS and btrfs, so it's fast and the two copies share disk until one is written to. |
 | `cove delete <name> [--force]` | Deletes a site's directory and its associated database. |
 | `cove rename <old-name> <new-name>` | Renames a site, its directory, database, and runs `wp search-replace` so stored URLs (siteurl, home, serialized content) all update to the new domain. |
