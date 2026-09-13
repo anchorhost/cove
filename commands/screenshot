@@ -1,0 +1,124 @@
+# Site previews: a headless capture of a site's front page by whichever
+# Chromium-family browser is installed (Chrome, Chromium, Brave, Edge, Arc,
+# Vivaldi). Cove ships no renderer of its own; when none is found the
+# dashboard says so instead of showing a preview.
+
+SCREENSHOTS_DIR="${SCREENSHOTS_DIR:-$COVE_DIR/cache/screenshots}"
+
+find_headless_browser() {
+    local c
+    if [ "$(uname -s)" == "Darwin" ]; then
+        for c in \
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+            "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+            "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" \
+            "/Applications/Arc.app/Contents/MacOS/Arc" \
+            "/Applications/Vivaldi.app/Contents/MacOS/Vivaldi" \
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"; do
+            [ -x "$c" ] && { echo "$c"; return 0; }
+        done
+    fi
+    for c in google-chrome google-chrome-stable chromium chromium-browser brave-browser microsoft-edge microsoft-edge-stable vivaldi; do
+        command -v "$c" >/dev/null 2>&1 && { command -v "$c"; return 0; }
+    done
+    # Flatpak and snap Chromium on Linux desktops.
+    if command -v flatpak >/dev/null 2>&1 && flatpak info org.chromium.Chromium >/dev/null 2>&1; then
+        echo "flatpak run org.chromium.Chromium"; return 0
+    fi
+    return 1
+}
+
+cove_screenshot() {
+    local site_name="" out="" width=1280 height=800 quiet=0
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --out=*)    out="${arg#*=}" ;;
+            --width=*)  width="${arg#*=}" ;;
+            --height=*) height="${arg#*=}" ;;
+            --quiet)    quiet=1 ;;
+            -h|--help)
+                echo "Usage: cove screenshot <site> [--out=<file.png>] [--width=1280] [--height=800]"
+                echo ""
+                echo "Captures the site's front page with a headless Chromium-family browser"
+                echo "(Chrome, Chromium, Brave, Edge, Arc, Vivaldi). Without --out the image"
+                echo "goes to ~/Cove/cache/screenshots/<site>.png, where the dashboard shows it."
+                return
+                ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                exit 1
+                ;;
+            *) [ -z "$site_name" ] && site_name="$arg" ;;
+        esac
+    done
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove screenshot <site> [--out=<file.png>]"
+        exit 1
+    fi
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+    if [ ! -d "$SITES_DIR/$site_name.localhost/public" ]; then
+        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
+        exit 1
+    fi
+    if ! [[ "$width" =~ ^[0-9]{3,4}$ ]] || ! [[ "$height" =~ ^[0-9]{3,4}$ ]]; then
+        gum style --foreground red "❌ Error: --width and --height take a number of pixels."
+        exit 1
+    fi
+
+    local browser
+    if ! browser=$(find_headless_browser); then
+        gum style --foreground red "❌ Error: No Chromium-family browser found (Chrome, Chromium, Brave, Edge, Arc, Vivaldi)." "Install one to capture previews."
+        exit 2
+    fi
+
+    [ -z "$out" ] && { mkdir -p "$SCREENSHOTS_DIR"; out="$SCREENSHOTS_DIR/$site_name.png"; }
+    local url
+    url=$(url_for "$site_name.localhost")
+    local tmp_profile tmp_out
+    tmp_profile=$(mktemp -d "${TMPDIR:-/tmp}/cove-shot-profile.XXXXXX")
+    tmp_out="$out.tmp.png"
+    [ "$quiet" -eq 1 ] || echo "📷 Capturing $url with $(basename "${browser%% *}")…"
+    # A throwaway profile: headless refuses to start on a profile the user's
+    # open browser holds, and nothing from the user's session should leak
+    # into the capture. Chrome's new headless mode writes the file and then,
+    # on some builds, never exits — so the capture is watched for and the
+    # browser stopped once the file is there (or after 30 s regardless).
+    local -a cmd
+    case "$browser" in
+        "flatpak run "*) read -r -a cmd <<< "$browser" ;;
+        *) cmd=("$browser") ;;
+    esac
+    "${cmd[@]}" \
+        --headless=new --disable-gpu --hide-scrollbars --no-first-run --no-default-browser-check \
+        --ignore-certificate-errors --disable-features=MacAppCodeSignClone,TranslateUI \
+        --user-data-dir="$tmp_profile" --window-size="${width},${height}" \
+        --timeout=20000 --screenshot="$tmp_out" "$url" >/dev/null 2>&1 &
+    local pid=$!
+    local waited=0
+    while [ $waited -lt 300 ]; do
+        [ -s "$tmp_out" ] && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    # Let the write finish, then stop the browser if it is still around.
+    [ -s "$tmp_out" ] && sleep 0.5
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    rm -rf "$tmp_profile"
+    if [ ! -s "$tmp_out" ]; then
+        rm -f "$tmp_out"
+        gum style --foreground red "❌ Error: The capture failed (is the site answering at $url?)."
+        exit 1
+    fi
+    mv -f "$tmp_out" "$out"
+    [ "$quiet" -eq 1 ] && { echo "$out"; return; }
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Saved $out"
+}

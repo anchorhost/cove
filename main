@@ -2895,6 +2895,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'db_name' => $db_name,
                         // Per-site PHP pin (`cove php`); null = Cove's default PHP.
                         'php_version' => is_file($site_path . '/php_version') ? trim((string) @file_get_contents($site_path . '/php_version')) : null,
+                        // When the dashboard's preview of the front page was captured.
+                        'shot_mtime' => is_file($user_home . '/Cove/cache/screenshots/' . str_replace('.localhost', '', $item) . '.png') ? filemtime($user_home . '/Cove/cache/screenshots/' . str_replace('.localhost', '', $item) . '.png') : null,
                     ];
                 }
             }
@@ -2907,6 +2909,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             }
         }
         echo json_encode($sites_info);
+        exit;
+    }
+    if ($action === 'site_shot') {
+        // The cached front-page capture, as an image.
+        $site = (string) ($_GET['site'] ?? '');
+        $png = preg_match('/^[a-zA-Z0-9-]+$/', $site) ? $user_home . '/Cove/cache/screenshots/' . $site . '.png' : '';
+        if ($png === '' || !is_file($png)) { http_response_code(404); echo json_encode(['success' => false, 'message' => 'No preview yet.']); exit; }
+        header('Content-Type: image/png');
+        header('Content-Length: ' . filesize($png));
+        header('Cache-Control: private, max-age=31536000, immutable');
+        header('X-Content-Type-Options: nosniff');
+        readfile($png);
         exit;
     }
     if ($action === 'file_raw') {
@@ -3333,6 +3347,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             [$data, $code, $out, $ms] = $__snap(['delete', $id]);
             if ($code !== 0) $__snap_fail($out, 'Could not delete that snapshot.');
             echo json_encode(['success' => true]);
+            exit;
+        case 'site_shot_refresh':
+            // Recapture the front page. Slow (a headless browser start plus
+            // the site's own load), so the dashboard asks in the background.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) { echo json_encode(['success' => false, 'message' => 'Invalid site name.']); exit; }
+            set_time_limit(0);
+            exec(sprintf('HOME=%s %s screenshot %s --quiet 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name)), $shot_lines, $shot_code);
+            $png = $user_home . '/Cove/cache/screenshots/' . $site_name . '.png';
+            if ($shot_code !== 0 || !is_file($png)) {
+                $msg = trim(preg_replace('/\x1b\[[0-9;]*m/', '', implode(' ', $shot_lines)));
+                echo json_encode(['success' => false, 'unsupported' => $shot_code === 2, 'message' => $msg !== '' ? preg_replace('/^[^\w]*(Error: )?/u', '', $msg) : 'The capture failed.']);
+                exit;
+            }
+            clearstatcache(true, $png);
+            echo json_encode(['success' => true, 'mtime' => filemtime($png)]);
             exit;
         case 'network_sites':
             // The sites on a multisite network, via `cove network`, which
@@ -4979,8 +5008,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
         /* Site page. One site: facts, its views, its network, its actions. */
         body.view-site .wrap { max-width: 1040px; }
-        .site-head { align-items: flex-start; }
-        .site-head-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.45rem; }
+        .sp-head { align-items: flex-start; }
+        .sp-head-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.45rem; }
+        .sp-head .card-title { overflow-wrap: anywhere; }
         .site-back { align-self: flex-start; background: transparent; border: 0; padding: 0; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); cursor: pointer; }
         .site-back:hover { color: var(--text); }
         .site-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.85rem; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); min-width: 0; }
@@ -4990,7 +5020,19 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-facts .fact-path { cursor: copy; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
         .site-facts .fact-path:hover { color: var(--text); }
         .site-body { padding: 1.25rem 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 1.25rem; }
+        .site-top { display: grid; grid-template-columns: minmax(260px, 400px) minmax(0, 1fr); gap: 1rem; align-items: start; }
+        .site-shot { position: relative; display: block; aspect-ratio: 16 / 10; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--bg-sunk); overflow: hidden; text-decoration: none; color: var(--text-faint); }
+        .site-shot img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top; }
+        .site-shot.is-stale img { opacity: 0.75; }
+        .site-shot-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 1rem; text-align: center; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-faint); }
+        .site-shot-bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.3rem 0.6rem; font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-dim); background: color-mix(in oklch, var(--panel) 88%, transparent); border-top: 1px solid var(--panel-border); opacity: 0; transition: opacity 120ms; }
+        .site-shot:hover .site-shot-bar, .site-shot.is-busy .site-shot-bar { opacity: 1; }
+        .site-shot-refresh { background: transparent; border: 1px solid var(--panel-border); border-radius: var(--radius-pill); color: var(--text-dim); font: inherit; padding: 0.05rem 0.5rem; cursor: pointer; }
+        .site-shot-refresh:hover { color: var(--text); border-color: var(--text-faint); }
+        .site-shot-refresh:disabled { opacity: 0.6; cursor: default; }
         .site-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0.75rem; }
+        .site-top .site-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        @media (max-width: 760px) { .site-top { grid-template-columns: 1fr; } }
         .site-tile { text-align: left; background: var(--bg-sunk); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.85rem 1rem; cursor: pointer; display: flex; flex-direction: column; gap: 0.3rem; color: var(--text); font: inherit; transition: border-color 120ms, background 120ms; }
         .site-tile:hover { border-color: var(--text-faint); background: var(--panel-hover); }
         .site-tile-name { font-family: var(--font-mono); font-size: 0.86rem; color: var(--text); }
@@ -5738,8 +5780,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         </section>
 
         <section class="card site-card" id="siteCard" style="display: none;">
-            <header class="card-head site-head">
-                <div class="site-head-main">
+            <header class="card-head sp-head">
+                <div class="sp-head-main">
                     <button type="button" class="site-back" id="btnSiteBack" title="Back to the sites list (Esc)">← sites</button>
                     <h1 class="card-title" id="siteTitle"></h1>
                     <div class="site-facts" id="siteFacts"></div>
@@ -5761,11 +5803,21 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </div>
             </div>
             <div class="site-body" id="sitePanel-overview">
+                <div class="site-top">
+                    <a class="site-shot" id="siteShot" href="#" target="_blank" rel="noopener" title="Open the site">
+                        <img id="siteShotImg" alt="" style="display: none;">
+                        <span class="site-shot-empty" id="siteShotEmpty">no preview yet</span>
+                        <span class="site-shot-bar">
+                            <span id="siteShotAge"></span>
+                            <button type="button" class="site-shot-refresh" id="btnSiteShot" title="Capture the front page again">refresh</button>
+                        </span>
+                    </a>
                 <div class="site-tiles" id="siteTiles">
                     <button type="button" class="site-tile" data-go="files"><span class="site-tile-name">files</span><span class="site-tile-desc">Browse and edit the site's directory, upload, tidy up.</span></button>
                     <button type="button" class="site-tile" data-go="db" id="tileDb"><span class="site-tile-name">database</span><span class="site-tile-desc">Tables, rows in place, a SQL console.</span></button>
                     <button type="button" class="site-tile" data-go="mail"><span class="site-tile-name">mail</span><span class="site-tile-desc">Everything this site has sent, links lifted out.</span></button>
                     <button type="button" class="site-tile" data-go="logs"><span class="site-tile-name">logs</span><span class="site-tile-desc">PHP errors, debug.log, and the access log, live.</span></button>
+                </div>
                 </div>
 
                 <section class="site-section" id="siteNetwork" style="display: none;">
@@ -6209,7 +6261,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             selectedName: null,
             ctxMenu: { open: false, site: null, x: 0, y: 0, openedAt: 0 },
             fileCtx: { open: false, target: null, x: 0, y: 0, openedAt: 0 },
-            sitePage: { name: null, tab: 'overview', tabs: {}, net: { items: [], loading: false, error: null, loadedFor: null }, busy: null, cli: { cmd: '', output: '', code: 0, ms: 0, ran: null, running: false, history: [], histIdx: -1 } },
+            sitePage: { name: null, tab: 'overview', tabs: {}, shot: { busy: null, asked: {}, unsupported: false }, net: { items: [], loading: false, error: null, loadedFor: null }, busy: null, cli: { cmd: '', output: '', code: 0, ms: 0, ran: null, running: false, history: [], histIdx: -1 } },
             siteDeleteConfirm: null,
             palette: { open: false, query: '', index: 0 },
             rename: { open: false, site: null, value: '', busy: false },
@@ -9121,6 +9173,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const path = fact(site.display_path, 'fact-path', 'Click to copy the path');
                 path.dataset.path = site.full_path;
                 $id('siteOpenLink').href = site.domain;
+                this.renderSiteShot(site);
                 const login = $id('btnSiteLogin');
                 show(login, isWp);
                 login.disabled = !!site.isLoggingIn;
@@ -9147,6 +9200,50 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); show(b, isWp || b.dataset.tab === 'overview' || b.dataset.tab === 'snapshots'); });
                 for (const tb of this.siteTabs) show($id('sitePanel-' + tb), p.tab === tb);
                 this.renderSiteTab();
+            },
+
+            // The front-page preview: shown from the cache at once, recaptured
+            // in the background when the site changed since (or a day passed),
+            // and on demand from the refresh button.
+            renderSiteShot(site) {
+                const s = this.sitePage.shot;
+                const a = $id('siteShot');
+                const img = $id('siteShotImg');
+                a.href = site.domain;
+                const has = !!site.shot_mtime;
+                const src = has ? '/api.php?action=site_shot&site=' + encodeURIComponent(site.name) + '&v=' + site.shot_mtime : '';
+                if (img.getAttribute('src') !== src) { if (src) img.src = src; else img.removeAttribute('src'); }
+                show(img, has);
+                const busy = s.busy === site.name;
+                const stale = has && ((site.modified_at && site.modified_at > site.shot_mtime) || (Date.now() / 1000 - site.shot_mtime > 86400));
+                a.classList.toggle('is-busy', busy);
+                a.classList.toggle('is-stale', stale && !busy);
+                const empty = $id('siteShotEmpty');
+                show(empty, !has);
+                empty.textContent = busy ? 'capturing…' : s.unsupported ? 'Previews need Chrome, Chromium, Brave, Edge, Arc, or Vivaldi' : (s.asked[site.name] === 'failed' ? 'The capture failed — is the site answering?' : 'no preview yet');
+                $id('siteShotAge').textContent = busy ? 'capturing…' : has ? 'captured ' + (this.formatRelative(site.shot_mtime) === 'now' ? 'just now' : this.formatRelative(site.shot_mtime) + ' ago') + (stale ? ' · site changed since' : '') : '';
+                const btn = $id('btnSiteShot');
+                btn.disabled = busy || s.unsupported;
+                btn.textContent = busy ? 'capturing…' : has ? 'refresh' : 'capture';
+                if (!busy && !s.unsupported && !s.asked[site.name] && (!has || stale)) this.refreshSiteShot(site.name, true);
+            },
+
+            async refreshSiteShot(name, auto) {
+                const s = this.sitePage.shot;
+                if (s.busy) return;
+                s.asked[name] = 'asked';
+                s.busy = name;
+                if (this.pageSite && this.pageSite.name === name) this.renderSiteShot(this.pageSite);
+                const res = await this.apiPost('site_shot_refresh', { site_name: name }, { quiet: true, timeoutMs: 90000 });
+                s.busy = null;
+                const site = this.sites.find(x => x.name === name);
+                if (res.success) { if (site) site.shot_mtime = res.mtime; s.asked[name] = 'done'; }
+                else {
+                    s.asked[name] = 'failed';
+                    if (res.unsupported) s.unsupported = true;
+                    if (!auto) this.showSnack(res.message || 'The capture failed.', true);
+                }
+                if (this.view === 'site' && this.pageSite && this.pageSite.name === name) this.renderSiteShot(this.pageSite);
             },
 
             renderSiteNetwork() {
@@ -9222,6 +9319,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             bindSiteEvents() {
                 $id('btnSiteBack').addEventListener('click', () => this.setView('sites'));
+                $id('btnSiteShot').addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); const s = this.pageSite; if (s) { this.sitePage.shot.asked[s.name] = null; this.refreshSiteShot(s.name, false); } });
+                $id('siteShot').addEventListener('click', (e) => { if (e.target.closest('.site-shot-refresh')) e.preventDefault(); });
                 $id('btnSiteLogin').addEventListener('click', () => { const s = this.pageSite; if (s) this.getLoginLink(s.name); });
                 $id('siteFacts').addEventListener('click', (e) => {
                     const path = e.target.closest('.fact-path');
@@ -11659,6 +11758,7 @@ show_general_help() {
     echo "  network          Lists the sites on a multisite network."
     echo "  wp               Runs WP-CLI inside a site from anywhere."
     echo "  snapshot         Take, list, restore, or delete snapshots of a site."
+    echo "  screenshot       Capture a site's front page with a headless browser."
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
     echo "  pull             Pulls a remote WordPress site into Cove via SSH."
@@ -11974,6 +12074,9 @@ display_command_help() {
             ;;
         snapshot)
             cove_snapshot --help
+            ;;
+        screenshot)
+            cove_screenshot --help
             ;;
         network)
             echo "Usage: cove network <site> [--format=json]"
@@ -12312,6 +12415,9 @@ main() {
         snapshot)
             check_dependencies
             cove_snapshot "$@"
+            ;;
+        screenshot)
+            cove_screenshot "$@"
             ;;
         enable)
             check_dependencies
