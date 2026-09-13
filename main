@@ -4144,6 +4144,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --pill-static-fg: #9a9d94;
             --input-bg: #0b0e0c;
             --danger: #d66a6a;
+            /* Syntax highlighting in the Files editor. */
+            --hl-cmt: #6c716a; --hl-str: #b3c78c; --hl-kw: #7cc3cf; --hl-num: #e0b078; --hl-var: #c7b6e6; --hl-tag: #5fb6c4; --hl-attr: #d8c68e; --hl-fn: #e9e7dc;
             --shadow-lg: none;
             color-scheme: dark;
         }
@@ -4172,6 +4174,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --pill-static-fg: #8a8781;
             --input-bg: #fbfaf7;
             --danger: #b44848;
+            --hl-cmt: #8a8e85; --hl-str: #4f7d2a; --hl-kw: #1f7a8c; --hl-num: #b0641d; --hl-var: #7a4fa8; --hl-tag: #0f6d7a; --hl-attr: #8a6a10; --hl-fn: #2f3a3c;
             --shadow-lg: none;
             color-scheme: light;
         }
@@ -4776,9 +4779,26 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .files-editor { flex: 1; min-height: 0; display: none; flex-direction: column; }
         .files-main.has-file .file-list, .files-main.has-file .file-head { display: none; }
         .files-main.has-file .files-editor { display: flex; }
-        .files-editor textarea { flex: 1; min-height: 0; width: 100%; box-sizing: border-box; background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.55; padding: 0.9rem 1.25rem; resize: none; outline: 0; white-space: pre; overflow: auto; tab-size: 4; }
-        .files-editor textarea:disabled { color: var(--text-dim); }
-        .files-editor textarea.is-wrapped { white-space: pre-wrap; overflow-wrap: anywhere; }
+        /* The editor: a transparent textarea over a highlighted layer that
+           shares its font, padding and wrapping exactly. */
+        .files-code { position: relative; flex: 1; min-height: 0; display: flex; }
+        .files-code .files-hl, .files-code textarea { margin: 0; font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.55; padding: 0.9rem 1.25rem; tab-size: 4; white-space: pre; box-sizing: border-box; }
+        .files-hl { position: absolute; top: 0; left: 0; right: 0; bottom: 0; overflow: hidden; pointer-events: none; color: var(--text); background: transparent; }
+        .files-hl code { font: inherit; }
+        .files-code textarea { position: relative; z-index: 1; flex: 1; width: 100%; min-height: 0; background: transparent; border: 0; color: transparent; caret-color: var(--text); resize: none; outline: 0; overflow: auto; }
+        .files-code.is-plain textarea { color: var(--text); }
+        .files-code.is-plain textarea:disabled { color: var(--text-dim); }
+        .files-code.is-plain .files-hl { display: none; }
+        .files-code:has(textarea:disabled) .files-hl { color: var(--text-dim); }
+        .files-code.is-wrapped .files-hl, .files-code.is-wrapped textarea { white-space: pre-wrap; overflow-wrap: anywhere; }
+        .hl-cmt { color: var(--hl-cmt); font-style: italic; }
+        .hl-str { color: var(--hl-str); }
+        .hl-kw { color: var(--hl-kw); }
+        .hl-num { color: var(--hl-num); }
+        .hl-var { color: var(--hl-var); }
+        .hl-tag { color: var(--hl-tag); }
+        .hl-attr { color: var(--hl-attr); }
+        .hl-fn { color: var(--hl-fn); }
         .files-preview { flex: 1; min-height: 0; overflow: auto; display: flex; align-items: center; justify-content: center; padding: 1.5rem; background: var(--bg-sunk); background-image: linear-gradient(45deg, var(--panel-border) 25%, transparent 25%, transparent 75%, var(--panel-border) 75%), linear-gradient(45deg, var(--panel-border) 25%, transparent 25%, transparent 75%, var(--panel-border) 75%); background-size: 16px 16px; background-position: 0 0, 8px 8px; }
         .files-preview img { max-width: 100%; max-height: 100%; box-shadow: 0 2px 12px rgba(0,0,0,0.25); background: white; }
         .files-note { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.4rem; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
@@ -5453,7 +5473,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         </li>
                     </ul>
                     <div class="files-editor" id="filesEditor">
-                        <textarea id="filesText" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" aria-label="File contents"></textarea>
+                        <div class="files-code" id="filesCode">
+                            <pre class="files-hl" id="filesHl" aria-hidden="true"><code id="filesHlCode"></code></pre>
+                            <textarea id="filesText" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" aria-label="File contents"></textarea>
+                        </div>
                         <div class="files-preview" id="filesPreview" style="display: none;"><img id="filesPreviewImg" alt=""></div>
                         <div class="files-note" id="filesNote" style="display: none;">
                             <div id="filesNoteText"></div>
@@ -5565,6 +5588,38 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <!-- Context menu: one component driven by right- OR left-click anywhere on
          a row, so the two affordances can never drift apart. Opening the site
          itself lives on the row's ↗ icon. -->
+    <!-- Files view: right-click menu for entries, the open folder, and crumbs. -->
+    <div class="ctx-menu" id="fileCtxMenu" style="display: none;">
+        <div>
+            <div class="ctx-title" id="fctxTitle"></div>
+            <button class="ctx-item" id="fctxOpen" data-act="open"><span>Open</span><span class="ctx-key">↵</span></button>
+            <button class="ctx-item" id="fctxRename" data-act="rename"><span>Rename…</span><span class="ctx-key">F2</span></button>
+            <button class="ctx-item" id="fctxDownload" data-act="download"><span>Download</span></button>
+            <button class="ctx-item" id="fctxReveal" data-act="reveal"><span>Reveal in Finder</span></button>
+            <button class="ctx-item" id="fctxCopy" data-act="copy"><span>Copy path</span></button>
+            <div class="ctx-sep" id="fctxSepNew"></div>
+            <button class="ctx-item" id="fctxNewFile" data-act="newfile"><span>New file…</span></button>
+            <button class="ctx-item" id="fctxNewFolder" data-act="newfolder"><span>New folder…</span></button>
+            <button class="ctx-item" id="fctxUpload" data-act="upload"><span>Upload…</span></button>
+            <div class="ctx-sep" id="fctxSepDel"></div>
+            <button class="ctx-item danger" id="fctxDelete" data-act="delete"><span>Delete</span><span class="ctx-key">⌦</span></button>
+            <button class="ctx-item danger" id="fctxDeleteSite" data-act="deletesite"><span>Delete site…</span></button>
+        </div>
+    </div>
+
+    <!-- Files view: the site root and public/ are the site — deleting them
+         is the sites list's delete, behind a confirm, with its undo window. -->
+    <div class="modal-backdrop" id="siteDeleteModal" style="display: none;">
+        <div class="modal">
+            <h3>Delete <span id="siteDeleteName"></span>?</h3>
+            <p class="modal-sub" id="siteDeleteSub"></p>
+            <div class="modal-actions">
+                <button type="button" class="pill" id="btnSiteDeleteCancel">cancel</button>
+                <button type="button" class="pill mail-delete-all armed" id="btnSiteDeleteConfirm">delete site</button>
+            </div>
+        </div>
+    </div>
+
     <div class="ctx-menu" id="ctxMenu" style="display: none;">
         <div>
             <div class="ctx-title" id="ctxTitle"></div>
@@ -5648,6 +5703,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             pinned: (() => { try { return JSON.parse(localStorage.getItem('pinned')) || []; } catch (e) { return []; } })(),
             selectedName: null,
             ctxMenu: { open: false, site: null, x: 0, y: 0, openedAt: 0 },
+            fileCtx: { open: false, target: null, x: 0, y: 0, openedAt: 0 },
+            siteDeleteConfirm: null,
             palette: { open: false, query: '', index: 0 },
             rename: { open: false, site: null, value: '', busy: false },
             logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
@@ -8482,6 +8539,321 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 document.addEventListener('visibilitychange', () => { if (!document.hidden && this.view === 'logs') this.pollLogs(); });
             },
 
+            // --- Syntax highlighting ---------------------------------------
+            // A small tokenizer of Cove's own — no library, nothing fetched.
+            // Each language is a list of [class, pattern] pairs compiled into
+            // one alternation; the first alternative to match at a position
+            // wins, and anything no rule claims is plain text. Rules must not
+            // contain capturing groups (the alternation's numbering relies on
+            // it). The result paints a <pre> that sits under the textarea.
+            get hlLangs() {
+                if (this._hlLangs) return this._hlLangs;
+                const str = `'(?:[^'\\\\\\n]|\\\\.)*'|"(?:[^"\\\\\\n]|\\\\.)*"`;
+                const num = `\\b0x[\\da-fA-F]+\\b|\\b\\d+(?:\\.\\d+)?(?:e[+-]?\\d+)?\\b`;
+                const kw = (list) => `\\b(?:${list})\\b`;
+                const L = {
+                    php: [
+                        ['cmt', `\\/\\*[\\s\\S]*?\\*\\/|\\/\\/[^\\n]*|#(?!\\[)[^\\n]*`],
+                        ['str', str],
+                        ['var', `\\$[A-Za-z_]\\w*`],
+                        ['num', num],
+                        ['kw', kw('abstract|and|array|as|break|callable|case|catch|class|clone|const|continue|declare|default|do|echo|else|elseif|empty|enddeclare|endfor|endforeach|endif|endswitch|endwhile|enum|extends|final|finally|fn|for|foreach|function|global|goto|if|implements|include|include_once|instanceof|insteadof|interface|isset|list|match|namespace|new|or|print|private|protected|public|readonly|require|require_once|return|static|switch|throw|trait|try|unset|use|var|while|xor|yield|true|false|null|TRUE|FALSE|NULL|self|parent|int|string|bool|float|void|mixed|never|iterable|object|__DIR__|__FILE__|__LINE__|__CLASS__|__FUNCTION__|__METHOD__|__NAMESPACE__')],
+                        ['fn', `\\b[A-Za-z_]\\w*(?=\\s*\\()`],
+                    ],
+                    js: [
+                        ['cmt', `\\/\\*[\\s\\S]*?\\*\\/|\\/\\/[^\\n]*`],
+                        ['str', '`(?:[^`\\\\]|\\\\.)*`|' + str],
+                        ['num', num],
+                        ['kw', kw('async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|from|function|get|if|import|in|instanceof|let|new|of|return|set|static|super|switch|this|throw|try|typeof|var|void|while|with|yield|true|false|null|undefined|NaN|Infinity|interface|type|enum|implements|readonly|declare|namespace|abstract|as|is|keyof')],
+                        ['fn', `\\b[A-Za-z_$][\\w$]*(?=\\s*\\()`],
+                    ],
+                    css: [
+                        ['cmt', `\\/\\*[\\s\\S]*?\\*\\/`],
+                        ['str', str],
+                        ['kw', `@[\\w-]+|!important\\b`],
+                        ['num', `#[\\da-fA-F]{3,8}\\b|\\b\\d+(?:\\.\\d+)?(?:px|em|rem|%|vh|vw|vmin|vmax|ch|s|ms|deg|fr|pt)?\\b|\\.\\d+(?:px|em|rem|%|s|ms)?\\b`],
+                        ['attr', `[A-Za-z-]+(?=\\s*:(?!:))`],
+                        ['fn', `\\b[a-z-]+(?=\\()`],
+                        ['tag', `[.#][A-Za-z_-][\\w-]*|::?[a-z-]+(?![\\w-]*\\s*:)`],
+                    ],
+                    html: [
+                        ['cmt', `<!--[\\s\\S]*?-->|<!DOCTYPE[^>]*>|<!doctype[^>]*>`],
+                        ['tag', `<\\/?[A-Za-z][\\w:-]*|\\/?>`],
+                        ['str', str],
+                        ['attr', `\\b[A-Za-z_:@][\\w:.-]*(?=\\s*=)`],
+                        ['num', `&[#\\w]+;`],
+                    ],
+                    json: [
+                        ['attr', `"(?:[^"\\\\]|\\\\.)*"(?=\\s*:)`],
+                        ['str', `"(?:[^"\\\\]|\\\\.)*"`],
+                        ['num', `-?\\b\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b`],
+                        ['kw', kw('true|false|null')],
+                    ],
+                    sql: [
+                        ['cmt', `--[^\\n]*|#[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/`],
+                        ['str', '`[^`\\n]*`|' + str],
+                        ['num', num],
+                        ['kw', kw('SELECT|FROM|WHERE|AND|OR|NOT|NULL|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|TABLE|ALTER|DROP|INDEX|PRIMARY|KEY|DEFAULT|AUTO_INCREMENT|JOIN|LEFT|RIGHT|INNER|OUTER|CROSS|ON|AS|ORDER|BY|GROUP|HAVING|LIMIT|OFFSET|UNION|ALL|DISTINCT|IF|EXISTS|BEGIN|COMMIT|ROLLBACK|TRUNCATE|ENGINE|CHARSET|COLLATE|UNSIGNED|INT|INTEGER|VARCHAR|CHAR|TEXT|LONGTEXT|MEDIUMTEXT|DATETIME|DATE|TIMESTAMP|BIGINT|TINYINT|SMALLINT|DECIMAL|FLOAT|DOUBLE|BOOLEAN|LIKE|IN|IS|BETWEEN|CASE|WHEN|THEN|ELSE|END|COUNT|SUM|MAX|MIN|AVG|ASC|DESC|USE|SHOW|DESCRIBE|EXPLAIN|LOCK|UNLOCK|TABLES|WRITE|READ|REPLACE|IGNORE|DUPLICATE|CONSTRAINT|FOREIGN|REFERENCES|UNIQUE|CASCADE|VIEW|TRIGGER|PROCEDURE|FUNCTION|RETURNS|DECLARE|WITH')],
+                        ['fn', `\\b[A-Za-z_]\\w*(?=\\s*\\()`],
+                    ],
+                    shell: [
+                        ['cmt', `(?:^|(?<=\\s))#[^\\n]*`],
+                        ['str', `"(?:[^"\\\\]|\\\\[\\s\\S])*"|'[^']*'`],
+                        ['var', `\\$\\{[^}\\n]*\\}|\\$[\\w@#?*!$-]+|\\$\\(`],
+                        ['num', num],
+                        ['kw', kw('if|then|else|elif|fi|for|while|until|do|done|case|esac|in|function|select|return|local|export|readonly|declare|typeset|exit|echo|printf|set|unset|shift|break|continue|source|eval|exec|trap|test|read|cd|true|false')],
+                        ['fn', `^\\s*[A-Za-z_][\\w-]*(?=\\s*\\(\\))`],
+                    ],
+                    md: [
+                        ['str', '```[\\s\\S]*?```|`[^`\\n]+`'],
+                        ['kw', `^#{1,6}[^\\n]*`],
+                        ['cmt', `^>[^\\n]*`],
+                        ['fn', `!?\\[[^\\]\\n]*\\]\\([^)\\n]*\\)`],
+                        ['attr', `\\*\\*[^*\\n]+\\*\\*|__[^_\\n]+__|(?<![\\w*])\\*[^*\\n]+\\*(?!\\w)|(?<![\\w_])_[^_\\n]+_(?!\\w)`],
+                        ['tag', `^\\s*(?:[-*+]|\\d+\\.)\\s|^-{3,}$|^={3,}$`],
+                    ],
+                    conf: [
+                        ['cmt', `(?:^|(?<=\\s))[#;][^\\n]*`],
+                        ['kw', `^\\s*\\[[^\\]\\n]+\\]\\s*$`],
+                        ['attr', `^\\s*[\\w.-]+(?=\\s*[:=])`],
+                        ['str', str],
+                        ['num', num],
+                        ['var', `\\$\\{[^}\\n]*\\}|\\$[A-Za-z_]\\w*|\\{\\$?[\\w.]+\\}`],
+                        ['fn', kw('true|false|yes|no|on|off|null|True|False|None')],
+                    ],
+                    generic: [
+                        ['cmt', `\\/\\*[\\s\\S]*?\\*\\/|\\/\\/[^\\n]*|(?:^|(?<=\\s))#[^\\n]*`],
+                        ['str', `"""[\\s\\S]*?"""|'''[\\s\\S]*?'''|` + str],
+                        ['num', num],
+                        ['kw', kw('def|class|if|elif|else|for|while|return|import|from|as|with|try|except|finally|raise|pass|lambda|yield|and|or|not|in|is|None|True|False|self|func|package|var|let|const|struct|type|interface|fn|pub|mut|impl|use|mod|match|enum|trait|where|loop|break|continue|new|this|nil|end|do|then|begin|module|require|unless|when|case|switch|default|throw|throws|catch|public|private|protected|static|final|void|int|string|bool|float|double|char|long|guard|defer|extension|protocol|override|super|async|await')],
+                        ['fn', `\\b[A-Za-z_]\\w*(?=\\s*\\()`],
+                    ],
+                };
+                const out = {};
+                for (const [name, rules] of Object.entries(L)) {
+                    out[name] = { classes: rules.map(r => r[0]), re: new RegExp(rules.map(r => '(' + r[1] + ')').join('|'), name === 'sql' ? 'gim' : 'gm') };
+                }
+                this._hlLangs = out;
+                return out;
+            },
+
+            hlLang(name) {
+                const base = name.toLowerCase();
+                const ext = base.includes('.') ? base.slice(base.lastIndexOf('.') + 1) : '';
+                if (['php', 'phtml', 'inc'].includes(ext)) return 'php';
+                if (['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'vue'].includes(ext)) return 'js';
+                if (['css', 'scss', 'sass', 'less'].includes(ext)) return 'css';
+                if (['html', 'htm', 'xml', 'svg', 'xhtml', 'twig', 'hbs', 'mustache'].includes(ext)) return 'html';
+                if (ext === 'json' || ext === 'webmanifest' || base === 'composer.lock') return 'json';
+                if (ext === 'sql') return 'sql';
+                if (['sh', 'bash', 'zsh', 'fish'].includes(ext) || ['makefile', 'dockerfile'].includes(base)) return 'shell';
+                if (['md', 'markdown', 'mdx'].includes(ext) || base === 'readme') return 'md';
+                if (['yml', 'yaml', 'toml', 'ini', 'conf', 'cfg', 'env', 'properties', 'htaccess', 'editorconfig', 'gitignore', 'gitattributes', 'lock'].includes(ext) || base.startsWith('.env') || base === 'caddyfile' || base === '.htaccess' || base === 'wp-cli.yml') return 'conf';
+                if (['py', 'rb', 'go', 'rs', 'java', 'kt', 'swift', 'c', 'h', 'cpp', 'hpp', 'cs', 'lua', 'pl', 'r', 'scala', 'dart'].includes(ext)) return 'generic';
+                if (['txt', 'log', 'csv', 'tsv', 'pot', 'po'].includes(ext)) return null;
+                return null;
+            },
+
+            hlEscape(s) { return s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); },
+
+            hlTokens(text, lang) {
+                const L = this.hlLangs[lang];
+                if (!L || !text) return this.hlEscape(text);
+                const re = L.re;
+                re.lastIndex = 0;
+                let out = '', last = 0, m;
+                while ((m = re.exec(text))) {
+                    if (m[0] === '') { re.lastIndex++; continue; }
+                    if (m.index > last) out += this.hlEscape(text.slice(last, m.index));
+                    let cls = '';
+                    for (let i = 1; i < m.length; i++) if (m[i] !== undefined) { cls = L.classes[i - 1]; break; }
+                    out += '<span class="hl-' + cls + '">' + this.hlEscape(m[0]) + '</span>';
+                    last = m.index + m[0].length;
+                }
+                return out + this.hlEscape(text.slice(last));
+            },
+
+            // HTML with script/style islands; PHP as HTML with PHP islands.
+            hlHtml(text) {
+                const re = /(<script\b[^>]*>)([\s\S]*?)(<\/script\s*>)|(<style\b[^>]*>)([\s\S]*?)(<\/style\s*>)/gi;
+                let out = '', last = 0, m;
+                while ((m = re.exec(text))) {
+                    out += this.hlTokens(text.slice(last, m.index), 'html');
+                    if (m[1] !== undefined) out += this.hlTokens(m[1], 'html') + this.hlTokens(m[2], 'js') + this.hlTokens(m[3], 'html');
+                    else out += this.hlTokens(m[4], 'html') + this.hlTokens(m[5], 'css') + this.hlTokens(m[6], 'html');
+                    last = m.index + m[0].length;
+                }
+                return out + this.hlTokens(text.slice(last), 'html');
+            },
+
+            hlPhp(text) {
+                const re = /<\?(?:php\b|=)?[\s\S]*?(?:\?>|$(?![\s\S]))/g;
+                let out = '', last = 0, m;
+                while ((m = re.exec(text))) {
+                    if (m[0] === '') { re.lastIndex++; continue; }
+                    out += this.hlHtml(text.slice(last, m.index));
+                    const open = /^<\?(?:php\b|=)?/.exec(m[0])[0];
+                    const close = m[0].endsWith('?>') ? '?>' : '';
+                    const inner = m[0].slice(open.length, m[0].length - close.length);
+                    out += '<span class="hl-tag">' + this.hlEscape(open) + '</span>' + this.hlTokens(inner, 'php') + (close ? '<span class="hl-tag">?&gt;</span>' : '');
+                    last = m.index + m[0].length;
+                }
+                return out + this.hlHtml(text.slice(last));
+            },
+
+            highlight(text, lang) {
+                if (lang === 'php') return this.hlPhp(text);
+                if (lang === 'html') return this.hlHtml(text);
+                return this.hlTokens(text, lang);
+            },
+
+            // Repaint the layer under the textarea. Deferred to the next
+            // frame so a burst of keystrokes costs one pass; files past the
+            // size cap stay plain (the textarea shows its own text then).
+            renderFilesHighlight(now) {
+                const f = this.files;
+                const code = $id('filesCode');
+                const ta = $id('filesText');
+                const lang = f.file && f.file.kind === 'text' ? this.hlLang(this.filesBase(f.file.path)) : null;
+                const plain = !lang || ta.value.length > 400000;
+                code.classList.toggle('is-plain', plain);
+                if (plain) { $id('filesHlCode').innerHTML = ''; return; }
+                cancelAnimationFrame(f.hlFrame);
+                const paint = () => {
+                    const text = ta.value;
+                    $id('filesHlCode').innerHTML = this.highlight(text, lang) + (text.endsWith('\n') ? '​' : '');
+                    this.syncFilesHighlight();
+                };
+                if (now) paint(); else f.hlFrame = requestAnimationFrame(paint);
+            },
+
+            syncFilesHighlight() {
+                const ta = $id('filesText');
+                const pre = $id('filesHl');
+                pre.scrollTop = ta.scrollTop;
+                pre.scrollLeft = ta.scrollLeft;
+                // A visible scrollbar narrows the textarea's text column; the
+                // layer wraps at the same width only when it loses the same.
+                const bar = ta.offsetWidth - ta.clientWidth;
+                pre.style.right = bar + 'px';
+                const hbar = ta.offsetHeight - ta.clientHeight;
+                pre.style.bottom = hbar + 'px';
+            },
+
+            // --- File context menu -----------------------------------------
+            // Right-click on a row, on the listing itself (the open folder),
+            // or on a crumb. The target is a path inside the site; the site
+            // root and public/ ARE the site, so their delete is the real
+            // delete-site flow with its undo window, never a file delete.
+            openFileCtx(target, event) {
+                event.preventDefault();
+                const f = this.files;
+                this.closeRowMenu();
+                this.fileCtx = { open: true, target, x: event.clientX, y: event.clientY, openedAt: event.timeStamp };
+                this.renderFileCtxMenu();
+                const rect = $id('fileCtxMenu').getBoundingClientRect();
+                this.fileCtx.x = Math.max(8, Math.min(event.clientX, window.innerWidth - rect.width - 8));
+                this.fileCtx.y = Math.max(8, Math.min(event.clientY, window.innerHeight - rect.height - 8));
+                this.renderFileCtxMenu();
+                if (target.inList) { f.selected = target.name; this.renderFilesList(); }
+            },
+
+            closeFileCtx() {
+                if (!this.fileCtx.open) return;
+                this.fileCtx.open = false;
+                show($id('fileCtxMenu'), false);
+            },
+
+            // target: { path, name, type, inList } — inList when it is a row
+            // of the open folder (rename/delete act on rows only).
+            fileCtxIsSite(t) { return t.path === '' || t.path === 'public'; },
+
+            renderFileCtxMenu() {
+                const menu = $id('fileCtxMenu');
+                const c = this.fileCtx;
+                show(menu, c.open);
+                if (!c.open) return;
+                const f = this.files;
+                const t = c.target;
+                menu.style.left = c.x + 'px';
+                menu.style.top = c.y + 'px';
+                const isDir = t.type === 'dir';
+                const site = this.fileCtxIsSite(t);
+                const rowOps = !!t.inList && f.writable && !site;
+                $id('fctxTitle').textContent = t.path === '' ? this.filesRoot : t.name + (isDir ? '/' : '');
+                show($id('fctxOpen'), !!t.inList);
+                show($id('fctxRename'), rowOps);
+                show($id('fctxDownload'), !isDir);
+                show($id('fctxNewFile'), isDir && f.writable);
+                show($id('fctxNewFolder'), isDir && f.writable);
+                show($id('fctxUpload'), isDir && f.writable);
+                show($id('fctxSepNew'), isDir && f.writable);
+                $id('fctxReveal').querySelector('span').textContent = isDir ? this.revealLabel : (this.revealLabel.startsWith('Reveal') ? 'Reveal in Finder' : 'Show in folder');
+                show($id('fctxDelete'), rowOps);
+                show($id('fctxDeleteSite'), site);
+                show($id('fctxSepDel'), rowOps || site);
+            },
+
+            async fileCtxRun(what) {
+                const f = this.files;
+                const t = this.fileCtx.target;
+                if (!t) return;
+                this.closeFileCtx();
+                if (what === 'open') { this.filesNavigate(t.path, t.type); return; }
+                if (what === 'rename') { if (t.inList) this.startFilesRename(t.name); return; }
+                if (what === 'download') { const a = document.createElement('a'); a.href = this.filesRawUrl(t.path, true); a.download = t.name; document.body.appendChild(a); a.click(); a.remove(); return; }
+                if (what === 'reveal') {
+                    const res = await this.apiPost('file_reveal', { site: f.site, path: t.path }, { timeoutMs: 10000 });
+                    if (res.success) this.showSnack('Opened in the file manager.');
+                    return;
+                }
+                if (what === 'copy') {
+                    const abs = (f.root || '') + (t.path ? '/' + t.path : '');
+                    navigator.clipboard.writeText(abs).then(() => this.showSnack('Path copied.')).catch(() => this.showSnack('Could not copy.', true));
+                    return;
+                }
+                if (what === 'newfile' || what === 'newfolder' || what === 'upload') {
+                    const dir = t.type === 'dir' ? t.path : this.filesParent(t.path);
+                    if (dir !== f.path || f.file) { await this.filesNavigate(dir, 'dir'); if (f.path !== dir) return; }
+                    if (what === 'upload') $id('filesUploadInput').click();
+                    else this.startFilesCreate(what === 'newfile' ? 'file' : 'dir');
+                    return;
+                }
+                if (what === 'delete') { if (t.inList) this.deleteFilesEntry(t.name); return; }
+                if (what === 'deletesite') { this.openSiteDeleteConfirm(f.site); return; }
+            },
+
+            // The confirm before a site is staged for deletion from the Files
+            // view. Staging itself is deleteSite(): the row leaves the sites
+            // list at once and the undo snackbar holds the real work back.
+            openSiteDeleteConfirm(name) {
+                const site = this.sites.find(s => s.name === name);
+                if (!site) { this.showSnack('That site is not in the list — is it still being created?', true); return; }
+                this.siteDeleteConfirm = name;
+                $id('siteDeleteName').textContent = name + '.localhost';
+                $id('siteDeleteSub').textContent = (site.type === 'WordPress'
+                    ? 'Deletes the whole site: every file under ' + name + '.localhost/ (public/, logs, uploads) and its database. '
+                    : 'Deletes the whole site: every file under ' + name + '.localhost/. ')
+                    + 'The Files view cannot delete just the site folder — this is the same as "Delete site" on the sites list, with the same few seconds to undo.';
+                show($id('siteDeleteModal'), true);
+                $id('btnSiteDeleteConfirm').focus();
+            },
+
+            closeSiteDeleteConfirm() {
+                this.siteDeleteConfirm = null;
+                show($id('siteDeleteModal'), false);
+            },
+
+            confirmSiteDelete() {
+                const name = this.siteDeleteConfirm;
+                this.closeSiteDeleteConfirm();
+                if (!name) return;
+                const f = this.files;
+                f.dirty = false;
+                if (f.site === name) this.setFilesSite(null);
+                this.deleteSite(name);
+            },
+
             // --- Files -----------------------------------------------------
             // A file manager over each site's directory. `path` is the
             // folder on screen, `file` the one open in the editor (its parent
@@ -8679,6 +9051,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const f = this.files;
                 if (!f.file || f.file.kind !== 'text') return;
                 $id('filesText').value = f.file.content;
+                this.renderFilesHighlight(true);
                 f.dirty = false; f.conflict = false;
                 this.renderFilesBar(); this.renderFilesFooter();
                 $id('filesText').focus();
@@ -9036,7 +9409,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         del.classList.toggle('armed', armed);
                         del.textContent = armed ? 'sure?' : '×';
                         del.title = armed ? 'Click again to delete' + (e.type === 'dir' && !e.link ? ' the folder and everything in it' : '') : 'Delete';
-                        if (e.name === 'public' && !f.path) del.remove();
+                        if (e.name === 'public' && !f.path) { del.remove(); row.querySelector('.file-row-rename').remove(); }
                         if (!f.writable) row.querySelector('.file-row-actions').remove();
                     }
                     row.querySelector('.file-size').textContent = e.type === 'dir' ? '' : (e.broken ? '' : this.formatSize(e.size));
@@ -9060,18 +9433,19 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const ta = $id('filesText');
                 const prev = $id('filesPreview');
                 const note = $id('filesNote');
-                if (!file) { show(ta, false); show(prev, false); show(note, false); f.renderedPath = null; return; }
+                if (!file) { show($id('filesCode'), false); show(prev, false); show(note, false); f.renderedPath = null; return; }
                 const kind = file.loading ? 'loading' : file.kind;
-                show(ta, kind === 'text');
+                show($id('filesCode'), kind === 'text');
                 show(prev, kind === 'image');
                 show(note, kind !== 'text' && kind !== 'image');
-                ta.classList.toggle('is-wrapped', f.wrap);
+                $id('filesCode').classList.toggle('is-wrapped', f.wrap);
                 if (kind === 'text') {
                     if (f.renderedPath !== file.path) {
                         ta.value = file.content;
                         ta.scrollTop = 0;
                         f.renderedPath = file.path;
                         f.dirty = false;
+                        this.renderFilesHighlight(true);
                     }
                     ta.disabled = file.writable === false || !!file.lossy;
                     ta.readOnly = false;
@@ -9136,18 +9510,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     return false;
                 }
                 if (inEditor) {
-                    if (e.key === 'Escape') { e.preventDefault(); ta.blur(); return true; }
+                    if (e.key === 'Escape') { e.preventDefault(); if (this.siteDeleteConfirm) this.closeSiteDeleteConfirm(); else if (this.fileCtx.open) this.closeFileCtx(); else ta.blur(); return true; }
                     if (e.key === 'Tab' && !e.shiftKey && !ta.disabled) {
                         e.preventDefault();
                         const s = ta.selectionStart, end = ta.selectionEnd;
                         ta.setRangeText('\t', s, end, 'end');
-                        f.dirty = true; this.renderFilesBar(); this.renderFilesFooter();
+                        f.dirty = true; this.renderFilesBar(); this.renderFilesFooter(); this.renderFilesHighlight();
                         return true;
                     }
                     return false;
                 }
                 if (typing) return false;
                 if (e.key === 'Escape') {
+                    if (this.siteDeleteConfirm) { this.closeSiteDeleteConfirm(); return true; }
+                    if (this.fileCtx.open) { this.closeFileCtx(); return true; }
                     if (this.ctxMenu.open) { this.closeRowMenu(); return true; }
                     if (this.showDbModal) { this.setDbModal(false); return true; }
                     if (f.edit) { this.cancelFilesEdit(); return true; }
@@ -9280,11 +9656,48 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     f.dirty = f.file && f.file.kind === 'text' ? ta.value !== f.file.content : false;
                     if (was !== f.dirty) this.renderFilesBar();
                     this.renderFilesFooter();
+                    this.renderFilesHighlight();
                 });
                 $id('btnFileSave').addEventListener('click', () => this.saveFile());
                 $id('btnFileRevert').addEventListener('click', () => this.revertFile());
                 $id('btnFileDelete').addEventListener('click', () => this.deleteOpenFile());
-                $id('btnFileWrap').addEventListener('click', () => { f.wrap = !f.wrap; try { localStorage.setItem('files.wrap', f.wrap ? '1' : '0'); } catch (err) {} this.renderFilesEditor(); this.renderFilesBar(); });
+                $id('btnFileWrap').addEventListener('click', () => { f.wrap = !f.wrap; try { localStorage.setItem('files.wrap', f.wrap ? '1' : '0'); } catch (err) {} this.renderFilesEditor(); this.renderFilesBar(); this.renderFilesHighlight(true); });
+                // The highlighted layer follows the textarea's scroll and size.
+                ta.addEventListener('scroll', () => this.syncFilesHighlight(), { passive: true });
+                window.addEventListener('resize', () => { if (this.view === 'files' && f.file) this.syncFilesHighlight(); });
+                // Right-click menus: a row, the listing (= the open folder), a crumb.
+                list.addEventListener('contextmenu', (e) => {
+                    if (!f.site || f.file) return;
+                    const row = e.target.closest('.file-row');
+                    if (row && (row.classList.contains('is-editing') || row.dataset.up)) return;
+                    if (row) {
+                        const en = f.entries.find(x => x.name === row.dataset.name);
+                        if (!en || en.broken) return;
+                        this.openFileCtx({ path: this.filesJoin(f.path, en.name), name: en.name, type: en.type, inList: true }, e);
+                    } else {
+                        this.openFileCtx({ path: f.path, name: f.path ? this.filesBase(f.path) : '', type: 'dir', inList: false }, e);
+                    }
+                });
+                $id('filesCrumbs').addEventListener('contextmenu', (e) => {
+                    const b = e.target.closest('.files-crumb');
+                    if (!b || !f.site) return;
+                    const p = b.dataset.path;
+                    const isFile = !!(f.file && f.file.path === p);
+                    this.openFileCtx({ path: p, name: p ? this.filesBase(p) : '', type: isFile ? 'file' : 'dir', inList: false }, e);
+                });
+                $id('fileCtxMenu').addEventListener('click', (e) => {
+                    const b = e.target.closest('.ctx-item');
+                    if (b) this.fileCtxRun(b.dataset.act);
+                });
+                document.addEventListener('click', (e) => {
+                    if (!this.fileCtx.open || e.timeStamp === this.fileCtx.openedAt) return;
+                    if (!$id('fileCtxMenu').contains(e.target)) this.closeFileCtx();
+                });
+                window.addEventListener('scroll', () => { if (this.fileCtx.open) this.closeFileCtx(); }, { passive: true });
+                window.addEventListener('resize', () => { if (this.fileCtx.open) this.closeFileCtx(); });
+                $id('btnSiteDeleteCancel').addEventListener('click', () => this.closeSiteDeleteConfirm());
+                $id('btnSiteDeleteConfirm').addEventListener('click', () => this.confirmSiteDelete());
+                $id('siteDeleteModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) this.closeSiteDeleteConfirm(); });
                 window.addEventListener('beforeunload', (e) => { if (f.dirty) { e.preventDefault(); e.returnValue = ''; } });
             },
 
