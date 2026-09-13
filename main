@@ -5197,6 +5197,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         /* Site page. One site: facts, its views, its network, its actions. */
         body.view-site .wrap { max-width: 1040px; }
         .sp-head { align-items: flex-start; }
+        .view-head { display: flex; flex-direction: column; gap: 0.25rem; min-width: 0; }
+        .view-back { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
         .sp-head-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.45rem; }
         .sp-head .card-title { overflow-wrap: anywhere; }
         .site-back { align-self: flex-start; background: transparent; border: 0; padding: 0; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); cursor: pointer; }
@@ -5636,7 +5638,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
              filter Mailpit's own UI cannot offer. -->
         <section class="card mail-card" id="mailCard" style="display: none;">
             <header class="card-head">
-                <h1 class="card-title">Mail</h1>
+                <div class="view-head"><button type="button" class="site-back view-back" id="mailBack" style="display: none;"></button><h1 class="card-title">Mail</h1></div>
                 <div class="card-actions">
                     <a class="pill" href="https://mail.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Mailpit's own interface">
                         mailpit
@@ -5783,7 +5785,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
              away for exports, imports and schema work. -->
         <section class="card db-card" id="dbCard" style="display: none;">
             <header class="card-head">
-                <h1 class="card-title">Databases</h1>
+                <div class="view-head"><button type="button" class="site-back view-back" id="dbBack" style="display: none;"></button><h1 class="card-title">Databases</h1></div>
                 <div class="card-actions">
                     <a class="pill" id="dbAdminerLink" href="https://db.cove.localhost<?= $__cove_port_suffix ?>" target="_blank" rel="noopener" title="Open Adminer — exports, imports, schema changes, users">
                         adminer
@@ -5900,7 +5902,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
              its entries; each site also has its own debug.log and access log. -->
         <section class="card logs-card" id="logsCard" style="display: none;">
             <header class="card-head">
-                <h1 class="card-title">Logs</h1>
+                <div class="view-head"><button type="button" class="site-back view-back" id="logsBack" style="display: none;"></button><h1 class="card-title">Logs</h1></div>
                 <div class="card-actions">
                     <label class="mail-unread-toggle" title="Follow the log as it grows">
                         <input type="checkbox" id="logsLive" checked>
@@ -6186,7 +6188,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
         <section class="card files-card" id="filesCard" style="display: none;">
             <header class="card-head">
-                <h1 class="card-title">Files</h1>
+                <div class="view-head"><button type="button" class="site-back view-back" id="filesBack" style="display: none;"></button><h1 class="card-title">Files</h1></div>
                 <div class="card-actions">
                     <label class="mail-unread-toggle" title="Show dotfiles and dotfolders">
                         <input type="checkbox" id="filesHidden" checked>
@@ -8060,6 +8062,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             renderMailChrome() {
+                this.renderViewBack('mailBack', this.mail.site);
                 const m = this.mail;
                 const chip = $id('mailSiteChip');
                 show(chip, !!m.site);
@@ -8652,6 +8655,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 show($id('btnDbFilterClear'), !!d.filter);
                 $id('btnDbSql').classList.toggle('primary', d.sql);
                 const site = d.name ? this.dbSiteOf(d.name) : null;
+                this.renderViewBack('dbBack', site);
                 const adminer = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) + (d.name ? '&db=' + encodeURIComponent(d.name) + (d.table ? '&select=' + encodeURIComponent(d.table) : '') : '');
                 $id('dbAdminerLink').href = adminer;
                 $id('dbAdminerLink').title = 'Open ' + (d.table ? d.table + ' in Adminer' : d.name ? d.name + ' in Adminer' : 'Adminer') + (site ? ' (' + site + '.localhost)' : '') + ' — exports, imports, schema changes, users';
@@ -9214,6 +9218,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             renderLogsChrome() {
                 const l = this.logs;
+                this.renderViewBack('logsBack', l.site);
                 show($id('logsSiteChip'), !!l.site);
                 if (l.site) $id('logsSiteChipLabel').textContent = l.site;
                 const active = !!(l.query || l.level !== 'all');
@@ -9419,6 +9424,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // the sites on its network (with a login per subsite), and the
             // management actions the row menu offers. Reached by clicking a
             // row; /site/<name> is its address.
+            // "← site.localhost" above a view's title while it is scoped to a site.
+            renderViewBack(id, name) {
+                const b = $id(id);
+                show(b, !!name);
+                if (name) { b.textContent = '← ' + name + '.localhost'; b.title = 'Back to ' + name + '.localhost'; }
+            },
+
             get pageSite() { return this.sites.find(s => s.name === this.sitePage.name) || null; },
 
             openSitePage(name) {
@@ -9770,6 +9782,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             bindSiteEvents() {
                 $id('btnSiteBack').addEventListener('click', () => this.setView('sites'));
+                for (const [id, get] of [['filesBack', () => this.files.site], ['logsBack', () => this.logs.site], ['mailBack', () => this.mail.site], ['dbBack', () => this.db.name ? this.dbSiteOf(this.db.name) : null]]) {
+                    $id(id).addEventListener('click', () => { const s = get(); if (s) this.openSitePage(s); });
+                }
                 $id('btnSiteShot').addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); const s = this.pageSite; if (s) { this.sitePage.shot.asked[s.name] = null; this.refreshSiteShot(s.name, false); } });
                 $id('siteShot').addEventListener('click', (e) => { if (e.target.closest('.site-shot-refresh')) e.preventDefault(); });
                 $id('btnSiteLogin').addEventListener('click', () => { const s = this.pageSite; if (s) this.getLoginLink(s.name); });
@@ -11065,6 +11080,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             renderFilesChrome() {
                 const f = this.files;
+                this.renderViewBack('filesBack', f.site);
                 show($id('filesSiteChip'), !!f.site);
                 if (f.site) $id('filesSiteChipLabel').textContent = f.site;
                 const active = !!f.filter;
