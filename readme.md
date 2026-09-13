@@ -228,7 +228,7 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
   * Every site Cove manages, with its WordPress version (flagged when wp.org marks it insecure), PHP pin, disk usage, and last-modified time.
   * Filter by name (press `/` from anywhere) or by type (click a `WP` / `STATIC` pill); sort by name, type, size, or last modified; pin the sites you are working on to the top.
   * `⌘K` opens a command palette that searches sites and commands from anywhere.
-  * Add WordPress or plain sites from a form that offers real WordPress versions; delete with an undo window, or bulk-delete everything a filter matches.
+  * Add WordPress or plain sites from a form that offers real WordPress versions; delete with an undo window, or bulk-delete everything a filter matches — behind a dialog that lists the sites and asks for their number to be typed.
   * Click a row to open the site's page (below). Right-click any row for the menu: manage, open, one-time admin login, rename, reveal in Finder, browse files, database, PHP version, logs, mail, copy path, pin, delete.
   * The `caddy`, `mariadb`, and `mailpit` dots in the top bar open a panel with each service's status, version, ports, and credentials.
 

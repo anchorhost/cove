@@ -14,6 +14,8 @@
 
 ### 🛠️ Improvements & Changes
 
+* **Bulk Delete Asks Properly:** The sites list's "delete N shown" button was armed by one click and fired on the next — easy to stumble into with a filter that matched more than intended. It now opens a dialog that lists every site the filter matched, says that their files and databases go, and needs the number of sites typed before its button enables. The undo window afterwards is unchanged.
+* **No Auto-Update Switch on Must-Use Plugins:** They have no such setting, so the plugins tab and its menu no longer offer one for them.
 * **Long Site Names on the Site Page:** The page's header shared a class name with the sites list's column header, so it inherited that grid and squeezed the title, facts, and path into a quarter of the width — a longer name wrapped onto three lines and the path was cut short. The header now has the full width, and a very long name wraps only when it must.
 * **`cove login <site> <user>` for Any Role:** Naming a user no longer requires them to be an administrator; a non-administrator is logged in with a note of their roles. Without a user the command still picks an administrator.
 
