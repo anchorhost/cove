@@ -16,6 +16,7 @@
 
 ### 🛠️ Improvements & Changes
 
+* **Back to the Site:** While the Files, Databases, Mail, or Logs view is scoped to one site, a `← site.localhost` link sits above its title and returns to that site's page.
 * **Two Dashes Stay Two:** The dashboard's monospace face ligates `--` into one long dash, so `--format=json` in the WP-CLI console looked like it had lost a character (it had not). Ligatures are off in the console, the file editor, the SQL console, log entries, and the filter boxes.
 * **Tile Illustrations:** The four tiles on a site's overview — files, database, mail, logs — each carry a small monoline drawing in the dashboard's empty-state style: a folder, a cylinder, an envelope, a page with a live dot, each over the wave, washed in the accent and darkening on hover.
 * **The Palette Lands on the Site Page:** `⌘K`, pick a site, `↵` now opens the site's page rather than the site in a new tab; `⇧↵` opens the site itself and `⌘↵` still logs in. The footer says so.
