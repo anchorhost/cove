@@ -186,7 +186,7 @@ RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="1.16"
+COVE_VERSION="1.17"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -196,11 +196,13 @@ WHOOPS_VERSION="2.18.0"
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
 MU_PLUGIN_VERSION="0.6.1"
-# Version of the macOS menu bar companion app (menubar/, embedded at compile
-# time). Bump whenever anything under menubar/ changes — post-upgrade compares
-# this against the installed bundle's CFBundleShortVersionString to decide
+# Version of the menu bar companion apps (menubar/, embedded at compile
+# time): the macOS app under Sources/ and the Linux tray under Linux/ share
+# this one number. Bump whenever anything under menubar/ changes — post-upgrade
+# compares it against the installed copy (the bundle's
+# CFBundleShortVersionString on macOS, the VERSION file on Linux) to decide
 # whether an enabled menu bar needs a rebuild. Opt-in: never auto-installed.
-MENUBAR_VERSION="1.2"
+MENUBAR_VERSION="1.3"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -1242,8 +1244,11 @@ update_etc_hosts() {
                 # Check for additional mappings
                 if [ -f "$site_path/mappings" ]; then
                     while IFS= read -r mapping || [ -n "$mapping" ]; do
-                        # Skip empty lines
-                        if [ -n "$mapping" ]; then
+                        # Skip empty lines and wildcards: /etc/hosts has no
+                        # wildcard syntax and *.localhost already resolves to
+                        # loopback natively, so a "*.name" line would be inert
+                        # — and would prompt for sudo on every reload.
+                        if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]]; then
                             required_hosts+=("$mapping")
                         fi
                     done < "$site_path/mappings"
@@ -1261,6 +1266,12 @@ update_etc_hosts() {
     done
 
     if [ ${#missing_hosts[@]} -gt 0 ]; then
+        # No terminal to ask for a password on (the dashboard's shell_exec,
+        # a cron job): say what is missing instead of failing inside tee.
+        if [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
+            echo "   - ⚠️  Cannot prompt for sudo here — run 'cove reload' in a terminal to add to /etc/hosts: ${missing_hosts[*]}"
+            return 0
+        fi
         echo "   - Adding missing entries to /etc/hosts (requires sudo)..."
         # printf '%s\n' (not echo -e) so a backslash sequence in a host value
         # can never expand into an extra root-written line. Defense-in-depth
@@ -2855,8 +2866,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         if ($cfg_head !== false && preg_match('/define\s*\(\s*[\'"]DB_NAME[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $cfg_head, $m)) $db_name = $m[1];
                     }
 
+                    // Extra hostnames from `cove mappings` (one per line) and
+                    // the multisite marker — together they decide which
+                    // addresses the site's Caddy block answers on.
+                    $mappings_list = [];
+                    if (is_file($site_path . '/mappings')) {
+                        foreach (file($site_path . '/mappings', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $m_line) {
+                            $m_line = trim($m_line);
+                            if ($m_line !== '') $mappings_list[] = $m_line;
+                        }
+                    }
+                    $multisite_mode = is_file($site_path . '/multisite') ? trim((string) @file_get_contents($site_path . '/multisite')) : '';
+
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
+                        'mappings' => $mappings_list,
+                        'multisite' => $multisite_mode !== '' ? $multisite_mode : null,
                         'domain' => 'https://' . $item . $__cove_port_suffix,
                         'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
                         'wp_version' => $wp_version,
@@ -3085,6 +3110,62 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             echo json_encode($response);
             exit; // Exit immediately
+        case 'add_mapping':
+        case 'remove_mapping':
+            // Extra hostnames for a site (`cove mappings`). The CLI owns the
+            // file format and the Caddyfile/hosts regeneration; this gates
+            // the inputs and shells out. Same wildcard-tolerant hostname rule
+            // as validate_hostname in the CLI.
+            $domain = strtolower(trim((string) ($input['domain'] ?? '')));
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            $bare_domain = preg_replace('/^\*\./', '', $domain);
+            if ($domain === '' || strlen($domain) > 253 || !preg_match('/^[a-z0-9_]([a-z0-9._-]*[a-z0-9_])?$/', $bare_domain)) {
+                $response['message'] = 'Invalid domain. Use letters, numbers, dots, hyphens and underscores, with an optional leading *. wildcard.';
+                break;
+            }
+            $mapping_site_dir = $sitedir . '/' . $site_name . '.localhost';
+            if (!is_dir($mapping_site_dir)) {
+                $response['message'] = 'Site not found.';
+                break;
+            }
+            if ($domain === $site_name . '.localhost') {
+                $response['message'] = 'That is already the site\'s own address.';
+                break;
+            }
+            $mapping_verb = $action === 'add_mapping' ? 'add' : 'remove';
+            // Either direction regenerates the Caddyfile and reloads the Caddy
+            // serving this dashboard, so the response can be dropped and the
+            // UI retries. The CLI is idempotent on both sides ("already
+            // mapped" and "not found" both exit 0), which makes that safe.
+            exec(sprintf('HOME=%s %s mappings %s %s %s 2>&1',
+                escapeshellarg($user_home), escapeshellarg($cove_path),
+                escapeshellarg($site_name), $mapping_verb, escapeshellarg($domain)), $map_out, $map_rc);
+            $map_text = implode("\n", $map_out);
+            if ($map_rc !== 0) {
+                $msg = $mapping_verb === 'add' ? 'Could not add domain.' : 'Could not remove domain.';
+                if (stripos($map_text, 'Invalid domain') !== false) $msg = 'Invalid domain.';
+                echo json_encode(['success' => false, 'message' => $msg, 'output' => $map_text]);
+                exit;
+            }
+            $mappings_now = [];
+            if (is_file($mapping_site_dir . '/mappings')) {
+                foreach (file($mapping_site_dir . '/mappings', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $m_line) {
+                    $m_line = trim($m_line);
+                    if ($m_line !== '') $mappings_now[] = $m_line;
+                }
+            }
+            echo json_encode([
+                'success' => true,
+                'message' => ($mapping_verb === 'add' ? 'Added ' : 'Removed ') . $domain . '.',
+                'mappings' => $mappings_now,
+                // A non-.localhost name needs an /etc/hosts line, which needs
+                // sudo — impossible from here, so the CLI leaves it and says so.
+                'hosts_pending' => stripos($map_text, 'Cannot prompt for sudo') !== false,
+            ]);
+            exit;
         case 'set_php':
             // Pin a site to an older PHP (native php-fpm) or back to the
             // default. Charset gates mirror add/delete; the version must be a
@@ -4118,6 +4199,21 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .php-option.uninstalled .php-option-name { color: var(--text-faint); }
         .php-option .php-option-meta { font-size: 0.72rem; color: var(--text-faint); }
         .php-option:disabled { opacity: 0.65; cursor: default; }
+        /* Domains modal: one row per hostname the site answers on. The primary
+           and multisite-implied rows are informational, so their × is hidden. */
+        .dom-list { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.8rem; }
+        .dom-row { display: flex; align-items: center; gap: 0.7rem; background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.45rem 0.5rem 0.45rem 0.9rem; font-family: var(--font-mono); font-size: 0.85rem; }
+        .dom-row .dom-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .dom-row.primary .dom-name, .dom-row.implied .dom-name { color: var(--text-dim); }
+        .dom-row .dom-meta { font-size: 0.72rem; color: var(--text-faint); white-space: nowrap; }
+        .dom-row .dom-remove { background: none; border: 0; color: var(--text-faint); font-size: 1.05rem; line-height: 1; cursor: pointer; padding: 0.1rem 0.35rem; border-radius: var(--radius-sm); }
+        .dom-row .dom-remove:hover { color: var(--danger); }
+        .dom-row .dom-remove:disabled { opacity: 0.4; cursor: default; }
+        .dom-row.primary .dom-remove, .dom-row.implied .dom-remove { visibility: hidden; }
+        .dom-form { display: flex; gap: 0.5rem; align-items: stretch; }
+        .dom-form .modal-input { flex: 1; }
+        .modal-hint a { color: var(--accent); text-decoration: none; cursor: pointer; }
+        .modal-hint a:hover { text-decoration: underline; }
 
         /* Wider variant for log output, which is unreadable at 540px. */
         .modal-wide { max-width: min(900px, 92vw); width: 900px; }
@@ -4969,6 +5065,31 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         </div>
     </div>
 
+    <!-- Domains: the dashboard face of `cove mappings` -->
+    <div class="modal-backdrop" id="domainsModal" style="display: none;">
+        <div class="modal">
+            <h3>Domains <span class="modal-title-dim" id="domainsModalSite"></span></h3>
+            <p class="modal-sub">Extra hostnames this site answers on. Caddy issues a local certificate for each; a leading *. covers every subdomain.</p>
+            <div class="dom-list" id="domainsList"></div>
+            <template id="tpl-dom-row">
+                <div class="dom-row">
+                    <span class="dom-name"></span>
+                    <span class="dom-meta"></span>
+                    <button type="button" class="dom-remove" title="Remove">×</button>
+                </div>
+            </template>
+            <form id="domainsForm" class="dom-form">
+                <input class="modal-input" type="text" id="domainsInput" spellcheck="false" autocomplete="off" placeholder="shop.example.localhost">
+                <button type="submit" class="pill primary" id="btnDomainsAdd">add</button>
+            </form>
+            <div class="modal-hint" id="domainsHint"></div>
+            <div class="modal-foot">
+                <span id="domainsFoot"></span>
+                <button type="button" class="pill" id="btnDomainsClose">close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Site log -->
     <div class="modal-backdrop" id="logModal" style="display: none;">
         <div class="modal modal-wide">
@@ -4996,6 +5117,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <button class="ctx-item" id="ctxReveal"><span>Open folder</span></button>
             <button class="ctx-item" id="ctxDb"><span>Open database</span></button>
             <button class="ctx-item" id="ctxPhp"><span>PHP version…</span><span class="ctx-key" id="ctxPhpMeta"></span></button>
+            <button class="ctx-item" id="ctxDomains"><span>Domains…</span><span class="ctx-key" id="ctxDomainsMeta"></span></button>
             <button class="ctx-item" id="ctxLog"><span>View log</span></button>
             <button class="ctx-item" id="ctxMail"><span>View mail</span></button>
             <div class="ctx-sep"></div>
@@ -5071,6 +5193,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             rename: { open: false, site: null, value: '', busy: false },
             logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
             phpModal: { open: false, site: null },
+            domainsModal: { open: false, site: null, busy: false, pending: null },
             // { supported, default, versions: [{version, installed}] } — fetched
             // lazily; null until loaded, refreshed after any pin change.
             phpInfo: null,
@@ -5326,6 +5449,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (e.key === 'Escape') {
                         if (this.ctxMenu.open) { this.closeRowMenu(); return; }
                         if (this.phpModal.open) { this.closePhpModal(); return; }
+                        if (this.domainsModal.open) { this.closeDomainsModal(); return; }
                         if (this.rename.open) { this.closeRename(); return; }
                         if (this.logView.open) { this.closeLog(); return; }
                         if (this.showDbModal) { this.setDbModal(false); return; }
@@ -5496,6 +5620,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (btn && !btn.disabled) this.choosePhp(btn.dataset.version);
                 });
                 $id('ctxCopy').addEventListener('click', withCtxSite(s => this.copyPath(s.full_path)));
+
+                // Domains (cove mappings)
+                $id('ctxDomains').addEventListener('click', withCtxSite(s => this.openDomainsModal(s)));
+                $id('btnDomainsClose').addEventListener('click', () => this.closeDomainsModal());
+                $id('domainsModal').addEventListener('click', (e) => { if (e.target === $id('domainsModal')) this.closeDomainsModal(); });
+                $id('domainsForm').addEventListener('submit', (e) => { e.preventDefault(); this.addDomain($id('domainsInput').value); });
+                $id('domainsList').addEventListener('click', (e) => {
+                    const btn = e.target.closest('.dom-remove');
+                    if (btn && !btn.disabled) this.removeDomain(btn.dataset.domain);
+                });
+                $id('domainsHint').addEventListener('click', (e) => {
+                    const a = e.target.closest('a[data-domain]');
+                    if (a) { e.preventDefault(); this.addDomain(a.dataset.domain); }
+                });
                 $id('ctxPin').addEventListener('click', withCtxSite(s => this.togglePin(s.name)));
                 $id('ctxDelete').addEventListener('click', withCtxSite(s => this.deleteSite(s.name)));
 
@@ -5730,6 +5868,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 show($id('ctxPhp'), !this.phpInfo || this.phpInfo.supported !== false);
                 const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
                 $id('ctxPhpMeta').textContent = effPhp ? 'php ' + effPhp : '';
+                // Extra addresses beyond <site>.localhost: explicit mappings
+                // plus the wildcard a subdomain multisite gets for free.
+                const extraDomains = (site.mappings || []).length + (site.multisite === 'subdomain' ? 1 : 0);
+                $id('ctxDomainsMeta').textContent = extraDomains ? '+' + extraDomains : '';
             },
 
             renderPhpModal() {
@@ -5795,6 +5937,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 show($id('logModal'), this.logView.open);
                 this.renderLog();
                 this.renderPhpModal();
+                this.renderDomainsModal();
             },
 
             renderRename() {
@@ -8003,6 +8146,105 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 window.open(url, '_blank', 'noopener');
             },
 
+            // --- Domains (cove mappings) --------------------------------------
+            openDomainsModal(site) {
+                this.domainsModal = { open: true, site, busy: false, pending: null };
+                $id('domainsInput').value = '';
+                this.renderDomainsModal();
+                $id('domainsInput').focus();
+            },
+
+            closeDomainsModal() {
+                this.domainsModal.open = false;
+                show($id('domainsModal'), false);
+            },
+
+            renderDomainsModal() {
+                const m = this.domainsModal;
+                show($id('domainsModal'), m.open);
+                if (!m.open) return;
+                // Read the live site entry: an add/remove refreshes the list
+                // and the entry captured at open time would be stale.
+                const site = this.sites.find(s => s.name === m.site.name) || m.site;
+                const host = site.name + '.localhost';
+                const wild = '*.' + host;
+                $id('domainsModalSite').textContent = host;
+                const rows = [{ name: host, meta: 'primary', kind: 'primary' }];
+                if (site.multisite === 'subdomain') rows.push({ name: wild, meta: 'multisite', kind: 'implied' });
+                for (const d of (site.mappings || [])) {
+                    rows.push({
+                        name: d,
+                        meta: d.startsWith('*.') ? 'wildcard' : (/\.localhost$/i.test(d) ? '' : '/etc/hosts'),
+                        kind: 'mapping',
+                    });
+                }
+                const list = $id('domainsList');
+                list.textContent = '';
+                const tpl = $id('tpl-dom-row');
+                for (const r of rows) {
+                    const el = tpl.content.firstElementChild.cloneNode(true);
+                    el.classList.add(r.kind);
+                    el.querySelector('.dom-name').textContent = r.name;
+                    el.querySelector('.dom-meta').textContent = r.meta;
+                    const rm = el.querySelector('.dom-remove');
+                    rm.dataset.domain = r.name;
+                    rm.disabled = m.busy;
+                    list.appendChild(el);
+                }
+                // The common ask — every subdomain of the site — as one click,
+                // until it is covered (explicitly or by a subdomain multisite).
+                const hasWild = site.multisite === 'subdomain' || (site.mappings || []).includes(wild);
+                const hint = $id('domainsHint');
+                hint.textContent = '';
+                if (!hasWild && !m.busy) {
+                    hint.append('Accept any subdomain: ');
+                    const a = document.createElement('a');
+                    a.href = '#';
+                    a.dataset.domain = wild;
+                    a.textContent = 'add ' + wild;
+                    hint.appendChild(a);
+                }
+                $id('domainsInput').disabled = m.busy;
+                const add = $id('btnDomainsAdd');
+                add.disabled = m.busy;
+                add.textContent = m.busy && m.pending === 'add' ? 'adding…' : 'add';
+                $id('domainsFoot').textContent = m.busy ? 'Reloading Caddy…' : 'cove mappings ' + site.name;
+            },
+
+            addDomain(raw) { return this.changeDomain('add_mapping', (raw || '').trim().toLowerCase()); },
+            removeDomain(domain) { return this.changeDomain('remove_mapping', domain); },
+
+            async changeDomain(action, domain) {
+                const m = this.domainsModal;
+                const site = m.site;
+                if (!site || !domain || m.busy) return;
+                if (!/^(\*\.)?[a-z0-9_]([a-z0-9._-]*[a-z0-9_])?$/i.test(domain) || domain.length > 253) {
+                    this.showSnack('Use a hostname: letters, numbers, dots and hyphens, with an optional leading *.', true);
+                    return;
+                }
+                m.busy = true;
+                m.pending = action === 'add_mapping' ? 'add' : 'remove';
+                this.renderDomainsModal();
+                // Both directions rewrite the Caddyfile and reload the Caddy
+                // serving this page — same dropped-response retry as rename.
+                // Five attempts, not three: with a hundred-odd sites the adapt
+                // alone runs past the default retry window.
+                const res = await this.apiPostRetry(action, { site_name: site.name, domain }, 5);
+                m.busy = false;
+                m.pending = null;
+                if (!res.success) { this.renderDomainsModal(); return; } // apiPost surfaced the reason
+                const live = this.sites.find(s => s.name === site.name);
+                if (live) live.mappings = res.mappings || [];
+                if (action === 'add_mapping') $id('domainsInput').value = '';
+                this.renderDomainsModal();
+                if (res.hosts_pending) {
+                    this.showSnack(res.message + ' Run cove reload in a terminal to add it to /etc/hosts.', false, { duration: 12000 });
+                } else {
+                    this.showSnack(res.message);
+                }
+                this.getSites();
+            },
+
             // --- Per-site PHP version ---------------------------------------
             loadPhpInfo(force = false) {
                 if (this.phpInfo && !force) return Promise.resolve(this.phpInfo);
@@ -8611,6 +8853,8 @@ show_general_help() {
     echo "  tailscale        Expose all sites to your Tailscale network."
     if [ "$OS" == "macos" ]; then
         echo "  menubar          Manage the macOS menu bar companion app."
+    elif [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; then
+        echo "  menubar          Manage the system tray companion app."
     fi
     echo "  db               Manage databases (e.g., 'cove db backup')."
     echo "  lan              Enable LAN access to sites for mobile app sync."
@@ -8867,16 +9111,18 @@ display_command_help() {
         menubar)
             echo "Usage: cove menubar <subcommand>"
             echo ""
-            echo "Manage the native macOS menu bar companion app."
-            echo "The menu bar icon shows Cove's status at a glance and can start/stop"
-            echo "services and open the Dashboard, Adminer, Mailpit, and logs."
+            echo "Manage the menu bar companion app: a native menu bar app on macOS,"
+            echo "a system tray app on Linux desktops. The icon shows Cove's status at"
+            echo "a glance; the menu can start/stop services, open sites (or log in to"
+            echo "them), and open the Dashboard, Adminer, Mailpit, and logs."
             echo ""
             echo "Subcommands:"
             echo "  enable     Build, install, and launch the menu bar app (also updates it)"
             echo "  disable    Quit and remove the menu bar app"
             echo ""
-            echo "The app is built locally (requires Apple Command Line Tools) and is"
-            echo "strictly opt-in — once enabled, 'cove upgrade' keeps it up to date."
+            echo "macOS builds the app locally (requires Apple Command Line Tools); Linux"
+            echo "needs python3 with GTK 3 and AyatanaAppIndicator3 (offered via apt)."
+            echo "Strictly opt-in — once enabled, 'cove upgrade' keeps it up to date."
             echo ""
             echo "Examples:"
             echo "  cove menubar enable"
@@ -9607,8 +9853,13 @@ cove_add() {
                 exit 1
             fi
 
-            # 2. Create the config file
+            # 2. Create the config file. WP_ENVIRONMENT_TYPE tells WordPress
+            # and any plugin that checks wp_get_environment_type() that this
+            # is a local site: core's automatic updates back off, WooCommerce
+            # and other plugins that gate live-only behaviour (payment
+            # gateways, tracking, license pings) treat it as a sandbox.
             $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
+define( 'WP_ENVIRONMENT_TYPE', 'local' );
 define( 'WP_DEBUG', true );
 define( 'WP_DEBUG_LOG', true );
 define( 'WP_DEBUG_DISPLAY', false );
@@ -13048,26 +13299,67 @@ cove_memory_set() {
     gum style --foreground green "✅ Done. Run 'cove memory' to verify."
 }
 
-# --- macOS Menu Bar App ---
-# Native menu bar companion (menubar/ in the repo), embedded into cove.sh at
-# compile time and built locally with clang. Originally by Robby McCullough
-# (github.com/RobbyMcCullough/cove-menubar, MIT), folded in with his blessing.
+# --- Menu Bar App ---
+# Menu bar companion (menubar/ in the repo), embedded into cove.sh at compile
+# time. On macOS it is a native app (menubar/Sources/main.m) built locally with
+# clang; on Linux it is a system tray app (menubar/Linux/cove-tray.py) run
+# as-is under python3 with GTK 3 + AyatanaAppIndicator3. Originally by Robby
+# McCullough (github.com/RobbyMcCullough/cove-menubar, MIT), folded in with
+# his blessing.
 MENUBAR_APP_PATH="$HOME/Applications/Cove Menu Bar.app"
+MENUBAR_LINUX_DIR="$HOME/.local/share/cove-menubar"
+MENUBAR_AUTOSTART_FILE="$HOME/.config/autostart/cove-menubar.desktop"
 
-# Prints the CFBundleShortVersionString of the installed app, or nothing if the
-# app is missing or the plist is unreadable (e.g. a pre-official install).
+# Prints the installed app's version, or nothing if it is missing or unreadable
+# (e.g. a pre-official macOS install): the bundle's CFBundleShortVersionString
+# on macOS, the VERSION file on Linux.
 menubar_installed_version() {
-    /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
-        "$MENUBAR_APP_PATH/Contents/Info.plist" 2>/dev/null
+    if [ "$OS" == "macos" ]; then
+        /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
+            "$MENUBAR_APP_PATH/Contents/Info.plist" 2>/dev/null
+    else
+        cat "$MENUBAR_LINUX_DIR/VERSION" 2>/dev/null
+    fi
+}
+
+# True when the companion is installed on this platform.
+menubar_is_enabled() {
+    if [ "$OS" == "macos" ]; then
+        [ -d "$MENUBAR_APP_PATH" ]
+    else
+        [ -d "$MENUBAR_LINUX_DIR" ]
+    fi
+}
+
+# Platform gate shared by enable/disable. WSL has no system tray to host an
+# indicator, so it is refused up front rather than failing at launch.
+menubar_require_platform() {
+    if [ "$OS" == "macos" ]; then
+        return 0
+    fi
+    if [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; then
+        return 0
+    fi
+    if [ "$IS_WSL" = true ]; then
+        gum style --foreground red "❌ The menu bar app needs a desktop session; WSL has no system tray."
+    else
+        gum style --foreground red "❌ The menu bar app is only available on macOS and Linux desktops."
+    fi
+    exit 1
 }
 
 cove_menubar_enable() {
     local quiet="$1"
-
-    if [ "$OS" != "macos" ]; then
-        gum style --foreground red "❌ The menu bar app is only available on macOS."
-        exit 1
+    menubar_require_platform
+    if [ "$OS" == "macos" ]; then
+        cove_menubar_enable_macos "$quiet"
+    else
+        cove_menubar_enable_linux "$quiet"
     fi
+}
+
+cove_menubar_enable_macos() {
+    local quiet="$1"
 
     # clang ships with the Command Line Tools, which Homebrew already requires.
     if ! command -v clang &>/dev/null || ! xcode-select -p &>/dev/null; then
@@ -13168,15 +13460,123 @@ cove_menubar_enable() {
         "Remove it anytime with: cove menubar disable"
 }
 
-cove_menubar_disable() {
-    if [ "$OS" != "macos" ]; then
-        gum style --foreground red "❌ The menu bar app is only available on macOS."
-        exit 1
+# Can python3 load the two GObject-introspection libraries the tray needs?
+menubar_linux_deps_ok() {
+    command -v python3 &>/dev/null || return 1
+    python3 - <<'EOM' &>/dev/null
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import Gtk, AyatanaAppIndicator3
+EOM
+}
+
+cove_menubar_enable_linux() {
+    local quiet="$1"
+
+    if ! menubar_linux_deps_ok; then
+        echo "📦 The tray app needs python3 with GTK 3 and AyatanaAppIndicator3 bindings."
+        if command -v apt-get &>/dev/null; then
+            local pkgs="python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7"
+            if [ -t 0 ]; then
+                if ! gum confirm "Install them now? (sudo apt-get install $pkgs)"; then
+                    echo "Aborted."
+                    exit 1
+                fi
+            else
+                echo "   Installing via apt..."
+            fi
+            # shellcheck disable=SC2086
+            if ! $SUDO_CMD apt-get install -y $pkgs; then
+                gum style --foreground red "❌ apt-get install failed."
+                exit 1
+            fi
+        else
+            gum style --foreground red "❌ Install them with your package manager, then re-run 'cove menubar enable':"
+            echo "   Fedora: sudo dnf install python3-gobject gtk3 libayatana-appindicator-gtk3"
+            echo "   Arch:   sudo pacman -S python-gobject gtk3 libayatana-appindicator"
+            exit 1
+        fi
+        if ! menubar_linux_deps_ok; then
+            gum style --foreground red "❌ python3 still cannot load GTK 3 / AyatanaAppIndicator3."
+            exit 1
+        fi
     fi
 
-    if [ ! -d "$MENUBAR_APP_PATH" ]; then
+    # GNOME hides StatusNotifierItems unless an AppIndicator extension is on
+    # (Ubuntu enables one out of the box; vanilla GNOME and Debian do not).
+    # Warn rather than refuse: the extension can be enabled afterwards and the
+    # already-running tray will appear as soon as it is.
+    case "${XDG_CURRENT_DESKTOP:-}" in
+        *GNOME*)
+            if command -v gnome-extensions &>/dev/null \
+                && ! gnome-extensions list --enabled 2>/dev/null | grep -qi appindicator; then
+                echo "⚠️  GNOME only shows tray icons with an AppIndicator extension enabled."
+                echo "   Ubuntu:  gnome-extensions enable ubuntu-appindicators@ubuntu.com"
+                echo "   Others:  install 'AppIndicator and KStatusNotifierItem Support' from extensions.gnome.org"
+            fi
+            ;;
+    esac
+
+    echo "🛠️  Installing Cove Menu Bar v${MENUBAR_VERSION}..."
+    pkill -f "cove-menubar/cove-tray.py" 2>/dev/null || true
+    mkdir -p "$MENUBAR_LINUX_DIR" "$LOGS_DIR" "$(dirname "$MENUBAR_AUTOSTART_FILE")"
+    emit_menubar_tray_py > "$MENUBAR_LINUX_DIR/cove-tray.py"
+    emit_menubar_icon_svg > "$MENUBAR_LINUX_DIR/cove-logo.svg"
+    echo "$MENUBAR_VERSION" > "$MENUBAR_LINUX_DIR/VERSION"
+    chmod +x "$MENUBAR_LINUX_DIR/cove-tray.py"
+    # The tray owns the autostart entry (its "Launch at Login" toggle removes
+    # and re-creates it), so let it write the file: one source of truth.
+    python3 "$MENUBAR_LINUX_DIR/cove-tray.py" --autostart-entry > "$MENUBAR_AUTOSTART_FILE"
+
+    # Launch into the current desktop session. From a terminal inside the
+    # session the bus address and display are already exported; from SSH or a
+    # bare tty they are not, and the autostart entry covers the next login.
+    local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$runtime_dir/bus" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
+    fi
+    local launched=false
+    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && { [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; }; then
+        setsid nohup python3 "$MENUBAR_LINUX_DIR/cove-tray.py" \
+            >"$LOGS_DIR/menubar-stderr.log" 2>&1 </dev/null &
+        launched=true
+    fi
+
+    if [ "$quiet" == "quiet" ]; then
+        echo "   - Cove Menu Bar updated to v${MENUBAR_VERSION}."
+        return 0
+    fi
+
+    echo ""
+    if [ "$launched" = true ]; then
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Cove Menu Bar is enabled" \
+            "Look for the Cove icon in your system tray." \
+            "It starts at login and stays up to date via 'cove upgrade'." \
+            "Remove it anytime with: cove menubar disable"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+            "✅ Cove Menu Bar is enabled" \
+            "No desktop session was detected from this shell, so the tray" \
+            "will appear at your next login (or run it now from a terminal" \
+            "inside your session: python3 $MENUBAR_LINUX_DIR/cove-tray.py &)." \
+            "Remove it anytime with: cove menubar disable"
+    fi
+}
+
+cove_menubar_disable() {
+    menubar_require_platform
+    if ! menubar_is_enabled; then
         echo "The menu bar app is not enabled."
         exit 0
+    fi
+    if [ "$OS" != "macos" ]; then
+        pkill -f "cove-menubar/cove-tray.py" 2>/dev/null || true
+        rm -rf "$MENUBAR_LINUX_DIR"
+        rm -f "$MENUBAR_AUTOSTART_FILE"
+        echo "✅ Cove Menu Bar disabled and removed."
+        return 0
     fi
 
     pkill -x CoveMenuBar 2>/dev/null || true
@@ -13189,11 +13589,14 @@ cove_menubar_disable() {
 }
 
 # Called from post-upgrade. Strictly opt-in: does nothing unless the app is
-# already installed. Rebuilds only when the installed bundle's version differs
-# from MENUBAR_VERSION (a missing/unreadable version — e.g. the original
-# standalone install — counts as out of date and gets adopted).
+# already installed. Rebuilds only when the installed version differs from
+# MENUBAR_VERSION (a missing/unreadable version — e.g. the original
+# standalone macOS install — counts as out of date and gets adopted).
 menubar_refresh_if_enabled() {
-    if [ "$OS" != "macos" ] || [ ! -d "$MENUBAR_APP_PATH" ]; then
+    if [ "$OS" == "linux" ] && [ "$IS_WSL" = true ]; then
+        return 0
+    fi
+    if ! menubar_is_enabled; then
         return 0
     fi
 
@@ -13219,18 +13622,19 @@ cove_menubar() {
         *)
             echo "Usage: cove menubar <subcommand>"
             echo ""
-            echo "Manage the native macOS menu bar companion app."
-            echo "Shows service status at a glance and can start/stop Cove,"
-            echo "open the Dashboard, Adminer, Mailpit, and logs."
+            echo "Manage the menu bar companion app (a native menu bar app on macOS,"
+            echo "a system tray app on Linux desktops). Shows service status at a"
+            echo "glance and can start/stop Cove, open or log in to sites, and open"
+            echo "the Dashboard, Adminer, Mailpit, and logs."
             echo ""
             echo "Subcommands:"
             echo "  enable     Build, install, and launch the menu bar app (also updates it)"
             echo "  disable    Quit and remove the menu bar app"
             echo ""
-            if [ "$OS" == "macos" ]; then
+            if [ "$OS" == "macos" ] || { [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; }; then
                 local installed
                 installed=$(menubar_installed_version)
-                if [ -d "$MENUBAR_APP_PATH" ]; then
+                if menubar_is_enabled; then
                     echo "Currently: enabled (v${installed:-unknown})"
                 else
                     echo "Currently: disabled"
@@ -15894,9 +16298,9 @@ cove_trust() {
     echo "🔐 Installing Cove's local root certificate..."
 
     # FrankenPHP's `trust` subcommand writes the Caddy local root into the
-    # system store and any NSS DBs it discovers at the standard paths. On
-    # macOS that's the login keychain; on Linux it's /usr/local/share/ca-
-    # certificates + ~/.pki/nssdb + ~/.mozilla/firefox/*.
+    # system store: the login keychain on macOS, /usr/local/share/ca-
+    # certificates on Linux. Browsers on Linux need their NSS databases
+    # handled separately below.
     #
     # Safe to re-run — all writes are idempotent.
 
@@ -15933,9 +16337,13 @@ cove_trust() {
     fi
     echo "$trust_output" | grep -vE '^\{|^$' || true
 
-    # Linux-only: Firefox and Chromium ship as snaps on Ubuntu 22+ and
-    # store their NSS DBs under ~/snap/... — a path that neither Caddy nor
-    # mkcert scans. Inject the root explicitly for each profile we find.
+    # Linux-only: browsers do not read the system store. Chrome, Chromium,
+    # Brave, Edge and Vivaldi (deb/rpm builds) read the shared NSS DB at
+    # ~/.pki/nssdb; Firefox keeps one per profile under ~/.mozilla/firefox;
+    # the snap builds live under ~/snap/<app>/...; Flatpak builds under
+    # ~/.var/app/<id>/.... `frankenphp trust` runs under sudo above, so its
+    # own NSS scan looks in root's home and never reaches any of these.
+    # Inject the root explicitly into every NSS DB we can find.
     if [ "$OS" = "linux" ] && command -v certutil &>/dev/null; then
         local root_cert
         root_cert=$(find "$HOME/.local/share/caddy/pki/authorities/local" \
@@ -15947,9 +16355,17 @@ cove_trust() {
         fi
 
         if [ -n "$root_cert" ] && [ -r "$root_cert" ]; then
-            # Snap Firefox, snap Chromium, plus any other NSS DB under ~/snap.
+            # Chrome creates ~/.pki/nssdb on first run, but a fresh machine
+            # that installs Cove before ever launching a browser has none —
+            # create it (empty password, Chrome's own default) so the root is
+            # already trusted the first time Chrome opens.
+            if [ ! -f "$HOME/.pki/nssdb/cert9.db" ]; then
+                mkdir -p "$HOME/.pki/nssdb"
+                certutil -N -d sql:"$HOME/.pki/nssdb" --empty-password 2>/dev/null || true
+            fi
+
             # The `sql:` prefix tells certutil the DB is the modern cert9 format.
-            local db
+            local db trusted_dbs=0
             while IFS= read -r db; do
                 [ -z "$db" ] && continue
                 local profile_dir
@@ -15958,11 +16374,36 @@ cove_trust() {
                 # Remove any prior entry under our nickname so re-runs don't
                 # layer stale copies, then add the current root.
                 certutil -D -d sql:"$profile_dir" -n "Cove Local Authority" 2>/dev/null || true
-                certutil -A -d sql:"$profile_dir" -n "Cove Local Authority" -t "C,," -i "$root_cert" 2>/dev/null || true
-            done < <(find "$HOME/snap" "$HOME/.mozilla/firefox" \
+                if certutil -A -d sql:"$profile_dir" -n "Cove Local Authority" -t "C,," -i "$root_cert" 2>/dev/null; then
+                    trusted_dbs=$((trusted_dbs + 1))
+                fi
+            done < <(find "$HOME/.pki" "$HOME/.mozilla/firefox" "$HOME/snap" "$HOME/.var/app" \
                 -name 'cert9.db' 2>/dev/null)
+            if [ "$trusted_dbs" -eq 0 ]; then
+                gum style --foreground yellow "⚠️ No browser certificate databases found — open a browser once, then re-run 'cove trust'."
+            fi
+
+            # Every root rotation (a reinstall, a wiped Caddy data dir) leaves
+            # the previous Caddy_Local_Authority_*.crt behind in the system
+            # store. They are Cove's own files and trust nothing current, so
+            # prune the ones whose fingerprint no longer matches the live root.
+            local live_fp stale_fp stale_file pruned=0
+            live_fp=$(openssl x509 -in "$root_cert" -noout -fingerprint -sha256 2>/dev/null)
+            if [ -n "$live_fp" ]; then
+                for stale_file in /usr/local/share/ca-certificates/Caddy_Local_Authority*.crt; do
+                    [ -f "$stale_file" ] || continue
+                    stale_fp=$(openssl x509 -in "$stale_file" -noout -fingerprint -sha256 2>/dev/null)
+                    if [ -n "$stale_fp" ] && [ "$stale_fp" != "$live_fp" ]; then
+                        $SUDO_CMD rm -f "$stale_file" && pruned=$((pruned + 1))
+                    fi
+                done
+                if [ "$pruned" -gt 0 ]; then
+                    echo "   - Removed $pruned stale Cove root(s) from the system store"
+                    $SUDO_CMD update-ca-certificates --fresh >/dev/null 2>&1 || true
+                fi
+            fi
         else
-            gum style --foreground yellow "⚠️ Could not locate Caddy root.crt — snap Firefox/Chromium trust skipped."
+            gum style --foreground yellow "⚠️ Could not locate Caddy root.crt — browser trust skipped."
         fi
     fi
 
@@ -16518,7 +16959,7 @@ cove_wsl_hosts() {
     echo ""
 }
 
-# --- Embedded macOS Menu Bar App (generated from menubar/ by compile.sh) ---
+# --- Embedded Menu Bar Apps (generated from menubar/ by compile.sh) ---
 
 emit_menubar_main_m() {
 cat <<'COVE_MENUBAR_MAIN_M_EOF'
@@ -17078,7 +17519,7 @@ static const NSInteger kServiceRowStartIndex = 2;
 
     [self.menu addItem:[NSMenuItem separatorItem]];
 
-    self.dashboardItem = [self linkItemWithTitle:@"Open Cove Dashboard"
+    self.dashboardItem = [self linkItemWithTitle:@"Open Dashboard"
                                           action:@selector(openDashboard)];
     [self.menu addItem:self.dashboardItem];
     self.adminerItem = [self linkItemWithTitle:@"Open Adminer"
@@ -17888,6 +18329,681 @@ cat <<'COVE_MENUBAR_ICON_EOF'
     </g>
 </svg>
 COVE_MENUBAR_ICON_EOF
+}
+
+emit_menubar_tray_py() {
+cat <<'COVE_MENUBAR_TRAY_EOF'
+#!/usr/bin/env python3
+# Cove Menu Bar for Linux — a system tray companion for Cove.
+#
+# The Linux sibling of Sources/main.m. Same contract, same menu: status is
+# read via `cove status --porcelain` (key=value per line, defined in
+# commands/status — never change those keys without updating both apps),
+# actions shell out to `cove`, and the icon tells the story at a glance:
+# full colour when Caddy, MariaDB and Mailpit are all up, light grey when
+# some are, dark grey when everything is stopped.
+#
+# It is a StatusNotifierItem (the freedesktop tray protocol) published through
+# AyatanaAppIndicator3, so it shows up on any desktop that hosts a tray:
+# COSMIC, KDE, XFCE, MATE, Cinnamon, and GNOME with the AppIndicator extension
+# (Ubuntu ships it enabled; vanilla GNOME and Debian do not). The menu itself
+# is rendered by the desktop's panel over DBus, which is why there is no
+# Option-key trick here: the panel never tells us which modifiers were held.
+# WordPress sites therefore get a second, indented "Log in as admin" row right
+# under their open row. Not a nested submenu: COSMIC's panel renders submenus
+# inline and cannot drill into a second level at all.
+#
+# Written out and launched by `cove menubar enable`; there is no build step.
+# Runtime needs: python3, GTK 3 and AyatanaAppIndicator3 introspection data
+# (Debian/Ubuntu: python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1).
+# gir1.2-notify-0.7 is optional and only used for desktop notifications.
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+
+try:
+    gi.require_version("Notify", "0.7")
+    from gi.repository import Notify  # noqa: E402
+    Notify.init("Cove")
+    HAVE_NOTIFY = True
+except (ValueError, ImportError):
+    HAVE_NOTIFY = False
+
+HOME = os.path.expanduser("~")
+COVE_DIR = os.path.join(HOME, "Cove")
+SITES_DIR = os.path.join(COVE_DIR, "Sites")
+LOGS_DIR = os.path.join(COVE_DIR, "Logs")
+INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_DIR = os.path.join(INSTALL_DIR, "icons")
+AUTOSTART_FILE = os.path.join(HOME, ".config", "autostart", "cove-menubar.desktop")
+LOG_FILE = os.path.join(LOGS_DIR, "menubar.log")
+REFRESH_SECONDS = 20
+UPDATE_CHECK_SECONDS = 86400
+CORE_SERVICES = ("caddy", "mariadb", "mailpit")
+SERVICE_NAMES = {"caddy": "Caddy", "mariadb": "MariaDB", "mailpit": "Mailpit"}
+URL_PATTERN = re.compile(r"https://[A-Za-z0-9.:/_?=&%~#+!@-]+")
+SITE_NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+# Icon colours: the brand disc, then the two greys the macOS app uses for
+# "some services" and "everything stopped".
+ICON_VARIANTS = {
+    "cove-logo": "#009b95",
+    "cove-logo-partial": "#9a9a9a",
+    "cove-logo-stopped": "#4a4a4a",
+}
+
+
+def log(text):
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {text}\n")
+    except OSError:
+        pass
+
+
+def cove_path():
+    for candidate in ("/usr/local/bin/cove", "/usr/bin/cove", os.path.join(HOME, ".local", "bin", "cove")):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("cove") or "cove"
+
+
+def cove_env():
+    env = dict(os.environ)
+    env["PATH"] = "/usr/local/bin:/usr/bin:/bin:" + env.get("PATH", "")
+    return env
+
+
+def run_cove(args, timeout):
+    """Run a cove subcommand headlessly. Returns (status, merged output, error text)."""
+    try:
+        result = subprocess.run(
+            [cove_path(), *args], capture_output=True, text=True, timeout=timeout,
+            env=cove_env(), stdin=subprocess.DEVNULL,
+        )
+        return result.returncode, (result.stdout or "") + (result.stderr or ""), None
+    except subprocess.TimeoutExpired:
+        return 1, "", f"cove {' '.join(args)} timed out after {int(timeout)}s."
+    except OSError as error:
+        return 1, "", str(error)
+
+
+def strip_ansi(text):
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+
+
+def first_line(text):
+    """First meaningful line of command output, with gum's box borders stripped."""
+    for line in strip_ansi(text or "").splitlines():
+        line = line.strip().strip("│").strip()
+        if line and not set(line) <= set("─┌┐└┘╭╮╰╯ "):
+            return line
+    return ""
+
+
+def https_port():
+    try:
+        with open(os.path.join(COVE_DIR, "config"), encoding="utf-8") as handle:
+            match = re.search(r"^HTTPS_PORT='?(\d+)'?", handle.read(), re.M)
+            return match.group(1) if match else "443"
+    except OSError:
+        return "443"
+
+
+def cove_url(host):
+    port = https_port()
+    return f"https://{host}" if port == "443" else f"https://{host}:{port}"
+
+
+def open_uri(uri):
+    log(f"open {uri}")
+    subprocess.Popen(["xdg-open", uri], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def display_name(key):
+    if key in SERVICE_NAMES:
+        return SERVICE_NAMES[key]
+    if key.startswith("php-fpm-"):
+        return "PHP-FPM " + key[len("php-fpm-"):]
+    return key
+
+
+def version_tuple(text):
+    return tuple(int(part) if part.isdigit() else 0 for part in text.split("."))
+
+
+def write_icon_variants():
+    """Derive the grey icon states from the shipped SVG so all three stay one drawing."""
+    source = os.path.join(INSTALL_DIR, "cove-logo.svg")
+    try:
+        with open(source, encoding="utf-8") as handle:
+            svg = handle.read()
+    except OSError:
+        return
+    os.makedirs(ICON_DIR, exist_ok=True)
+    for name, colour in ICON_VARIANTS.items():
+        try:
+            with open(os.path.join(ICON_DIR, f"{name}.svg"), "w", encoding="utf-8") as handle:
+                handle.write(svg.replace("#009b95", colour))
+        except OSError:
+            pass
+
+
+class CoveTray:
+    def __init__(self):
+        self.states = {}
+        self.service_keys = list(CORE_SERVICES)
+        self.states_known = False
+        self.busy = None
+        self.last_error = None
+        self.last_action_error = None
+        self.last_user_action = 0.0
+        self.pending_stops = set()
+        self.cove_version = ""
+        self.latest_version = ""
+        self.sites_dir_mtime = None
+
+        write_icon_variants()
+        self.indicator = AppIndicator.Indicator.new(
+            "cove", "cove-logo-partial", AppIndicator.IndicatorCategory.APPLICATION_STATUS)
+        self.indicator.set_icon_theme_path(ICON_DIR)
+        self.indicator.set_title("Cove")
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+
+        self.menu = Gtk.Menu()
+        self.build_menu()
+        self.indicator.set_menu(self.menu)
+        self.render()
+
+        self.refresh_status()
+        self.check_for_updates()
+        GLib.timeout_add_seconds(REFRESH_SECONDS, self.on_refresh_tick)
+        GLib.timeout_add_seconds(UPDATE_CHECK_SECONDS, self.on_update_tick)
+
+    # --- Menu skeleton -------------------------------------------------
+
+    def add_item(self, label, callback=None, sensitive=True, menu=None):
+        item = Gtk.MenuItem(label=label)
+        item.set_sensitive(sensitive)
+        if callback is not None:
+            item.connect("activate", lambda *_: callback())
+        (menu or self.menu).append(item)
+        return item
+
+    def add_separator(self, menu=None):
+        (menu or self.menu).append(Gtk.SeparatorMenuItem())
+
+    def build_menu(self):
+        self.summary_item = self.add_item("Checking Cove…", sensitive=False)
+        self.add_separator()
+        self.service_items = {}
+        self.service_anchor = Gtk.SeparatorMenuItem()
+        for key in self.service_keys:
+            self.service_items[key] = self.add_item(display_name(key) + ": …", sensitive=False)
+        self.error_item = self.add_item("", sensitive=False)
+        self.error_item.set_no_show_all(True)
+        self.menu.append(self.service_anchor)
+
+        self.action_item = self.add_item("Start Cove", self.toggle_cove)
+        self.refresh_item = self.add_item("Refresh Status", self.refresh_status)
+        self.reload_item = self.add_item("Reload Caddy", self.reload_caddy)
+        self.add_separator()
+
+        self.sites_item = Gtk.MenuItem(label="Sites")
+        self.sites_menu = Gtk.Menu()
+        self.sites_item.set_submenu(self.sites_menu)
+        self.menu.append(self.sites_item)
+        self.add_separator()
+
+        self.dashboard_item = self.add_item("Open Dashboard", lambda: open_uri(cove_url("cove.localhost")))
+        self.adminer_item = self.add_item("Open Adminer", lambda: open_uri(cove_url("db.cove.localhost")))
+        self.mailpit_item = self.add_item("Open Mailpit", lambda: open_uri(cove_url("mail.cove.localhost")))
+        self.add_item("Open Cove Logs", lambda: open_uri("file://" + LOGS_DIR))
+        self.add_item("Open Sites Folder", lambda: open_uri("file://" + SITES_DIR))
+        self.add_separator()
+
+        self.launch_item = Gtk.CheckMenuItem(label="Launch at Login")
+        self.launch_item.set_active(os.path.exists(AUTOSTART_FILE))
+        self.launch_item.connect("toggled", self.on_launch_toggled)
+        self.menu.append(self.launch_item)
+
+        self.version_item = self.add_item("", sensitive=False)
+        self.version_item.set_no_show_all(True)
+        self.add_item("Quit Cove Menu Bar", Gtk.main_quit)
+        self.menu.show_all()
+        self.rebuild_sites_menu()
+
+    # --- Rendering (in place, never rebuilds the open menu) --------------
+
+    def all_running(self):
+        return self.states_known and all(self.states.get(key) for key in CORE_SERVICES)
+
+    def running(self, key):
+        return bool(self.states.get(key))
+
+    def summary_text(self):
+        if self.busy:
+            return self.busy
+        if not self.states_known:
+            return "Cove status unavailable" if self.last_error else "Checking Cove…"
+        count = sum(1 for value in self.states.values() if value)
+        if self.all_running():
+            return "Cove is running"
+        if count == 0:
+            return "Cove is stopped"
+        return f"Cove: {count} of {len(self.states)} services running"
+
+    def render(self):
+        self.summary_item.set_label(self.summary_text())
+
+        error = self.last_action_error or self.last_error
+        if error:
+            self.error_item.set_label("Error: " + first_line(error))
+            self.error_item.show()
+        else:
+            self.error_item.hide()
+
+        for key in self.service_keys:
+            item = self.service_items.get(key)
+            if item is None:
+                continue
+            state = self.states.get(key)
+            text = "…" if state is None else ("Running" if state else "Stopped")
+            mark = "○" if state is None else ("●" if state else "○")
+            item.set_label(f"{mark}  {display_name(key)}: {text}")
+
+        all_up = self.all_running()
+        self.action_item.set_label("Stop Cove" if all_up else "Start Cove")
+        self.action_item.set_sensitive(self.busy is None)
+        self.refresh_item.set_sensitive(self.busy is None)
+        self.reload_item.set_sensitive(self.busy is None and self.running("caddy"))
+        self.dashboard_item.set_sensitive(self.running("caddy"))
+        self.adminer_item.set_sensitive(self.running("caddy"))
+        self.mailpit_item.set_sensitive(self.running("mailpit"))
+
+        if self.latest_version and self.cove_version and \
+                version_tuple(self.latest_version) > version_tuple(self.cove_version):
+            self.version_item.set_label(f"Update Cove to v{self.latest_version}…")
+            self.version_item.set_sensitive(True)
+            if not getattr(self, "_upgrade_wired", False):
+                self.version_item.connect("activate", lambda *_: self.run_upgrade_in_terminal())
+                self._upgrade_wired = True
+            self.version_item.show()
+        elif self.cove_version:
+            self.version_item.set_label(f"Cove v{self.cove_version}")
+            self.version_item.set_sensitive(False)
+            self.version_item.show()
+        else:
+            self.version_item.hide()
+
+        if not self.states_known:
+            icon = "cove-logo-partial"
+        elif all_up:
+            icon = "cove-logo"
+        elif any(self.states.values()):
+            icon = "cove-logo-partial"
+        else:
+            icon = "cove-logo-stopped"
+        self.indicator.set_icon_full(icon, self.summary_text())
+
+    def sync_service_rows(self, keys):
+        """Add rows for services that appear after the first poll (php-fpm pools)."""
+        if keys == self.service_keys:
+            return
+        for key in list(self.service_items):
+            if key not in keys:
+                self.menu.remove(self.service_items.pop(key))
+        # New rows go above the error row, so the service block stays together.
+        position = self.menu.get_children().index(self.error_item)
+        for key in keys:
+            if key in self.service_items:
+                continue
+            item = Gtk.MenuItem(label=display_name(key) + ": …")
+            item.set_sensitive(False)
+            item.show()
+            self.menu.insert(item, position)
+            self.service_items[key] = item
+            position += 1
+        self.service_keys = list(keys)
+
+    # --- Status polling -------------------------------------------------
+
+    def on_refresh_tick(self):
+        self.refresh_status()
+        return True
+
+    def refresh_status(self):
+        if self.busy:
+            return
+        threading.Thread(target=self._poll_status, daemon=True).start()
+
+    def _poll_status(self):
+        status, output, error = run_cove(["status", "--porcelain"], timeout=30)
+        GLib.idle_add(self._apply_status, status, output, error)
+
+    def _apply_status(self, status, output, error):
+        if status != 0:
+            self.last_error = error or first_line(output) or "Unable to read Cove status."
+            self.render()
+            return False
+        states = {}
+        version = self.cove_version
+        for line in output.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.strip().split("=", 1)
+            if key == "version":
+                version = value
+            elif value in ("running", "stopped"):
+                states[key] = value == "running"
+        if not states:
+            self.last_error = "Unexpected status output from Cove."
+            self.render()
+            return False
+
+        keys = [key for key in CORE_SERVICES if key in states] + \
+               sorted(key for key in states if key not in CORE_SERVICES)
+        old_states = dict(self.states)
+        self.states = states
+        self.cove_version = version
+        self.last_error = None
+        self.sync_service_rows(keys)
+        self.notify_unexpected_stops(old_states, states)
+        self.states_known = True
+        self.render()
+        self.rebuild_sites_menu()
+        return False
+
+    # Mirrors the macOS app: a service that is newly stopped is held for one
+    # more poll before it alarms, everything-stopped-at-once is treated as a
+    # deliberate `cove disable`, and nothing fires within 20s of our own action.
+    def notify_unexpected_stops(self, old_states, new_states):
+        if not self.states_known or time.monotonic() - self.last_user_action < 20.0 \
+                or not any(new_states.values()):
+            self.pending_stops.clear()
+            return
+        still_pending = set()
+        for key, running in new_states.items():
+            if running:
+                continue
+            if old_states.get(key):
+                still_pending.add(key)
+            elif key in self.pending_stops:
+                self.notify(f"{display_name(key)} stopped unexpectedly.")
+        self.pending_stops = still_pending
+
+    # --- Actions ---------------------------------------------------------
+
+    def toggle_cove(self):
+        if self.all_running():
+            self.run_action(["disable"], "stop", "Stopping Cove…")
+        else:
+            self.run_action(["enable"], "start", "Starting Cove…")
+
+    def reload_caddy(self):
+        self.run_action(["reload"], "reload", "Reloading Caddy…")
+
+    def run_action(self, args, name, busy_text, timeout=300, on_success=None):
+        if self.busy:
+            return
+        self.busy = busy_text
+        self.last_action_error = None
+        self.last_user_action = time.monotonic()
+        self.render()
+
+        def work():
+            status, output, error = run_cove(args, timeout)
+            GLib.idle_add(self._finish_action, name, status, output, error, on_success)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_action(self, name, status, output, error, on_success):
+        self.busy = None
+        self.last_user_action = time.monotonic()
+        log(f"cove {name}: exit {status}")
+        if status != 0:
+            self.report_failure(f"Could not {name} Cove" if name in ("start", "stop", "reload") else name,
+                                error or output or f"cove {name} exited with an error.")
+        elif on_success is not None:
+            on_success(output)
+        self.refresh_status()
+        self.render()
+        return False
+
+    def report_failure(self, title, detail):
+        self.last_action_error = title
+        self.notify(f"{title} — {first_line(detail)}")
+        log(f"{title}\n{strip_ansi(detail)}")
+        self.render()
+
+    def notify(self, body):
+        log(f"notify: {body}")
+        if HAVE_NOTIFY:
+            try:
+                Notify.Notification.new("Cove", body, os.path.join(ICON_DIR, "cove-logo.svg")).show()
+                return
+            except GLib.Error:
+                pass
+        if shutil.which("notify-send"):
+            subprocess.Popen(["notify-send", "-a", "Cove", "Cove", body])
+
+    # --- Sites submenu ----------------------------------------------------
+
+    def list_sites(self):
+        sites = []
+        try:
+            entries = sorted(os.listdir(SITES_DIR), key=str.lower)
+        except OSError:
+            return sites
+        for entry in entries:
+            path = os.path.join(SITES_DIR, entry)
+            if not entry.endswith(".localhost") or not os.path.isdir(path):
+                continue
+            public = os.path.join(path, "public")
+            try:
+                modified = os.stat(public).st_mtime
+            except OSError:
+                try:
+                    modified = os.stat(path).st_mtime
+                except OSError:
+                    modified = 0
+            sites.append({
+                "name": entry,
+                "modified": modified,
+                "wp": os.path.exists(os.path.join(public, "wp-config.php")),
+            })
+        return sites
+
+    def rebuild_sites_menu(self):
+        sites = self.list_sites()
+        signature = [(site["name"], site["wp"], site["modified"]) for site in sites]
+        if signature == self.sites_dir_mtime and self.sites_menu.get_children():
+            return
+        self.sites_dir_mtime = signature
+
+        for child in self.sites_menu.get_children():
+            self.sites_menu.remove(child)
+
+        if len(sites) >= 8:
+            self.add_item("Recent", sensitive=False, menu=self.sites_menu)
+            for site in sorted(sites, key=lambda site: site["modified"], reverse=True)[:5]:
+                self.add_site_entry(site)
+            self.add_separator(self.sites_menu)
+
+        for site in sites:
+            self.add_site_entry(site)
+
+        if sites:
+            self.add_separator(self.sites_menu)
+            self.sites_item.set_label(f"Sites ({len(sites)})")
+        else:
+            self.sites_item.set_label("Sites")
+
+        self.add_item("New Site…", self.prompt_for_new_site, menu=self.sites_menu)
+        self.sites_menu.show_all()
+
+    def add_site_entry(self, site):
+        host = site["name"]
+        self.add_item(host, lambda h=host: open_uri(cove_url(h)), menu=self.sites_menu)
+        # The panel renders this menu and never reports modifier keys, and
+        # COSMIC cannot open a submenu inside a submenu, so the macOS
+        # Option-key alternate becomes a flat, indented row under the site.
+        if site["wp"]:
+            self.add_item("      ↳ Log in as admin", lambda h=host: self.login_to_site(h), menu=self.sites_menu)
+
+    def login_to_site(self, host):
+        site_name = host[:-len(".localhost")] if host.endswith(".localhost") else host
+
+        def opened(output):
+            login_url = None
+            for candidate in URL_PATTERN.findall(strip_ansi(output)):
+                if host in candidate and "wp-login" in candidate:
+                    login_url = candidate
+            if login_url:
+                open_uri(login_url)
+            else:
+                self.report_failure(f"Could not log in to {host}", "cove login did not return a login URL.")
+
+        self.run_action(["login", site_name], f"log in to {host}", f"Logging in to {host}…",
+                        timeout=45, on_success=opened)
+
+    def prompt_for_new_site(self):
+        dialog = Gtk.Dialog(title="New Cove Site")
+        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Create", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        box.add(Gtk.Label(label="Creates a WordPress site at <name>.localhost.\n"
+                                "Lowercase letters, numbers, and hyphens only.", xalign=0))
+        entry = Gtk.Entry(placeholder_text="my-new-site", activates_default=True)
+        box.add(entry)
+        dialog.show_all()
+        response = dialog.run()
+        name = entry.get_text().strip().lower()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK or not name:
+            return
+        if not SITE_NAME_PATTERN.match(name):
+            self.report_failure("Invalid site name",
+                                "Site names can only contain lowercase letters, numbers, and hyphens, "
+                                "and cannot begin or end with a hyphen.")
+            return
+
+        def created(_output):
+            self.notify(f"{name}.localhost is ready — opening it now.")
+            self.sites_dir_mtime = None
+            open_uri(cove_url(f"{name}.localhost"))
+
+        self.run_action(["add", name], f"create {name}.localhost",
+                        f"Creating {name}.localhost… (takes about a minute)", timeout=240, on_success=created)
+
+    # --- Launch at login ----------------------------------------------------
+
+    def on_launch_toggled(self, item):
+        if item.get_active():
+            try:
+                os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+                with open(AUTOSTART_FILE, "w", encoding="utf-8") as handle:
+                    handle.write(autostart_entry())
+            except OSError as error:
+                self.report_failure("Launch at Login", str(error))
+        else:
+            try:
+                os.remove(AUTOSTART_FILE)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                self.report_failure("Launch at Login", str(error))
+
+    # --- Update check -------------------------------------------------------
+
+    def on_update_tick(self):
+        self.check_for_updates()
+        return True
+
+    def check_for_updates(self):
+        def work():
+            try:
+                request = urllib.request.Request(
+                    "https://github.com/anchorhost/cove/releases/latest", method="HEAD")
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    tag = response.geturl().rstrip("/").rsplit("/", 1)[-1]
+            except Exception:  # noqa: BLE001 — offline is not an error worth surfacing
+                return
+            if tag.startswith("v") and len(tag) > 1:
+                GLib.idle_add(self._set_latest, tag[1:])
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_latest(self, version):
+        self.latest_version = version
+        self.render()
+        return False
+
+    # `cove upgrade` may install packages and ask questions, so it belongs in
+    # a real terminal. Try the desktop's own terminal first, then common ones.
+    def run_upgrade_in_terminal(self):
+        self.last_user_action = time.monotonic()
+        script = "cove upgrade; echo; read -r -p 'Press Enter to close.' _"
+        candidates = [
+            ("cosmic-term", ["--", "bash", "-lc", script]),
+            ("x-terminal-emulator", ["-e", "bash", "-lc", script]),
+            ("gnome-terminal", ["--", "bash", "-lc", script]),
+            ("konsole", ["-e", "bash", "-lc", script]),
+            ("xfce4-terminal", ["-e", f"bash -lc \"{script}\""]),
+            ("alacritty", ["-e", "bash", "-lc", script]),
+            ("kitty", ["bash", "-lc", script]),
+            ("xterm", ["-e", "bash", "-lc", script]),
+        ]
+        for binary, args in candidates:
+            if shutil.which(binary):
+                subprocess.Popen([binary, *args], env=cove_env())
+                return
+        self.report_failure("Update Cove", "No terminal found. Run `cove upgrade` in a terminal.")
+
+
+def autostart_entry():
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Cove Menu Bar\n"
+        "Comment=Cove service status in the system tray\n"
+        f"Exec={sys.executable} {os.path.join(INSTALL_DIR, 'cove-tray.py')}\n"
+        f"Icon={os.path.join(INSTALL_DIR, 'cove-logo.svg')}\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+        "NoDisplay=true\n"
+    )
+
+
+def main():
+    if "--autostart-entry" in sys.argv:
+        sys.stdout.write(autostart_entry())
+        return
+    log("Cove Menu Bar started")
+    CoveTray()
+    Gtk.main()
+    log("Cove Menu Bar quit")
+
+
+if __name__ == "__main__":
+    main()
+COVE_MENUBAR_TRAY_EOF
 }
 
 #  Pass all script arguments to the main function.
