@@ -1,0 +1,32 @@
+cove_wp() {
+    local site_name="$1"
+    if [ -z "$site_name" ] || [ "$site_name" == "--help" ] || [ "$site_name" == "-h" ]; then
+        echo "Usage: cove wp <site> <wp-cli arguments…>"
+        echo ""
+        echo "Runs WP-CLI inside a site from anywhere, on the PHP the site is pinned to."
+        echo "Examples:"
+        echo "  cove wp mysite plugin list"
+        echo "  cove wp mysite option get siteurl"
+        echo "  cove wp mysite user create dev dev@mysite.localhost --role=editor"
+        [ -z "$site_name" ] && exit 1
+        return
+    fi
+    shift
+
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    local public_dir="$site_dir/public"
+    if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
+        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    local wp_cmd
+    wp_cmd=$(get_wp_cmd "$site_dir")
+    # $wp_cmd is intentionally unquoted: it can be "php-binary /path/wp-cli.phar".
+    cd "$public_dir" && exec $wp_cmd "$@"
+}

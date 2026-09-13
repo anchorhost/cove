@@ -79,10 +79,12 @@ cove_login() {
             exit 1
         fi
 
-        # On a network a super admin may hold no role on the subsite itself.
+        # A named user may hold any role: logging in as an editor or a
+        # subscriber is how a role's view of the site gets tested. Say so
+        # when it is not an administrator (a super admin may hold no role
+        # on a subsite at all).
         if ! echo "$user_roles" | grep -q "administrator" && ! (cd "$public_dir" && $wp_cmd super-admin list --skip-plugins --skip-themes 2>/dev/null | grep -Fxq "$user_identifier"); then
-            gum style --foreground red "❌ Error: User '$user_identifier' is not an administrator."
-            exit 1
+            echo "⚠️  '$user_identifier' is not an administrator (roles: $(echo "$user_roles" | tr -d '[]"' ))."
         fi
         
         admin_to_login="$user_identifier"

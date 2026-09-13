@@ -3114,6 +3114,180 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             fclose($fh);
             echo json_encode(['success' => true, 'log' => $log, 'truncated' => $size > $max]);
             exit;
+        case 'site_plugins':
+        case 'site_themes':
+        case 'site_users':
+        case 'site_cron':
+        case 'site_plugin_op':
+        case 'site_theme_op':
+        case 'site_cron_run':
+        case 'site_wp':
+            // --- Site page: plugins, themes, users, cron, wp-cli -----------
+            // Everything here is WP-CLI inside the site, through `cove wp`
+            // so the site's pinned PHP is honoured. Arguments are built
+            // here from validated inputs and passed one per escapeshellarg;
+            // nothing the browser sends is interpreted by a shell.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                echo json_encode(['success' => false, 'message' => 'Invalid site name.']);
+                exit;
+            }
+            if (!is_file($sitedir . '/' . $site_name . '.localhost/public/wp-config.php')) {
+                echo json_encode(['success' => false, 'message' => 'Not a WordPress site.']);
+                exit;
+            }
+            $__wp = function (array $args) use ($user_home, $cove_path, $site_name) {
+                $cmd = 'HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path) . ' wp ' . escapeshellarg($site_name);
+                foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string) $a);
+                $t0 = microtime(true);
+                exec($cmd . ' 2>&1', $lines, $code);
+                // WP-CLI colours its errors even without a TTY in some builds.
+                $out = preg_replace('/\x1b\[[0-9;]*m/', '', implode("\n", $lines));
+                return [$out, (int) $code, round((microtime(true) - $t0) * 1000)];
+            };
+            // PHP's own notices (a plugin, or wp-cli itself on a new PHP)
+            // arrive on the same stream; they would bury every listing and
+            // console result, so they are split off and counted.
+            $__wp_clean = function ($out) {
+                $kept = []; $dropped = 0;
+                foreach (explode("\n", $out) as $line) {
+                    if (preg_match('/^(?:PHP )?(?:Deprecated|Warning|Notice|Strict Standards):\s/', $line)) { $dropped++; continue; }
+                    $kept[] = $line;
+                }
+                return [trim(implode("\n", $kept)), $dropped];
+            };
+            $__wp_json = function (array $args) use ($__wp) {
+                [$out, $code, $ms] = $__wp($args);
+                $data = json_decode(trim($out), true);
+                if ($code !== 0 || !is_array($data)) {
+                    // The JSON may be preceded by a PHP notice from a plugin;
+                    // take the last line that parses.
+                    foreach (array_reverse(explode("\n", trim($out))) as $line) {
+                        $try = json_decode(trim($line), true);
+                        if (is_array($try)) { $data = $try; break; }
+                    }
+                }
+                if (!is_array($data)) {
+                    echo json_encode(['success' => false, 'message' => trim($out) !== '' ? trim(substr($out, -600)) : 'wp-cli returned nothing.']);
+                    exit;
+                }
+                return [$data, $ms];
+            };
+            $__slug_ok = function ($s) { return is_string($s) && $s !== '' && preg_match('/^[A-Za-z0-9._-]+$/', $s); };
+            $__multisite = is_file($sitedir . '/' . $site_name . '.localhost/multisite') || strpos((string) @file_get_contents($sitedir . '/' . $site_name . '.localhost/public/wp-config.php'), "'MULTISITE'") !== false;
+
+            if ($action === 'site_plugins' || $action === 'site_themes') {
+                $kind = $action === 'site_plugins' ? 'plugin' : 'theme';
+                // Listing skips loading plugins/themes: a heavy plugin can
+                // cost twenty seconds to boot and the list needs none of it.
+                // `check` asks wp.org for updates (slow, on demand).
+                $args = [$kind, 'list', '--fields=name,title,status,version,update,update_version,auto_update', '--format=json', '--skip-plugins', '--skip-themes'];
+                if (empty($input['check'])) $args[] = '--skip-update-check';
+                [$items, $ms] = $__wp_json($args);
+                echo json_encode(['success' => true, 'items' => array_values($items), 'ms' => $ms, 'multisite' => $__multisite, 'checked' => !empty($input['check'])]);
+                exit;
+            }
+
+            if ($action === 'site_users') {
+                // On a network the --network listing carries every user but
+                // no roles, so the main site's roles are merged in; users who
+                // belong only to subsites show without one. Super admins are
+                // marked either way.
+                $args = ['user', 'list', '--fields=ID,user_login,display_name,user_email,roles,registered', '--format=json', '--skip-plugins', '--skip-themes'];
+                [$items, $ms] = $__wp_json($args);
+                if ($__multisite) {
+                    // Every user on the network with the sites each belongs
+                    // to and the role held there, so a user who lives only
+                    // on a subsite can be logged in where they have a role.
+                    [$all, $ms2] = $__wp_json(['eval', '$out = []; foreach ( get_users( [ "blog_id" => 0, "number" => -1 ] ) as $u ) { $blogs = []; foreach ( get_blogs_of_user( $u->ID ) as $b ) { switch_to_blog( $b->userblog_id ); $r = ( new WP_User( $u->ID ) )->roles; $blogs[] = [ "id" => (int) $b->userblog_id, "url" => home_url( "/" ), "name" => $b->blogname, "roles" => array_values( $r ) ]; restore_current_blog(); } $out[] = [ "ID" => $u->ID, "user_login" => $u->user_login, "display_name" => $u->display_name, "user_email" => $u->user_email, "registered" => $u->user_registered, "blogs" => $blogs ]; } echo json_encode( $out );', '--skip-plugins', '--skip-themes']);
+                    $main = [];
+                    foreach ($items as $u) $main[(int) $u['ID']] = $u['roles'] ?? '';
+                    foreach ($all as &$u) { $u['roles'] = $main[(int) $u['ID']] ?? ''; $u['network_only'] = !isset($main[(int) $u['ID']]); }
+                    unset($u);
+                    $items = $all; $ms += $ms2;
+                }
+                $supers = [];
+                if ($__multisite) { [$so] = $__wp(['super-admin', 'list', '--skip-plugins', '--skip-themes']); [$so] = $__wp_clean($so); $supers = array_values(array_filter(array_map('trim', explode("\n", $so)))); }
+                echo json_encode(['success' => true, 'items' => array_values($items), 'ms' => $ms, 'multisite' => $__multisite, 'super_admins' => $supers]);
+                exit;
+            }
+
+            if ($action === 'site_cron') {
+                // Plugins must load here: they register the hooks and the
+                // custom schedules the list names.
+                [$items, $ms] = $__wp_json(['cron', 'event', 'list', '--fields=hook,next_run_gmt,next_run_relative,recurrence', '--format=json']);
+                echo json_encode(['success' => true, 'items' => array_values($items), 'ms' => $ms]);
+                exit;
+            }
+
+            if ($action === 'site_plugin_op' || $action === 'site_theme_op') {
+                $kind = $action === 'site_plugin_op' ? 'plugin' : 'theme';
+                $op = (string) ($input['op'] ?? '');
+                $slug = $input['slug'] ?? '';
+                $allowed = $kind === 'plugin' ? ['activate', 'deactivate', 'delete', 'update', 'auto-on', 'auto-off'] : ['activate', 'delete', 'update', 'auto-on', 'auto-off'];
+                if (!in_array($op, $allowed, true) || !$__slug_ok($slug)) {
+                    echo json_encode(['success' => false, 'message' => 'Invalid operation.']);
+                    exit;
+                }
+                if ($op === 'auto-on') $args = [$kind, 'auto-updates', 'enable', $slug];
+                elseif ($op === 'auto-off') $args = [$kind, 'auto-updates', 'disable', $slug];
+                else $args = [$kind, $op, $slug];
+                if ($kind === 'plugin' && $__multisite && in_array($op, ['activate', 'deactivate'], true) && !empty($input['network'])) $args[] = '--network';
+                if ($kind === 'theme' && $__multisite && $op === 'activate' && !empty($input['network'])) { $args = ['theme', 'enable', $slug, '--network', '--activate']; }
+                [$out, $code, $ms] = $__wp($args);
+                [$out] = $__wp_clean($out);
+                echo json_encode(['success' => $code === 0, 'message' => trim($out) !== '' ? trim($out) : ($code === 0 ? 'Done.' : 'wp-cli failed (' . $code . ').'), 'ms' => $ms]);
+                exit;
+            }
+
+            if ($action === 'site_cron_run') {
+                if (!empty($input['due'])) $args = ['cron', 'event', 'run', '--due-now'];
+                else {
+                    $hook = (string) ($input['hook'] ?? '');
+                    if ($hook === '' || !preg_match('#^[A-Za-z0-9_.:\\/-]+$#', $hook)) { echo json_encode(['success' => false, 'message' => 'Invalid hook.']); exit; }
+                    $args = ['cron', 'event', 'run', $hook];
+                }
+                [$out, $code, $ms] = $__wp($args);
+                [$out] = $__wp_clean($out);
+                echo json_encode(['success' => $code === 0, 'message' => trim($out) !== '' ? trim($out) : ($code === 0 ? 'Done.' : 'wp-cli failed (' . $code . ').'), 'ms' => $ms]);
+                exit;
+            }
+
+            if ($action === 'site_wp') {
+                // A WP-CLI line from the console: split on whitespace with
+                // quotes honoured, then each token is one argument. There is
+                // no shell in the path, so `;`, `|` and `$(...)` are literal.
+                $line = trim((string) ($input['args'] ?? ''));
+                $line = preg_replace('/^wp\s+/', '', $line);
+                if ($line === '' || strlen($line) > 4000) { echo json_encode(['success' => false, 'message' => 'Nothing to run.']); exit; }
+                $tokens = []; $cur = ''; $q = null; $has = false;
+                for ($i = 0, $n = strlen($line); $i < $n; $i++) {
+                    $ch = $line[$i];
+                    if ($q !== null) {
+                        if ($ch === $q) { $q = null; continue; }
+                        if ($ch === '\\' && $q === '"' && $i + 1 < $n) { $cur .= $line[++$i]; continue; }
+                        $cur .= $ch; continue;
+                    }
+                    if ($ch === '"' || $ch === "'") { $q = $ch; $has = true; continue; }
+                    if ($ch === '\\' && $i + 1 < $n) { $cur .= $line[++$i]; $has = true; continue; }
+                    if ($ch === ' ' || $ch === "\t" || $ch === "\n") { if ($cur !== '' || $has) { $tokens[] = $cur; $cur = ''; $has = false; } continue; }
+                    $cur .= $ch; $has = true;
+                }
+                if ($q !== null) { echo json_encode(['success' => false, 'message' => 'Unbalanced quote.']); exit; }
+                if ($cur !== '' || $has) $tokens[] = $cur;
+                if (!$tokens) { echo json_encode(['success' => false, 'message' => 'Nothing to run.']); exit; }
+                $first = $tokens[0];
+                if (in_array($first, ['shell', 'db', 'server'], true) && ($first !== 'db' || in_array($tokens[1] ?? '', ['cli', 'shell'], true) || count($tokens) === 1)) {
+                    echo json_encode(['success' => false, 'message' => 'Interactive commands (wp shell, wp db cli, wp server) have no terminal here.']);
+                    exit;
+                }
+                $tokens[] = '--no-color';
+                [$out, $code, $ms] = $__wp($tokens);
+                [$out, $dropped] = $__wp_clean($out);
+                echo json_encode(['success' => true, 'output' => $out, 'code' => $code, 'ms' => $ms, 'notices' => $dropped]);
+                exit;
+            }
+            echo json_encode(['success' => false, 'message' => 'Unknown site action.']);
+            exit;
         case 'network_sites':
             // The sites on a multisite network, via `cove network`, which
             // runs one wp-cli eval inside the install.
@@ -3137,6 +3311,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // An optional `url` names a subsite of a multisite network; the
                 // command checks it against the network before minting anything.
                 $login_url_arg = '';
+                $login_user = (string) ($input['user'] ?? '');
+                if ($login_user !== '') {
+                    if (!preg_match('/^[A-Za-z0-9 _.@+-]{1,60}$/', $login_user)) { echo json_encode(['success' => false, 'message' => 'Invalid user.']); exit; }
+                    $login_url_arg .= ' ' . escapeshellarg($login_user);
+                }
                 $sub = (string) ($input['url'] ?? '');
                 if ($sub !== '') {
                     if (!preg_match('#^https?://[a-z0-9.-]+(?::\d+)?/[a-z0-9._~/-]*$#i', $sub)) {
@@ -4799,6 +4978,57 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             .net-updated, .net-row .net-open { display: none; }
         }
 
+        /* Site page tabs: plugins, themes, users, cron, wp-cli. */
+        .site-tabs { padding: 0.35rem 1.5rem; }
+        .st-toolbar { display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1.5rem; border-bottom: 1px solid var(--panel-border); flex-wrap: wrap; }
+        .st-toolbar .st-filter { flex: 1; min-width: 160px; }
+        .st-toolbar .st-count { margin-left: auto; }
+        .st-list { list-style: none; margin: 0; padding: 0; max-height: calc(100vh - 330px); min-height: 220px; overflow-y: auto; }
+        .st-list > .loading, .st-list > .empty, .st-empty { padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .st-row { display: grid; align-items: center; column-gap: 0.9rem; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); }
+        .st-row:hover { background: var(--panel-hover); }
+        .st-plugins, .st-themes { grid-template-columns: minmax(0, 1fr) auto auto auto minmax(9rem, auto); }
+        .st-users { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+        .st-cron { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+        .st-main { min-width: 0; display: flex; flex-direction: column; gap: 0.1rem; }
+        .st-title { font-size: 0.88rem; color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .st-title.st-mono { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 400; }
+        .st-row.is-off .st-title { color: var(--text-dim); font-weight: 400; }
+        .st-sub { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .st-ver { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); white-space: nowrap; }
+        .st-upd { color: var(--accent); }
+        .st-row.is-due .st-ver { color: var(--pill-warn-fg, #d08c30); }
+        .st-chip { font-family: var(--font-mono); font-size: 0.62rem; letter-spacing: 0.04em; padding: 0.08rem 0.5rem; border-radius: var(--radius-pill); border: 1px solid var(--panel-border); color: var(--text-dim); white-space: nowrap; }
+        .st-chip.st-status-active, .st-chip.st-status-active-network, .st-chip.st-status-must-use, .st-chip.st-status-parent { background: var(--pill-wp-bg); color: var(--pill-wp-fg); border-color: transparent; }
+        .st-chip.st-none { color: var(--text-faint); border-style: dashed; }
+        .st-roles { display: flex; gap: 0.25rem; flex-wrap: wrap; justify-content: flex-end; }
+        .st-auto { background: transparent; border: 1px solid var(--panel-border); color: var(--text-faint); font-family: var(--font-mono); font-size: 0.62rem; letter-spacing: 0.04em; padding: 0.08rem 0.5rem; border-radius: var(--radius-pill); cursor: pointer; }
+        .st-auto.is-on { color: var(--accent); border-color: var(--accent); }
+        .st-auto:hover { color: var(--text); }
+        .st-actions { display: flex; gap: 0.3rem; justify-content: flex-end; min-width: 0; }
+        .st-actions .pill { padding: 0.22rem 0.55rem; font-size: 0.72rem; }
+        .st-del { color: var(--text-faint); }
+        .st-del.armed { color: white; background: var(--danger); border-color: var(--danger); }
+        .st-busy { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
+        .site-cli { padding: 1rem 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 0.6rem; }
+        .st-cli-line { display: flex; align-items: center; gap: 0.5rem; background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.35rem 0.5rem 0.35rem 0.8rem; }
+        .st-cli-line:focus-within { border-color: var(--accent); }
+        .st-cli-prompt { font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-faint); white-space: nowrap; }
+        .st-cli-input { flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.82rem; }
+        .st-cli-examples { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .st-cli-examples button { background: transparent; border: 1px solid var(--panel-border); border-radius: var(--radius-pill); color: var(--text-dim); font: inherit; padding: 0.1rem 0.55rem; cursor: pointer; }
+        .st-cli-examples button:hover { color: var(--text); border-color: var(--text-faint); }
+        .st-cli-out { margin: 0; padding: 0.9rem 1rem; background: var(--bg-sunk); border: 1px solid var(--panel-border); border-radius: var(--radius-md); font-family: var(--font-mono); font-size: 0.76rem; line-height: 1.5; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 60vh; overflow: auto; }
+        .st-cli-out.is-error { color: var(--danger); }
+        @media (max-width: 760px) {
+            .st-plugins, .st-themes { grid-template-columns: minmax(0, 1fr) auto minmax(7rem, auto); }
+            .st-plugins .st-chip, .st-themes .st-chip, .st-auto { display: none; }
+            .st-users { grid-template-columns: minmax(0, 1fr) auto; }
+            .st-roles, .st-users .st-ver { display: none; }
+            .st-cron { grid-template-columns: minmax(0, 1fr) auto auto; }
+            .st-cron .st-chip { display: none; }
+        }
+
         /* Files. A file manager over each site's directory: sites on the
            left, a breadcrumb bar and listing (or the open file) on the right. */
         body.view-files .wrap { max-width: 1280px; }
@@ -5466,7 +5696,17 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     <button type="button" class="pill primary" id="btnSiteLogin" title="One-time admin login (⌘↵)"><span class="btn-label">log in to admin</span></button>
                 </div>
             </header>
-            <div class="site-body">
+            <div class="mail-msg-bar site-tabs" id="siteTabs" style="display: none;">
+                <div class="mail-parts" role="tablist">
+                    <button type="button" class="mail-part is-active" role="tab" data-tab="overview">overview</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="plugins">plugins</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="themes">themes</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="users">users</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="cron">cron</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="cli">wp-cli</button>
+                </div>
+            </div>
+            <div class="site-body" id="sitePanel-overview">
                 <div class="site-tiles" id="siteTiles">
                     <button type="button" class="site-tile" data-go="files"><span class="site-tile-name">files</span><span class="site-tile-desc">Browse and edit the site's directory, upload, tidy up.</span></button>
                     <button type="button" class="site-tile" data-go="db" id="tileDb"><span class="site-tile-name">database</span><span class="site-tile-desc">Tables, rows in place, a SQL console.</span></button>
@@ -5509,6 +5749,73 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         <button type="button" class="pill danger" id="spDelete"><span class="pill-label">delete site…</span></button>
                     </div>
                 </section>
+            </div>
+
+            <div class="site-panel" id="sitePanel-plugins" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter plugins…" spellcheck="false" autocomplete="off" aria-label="Filter plugins">
+                    <div class="log-levels" role="group" aria-label="Status">
+                        <button type="button" class="log-level st-status is-active" data-status="all">all</button>
+                        <button type="button" class="log-level st-status" data-status="active">active</button>
+                        <button type="button" class="log-level st-status" data-status="inactive">inactive</button>
+                        <button type="button" class="log-level st-status" data-status="updates">updates</button>
+                    </div>
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill st-check" title="Ask wp.org for new versions (loads the site's plugins, so it can take a while)">check for updates</button>
+                    <button type="button" class="pill st-refresh" title="Re-read the list">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading plugins…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel" id="sitePanel-themes" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter themes…" spellcheck="false" autocomplete="off" aria-label="Filter themes">
+                    <div class="log-levels" role="group" aria-label="Status">
+                        <button type="button" class="log-level st-status is-active" data-status="all">all</button>
+                        <button type="button" class="log-level st-status" data-status="active">active</button>
+                        <button type="button" class="log-level st-status" data-status="inactive">inactive</button>
+                        <button type="button" class="log-level st-status" data-status="updates">updates</button>
+                    </div>
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill st-check" title="Ask wp.org for new versions">check for updates</button>
+                    <button type="button" class="pill st-refresh" title="Re-read the list">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading themes…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel" id="sitePanel-users" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter users…" spellcheck="false" autocomplete="off" aria-label="Filter users">
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill st-refresh" title="Re-read the list">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading users…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel" id="sitePanel-cron" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter events…" spellcheck="false" autocomplete="off" aria-label="Filter events">
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill st-due" title="Run every event whose time has come">run all due</button>
+                    <button type="button" class="pill st-refresh" title="Re-read the schedule">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading the schedule…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel site-cli" id="sitePanel-cli" style="display: none;">
+                <div class="st-cli-line">
+                    <span class="st-cli-prompt" id="siteCliPrompt"></span>
+                    <input class="st-cli-input" id="siteCliInput" type="text" placeholder="plugin list --status=active" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" aria-label="WP-CLI command">
+                    <button type="button" class="pill primary" id="btnSiteCliRun">run</button>
+                </div>
+                <div class="st-cli-examples" id="siteCliExamples">
+                    <span>try</span>
+                    <button type="button" data-cmd="core version --extra">core version --extra</button>
+                    <button type="button" data-cmd="option get siteurl">option get siteurl</button>
+                    <button type="button" data-cmd="plugin list --status=active">plugin list --status=active</button>
+                    <button type="button" data-cmd="cache flush">cache flush</button>
+                    <button type="button" data-cmd="transient delete --all">transient delete --all</button>
+                    <button type="button" data-cmd="search-replace https://old.example https://new.example --dry-run">search-replace --dry-run</button>
+                    <button type="button" data-cmd="eval 'echo wp_get_environment_type();'">eval …</button>
+                </div>
+                <div class="mail-bar-note" id="siteCliMeta"></div>
+                <pre class="st-cli-out" id="siteCliOut" style="display: none;"></pre>
             </div>
         </section>
 
@@ -5838,7 +6145,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             selectedName: null,
             ctxMenu: { open: false, site: null, x: 0, y: 0, openedAt: 0 },
             fileCtx: { open: false, target: null, x: 0, y: 0, openedAt: 0 },
-            sitePage: { name: null, net: { items: [], loading: false, error: null, loadedFor: null }, busy: null },
+            sitePage: { name: null, tab: 'overview', tabs: {}, net: { items: [], loading: false, error: null, loadedFor: null }, busy: null, cli: { cmd: '', output: '', code: 0, ms: 0, ran: null, running: false, history: [], histIdx: -1 } },
             siteDeleteConfirm: null,
             palette: { open: false, query: '', index: 0 },
             rename: { open: false, site: null, value: '', busy: false },
@@ -5996,6 +6303,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.bindLogsEvents();
                 this.bindFilesEvents();
                 this.bindSiteEvents();
+                this.bindSiteTabEvents();
                 this.render();
 
                 // If the tab closes during an undo window, flush the staged
@@ -6049,7 +6357,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             if (this.domainsModal.open) { this.closeDomainsModal(); return; }
                             if (this.rename.open) { this.closeRename(); return; }
                             if (this.showDbModal) { this.setDbModal(false); return; }
-                            if (!typing) this.setView('sites');
+                            if (typing) return;
+                            if (this.sitePage.tab !== 'overview') { this.setSiteTab('overview'); return; }
+                            this.setView('sites');
                             return;
                         }
                         if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !typing) {
@@ -6390,7 +6700,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 // sites list, which usually lands after the first db render.
                 if (this.view === 'db') { this.renderDbList(); if (this.db.name && !this.db.table && !this.db.sql) this.renderDbOverview(); }
                 if (this.view === 'files') this.renderFilesSide();
-                if (this.view === 'site') this.renderSitePage();
+                if (this.view === 'site') { this.renderSitePage(); this.loadSiteTab(); }
                 if (this.palette.open) this.renderPalette();
             },
 
@@ -6865,6 +7175,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (view === 'site') {
                     this.renderSitePage();
                     this.loadSiteNetwork();
+                    this.loadSiteTab();
                 }
                 if (view === 'files') {
                     // A URL names a path that may be a folder or a file; the
@@ -6888,7 +7199,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             get viewPath() {
                 if (this.view === 'mail') return '/mail' + (this.mail.site ? '/' + this.mail.site : '');
                 if (this.view === 'db') return '/db' + (this.db.name ? '/' + encodeURIComponent(this.db.name) + (this.db.table ? '/' + encodeURIComponent(this.db.table) : '') : '');
-                if (this.view === 'site') return '/site/' + (this.sitePage.name || '');
+                if (this.view === 'site') return '/site/' + (this.sitePage.name || '') + (this.sitePage.tab && this.sitePage.tab !== 'overview' ? '/' + this.sitePage.tab : '');
                 if (this.view === 'files') return '/files' + (this.files.site ? '/' + this.files.site + this.filesEncode(this.files.file ? this.files.file.path : this.files.path) : '');
                 if (this.view === 'logs') return '/logs' + (this.logs.site ? '/' + this.logs.site + (this.logs.tab ? '/' + this.logs.tab : '') : (this.logs.source !== 'errors' ? '/@' + this.logs.source : ''));
                 return '/';
@@ -6926,8 +7237,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : null; }
                     else { this.logs.site = null; this.logs.source = 'errors'; }
                     this.setView('logs', { force: true });
-                } else if ((m = /^\/site\/([a-z0-9-]+)$/i.exec(p))) {
+                } else if ((m = /^\/site\/([a-z0-9-]+)(?:\/(plugins|themes|users|cron|cli))?$/i.exec(p))) {
                     this.sitePage.name = m[1].toLowerCase();
+                    this.sitePage.tab = m[2] ? m[2].toLowerCase() : 'overview';
                     this.setView('site', { force: true });
                 } else if ((m = /^\/files(?:\/([a-z0-9-]+)(?:\/(.+))?)?$/i.exec(p))) {
                     const site = m[1] ? m[1].toLowerCase() : null;
@@ -8713,6 +9025,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             get pageSite() { return this.sites.find(s => s.name === this.sitePage.name) || null; },
 
             openSitePage(name) {
+                if (name !== this.sitePage.name) this.sitePage.tab = 'overview';
                 this.sitePage.name = name;
                 this.setView('site', { force: true });
             },
@@ -8764,6 +9077,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('spPhpMeta').textContent = effPhp ? effPhp : '';
                 $id('spReveal').querySelector('.pill-label').textContent = this.revealLabel.toLowerCase();
                 $id('spPin').querySelector('.pill-label').textContent = this.isPinned(site.name) ? 'unpin' : 'pin to top';
+                // Tabs: WordPress only; a static site has just the overview.
+                if (!isWp && p.tab !== 'overview') { p.tab = 'overview'; this.syncUrl({ replace: true }); }
+                show($id('siteTabs'), isWp);
+                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
+                for (const tb of this.siteTabs) show($id('sitePanel-' + tb), p.tab === tb);
+                this.renderSiteTab();
             },
 
             renderSiteNetwork() {
@@ -8873,6 +9192,307 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('spCopy').addEventListener('click', withSite(s => this.copyPath(s.full_path)));
                 $id('spPin').addEventListener('click', withSite(s => { this.togglePin(s.name); this.renderSitePage(); }));
                 $id('spDelete').addEventListener('click', withSite(s => this.openSiteDeleteConfirm(s.name)));
+            },
+
+            // --- Site page tabs: plugins, themes, users, cron, wp-cli --------
+            // Each tab is a WP-CLI listing fetched when first shown and kept
+            // per site; row actions run one command and refetch.
+            get siteTabs() { return ['overview', 'plugins', 'themes', 'users', 'cron', 'cli']; },
+
+            setSiteTab(tab) {
+                const p = this.sitePage;
+                tab = this.siteTabs.includes(tab) ? tab : 'overview';
+                const site = this.pageSite;
+                if (site && site.type !== 'WordPress') tab = 'overview';
+                p.tab = tab;
+                this.syncUrl();
+                this.renderSitePage();
+                this.loadSiteTab();
+                if (tab === 'cli') $id('siteCliInput').focus();
+            },
+
+            siteTabState(tab) {
+                const p = this.sitePage;
+                if (!p.tabs[tab]) p.tabs[tab] = { items: [], loading: false, error: null, loadedFor: null, filter: '', status: 'all', busy: {}, arm: null, ms: 0, checked: false };
+                return p.tabs[tab];
+            },
+
+            async loadSiteTab(opts = {}) {
+                const p = this.sitePage;
+                const tab = p.tab;
+                const site = this.pageSite;
+                if (!site || site.type !== 'WordPress' || !['plugins', 'themes', 'users', 'cron'].includes(tab)) return;
+                const t = this.siteTabState(tab);
+                if (t.loadedFor === site.name && !opts.force) return;
+                if (t.loadedFor !== site.name) { t.items = []; t.loadedFor = null; t.filter = ''; t.status = 'all'; t.arm = null; }
+                t.loading = true; t.error = null;
+                this.renderSiteTab();
+                const action = { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron' }[tab];
+                const res = await this.apiPost(action, { site_name: site.name, check: !!opts.check }, { quiet: true, timeoutMs: opts.check ? 180000 : 90000 });
+                if (this.sitePage.name !== site.name) return;
+                t.loading = false;
+                if (!res.success) t.error = res.message || 'wp-cli failed.';
+                else { t.items = res.items || []; t.loadedFor = site.name; t.ms = res.ms || 0; t.extra = res; if (opts.check) t.checked = true; }
+                this.renderSiteTab();
+            },
+
+            // One row action: wp plugin/theme <op> <slug>, then a refetch.
+            async siteItemOp(tab, slug, op, network) {
+                const site = this.pageSite;
+                const t = this.siteTabState(tab);
+                if (!site || t.busy[slug]) return;
+                if (op === 'delete' && t.arm !== slug) {
+                    t.arm = slug;
+                    clearTimeout(t.armTimer);
+                    t.armTimer = setTimeout(() => { t.arm = null; this.renderSiteTab(); }, 3500);
+                    this.renderSiteTab();
+                    return;
+                }
+                t.arm = null;
+                t.busy[slug] = op;
+                this.renderSiteTab();
+                const res = await this.apiPost(tab === 'plugins' ? 'site_plugin_op' : 'site_theme_op', { site_name: site.name, slug, op, network: !!network }, { quiet: true, timeoutMs: 180000 });
+                delete t.busy[slug];
+                if (this.sitePage.name !== site.name) return;
+                const last = (res.message || '').split('\n').filter(Boolean).pop() || '';
+                this.showSnack(last.replace(/^(Success|Error|Warning): /, '') || (res.success ? 'Done.' : 'Failed.'), !res.success);
+                this.loadSiteTab({ force: true });
+            },
+
+            async siteCronRun(hook) {
+                const site = this.pageSite;
+                const t = this.siteTabState('cron');
+                const key = hook || '*';
+                if (!site || t.busy[key]) return;
+                t.busy[key] = 'run';
+                this.renderSiteTab();
+                const res = await this.apiPost('site_cron_run', hook ? { site_name: site.name, hook } : { site_name: site.name, due: true }, { quiet: true, timeoutMs: 180000 });
+                delete t.busy[key];
+                if (this.sitePage.name !== site.name) return;
+                const last = (res.message || '').split('\n').filter(Boolean).pop() || '';
+                this.showSnack(last.replace(/^(Success|Error|Warning): /, '') || (res.success ? 'Ran.' : 'Failed.'), !res.success);
+                this.loadSiteTab({ force: true });
+            },
+
+            async siteUserLogin(login, url) {
+                const site = this.pageSite;
+                const t = this.siteTabState('users');
+                if (!site || t.busy[login]) return;
+                t.busy[login] = 'login';
+                this.renderSiteTab();
+                const res = await this.apiPost('get_login_link', url ? { site_name: site.name, user: login, url } : { site_name: site.name, user: login });
+                delete t.busy[login];
+                if (res.success && res.url) { window.open(res.url, '_blank'); this.showSnack('Login link for ' + login + ' opened in a new tab.'); }
+                if (this.sitePage.name === site.name) this.renderSiteTab();
+            },
+
+            async runSiteCli() {
+                const site = this.pageSite;
+                const c = this.sitePage.cli;
+                const input = $id('siteCliInput');
+                const line = input.value.trim();
+                if (!site || !line || c.running) return;
+                c.running = true; c.cmd = line;
+                c.history = [line].concat(c.history.filter(h => h !== line)).slice(0, 50);
+                c.histIdx = -1;
+                try { localStorage.setItem('cove.cli.history', JSON.stringify(c.history)); } catch (e) {}
+                this.renderSiteCli();
+                const res = await this.apiPost('site_wp', { site_name: site.name, args: line }, { quiet: true, timeoutMs: 300000 });
+                c.running = false;
+                if (!res.success) { c.output = res.message || 'Failed.'; c.code = 1; c.ms = 0; }
+                else { c.output = res.output; c.code = res.code; c.ms = res.ms; c.notices = res.notices || 0; }
+                c.ran = line;
+                this.renderSiteCli();
+                // Listings the command may have changed are refetched next visit.
+                for (const tab of ['plugins', 'themes', 'users', 'cron']) { const t = this.sitePage.tabs[tab]; if (t) t.loadedFor = null; }
+            },
+
+            siteTabVisible(tab) {
+                const t = this.siteTabState(tab);
+                const q = t.filter.trim().toLowerCase();
+                let rows = t.items;
+                if (tab === 'plugins' || tab === 'themes') {
+                    if (t.status === 'active') rows = rows.filter(i => i.status === 'active' || i.status === 'active-network' || i.status === 'must-use' || i.status === 'parent');
+                    if (t.status === 'inactive') rows = rows.filter(i => i.status === 'inactive');
+                    if (t.status === 'updates') rows = rows.filter(i => i.update === 'available');
+                    if (q) rows = rows.filter(i => (i.name + ' ' + (i.title || '')).toLowerCase().includes(q));
+                    const rank = { 'must-use': 0, 'active-network': 1, active: 1, parent: 2, inactive: 3 };
+                    rows = [...rows].sort((a, b) => (rank[a.status] ?? 4) - (rank[b.status] ?? 4) || (a.title || a.name).localeCompare(b.title || b.name));
+                } else if (tab === 'users') {
+                    if (q) rows = rows.filter(u => (u.user_login + ' ' + u.display_name + ' ' + u.user_email + ' ' + u.roles).toLowerCase().includes(q));
+                } else if (tab === 'cron') {
+                    if (q) rows = rows.filter(e => (e.hook + ' ' + e.recurrence).toLowerCase().includes(q));
+                }
+                return rows;
+            },
+
+            renderSiteTab() {
+                if (this.view !== 'site') return;
+                const p = this.sitePage;
+                const tab = p.tab;
+                if (tab === 'cli') { this.renderSiteCli(); return; }
+                if (!['plugins', 'themes', 'users', 'cron'].includes(tab)) return;
+                const site = this.pageSite;
+                const t = this.siteTabState(tab);
+                const panel = $id('sitePanel-' + tab);
+                const list = panel.querySelector('.st-list');
+                list.querySelectorAll('.st-row, .st-empty').forEach(n => n.remove());
+                const loaded = site && t.loadedFor === site.name;
+                show(panel.querySelector('.st-loading'), t.loading && !loaded);
+                const err = panel.querySelector('.st-error');
+                show(err, !t.loading && !!t.error);
+                if (t.error) err.textContent = t.error;
+                const filter = panel.querySelector('.st-filter');
+                if (filter.value !== t.filter) filter.value = t.filter;
+                panel.querySelectorAll('.st-status').forEach(b => b.classList.toggle('is-active', b.dataset.status === t.status));
+                const refresh = panel.querySelector('.st-refresh');
+                if (refresh) refresh.disabled = t.loading;
+                const check = panel.querySelector('.st-check');
+                if (check) { check.disabled = t.loading; check.textContent = t.loading && t.checking ? 'checking…' : 'check for updates'; }
+                const due = panel.querySelector('.st-due');
+                if (due) { due.disabled = !!t.busy['*']; due.textContent = t.busy['*'] ? 'running…' : 'run all due'; }
+                const count = panel.querySelector('.st-count');
+                if (!loaded) { count.textContent = ''; return; }
+                const rows = this.siteTabVisible(tab);
+                const label = { plugins: 'plugin', themes: 'theme', users: 'user', cron: 'event' }[tab];
+                const updates = (tab === 'plugins' || tab === 'themes') ? t.items.filter(i => i.update === 'available').length : 0;
+                count.textContent = (rows.length === t.items.length ? t.items.length : rows.length + ' of ' + t.items.length) + ' ' + label + (t.items.length === 1 ? '' : 's')
+                    + (updates ? ' · ' + updates + ' update' + (updates === 1 ? '' : 's') : '')
+                    + (t.ms ? ' · ' + (t.ms >= 1000 ? (t.ms / 1000).toFixed(1) + ' s' : t.ms + ' ms') : '');
+                if (check) check.title = t.checked ? 'Checked wp.org this visit — click to check again' : 'Updates shown are as WordPress last saw them; click to ask wp.org now (loads the site\'s plugins, so it can take a while)';
+                const frag = document.createDocumentFragment();
+                const esc = (s) => this.escapeHtml(s == null ? '' : String(s));
+                const ms = site && site.multisite;
+                if (!rows.length) { const li = document.createElement('li'); li.className = 'st-empty'; li.textContent = t.items.length ? 'Nothing matches.' : 'Nothing here.'; frag.appendChild(li); }
+                for (const it of rows) {
+                    const li = document.createElement('li');
+                    li.className = 'st-row st-' + tab;
+                    if (tab === 'plugins' || tab === 'themes') {
+                        const slug = it.name;
+                        const busy = t.busy[slug];
+                        const on = it.status === 'active' || it.status === 'active-network' || it.status === 'must-use' || it.status === 'parent';
+                        const chip = it.status === 'active-network' ? 'network' : it.status === 'must-use' ? 'mu' : it.status === 'parent' ? 'parent' : it.status;
+                        li.classList.toggle('is-off', !on);
+                        li.dataset.slug = slug;
+                        let actions = '';
+                        if (busy) actions = '<span class="st-busy">' + ({ activate: 'activating…', deactivate: 'deactivating…', update: 'updating…', delete: 'deleting…' }[busy] || 'saving…') + '</span>';
+                        else {
+                            if (tab === 'plugins') {
+                                if (it.status === 'inactive') actions += '<button type="button" class="pill st-act" data-op="activate">activate</button>' + (ms ? '<button type="button" class="pill st-act" data-op="activate" data-network="1" title="Activate for every site on the network">network activate</button>' : '');
+                                else if (it.status === 'active') actions += '<button type="button" class="pill st-act" data-op="deactivate">deactivate</button>';
+                                else if (it.status === 'active-network') actions += '<button type="button" class="pill st-act" data-op="deactivate" data-network="1">network deactivate</button>';
+                            } else {
+                                if (it.status === 'inactive') actions += '<button type="button" class="pill st-act" data-op="activate">activate</button>';
+                            }
+                            if (it.update === 'available') actions += '<button type="button" class="pill primary st-act" data-op="update" title="Update to ' + esc(it.update_version) + '">update</button>';
+                            if (it.status !== 'must-use' && it.status !== 'active' && it.status !== 'active-network' && it.status !== 'parent') actions += '<button type="button" class="pill st-act st-del' + (t.arm === slug ? ' armed' : '') + '" data-op="delete">' + (t.arm === slug ? 'sure? delete' : '×') + '</button>';
+                        }
+                        li.innerHTML = '<div class="st-main"><span class="st-title">' + esc(it.title || it.name) + '</span><span class="st-sub">' + esc(it.name) + '</span></div>'
+                            + '<span class="st-ver">' + esc(it.version || '') + (it.update === 'available' ? ' <span class="st-upd" title="Update available">→ ' + esc(it.update_version) + '</span>' : '') + '</span>'
+                            + '<span class="st-chip st-status-' + esc(it.status) + '">' + esc(chip) + '</span>'
+                            + '<button type="button" class="st-auto' + (it.auto_update === 'on' ? ' is-on' : '') + '" data-op="' + (it.auto_update === 'on' ? 'auto-off' : 'auto-on') + '" title="Auto-updates ' + (it.auto_update === 'on' ? 'on — click to turn off' : 'off — click to turn on') + '">auto</button>'
+                            + '<span class="st-actions">' + actions + '</span>';
+                    } else if (tab === 'users') {
+                        const supers = (t.extra && t.extra.super_admins) || [];
+                        const roles = String(it.roles || '').split(',').map(r => r.trim()).filter(Boolean);
+                        if (supers.includes(it.user_login)) roles.unshift('super admin');
+                        const blogs = Array.isArray(it.blogs) ? it.blogs : [];
+                        let chips = roles.map(r => '<span class="st-chip">' + esc(r) + '</span>');
+                        let loginUrl = '';
+                        if (it.network_only && blogs.length) {
+                            // Roles on subsites, shown with the site's path.
+                            const others = blogs.filter(b => b.roles && b.roles.length);
+                            chips = others.slice(0, 2).map(b => '<span class="st-chip" title="' + esc(b.url) + '">' + esc(b.roles.join(', ')) + ' @ ' + esc(b.url.replace(/^https?:\/\/[^\/]+/, '') || '/') + '</span>');
+                            if (others.length > 2) chips.push('<span class="st-chip st-none">+' + (others.length - 2) + '</span>');
+                            const best = others.find(b => b.roles.includes('administrator')) || others[0];
+                            if (best) loginUrl = best.url;
+                        } else if (blogs.length > 1) {
+                            chips.push('<span class="st-chip st-none" title="' + esc(blogs.map(b => b.url).join('\n')) + '">' + blogs.length + ' sites</span>');
+                        }
+                        const busy = t.busy[it.user_login];
+                        li.dataset.login = it.user_login;
+                        if (loginUrl) li.dataset.loginUrl = loginUrl;
+                        li.innerHTML = '<div class="st-main"><span class="st-title">' + esc(it.display_name || it.user_login) + '</span><span class="st-sub">' + esc(it.user_login) + ' · ' + esc(it.user_email) + '</span></div>'
+                            + '<span class="st-roles">' + (chips.length ? chips.join('') : '<span class="st-chip st-none">no role</span>') + '</span>'
+                            + '<span class="st-ver" title="' + esc(it.registered || '') + '">' + esc(it.registered ? String(it.registered).slice(0, 10) : '') + '</span>'
+                            + '<span class="st-actions"><button type="button" class="pill primary st-login"' + (busy ? ' disabled' : '') + ' title="One-time login as ' + esc(it.user_login) + (loginUrl ? ' on ' + esc(loginUrl) : '') + '">' + (busy ? 'opening…' : 'log in') + '</button></span>';
+                    } else if (tab === 'cron') {
+                        const busy = t.busy[it.hook];
+                        const gmt = it.next_run_gmt ? Date.parse(it.next_run_gmt.replace(' ', 'T') + 'Z') : 0;
+                        const past = gmt && gmt < Date.now();
+                        li.dataset.hook = it.hook;
+                        li.classList.toggle('is-due', !!past);
+                        li.innerHTML = '<div class="st-main"><span class="st-title st-mono">' + esc(it.hook) + '</span></div>'
+                            + '<span class="st-ver" title="' + esc(it.next_run_gmt || '') + ' UTC">' + (past ? 'due' : esc(it.next_run_relative || '')) + '</span>'
+                            + '<span class="st-chip' + (it.recurrence === 'Non-repeating' ? ' st-none' : '') + '">' + esc(it.recurrence === 'Non-repeating' ? 'once' : it.recurrence) + '</span>'
+                            + '<span class="st-actions"><button type="button" class="pill st-run"' + (busy ? ' disabled' : '') + '>' + (busy ? 'running…' : 'run now') + '</button></span>';
+                    }
+                    frag.appendChild(li);
+                }
+                list.appendChild(frag);
+            },
+
+            renderSiteCli() {
+                const c = this.sitePage.cli;
+                const site = this.pageSite;
+                $id('siteCliPrompt').textContent = 'cove wp ' + (site ? site.name : '') + ' ';
+                $id('btnSiteCliRun').disabled = c.running;
+                $id('btnSiteCliRun').textContent = c.running ? 'running…' : 'run';
+                const out = $id('siteCliOut');
+                const meta = $id('siteCliMeta');
+                if (c.ran === null) { out.textContent = ''; show(out, false); meta.textContent = ''; return; }
+                show(out, true);
+                out.textContent = c.output === '' ? '(no output)' : c.output;
+                out.classList.toggle('is-error', c.code !== 0);
+                meta.textContent = '$ wp ' + c.ran + '  ·  exit ' + c.code + (c.ms ? ' · ' + (c.ms >= 1000 ? (c.ms / 1000).toFixed(1) + ' s' : c.ms + ' ms') : '') + (c.notices ? ' · ' + c.notices + ' PHP notice line' + (c.notices === 1 ? '' : 's') + ' hidden' : '');
+            },
+
+            bindSiteTabEvents() {
+                const p = this.sitePage;
+                try { p.cli.history = JSON.parse(localStorage.getItem('cove.cli.history') || '[]'); } catch (e) {}
+                $id('siteTabs').addEventListener('click', (e) => {
+                    const b = e.target.closest('.mail-part');
+                    if (b) this.setSiteTab(b.dataset.tab);
+                });
+                for (const tab of ['plugins', 'themes', 'users', 'cron']) {
+                    const panel = $id('sitePanel-' + tab);
+                    const t = () => this.siteTabState(tab);
+                    const filter = panel.querySelector('.st-filter');
+                    filter.addEventListener('input', () => { t().filter = filter.value; this.renderSiteTab(); });
+                    filter.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); t().filter = ''; filter.value = ''; filter.blur(); this.renderSiteTab(); } });
+                    panel.querySelectorAll('.st-status').forEach(b => b.addEventListener('click', () => { t().status = b.dataset.status; this.renderSiteTab(); }));
+                    const refresh = panel.querySelector('.st-refresh');
+                    if (refresh) refresh.addEventListener('click', () => this.loadSiteTab({ force: true }));
+                    const check = panel.querySelector('.st-check');
+                    if (check) check.addEventListener('click', () => { t().checking = true; this.loadSiteTab({ force: true, check: true }).then(() => { t().checking = false; this.renderSiteTab(); }); });
+                    const due = panel.querySelector('.st-due');
+                    if (due) due.addEventListener('click', () => this.siteCronRun(null));
+                    panel.querySelector('.st-list').addEventListener('click', (e) => {
+                        const row = e.target.closest('.st-row');
+                        if (!row) return;
+                        const act = e.target.closest('.st-act');
+                        if (act) { this.siteItemOp(tab, row.dataset.slug, act.dataset.op, !!act.dataset.network); return; }
+                        const auto = e.target.closest('.st-auto');
+                        if (auto) { this.siteItemOp(tab, row.dataset.slug, auto.dataset.op); return; }
+                        if (e.target.closest('.st-login')) { this.siteUserLogin(row.dataset.login, row.dataset.loginUrl || ''); return; }
+                        if (e.target.closest('.st-run')) { this.siteCronRun(row.dataset.hook); return; }
+                    });
+                }
+                const input = $id('siteCliInput');
+                input.addEventListener('keydown', (e) => {
+                    const c = p.cli;
+                    if (e.key === 'Enter') { e.preventDefault(); this.runSiteCli(); return; }
+                    if (e.key === 'ArrowUp' && c.history.length) { e.preventDefault(); c.histIdx = Math.min(c.history.length - 1, c.histIdx + 1); input.value = c.history[c.histIdx]; return; }
+                    if (e.key === 'ArrowDown' && c.histIdx >= 0) { e.preventDefault(); c.histIdx = c.histIdx - 1; input.value = c.histIdx >= 0 ? c.history[c.histIdx] : ''; return; }
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); input.blur(); }
+                });
+                $id('btnSiteCliRun').addEventListener('click', () => this.runSiteCli());
+                $id('siteCliExamples').addEventListener('click', (e) => {
+                    const b = e.target.closest('button');
+                    if (!b) return;
+                    input.value = b.dataset.cmd;
+                    input.focus();
+                });
             },
 
             // --- Syntax highlighting ---------------------------------------
@@ -10902,6 +11522,7 @@ show_general_help() {
     echo "  delete           Deletes a site's directory and associated database."
     echo "  login            Generates a one-time login link for a WordPress site."
     echo "  network          Lists the sites on a multisite network."
+    echo "  wp               Runs WP-CLI inside a site from anywhere."
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
     echo "  pull             Pulls a remote WordPress site into Cove via SSH."
@@ -11211,6 +11832,9 @@ display_command_help() {
             echo "  <user>         (Optional) The user ID, email, or login of the admin to use."
             echo "  --url=<url>    (Optional) On a multisite network, the subsite to log in to,"
             echo "                 e.g. --url=https://mysite.localhost/store/ — see 'cove network'."
+            ;;
+        wp)
+            cove_wp --help
             ;;
         network)
             echo "Usage: cove network <site> [--format=json]"
@@ -11541,6 +12165,10 @@ main() {
         network)
             check_dependencies
             cove_network "$@"
+            ;;
+        wp)
+            check_dependencies
+            cove_wp "$@"
             ;;
         enable)
             check_dependencies
