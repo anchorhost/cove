@@ -218,8 +218,13 @@ cove_add() {
                 exit 1
             fi
 
-            # 2. Create the config file
+            # 2. Create the config file. WP_ENVIRONMENT_TYPE tells WordPress
+            # and any plugin that checks wp_get_environment_type() that this
+            # is a local site: core's automatic updates back off, WooCommerce
+            # and other plugins that gate live-only behaviour (payment
+            # gateways, tracking, license pings) treat it as a sandbox.
             $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
+define( 'WP_ENVIRONMENT_TYPE', 'local' );
 define( 'WP_DEBUG', true );
 define( 'WP_DEBUG_LOG', true );
 define( 'WP_DEBUG_DISPLAY', false );
