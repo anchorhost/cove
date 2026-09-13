@@ -15,6 +15,7 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
   * **Database Management**: Browse and edit any table from the dashboard, run SQL with `⌘↵`, plus Adminer with passwordless auto-login for exports and schema work. `cove db backup` snapshots every site; `cove db list` shows credentials.
   * **Email Catching**: Built-in Mailpit catches every outgoing email so you never risk sending a test to a real inbox. Read it in the dashboard, filtered by site, with reset and login links lifted out of each message — and nothing is ever pruned.
   * **Logs, Parsed**: The shared PHP error log, each site's `debug.log`, Caddy access logs, and the service logs, read backwards in chunks so size never matters, with repeats folded and stack traces a click away.
+  * **Snapshots**: `cove snapshot mysite` copies a site's files and database in about a second (copy-on-write clones on APFS, btrfs, xfs); restore puts one back and keeps the state it replaced, so nothing is lost.
   * **Plugins, Themes, Users, Cron**: Manage a site's plugins and themes, log in as any user, run cron events, or type WP-CLI, all from the site's page in the dashboard.
   * **Files, In Place**: Browse any site's directory from the dashboard, open a file in a plain-text editor and save with `⌘S`, preview images, create, rename, delete, download, and drop files or whole folders onto the listing to upload them.
   * **Custom Ports**: Run Cove alongside Local, Studio, DevKinsta, or MAMP — pick alternative HTTP/HTTPS ports and Cove migrates stored WordPress URLs automatically.
@@ -82,6 +83,7 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove core update <site> [version]` | Updates a site's WordPress core to the latest release, or to a specific version (which may be a downgrade). Use `--all` to update every site that's behind. |
 | `cove login <site> [<user>] [--url=<subsite-url>]` | Generates a one-time login link for a WordPress site. On a multisite network, `--url` picks the subsite to log in to. |
 | `cove network <site> [--format=json]` | Lists the sites on a multisite network: name, URL, and ID. |
+| `cove snapshot <site> [create\|list\|restore <id>\|delete <id>]` | Point-in-time copies of a site's files and database under `~/Cove/Snapshots/<site>/`, restorable in place; a restore snapshots the current state first so it can be undone. `--note="…"` labels one. |
 | `cove wp <site> <args…>` | Runs WP-CLI inside a site from anywhere, on the PHP the site is pinned to: `cove wp mysite plugin list`. |
 | `cove path <name>` | Outputs the full system path to a site's public directory. |
 | `cove url <name>` | Prints the full HTTPS URL for a site (including the port suffix when on alternative ports). |
@@ -233,7 +235,7 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
 
   * One site on its own page: type, WordPress and PHP versions, size, last change, and path, with **open** and **log in to admin** beside them. Tiles lead to the site's files, database, mail, and logs; a **manage** row carries domains, PHP version, rename, reveal, copy path, pin, and delete.
   * On a multisite network the page lists every site on it with its own **open** and **log in** — a one-time link minted for that subsite, so it lands on the subsite's `wp-admin`. The same is available from the terminal as `cove network <site>` and `cove login <site> --url=<subsite-url>`.
-  * Tabs, each with its own URL: **plugins** and **themes** (status, version, waiting updates, auto-update; activate, deactivate, update, delete — network-wide on a multisite; **check for updates** asks wp.org on demand), **users** (roles, email, registered, and a one-time **log in** as any user, whatever the role; network-wide on a multisite, landing subsite-only users on a site they belong to), **cron** (every event with next run and recurrence, **run now**, **run all due**), and **wp-cli** (a console: type, `↵`, output with exit code and timing, history on `↑`/`↓`).
+  * Tabs, each with its own URL: **plugins** and **themes** (status, version, waiting updates, auto-update; activate, deactivate, update, delete — network-wide on a multisite; **check for updates** asks wp.org on demand), **users** (roles, email, registered, and a one-time **log in** as any user, whatever the role; network-wide on a multisite, landing subsite-only users on a site they belong to), **cron** (every event with next run and recurrence, **run now**, **run all due**), **snapshots** (take one with a note; restore or delete any — a restore keeps a snapshot of the state it replaced), and **wp-cli** (a console: type, `↵`, output with exit code and timing, history on `↑`/`↓`).
   * `Esc` returns to the list, `⌘↵` logs in.
 
 ### Mail — `/mail`, `/mail/<site>`
