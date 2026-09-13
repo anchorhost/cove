@@ -9169,7 +9169,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
                 if (isWp && effPhp) fact('php ' + effPhp, '', site.php_version ? 'Pinned with cove php' : 'Cove\'s default PHP');
                 if (site.size_bytes) fact(this.formatSize(site.size_bytes), '', 'On disk');
-                if (site.modified_at) fact('modified ' + this.formatRelative(site.modified_at) + ' ago', '', new Date(site.modified_at * 1000).toLocaleString());
+                if (site.modified_at) { const rel = this.formatRelative(site.modified_at); fact(rel === 'now' ? 'modified just now' : 'modified ' + rel + ' ago', '', new Date(site.modified_at * 1000).toLocaleString()); }
                 const path = fact(site.display_path, 'fact-path', 'Click to copy the path');
                 path.dataset.path = site.full_path;
                 $id('siteOpenLink').href = site.domain;
