@@ -164,11 +164,12 @@ snapshot_restore() {
 }
 
 cove_snapshot() {
-    local site_name="" sub="" id="" note="" format="table"
+    local site_name="" sub="" id="" note="" format="table" out=""
     local arg
     for arg in "$@"; do
         case "$arg" in
             --note=*)   note="${arg#*=}" ;;
+            --out=*)    out="${arg#*=}" ;;
             --format=*) format="${arg#*=}" ;;
             --json)     format="json" ;;
             -h|--help)
@@ -176,10 +177,12 @@ cove_snapshot() {
                 echo "       cove snapshot <site> list [--format=json]"
                 echo "       cove snapshot <site> restore <id>"
                 echo "       cove snapshot <site> delete <id>"
+                echo "       cove snapshot <site> export <id> [--out=<file>]"
                 echo ""
                 echo "Point-in-time copies of a site's files and database, kept under"
                 echo "~/Cove/Snapshots/<site>/. Restore puts one back in place — after"
                 echo "taking a snapshot of the current state, so a restore can be undone."
+                echo "Export packs one as a zip (files + db.sql) to hand to someone else."
                 return
                 ;;
             -*)
@@ -272,6 +275,34 @@ cove_snapshot() {
                 gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Restored $id" "The state from just before is snapshot $safety — restore it to undo."
             fi
             ;;
+        export)
+            if [ -z "$id" ]; then
+                gum style --foreground red "❌ Error: Which snapshot? cove snapshot $site_name export <id>"
+                exit 1
+            fi
+            local src="$SNAPSHOTS_DIR/$site_name/$id"
+            if [ ! -d "$src/public" ]; then
+                gum style --foreground red "❌ Error: Snapshot '$id' not found."
+                exit 1
+            fi
+            # zip where there is one (macOS and most Linux), tar.gz otherwise.
+            local archive
+            if command -v zip >/dev/null 2>&1; then archive="${out:-$src/$site_name-$id.zip}"; else archive="${out:-$src/$site_name-$id.tar.gz}"; fi
+            local tmp="$archive.tmp"
+            rm -f "$tmp"
+            if [ "$format" != "json" ]; then echo "📦 Packing snapshot $id…"; fi
+            if [[ "$archive" == *.zip ]]; then
+                ( cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
+            else
+                ( cd "$src" && tar -czf "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: tar failed."; exit 1; }
+            fi
+            mv -f "$tmp" "$archive"
+            local bytes
+            bytes=$(stat -f%z "$archive" 2>/dev/null || stat -c%s "$archive" 2>/dev/null || echo 0)
+            if [ "$format" == "json" ]; then printf '{"file":"%s","bytes":%s}\n' "$(snapshot_json_escape "$archive")" "$bytes"; else
+                gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Packed $archive" "$(awk -v b="$bytes" 'BEGIN{ s="B"; if (b>=1073741824){b/=1073741824; s="GB"} else if (b>=1048576){b/=1048576; s="MB"} else if (b>=1024){b/=1024; s="KB"}; printf (b>=10||s=="B") ? "%d %s" : "%.1f %s", b, s }')"
+            fi
+            ;;
         delete)
             if [ -z "$id" ]; then
                 gum style --foreground red "❌ Error: Which snapshot? cove snapshot $site_name delete <id>"
@@ -286,7 +317,7 @@ cove_snapshot() {
             ;;
         *)
             gum style --foreground red "❌ Error: Unknown subcommand '$sub'."
-            echo "Usage: cove snapshot <site> [create|list|restore <id>|delete <id>]"
+            echo "Usage: cove snapshot <site> [create|list|restore <id>|delete <id>|export <id>]"
             exit 1
             ;;
     esac

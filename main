@@ -2911,6 +2911,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         echo json_encode($sites_info);
         exit;
     }
+    if ($action === 'snapshot_download') {
+        // The packed snapshot archive, as an attachment. Built by the
+        // site_snapshot_export action first; 404 until then.
+        $site = (string) ($_GET['site'] ?? '');
+        $id = (string) ($_GET['id'] ?? '');
+        $ok = preg_match('/^[a-zA-Z0-9-]+$/', $site) && preg_match('/^\d{8}-\d{6}(?:-\d+)?$/', $id);
+        $dir = $ok ? $user_home . '/Cove/Snapshots/' . $site . '/' . $id : '';
+        $file = '';
+        if ($ok && is_dir($dir)) { foreach ([$site . '-' . $id . '.zip', $site . '-' . $id . '.tar.gz'] as $n) { if (is_file($dir . '/' . $n)) { $file = $dir . '/' . $n; break; } } }
+        if ($file === '') { http_response_code(404); echo json_encode(['success' => false, 'message' => 'Not packed yet.']); exit; }
+        header('Content-Type: application/octet-stream');
+        header('Content-Length: ' . filesize($file));
+        header('X-Content-Type-Options: nosniff');
+        header('Content-Security-Policy: sandbox');
+        header('Content-Disposition: attachment; filename="' . basename($file) . '"');
+        readfile($file);
+        exit;
+    }
     if ($action === 'site_shot') {
         // The cached front-page capture, as an image.
         $site = (string) ($_GET['site'] ?? '');
@@ -3258,7 +3276,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 else {
                     $hook = (string) ($input['hook'] ?? '');
                     if ($hook === '' || !preg_match('#^[A-Za-z0-9_.:\\/-]+$#', $hook)) { echo json_encode(['success' => false, 'message' => 'Invalid hook.']); exit; }
-                    $args = ['cron', 'event', 'run', $hook];
+                    // `delete` unschedules every event for the hook.
+                    $args = ['cron', 'event', ($input['op'] ?? '') === 'delete' ? 'delete' : 'run', $hook];
                 }
                 [$out, $code, $ms] = $__wp($args);
                 [$out] = $__wp_clean($out);
@@ -3306,6 +3325,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'site_snapshot_create':
         case 'site_snapshot_restore':
         case 'site_snapshot_delete':
+        case 'site_snapshot_export':
             // --- Snapshots: `cove snapshot` with --format=json ---------------
             if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) { echo json_encode(['success' => false, 'message' => 'Invalid site name.']); exit; }
             $__snap = function (array $args) use ($user_home, $cove_path, $site_name) {
@@ -3337,6 +3357,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             $id = $input['id'] ?? '';
             if (!$__snap_id($id)) { echo json_encode(['success' => false, 'message' => 'Invalid snapshot id.']); exit; }
+            if ($action === 'site_snapshot_export') {
+                // Packs the archive (cached beside the snapshot); the browser
+                // then fetches it from the GET endpoint as a download.
+                set_time_limit(0);
+                [$data, $code, $out, $ms] = $__snap(['export', $id]);
+                if ($code !== 0 || !is_array($data) || empty($data['file'])) $__snap_fail($out, 'Could not pack the snapshot.');
+                echo json_encode(['success' => true, 'bytes' => (int) ($data['bytes'] ?? 0), 'name' => basename($data['file']), 'ms' => $ms]);
+                exit;
+            }
             if ($action === 'site_snapshot_restore') {
                 set_time_limit(0);
                 [$data, $code, $out, $ms] = $__snap(['restore', $id]);
@@ -6144,6 +6173,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <!-- Context menu: one component driven by right- OR left-click anywhere on
          a row, so the two affordances can never drift apart. Opening the site
          itself lives on the row's ↗ icon. -->
+    <!-- Site page tabs: one right-click menu, its items built per row. -->
+    <div class="ctx-menu" id="tabCtxMenu" style="display: none;">
+        <div id="tabCtxItems"></div>
+    </div>
+
     <!-- Files view: right-click menu for entries, the open folder, and crumbs. -->
     <div class="ctx-menu" id="fileCtxMenu" style="display: none;">
         <div>
@@ -6263,6 +6297,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             fileCtx: { open: false, target: null, x: 0, y: 0, openedAt: 0 },
             sitePage: { name: null, tab: 'overview', tabs: {}, shot: { busy: null, asked: {}, unsupported: false }, net: { items: [], loading: false, error: null, loadedFor: null }, busy: null, cli: { cmd: '', output: '', code: 0, ms: 0, ran: null, running: false, history: [], histIdx: -1 } },
             siteDeleteConfirm: null,
+            tabCtx: { open: false, x: 0, y: 0, openedAt: 0, items: [], title: '' },
             palette: { open: false, query: '', index: 0 },
             rename: { open: false, site: null, value: '', busy: false },
             logView: { open: false, site: '', text: '', truncated: false, busy: false, raw: false },
@@ -6468,6 +6503,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
                     if (this.view === 'site') {
                         if (e.key === 'Escape') {
+                            if (this.tabCtx.open) { this.closeTabCtx(); return; }
                             if (this.siteDeleteConfirm) { this.closeSiteDeleteConfirm(); return; }
                             if (this.phpModal.open) { this.closePhpModal(); return; }
                             if (this.domainsModal.open) { this.closeDomainsModal(); return; }
@@ -7258,6 +7294,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const prev = this.view;
                 this.view = view;
                 this.closeRowMenu();
+                if (this.closeTabCtx) this.closeTabCtx();
                 if (prev !== view) this.crossfadeFrom(prev);
                 document.body.classList.toggle('view-mail', view === 'mail');
                 document.body.classList.toggle('view-db', view === 'db');
@@ -9482,6 +9519,155 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.loadSiteTab({ force: true });
             },
 
+            async snapshotDownload(id) {
+                const site = this.pageSite;
+                const t = this.siteTabState('snapshots');
+                if (!site || t.busy[id]) return;
+                t.busy[id] = 'pack';
+                this.renderSiteTab();
+                const res = await this.apiPost('site_snapshot_export', { site_name: site.name, id }, { quiet: true, timeoutMs: 1800000 });
+                delete t.busy[id];
+                if (this.sitePage.name !== site.name) return;
+                this.renderSiteTab();
+                if (!res.success) { this.showSnack(res.message || 'Could not pack the snapshot.', true); return; }
+                this.showSnack('Packed ' + (res.name || id) + ' (' + this.formatSize(res.bytes) + ') — downloading.');
+                // An attachment response leaves the page where it is.
+                window.location.href = '/api.php?action=snapshot_download&site=' + encodeURIComponent(site.name) + '&id=' + encodeURIComponent(id) + '&v=' + Date.now();
+            },
+
+            async siteCronDelete(hook) {
+                const site = this.pageSite;
+                const t = this.siteTabState('cron');
+                if (!site || t.busy[hook]) return;
+                if (t.arm !== 'delete:' + hook) {
+                    t.arm = 'delete:' + hook;
+                    clearTimeout(t.armTimer);
+                    t.armTimer = setTimeout(() => { t.arm = null; this.renderSiteTab(); }, 4000);
+                    this.renderSiteTab();
+                    return;
+                }
+                t.arm = null;
+                t.busy[hook] = 'delete';
+                this.renderSiteTab();
+                const res = await this.apiPost('site_cron_run', { site_name: site.name, hook, op: 'delete' }, { quiet: true, timeoutMs: 180000 });
+                delete t.busy[hook];
+                if (this.sitePage.name !== site.name) return;
+                const last = (res.message || '').split('\n').filter(Boolean).pop() || '';
+                this.showSnack(last.replace(/^(Success|Error|Warning): /, '') || (res.success ? 'Unscheduled.' : 'Failed.'), !res.success);
+                this.loadSiteTab({ force: true });
+            },
+
+            // The Files view, opened on a path inside this site.
+            openFilesAt(siteName, path) {
+                const f = this.files;
+                if (!this.filesGuardDirty()) return;
+                f.site = siteName; f.path = ''; f.file = null; f.entries = []; f.selected = null; f.filter = '';
+                f.target = path;
+                $id('filesFilter').value = '';
+                this.setView('files', { force: true });
+            },
+
+            // --- Tab right-click menu ---------------------------------------
+            // items: [{ label, run, danger, key, meta } | { sep: true }]
+            openTabCtx(event, title, items) {
+                event.preventDefault();
+                this.closeRowMenu(); this.closeFileCtx();
+                this.tabCtx = { open: true, x: event.clientX, y: event.clientY, openedAt: event.timeStamp, items, title };
+                this.renderTabCtx();
+                const rect = $id('tabCtxMenu').getBoundingClientRect();
+                this.tabCtx.x = Math.max(8, Math.min(event.clientX, window.innerWidth - rect.width - 8));
+                this.tabCtx.y = Math.max(8, Math.min(event.clientY, window.innerHeight - rect.height - 8));
+                this.renderTabCtx();
+            },
+
+            closeTabCtx() {
+                if (!this.tabCtx.open) return;
+                this.tabCtx.open = false;
+                show($id('tabCtxMenu'), false);
+            },
+
+            renderTabCtx() {
+                const c = this.tabCtx;
+                const menu = $id('tabCtxMenu');
+                show(menu, c.open);
+                if (!c.open) return;
+                menu.style.left = c.x + 'px';
+                menu.style.top = c.y + 'px';
+                const box = $id('tabCtxItems');
+                box.innerHTML = '';
+                const title = document.createElement('div');
+                title.className = 'ctx-title';
+                title.textContent = c.title;
+                box.appendChild(title);
+                c.items.forEach((it, i) => {
+                    if (it.sep) { const s = document.createElement('div'); s.className = 'ctx-sep'; box.appendChild(s); return; }
+                    const b = document.createElement('button');
+                    b.type = 'button';
+                    b.className = 'ctx-item' + (it.danger ? ' danger' : '');
+                    b.dataset.i = String(i);
+                    const l = document.createElement('span'); l.textContent = it.label; b.appendChild(l);
+                    if (it.key || it.meta) { const k = document.createElement('span'); k.className = 'ctx-key'; k.textContent = it.key || it.meta; b.appendChild(k); }
+                    if (it.disabled) b.disabled = true;
+                    box.appendChild(b);
+                });
+            },
+
+            copyText(text, what) {
+                navigator.clipboard.writeText(text).then(() => this.showSnack((what || 'Copied') + '.')).catch(() => this.showSnack('Could not copy.', true));
+            },
+
+            // The items for one row of one tab.
+            tabCtxItemsFor(tab, it) {
+                const site = this.pageSite;
+                if (!site) return [];
+                const ms = !!site.multisite;
+                const items = [];
+                if (tab === 'plugins' || tab === 'themes') {
+                    const slug = it.name;
+                    const dir = 'public/wp-content/' + (tab === 'plugins' ? 'plugins/' : 'themes/') + slug;
+                    if (tab === 'plugins') {
+                        if (it.status === 'inactive') { items.push({ label: 'Activate', run: () => this.siteItemOp(tab, slug, 'activate') }); if (ms) items.push({ label: 'Network activate', run: () => this.siteItemOp(tab, slug, 'activate', true) }); }
+                        else if (it.status === 'active') items.push({ label: 'Deactivate', run: () => this.siteItemOp(tab, slug, 'deactivate') });
+                        else if (it.status === 'active-network') items.push({ label: 'Network deactivate', run: () => this.siteItemOp(tab, slug, 'deactivate', true) });
+                    } else if (it.status === 'inactive') items.push({ label: 'Activate', run: () => this.siteItemOp(tab, slug, 'activate') });
+                    if (it.update === 'available') items.push({ label: 'Update', meta: '→ ' + it.update_version, run: () => this.siteItemOp(tab, slug, 'update') });
+                    items.push({ label: it.auto_update === 'on' ? 'Turn auto-updates off' : 'Turn auto-updates on', run: () => this.siteItemOp(tab, slug, it.auto_update === 'on' ? 'auto-off' : 'auto-on') });
+                    items.push({ sep: true });
+                    items.push({ label: 'Browse files', run: () => this.openFilesAt(site.name, dir) });
+                    items.push({ label: 'Copy slug', run: () => this.copyText(slug, 'Slug copied') });
+                    if (it.status !== 'must-use' && it.status !== 'active' && it.status !== 'active-network' && it.status !== 'parent') {
+                        items.push({ sep: true });
+                        items.push({ label: 'Delete…', danger: true, run: () => this.siteItemOp(tab, slug, 'delete') });
+                    }
+                } else if (tab === 'users') {
+                    const blogs = Array.isArray(it.blogs) ? it.blogs.filter(b => b.roles && b.roles.length) : [];
+                    if (ms && blogs.length > 1) {
+                        blogs.slice(0, 6).forEach(b => items.push({ label: 'Log in on ' + (b.url.replace(/^https?:\/\/[^\/]+/, '') || '/'), meta: b.roles.join(', '), run: () => this.siteUserLogin(it.user_login, b.url) }));
+                    } else {
+                        items.push({ label: 'Log in as ' + it.user_login, key: '↵', run: () => this.siteUserLogin(it.user_login, it.network_only && blogs[0] ? blogs[0].url : '') });
+                    }
+                    items.push({ sep: true });
+                    items.push({ label: 'Copy login', run: () => this.copyText(it.user_login, 'Login copied') });
+                    items.push({ label: 'Copy email', run: () => this.copyText(it.user_email, 'Email copied') });
+                    items.push({ label: 'Copy ID', meta: '#' + it.ID, run: () => this.copyText(String(it.ID), 'ID copied') });
+                } else if (tab === 'cron') {
+                    items.push({ label: 'Run now', run: () => this.siteCronRun(it.hook) });
+                    items.push({ label: 'Copy hook', run: () => this.copyText(it.hook, 'Hook copied') });
+                    items.push({ sep: true });
+                    items.push({ label: 'Unschedule…', danger: true, run: () => this.siteCronDelete(it.hook) });
+                } else if (tab === 'snapshots') {
+                    const dir = ((this.sitePage.tabs.snapshots && this.sitePage.tabs.snapshots.extra && this.sitePage.tabs.snapshots.extra.dir) || '') + '/' + it.id;
+                    items.push({ label: 'Restore…', danger: false, run: () => this.snapshotOp(it.id, 'restore') });
+                    items.push({ label: 'Download zip', run: () => this.snapshotDownload(it.id) });
+                    items.push({ sep: true });
+                    items.push({ label: 'Copy path', run: () => this.copyText(dir, 'Path copied') });
+                    items.push({ label: 'Copy id', run: () => this.copyText(it.id, 'Id copied') });
+                    items.push({ sep: true });
+                    items.push({ label: 'Delete…', danger: true, run: () => this.snapshotOp(it.id, 'delete') });
+                }
+                return items;
+            },
+
             async siteUserLogin(login, url) {
                 const site = this.pageSite;
                 const t = this.siteTabState('users');
@@ -9636,11 +9822,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         li.innerHTML = '<div class="st-main"><span class="st-title" title="' + esc(it.created ? new Date(it.created * 1000).toLocaleString() : '') + '">' + esc(it.id) + (it.auto ? ' <span class="st-chip st-none">auto</span>' : '') + '</span><span class="st-sub">' + esc(it.note || (it.auto ? '' : 'no note')) + (it.wp ? ' · wp ' + esc(it.wp) : '') + '</span></div>'
                             + '<span class="st-ver">' + esc(when) + '</span>'
                             + '<span class="st-ver" title="Files' + (it.has_db ? ' + database' : '') + '">' + this.formatSize(it.files_bytes) + (it.has_db ? ' + ' + this.formatSize(it.db_bytes) + ' db' : '') + '</span>'
-                            + '<span class="st-actions">' + (busy ? '<span class="st-busy">' + (busy === 'restore' ? 'restoring…' : 'deleting…') + '</span>'
+                            + '<span class="st-actions">' + (busy ? '<span class="st-busy">' + (busy === 'restore' ? 'restoring…' : busy === 'pack' ? 'packing…' : 'deleting…') + '</span>'
                                 : '<button type="button" class="pill st-restore' + (armR ? ' armed' : '') + '" data-op="restore" title="Put these files and this database back in place (the current state is snapshotted first)">' + (armR ? 'sure? restore' : 'restore') + '</button>'
+                                + '<button type="button" class="pill st-dl" data-op="download" title="Pack files and database as a zip and download it">download</button>'
                                 + '<button type="button" class="pill st-del' + (armD ? ' armed' : '') + '" data-op="delete" title="Delete this snapshot">' + (armD ? 'sure? delete' : '×') + '</button>') + '</span>';
                     } else if (tab === 'cron') {
                         const busy = t.busy[it.hook];
+                        const armX = t.arm === 'delete:' + it.hook;
                         const gmt = it.next_run_gmt ? Date.parse(it.next_run_gmt.replace(' ', 'T') + 'Z') : 0;
                         const past = gmt && gmt < Date.now();
                         li.dataset.hook = it.hook;
@@ -9648,7 +9836,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         li.innerHTML = '<div class="st-main"><span class="st-title st-mono">' + esc(it.hook) + '</span></div>'
                             + '<span class="st-ver" title="' + esc(it.next_run_gmt || '') + ' UTC">' + (past ? 'due' : esc(it.next_run_relative || '')) + '</span>'
                             + '<span class="st-chip' + (it.recurrence === 'Non-repeating' ? ' st-none' : '') + '">' + esc(it.recurrence === 'Non-repeating' ? 'once' : it.recurrence) + '</span>'
-                            + '<span class="st-actions"><button type="button" class="pill st-run"' + (busy ? ' disabled' : '') + '>' + (busy ? 'running…' : 'run now') + '</button></span>';
+                            + '<span class="st-actions">' + (busy ? '<span class="st-busy">' + (busy === 'delete' ? 'unscheduling…' : 'running…') + '</span>' : '<button type="button" class="pill st-run">run now</button>' + (armX ? '<button type="button" class="pill st-del armed st-cron-del">sure? unschedule</button>' : '')) + '</span>';
                     }
                     frag.appendChild(li);
                 }
@@ -9708,8 +9896,38 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         if (e.target.closest('.st-run')) { this.siteCronRun(row.dataset.hook); return; }
                         const snap = e.target.closest('.st-restore, .st-snapshots .st-del');
                         if (snap && row.dataset.id) { this.snapshotOp(row.dataset.id, snap.dataset.op); return; }
+                        if (e.target.closest('.st-dl') && row.dataset.id) { this.snapshotDownload(row.dataset.id); return; }
+                        if (e.target.closest('.st-cron-del')) { this.siteCronDelete(row.dataset.hook); return; }
                     });
                 }
+                for (const tab of ['plugins', 'themes', 'users', 'cron', 'snapshots']) {
+                    $id('sitePanel-' + tab).querySelector('.st-list').addEventListener('contextmenu', (e) => {
+                        const row = e.target.closest('.st-row');
+                        if (!row) return;
+                        const t = this.siteTabState(tab);
+                        const key = tab === 'users' ? 'user_login' : tab === 'cron' ? 'hook' : tab === 'snapshots' ? 'id' : 'name';
+                        const val = row.dataset.login || row.dataset.hook || row.dataset.id || row.dataset.slug;
+                        const it = t.items.find(x => String(x[key]) === val);
+                        if (!it) return;
+                        const items = this.tabCtxItemsFor(tab, it);
+                        if (!items.length) return;
+                        const title = tab === 'users' ? it.user_login : tab === 'cron' ? it.hook : tab === 'snapshots' ? it.id : (it.title || it.name);
+                        this.openTabCtx(e, title, items);
+                    });
+                }
+                $id('tabCtxMenu').addEventListener('click', (e) => {
+                    const b = e.target.closest('.ctx-item');
+                    if (!b) return;
+                    const it = this.tabCtx.items[Number(b.dataset.i)];
+                    this.closeTabCtx();
+                    if (it && it.run) it.run();
+                });
+                document.addEventListener('click', (e) => {
+                    if (!this.tabCtx.open || e.timeStamp === this.tabCtx.openedAt) return;
+                    if (!$id('tabCtxMenu').contains(e.target)) this.closeTabCtx();
+                });
+                window.addEventListener('scroll', () => { if (this.tabCtx.open) this.closeTabCtx(); }, { passive: true });
+                window.addEventListener('resize', () => { if (this.tabCtx.open) this.closeTabCtx(); });
                 $id('btnSnapCreate').addEventListener('click', () => this.snapshotCreate());
                 $id('snapNote').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this.snapshotCreate(); } if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.target.blur(); } });
                 const input = $id('siteCliInput');
