@@ -6474,7 +6474,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 </li>
             </template>
             <div class="palette-hint">
-                <span>↑↓ navigate</span><span>↵ open</span><span>⌘↵ log in</span><span>esc close</span>
+                <span>↑↓ navigate</span><span>↵ manage</span><span>⇧↵ open</span><span>⌘↵ log in</span><span>esc close</span>
             </div>
         </div>
     </div>
@@ -11563,7 +11563,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         label: site.name + '.localhost',
                         meta: this.formatSize(site.size_bytes),
                         site,
-                        run: () => { this.closePalette(); this.openSite(site); }
+                        run: () => { this.closePalette(); this.openSitePage(site.name); }
                     });
                 }
                 for (const c of commands) {
@@ -11954,10 +11954,16 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             paletteRun(event) {
                 const item = this._paletteItems[this.palette.index];
                 if (!item) return;
-                // Cmd/Ctrl+Enter logs into a WordPress site instead of opening it.
+                // A site: Enter opens its page, Shift+Enter the site itself in
+                // a new tab, Cmd/Ctrl+Enter a one-time admin login.
                 if (event && (event.metaKey || event.ctrlKey) && item.site && item.site.type === 'WordPress') {
                     this.closePalette();
                     this.getLoginLink(item.site.name);
+                    return;
+                }
+                if (event && event.shiftKey && item.site) {
+                    this.closePalette();
+                    this.openSite(item.site);
                     return;
                 }
                 item.run();
