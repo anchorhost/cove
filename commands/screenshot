@@ -30,8 +30,58 @@ find_headless_browser() {
     return 1
 }
 
+# True when nobody has touched the keyboard or mouse for a while — the
+# sweep from the watchdog only runs then. Unknown platforms count as idle.
+cove_user_is_idle() {
+    local secs
+    if [ "$(uname -s)" == "Darwin" ]; then
+        secs=$(ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}')
+        [ -n "$secs" ] && [ "$secs" -ge 90 ] && return 0
+        [ -n "$secs" ] && return 1
+        return 0
+    fi
+    if command -v xprintidle >/dev/null 2>&1; then
+        secs=$(( $(xprintidle 2>/dev/null || echo 0) / 1000 ))
+        [ "$secs" -ge 90 ] && return 0 || return 1
+    fi
+    return 0
+}
+
+# Refresh previews that are missing, older than the site's public/ tree,
+# or older than a day — up to --max of them, one after another, at low
+# priority, under a lock so two sweeps never overlap.
+cove_screenshot_sweep() {
+    local max="$1" idle_only="$2"
+    if [ "$idle_only" -eq 1 ] && ! cove_user_is_idle; then return 0; fi
+    mkdir -p "$SCREENSHOTS_DIR"
+    local lock="$SCREENSHOTS_DIR/.sweep.lock"
+    if [ -f "$lock" ]; then
+        local lpid; lpid=$(cat "$lock" 2>/dev/null)
+        if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then return 0; fi
+    fi
+    echo $$ > "$lock"
+    trap 'rm -f "$lock"' EXIT
+    local done=0 site_path name png now site_m
+    now=$(date +%s)
+    for site_path in "$SITES_DIR"/*/; do
+        [ "$done" -ge "$max" ] && break
+        site_path="${site_path%/}"
+        [ -d "$site_path/public" ] || continue
+        name=$(basename "$site_path"); name="${name%.localhost}"
+        png="$SCREENSHOTS_DIR/$name.png"
+        site_m=$(stat -f%m "$site_path/public" 2>/dev/null || stat -c%Y "$site_path/public" 2>/dev/null || echo 0)
+        if [ -f "$png" ]; then
+            local png_m; png_m=$(stat -f%m "$png" 2>/dev/null || stat -c%Y "$png" 2>/dev/null || echo 0)
+            [ "$png_m" -ge "$site_m" ] && [ $((now - png_m)) -lt 86400 ] && continue
+        fi
+        if [ "$idle_only" -eq 1 ] && ! cove_user_is_idle; then break; fi
+        nice -n 15 "$0" screenshot "$name" --quiet >/dev/null 2>&1 || true
+        done=$((done + 1))
+    done
+}
+
 cove_screenshot() {
-    local site_name="" out="" width=1280 height=800 quiet=0
+    local site_name="" out="" width=1280 height=800 quiet=0 sweep=0 max=3 idle_only=0
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -39,12 +89,19 @@ cove_screenshot() {
             --width=*)  width="${arg#*=}" ;;
             --height=*) height="${arg#*=}" ;;
             --quiet)    quiet=1 ;;
+            --sweep)    sweep=1 ;;
+            --max=*)    max="${arg#*=}" ;;
+            --idle-only) idle_only=1 ;;
             -h|--help)
                 echo "Usage: cove screenshot <site> [--out=<file.png>] [--width=1280] [--height=800]"
                 echo ""
                 echo "Captures the site's front page with a headless Chromium-family browser"
                 echo "(Chrome, Chromium, Brave, Edge, Arc, Vivaldi). Without --out the image"
                 echo "goes to ~/Cove/cache/screenshots/<site>.png, where the dashboard shows it."
+                echo ""
+                echo "  --sweep [--max=N] [--idle-only]"
+                echo "        Refresh up to N stale previews (missing, older than the site, or older"
+                echo "        than a day) in the background; --idle-only waits for an idle desktop."
                 return
                 ;;
             -*)
@@ -54,6 +111,11 @@ cove_screenshot() {
             *) [ -z "$site_name" ] && site_name="$arg" ;;
         esac
     done
+    if [ "$sweep" -eq 1 ]; then
+        [[ "$max" =~ ^[0-9]+$ ]] || max=3
+        cove_screenshot_sweep "$max" "$idle_only"
+        return
+    fi
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
         echo "Usage: cove screenshot <site> [--out=<file.png>]"
@@ -84,6 +146,13 @@ cove_screenshot() {
     local tmp_profile tmp_out
     tmp_profile=$(mktemp -d "${TMPDIR:-/tmp}/cove-shot-profile.XXXXXX")
     tmp_out="$out.tmp.png"
+    # Another capture of this site is under way (the file is its lock).
+    if [ -f "$tmp_out" ]; then
+        local age; age=$(( $(date +%s) - $(stat -f%m "$tmp_out" 2>/dev/null || stat -c%Y "$tmp_out" 2>/dev/null || echo 0) ))
+        if [ "$age" -lt 60 ]; then [ "$quiet" -eq 1 ] && echo "$out"; return 0; fi
+        rm -f "$tmp_out"
+    fi
+    touch "$tmp_out"
     [ "$quiet" -eq 1 ] || echo "📷 Capturing $url with $(basename "${browser%% *}")…"
     # A throwaway profile: headless refuses to start on a profile the user's
     # open browser holds, and nothing from the user's session should leak
