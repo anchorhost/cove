@@ -5221,7 +5221,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0.75rem; }
         .site-top .site-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         @media (max-width: 760px) { .site-top { grid-template-columns: 1fr; } }
-        .site-tile { text-align: left; background: var(--bg-sunk); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.85rem 1rem; cursor: pointer; display: flex; flex-direction: column; gap: 0.3rem; color: var(--text); font: inherit; transition: border-color 120ms, background 120ms; }
+        .site-tile { text-align: left; background: var(--bg-sunk); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.85rem 1rem; cursor: pointer; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 0.9rem; color: var(--text); font: inherit; transition: border-color 120ms, background 120ms; }
+        .site-tile-text { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; }
+        .tile-art { width: 64px; height: 44px; flex: none; opacity: 0.9; }
+        .tile-art .art-line { stroke: var(--text-dim); stroke-width: 1.6; fill: none; }
+        .tile-art .art-fill { fill: var(--accent); opacity: 0.12; stroke: none; transition: opacity 120ms; }
+        .tile-art .art-wave { stroke: var(--accent); stroke-width: 1.6; fill: none; opacity: 0.5; }
+        .tile-art .art-dot { fill: var(--accent); }
+        .site-tile:hover .tile-art .art-fill { opacity: 0.22; }
+        .site-tile:hover .tile-art .art-line { stroke: var(--text); }
         .site-tile:hover { border-color: var(--text-faint); background: var(--panel-hover); }
         .site-tile-name { font-family: var(--font-mono); font-size: 0.86rem; color: var(--text); }
         .site-tile-name::after { content: " →"; color: var(--text-faint); }
@@ -6037,10 +6045,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         </span>
                     </a>
                 <div class="site-tiles" id="siteTiles">
-                    <button type="button" class="site-tile" data-go="files"><span class="site-tile-name">files</span><span class="site-tile-desc">Browse and edit the site's directory, upload, tidy up.</span></button>
-                    <button type="button" class="site-tile" data-go="db" id="tileDb"><span class="site-tile-name">database</span><span class="site-tile-desc">Tables, rows in place, a SQL console.</span></button>
-                    <button type="button" class="site-tile" data-go="mail"><span class="site-tile-name">mail</span><span class="site-tile-desc">Everything this site has sent, links lifted out.</span></button>
-                    <button type="button" class="site-tile" data-go="logs"><span class="site-tile-name">logs</span><span class="site-tile-desc">PHP errors, debug.log, and the access log, live.</span></button>
+                    <button type="button" class="site-tile" data-go="files"><span class="site-tile-text"><span class="site-tile-name">files</span><span class="site-tile-desc">Browse and edit the site's directory, upload, tidy up.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M8 10 h16 l5 5 h27 v22 H8 Z"/><path class="art-line" d="M8 10 h16 l5 5 h27 v22 H8 Z"/><path class="art-line" d="M8 20 h48"/><path class="art-line" d="M20 28 h18 M20 33 h12"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
+                    <button type="button" class="site-tile" data-go="db" id="tileDb"><span class="site-tile-text"><span class="site-tile-name">database</span><span class="site-tile-desc">Tables, rows in place, a SQL console.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M16 9 a16 5 0 0 1 32 0 v22 a16 5 0 0 1 -32 0 Z"/><ellipse class="art-line" cx="32" cy="9" rx="16" ry="5"/><path class="art-line" d="M16 9 v22 a16 5 0 0 0 32 0 V9"/><path class="art-line" d="M16 20 a16 5 0 0 0 32 0"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
+                    <button type="button" class="site-tile" data-go="mail"><span class="site-tile-text"><span class="site-tile-name">mail</span><span class="site-tile-desc">Everything this site has sent, links lifted out.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M9 12 h46 v24 H9 Z"/><path class="art-line" d="M9 12 h46 v24 H9 Z"/><path class="art-line" d="M9 13 l23 15 l23 -15"/><path class="art-line" d="M9 36 l17 -13 M55 36 l-17 -13"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
+                    <button type="button" class="site-tile" data-go="logs"><span class="site-tile-text"><span class="site-tile-name">logs</span><span class="site-tile-desc">PHP errors, debug.log, and the access log, live.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M14 6 h36 v30 H14 Z"/><path class="art-line" d="M14 6 h36 v30 H14 Z"/><path class="art-line" d="M21 14 h22 M21 20 h14 M21 26 h18"/><circle class="art-dot" cx="45" cy="26" r="2.2"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
                 </div>
                 </div>
                 <div class="site-health" id="siteHealth"></div>
