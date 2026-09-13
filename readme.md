@@ -16,6 +16,7 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
   * **Email Catching**: Built-in Mailpit catches every outgoing email so you never risk sending a test to a real inbox. Read it in the dashboard, filtered by site, with reset and login links lifted out of each message — and nothing is ever pruned.
   * **Logs, Parsed**: The shared PHP error log, each site's `debug.log`, Caddy access logs, and the service logs, read backwards in chunks so size never matters, with repeats folded and stack traces a click away.
   * **Traffic**: Each site's access log, read as requests, page views, errors, response times, and slowest requests, over a day, a week, or all of it, without any tracking script.
+  * **Import**: Drop a backup zip on the add-site form, or `cove import mysite backup.zip`, and a site is created and restored from it, URLs rewritten.
   * **Snapshots**: `cove snapshot mysite` copies a site's files and database in about a second (copy-on-write clones on APFS, btrfs, xfs); restore puts one back and keeps the state it replaced, so nothing is lost.
   * **Plugins, Themes, Users, Cron**: Manage a site's plugins and themes, log in as any user, run cron events, or type WP-CLI, all from the site's page in the dashboard.
   * **Files, In Place**: Browse any site's directory from the dashboard, open a file in a plain-text editor and save with `⌘S`, preview images, create, rename, delete, download, and drop files or whole folders onto the listing to upload them.
@@ -84,6 +85,7 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove core update <site> [version]` | Updates a site's WordPress core to the latest release, or to a specific version (which may be a downgrade). Use `--all` to update every site that's behind. |
 | `cove login <site> [<user>] [--url=<subsite-url>]` | Generates a one-time login link for a WordPress site. On a multisite network, `--url` picks the subsite to log in to. |
 | `cove network <site> [--format=json]` | Lists the sites on a multisite network: name, URL, and ID. |
+| `cove import <site> <archive.zip\|.tar.gz>` | Creates a new site from a backup archive — a Cove snapshot export, a Local export, or a host backup with a WordPress tree and a `.sql` dump anywhere inside — and rewrites its URLs. |
 | `cove snapshot <site> [create\|list\|restore <id>\|delete <id>\|export <id>]` | Point-in-time copies of a site's files and database under `~/Cove/Snapshots/<site>/`, restorable in place; a restore snapshots the current state first so it can be undone. `--note="…"` labels one. |
 | `cove screenshot <site> [--out=<file.png>]` | Captures the site's front page with a headless Chromium-family browser; the dashboard shows the capture on the site's page. `--sweep [--max=N] [--idle-only]` refreshes stale previews in the background (the watchdog does this while the desktop is idle). |
 | `cove wp <site> <args…>` | Runs WP-CLI inside a site from anywhere, on the PHP the site is pinned to: `cove wp mysite plugin list`. |
@@ -229,7 +231,7 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
   * Every site Cove manages, with its WordPress version (flagged when wp.org marks it insecure), PHP pin, disk usage, and last-modified time.
   * Filter by name (press `/` from anywhere) or by type (click a `WP` / `STATIC` pill); sort by name, type, size, or last modified; pin the sites you are working on to the top.
   * `⌘K` opens a command palette that searches sites and commands from anywhere: `↵` opens a site's page, `⇧↵` the site itself, `⌘↵` a one-time admin login.
-  * Add WordPress or plain sites from a form that offers real WordPress versions; delete with an undo window, or bulk-delete everything a filter matches — behind a dialog that lists the sites and asks for their number to be typed.
+  * Add WordPress or plain sites from a form that offers real WordPress versions, or drop a backup zip on the form to import one; delete with an undo window, or bulk-delete everything a filter matches — behind a dialog that lists the sites and asks for their number to be typed.
   * Click a row to open the site's page (below). Right-click any row for the menu: manage, open, one-time admin login, rename, reveal in Finder, browse files, database, PHP version, logs, mail, copy path, pin, delete.
   * The `caddy`, `mariadb`, and `mailpit` dots in the top bar open a panel with each service's status, version, ports, and credentials.
 
