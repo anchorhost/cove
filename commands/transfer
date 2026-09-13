@@ -438,20 +438,44 @@ cmd_restore() {
         php|phar) wp_eval "$site_dir" php_archive_script extract "$archive" "$work" ;;
     esac || die "Extraction failed."
 
-    # Archives carry a single top-level directory (the site folder). Descend
-    # into it when present so both shapes restore identically.
-    local src="$work"
-    local entries
-    entries=$(find "$work" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
-    if [ "$entries" = "1" ]; then
-        local only
-        only=$(find "$work" -mindepth 1 -maxdepth 1)
-        [ -d "$only" ] && src="$only"
+    # The WordPress tree may sit at the archive root, one folder down (a
+    # site folder), or deeper (a Cove export's public/, Local's app/public/,
+    # a host backup's files/ or public_html/). Take the shallowest folder
+    # that holds wp-settings.php, else wp-config.php, else the old rule.
+    local src=""
+    local marker
+    for marker in wp-settings.php wp-config.php; do
+        src=$(find "$work" -maxdepth 5 -name "$marker" -not -path '*/wp-content/*' 2>/dev/null | awk '{ print length($0) "\t" $0 }' | sort -n | head -1 | cut -f2-)
+        [ -n "$src" ] && { src=$(dirname "$src"); break; }
+    done
+    if [ -z "$src" ]; then
+        src="$work"
+        local entries
+        entries=$(find "$work" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+        if [ "$entries" = "1" ]; then
+            local only
+            only=$(find "$work" -mindepth 1 -maxdepth 1)
+            [ -d "$only" ] && src="$only"
+        fi
     fi
 
+    # The dump can be anywhere too (db.sql beside public/, app/sql/local.sql,
+    # database/backup.sql). Prefer one outside wp-content — backup plugins
+    # leave old dumps in uploads — and the largest of those; .sql.gz is fine.
     local sql
-    sql=$(find "$src" -maxdepth 1 -name '*.sql' | head -1)
+    sql=$(find "$work" -maxdepth 6 -type f \( -name '*.sql' -o -name '*.sql.gz' \) -not -path '*/wp-content/*' -not -path '*/wp-includes/*' -not -path '*/wp-admin/*' 2>/dev/null | while IFS= read -r f; do printf '%s\t%s\n' "$(wc -c < "$f" | tr -d ' ')" "$f"; done | sort -rn | head -1 | cut -f2-)
+    [ -n "$sql" ] || sql=$(find "$work" -maxdepth 8 -type f \( -name '*.sql' -o -name '*.sql.gz' \) 2>/dev/null | while IFS= read -r f; do printf '%s\t%s\n' "$(wc -c < "$f" | tr -d ' ')" "$f"; done | sort -rn | head -1 | cut -f2-)
     [ -n "$sql" ] || die "No .sql file found in the archive."
+    case "$sql" in
+        *.gz)
+            log "Unpacking $(basename "$sql")..."
+            gunzip -c "$sql" > "$work/.cove-import.sql" || die "Could not unpack the SQL dump."
+            sql="$work/.cove-import.sql"
+            ;;
+    esac
+    if [ -f "$src/wp-config.php" ] && grep -Eq "define\(\s*['\"]MULTISITE['\"]\s*,\s*true" "$src/wp-config.php"; then
+        die "The archive is a multisite network, which import does not support yet."
+    fi
 
     # Preserve the destination's own wp-config.php: its credentials are the
     # ones that work here. Shipping the source's would point the restored site

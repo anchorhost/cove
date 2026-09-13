@@ -219,7 +219,7 @@ cove_snapshot() {
 
     case "$sub" in
         create)
-            echo "📸 Snapshotting '$site_name.localhost'…"
+            echo "📸 Snapshotting '$site_name.localhost'…" >&2
             local new_id
             new_id=$(snapshot_create "$site_name" "$note" 0) || exit 1
             new_id="${new_id##*$'\n'}"
@@ -267,7 +267,7 @@ cove_snapshot() {
                 gum style --foreground red "❌ Error: Which snapshot? cove snapshot $site_name restore <id>"
                 exit 1
             fi
-            echo "⏪ Restoring '$site_name.localhost' to $id…"
+            echo "⏪ Restoring '$site_name.localhost' to $id…" >&2
             local safety
             safety=$(snapshot_restore "$site_name" "$id") || exit 1
             safety="${safety##*$'\n'}"

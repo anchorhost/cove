@@ -1,0 +1,82 @@
+cove_import() {
+    local site_name="" archive="" no_reload=false php_pin=""
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --no-reload) no_reload=true ;;
+            --php=*)     php_pin="${arg#*=}" ;;
+            -h|--help)
+                echo "Usage: cove import <site> <archive.zip|.tar.gz>"
+                echo ""
+                echo "Creates a new WordPress site and restores a backup archive into it."
+                echo "The archive needs a WordPress tree (wp-config.php or wp-settings.php,"
+                echo "at any depth) and a .sql or .sql.gz dump; Cove snapshot exports, Local"
+                echo "exports, and most host backups qualify. URLs are rewritten to the new"
+                echo "site's address. Multisite archives are not supported yet."
+                return
+                ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                exit 1
+                ;;
+            *)
+                if [ -z "$site_name" ]; then site_name="$arg"; elif [ -z "$archive" ]; then archive="$arg"; fi
+                ;;
+        esac
+    done
+    if [ -z "$site_name" ] || [ -z "$archive" ]; then
+        gum style --foreground red "❌ Error: A site name and an archive are required."
+        echo "Usage: cove import <site> <archive.zip|.tar.gz>"
+        exit 1
+    fi
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+    if [ -d "$SITES_DIR/$site_name.localhost" ]; then
+        gum style --foreground red "❌ Error: '$site_name.localhost' already exists." "Import creates a new site; to replace an existing one, restore a snapshot or use cove pull."
+        exit 1
+    fi
+    if [ ! -f "$archive" ]; then
+        gum style --foreground red "❌ Error: Archive not found: $archive"
+        exit 1
+    fi
+    case "$archive" in
+        *.zip|*.tar.gz|*.tgz) ;;
+        *)
+            gum style --foreground red "❌ Error: The archive must be a .zip, .tar.gz, or .tgz."
+            exit 1
+            ;;
+    esac
+    archive=$(cd "$(dirname "$archive")" && pwd -P)/$(basename "$archive")
+
+    echo "📦 Importing $(basename "$archive") into a new site '$site_name.localhost'…"
+    echo "   1/2 Creating the site…"
+    # A subprocess: cove add exits on its own failures, and this keeps it
+    # from taking the import down with it half-way.
+    if ! "$0" add "$site_name" --no-reload ${php_pin:+--php="$php_pin"}; then
+        gum style --foreground red "❌ Error: Creating the site failed; nothing was imported."
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    echo "   2/2 Restoring the archive…"
+    if ! transfer_local restore "$site_dir/public" "$archive" --url-to="$(url_for "$site_name.localhost")"; then
+        gum style --foreground red "❌ Error: The restore failed. The empty site '$site_name.localhost' was left in place —" "remove it with: cove delete $site_name"
+        exit 1
+    fi
+
+    local wp_cmd
+    wp_cmd=$(get_wp_cmd "$site_dir")
+    # A dump from an older WordPress may need its schema brought forward;
+    # harmless when there is nothing to do.
+    (cd "$site_dir/public" && $wp_cmd core update-db --quiet --skip-plugins --skip-themes >/dev/null 2>&1) || true
+    # The one-time login plugin and Cove's own bits ride in wp-config, which
+    # the restore kept; mu-plugins come from the archive, so put ours back.
+    inject_mu_plugin "$site_dir/public" >/dev/null 2>&1 || true
+
+    if [ "$no_reload" = false ]; then
+        cove_reload
+    fi
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Imported into $site_name.localhost" "$(url_for "$site_name.localhost")" "Log in with: cove login $site_name"
+}

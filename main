@@ -3394,6 +3394,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($code !== 0) $__snap_fail($out, 'Could not delete that snapshot.');
             echo json_encode(['success' => true]);
             exit;
+        case 'import_site':
+            // A new site from an uploaded backup archive: the upload is
+            // parked under ~/Cove/cache/imports and `cove import` does the
+            // rest (create, restore, rewrite URLs). Slow — minutes for a
+            // big archive — so the dashboard shows progress and waits.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) { echo json_encode(['success' => false, 'message' => 'Invalid site name.']); exit; }
+            if (is_dir($sitedir . '/' . $site_name . '.localhost')) { echo json_encode(['success' => false, 'message' => $site_name . '.localhost already exists.']); exit; }
+            if (empty($_FILES['files'])) {
+                $len = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+                echo json_encode(['success' => false, 'message' => $len > 0 && empty($_POST) ? 'The upload was larger than post_max_size (' . ini_get('post_max_size') . ').' : 'No archive received.']);
+                exit;
+            }
+            $f = $_FILES['files'];
+            $orig = is_array($f['name']) ? ($f['name'][0] ?? '') : $f['name'];
+            $tmp = is_array($f['tmp_name']) ? ($f['tmp_name'][0] ?? '') : $f['tmp_name'];
+            $err = is_array($f['error']) ? ($f['error'][0] ?? UPLOAD_ERR_NO_FILE) : $f['error'];
+            if ($err !== UPLOAD_ERR_OK || !is_uploaded_file($tmp)) { echo json_encode(['success' => false, 'message' => 'The upload did not complete.']); exit; }
+            $ext = preg_match('/\.tar\.gz$/i', $orig) ? '.tar.gz' : (preg_match('/\.tgz$/i', $orig) ? '.tgz' : (preg_match('/\.zip$/i', $orig) ? '.zip' : ''));
+            if ($ext === '') { echo json_encode(['success' => false, 'message' => 'The archive must be a .zip, .tar.gz, or .tgz.']); exit; }
+            $imports = $user_home . '/Cove/cache/imports';
+            @mkdir($imports, 0755, true);
+            $saved = $imports . '/' . $site_name . '-' . date('Ymd-His') . $ext;
+            if (!move_uploaded_file($tmp, $saved)) { echo json_encode(['success' => false, 'message' => 'Could not store the upload.']); exit; }
+            set_time_limit(0);
+            exec(sprintf('HOME=%s %s import %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), escapeshellarg($saved)), $imp_lines, $imp_code);
+            $out = preg_replace('/\x1b\[[0-9;]*m/', '', implode("\n", $imp_lines));
+            $out = preg_replace('/[│└┌─┐┘]/u', '', $out);
+            if ($imp_code !== 0) {
+                // Keep the upload for a retry from the terminal.
+                $lines = array_values(array_filter(array_map('trim', explode("\n", $out))));
+                $last = $lines ? end($lines) : 'The import failed.';
+                echo json_encode(['success' => false, 'message' => preg_replace('/^[^\w]*(Error: )?/u', '', $last), 'output' => $out, 'archive' => $saved]);
+                exit;
+            }
+            @unlink($saved);
+            $size = 0;
+            exec('du -sk ' . escapeshellarg($sitedir . '/' . $site_name . '.localhost') . ' 2>/dev/null', $du);
+            if ($du && preg_match('/^(\d+)/', $du[0], $mm)) $size = (int) $mm[1] * 1024;
+            echo json_encode(['success' => true, 'size_bytes' => $size, 'output' => $out]);
+            exit;
         case 'site_traffic':
             // --- Traffic: aggregates over the site's Caddy access log --------
             // The log is chronological JSON lines; it is read backwards in
@@ -4735,6 +4775,18 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
         .add-row { position: relative; padding: 0.9rem 1.5rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
         .add-row.is-creating { overflow: hidden; }
+        .add-drop { display: flex; align-items: center; gap: 0.7rem; padding: 0.6rem 0.9rem; margin-bottom: 0.7rem; border: 1px dashed var(--panel-border); border-radius: var(--radius-md); font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); cursor: pointer; transition: border-color 120ms, background 120ms; }
+        .add-drop:hover, .add-drop.is-over { border-color: var(--accent); color: var(--text); }
+        .add-drop.is-over { background: color-mix(in oklch, var(--accent) 10%, transparent); border-style: solid; }
+        .add-drop.has-file { border-style: solid; border-color: var(--accent); }
+        .add-drop-art { width: 16px; height: 16px; flex: none; color: var(--text-faint); }
+        .add-drop-art svg { width: 100%; height: 100%; }
+        .add-drop.has-file .add-drop-art, .add-drop.is-over .add-drop-art { color: var(--accent); }
+        .add-drop-text { flex: 1; min-width: 0; }
+        .add-drop-text u { text-decoration-color: var(--text-faint); }
+        .add-drop-file { display: inline-flex; align-items: center; gap: 0.2rem; padding: 0.15rem 0.25rem 0.15rem 0.6rem; border-radius: var(--radius-pill); background: var(--pill-wp-bg); color: var(--pill-wp-fg); font-size: 0.72rem; white-space: nowrap; }
+        .add-progress { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); padding: 0 0 0.6rem; }
+        .add-row.is-importing .plain-toggle, .add-row.is-importing .wp-version, .add-row.has-import .plain-toggle, .add-row.has-import .wp-version { display: none; }
         /* Indeterminate progress stripe across the top while cove add is
            running — site creation takes 5-10s so we need a clear "working"
            cue beyond just the button text swap. Solid accent block slides
@@ -5546,6 +5598,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </div>
 
             <div class="add-row" id="addRow" style="display: none;">
+                <div class="add-drop" id="addDrop" title="Import a backup: a zip or tar.gz holding a WordPress tree and a .sql dump — a Cove snapshot export, a Local export, a host backup">
+                    <span class="add-drop-art" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11M7 9l5-5 5 5"/><path d="M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></svg></span>
+                    <span class="add-drop-text" id="addDropText">drop a backup zip here to import a site, or <u>choose one</u> — otherwise create a fresh site below</span>
+                    <span class="add-drop-file" id="addDropFile" style="display: none;"><span id="addDropName"></span><button type="button" class="filter-chip-x" id="addDropClear" aria-label="Remove the archive" title="Remove">×</button></span>
+                    <input type="file" id="addDropInput" accept=".zip,.tar.gz,.tgz,application/zip,application/gzip" style="display: none;">
+                </div>
+                <div class="add-progress" id="addProgress" style="display: none;"><span id="addProgressText"></span></div>
                 <form id="addForm">
                     <input type="text" id="newSiteName" placeholder="site-name" required>
                     <label class="plain-toggle">
@@ -6563,6 +6622,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             pendingDelete: null, // { sites: [...], timer }
             bulkArmed: false,
             bulkConfirm: null, // { names: [...] } while the bulk-delete dialog is open
+            importFile: null,  // a File dropped on the add-site row, to import instead of installing
+            importing: null,   // { pct, phase } while an import runs
             bulkArmTimer: null,
             // Persistent dismissible banners for newly-created sites — the
             // snackbar only lives ~3.5s, not long enough to reach for the
@@ -6945,6 +7006,17 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 });
                 $id('wpVersionSelect').addEventListener('change', (e) => { this.newSite.wpVersion = e.target.value; });
                 $id('addForm').addEventListener('submit', (e) => { e.preventDefault(); this.addSite(); });
+                const drop = $id('addDrop');
+                const dropInput = $id('addDropInput');
+                drop.addEventListener('click', (e) => { if (e.target.closest('#addDropClear')) return; dropInput.click(); });
+                dropInput.addEventListener('change', (e) => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) this.setImportFile(f); });
+                $id('addDropClear').addEventListener('click', (e) => { e.stopPropagation(); this.setImportFile(null); });
+                const row = $id('addRow');
+                let dragDepth = 0;
+                row.addEventListener('dragenter', (e) => { if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return; e.preventDefault(); dragDepth++; drop.classList.add('is-over'); });
+                row.addEventListener('dragover', (e) => { if (!drop.classList.contains('is-over')) return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+                row.addEventListener('dragleave', () => { if (!drop.classList.contains('is-over')) return; dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) drop.classList.remove('is-over'); });
+                row.addEventListener('drop', (e) => { if (!drop.classList.contains('is-over')) return; e.preventDefault(); dragDepth = 0; drop.classList.remove('is-over'); const f = e.dataTransfer.files && e.dataTransfer.files[0]; if (f) this.setImportFile(f); });
 
                 // Sort headers
                 document.querySelectorAll('.site-head-btn[data-sort]').forEach(btn => {
@@ -7128,7 +7200,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 sel.disabled = this.newSite.isLoading || this.newSite.isPlain;
                 $id('btnCreate').disabled = !this.newSite.name || this.newSite.isLoading;
                 show($id('createSpinner'), this.newSite.isLoading);
-                $id('createLabel').textContent = this.newSite.isLoading ? 'creating…' : 'create';
+                $id('createLabel').textContent = this.newSite.isLoading ? 'creating…' : (this.importFile ? 'create & import' : 'create');
+                this.renderImportProgress();
 
                 // Theme button tooltip tracks the mode it would switch to.
                 $id('btnTheme').title = 'Theme: ' + ({ system: 'System', light: 'Light', dark: 'Dark' })[this.themePref] + ' (click to switch light and dark, right-click for options)';
@@ -7420,7 +7493,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             closeThemeMenu() { const m = $id('themeMenu'); if (m) { m.style.display = 'none'; this.themeMenuOpen = false; } },
 
             toggleAdd() {
+                if (this.importing) return;
                 this.adding = !this.adding;
+                if (!this.adding && this.importFile) this.setImportFile(null);
                 this.render();
                 if (this.adding) {
                     this.loadWpVersions();
@@ -12145,8 +12220,98 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 }
             },
 
+            // A name for an imported site from its archive's filename:
+            // "sable-2023-12-22-pre-plant-20260913-120048.zip" → "sable-2023-12-22-pre-plant".
+            nameFromArchive(filename) {
+                let n = filename.replace(/\.(tar\.gz|tgz|zip)$/i, '').toLowerCase();
+                n = n.replace(/[-_ ]?\d{8}[-_]\d{6}(-\d+)?$/, '').replace(/[-_ ]?\d{4}-\d{2}-\d{2}t?\d{2}-?\d{2}-?\d{2}.*$/, '');
+                n = n.replace(/[^a-z0-9-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+                n = n.replace(/\.localhost$/, '').replace(/-(backup|export|snapshot|files|site)$/, '');
+                if (!n) n = 'imported';
+                let cand = n, i = 2;
+                while (this.sites.some(s => s.name === cand)) cand = n + '-' + (i++);
+                return cand;
+            },
+
+            setImportFile(file) {
+                if (file && !/\.(zip|tar\.gz|tgz)$/i.test(file.name)) { this.showSnack('That is not a zip or tar.gz.', true); return; }
+                this.importFile = file || null;
+                const drop = $id('addDrop');
+                drop.classList.toggle('has-file', !!file);
+                $id('addRow').classList.toggle('has-import', !!file);
+                show($id('addDropFile'), !!file);
+                show($id('addDropText'), !file);
+                if (file) {
+                    $id('addDropName').textContent = file.name + ' · ' + this.formatSize(file.size);
+                    if (!this.newSite.name) { this.newSite.name = this.nameFromArchive(file.name); $id('newSiteName').value = this.newSite.name; }
+                    this.newSite.isPlain = false;
+                    $id('newSitePlain').checked = false;
+                }
+                this.render();
+                $id('newSiteName').focus();
+            },
+
+            async importSite() {
+                const name = this.newSite.name;
+                const file = this.importFile;
+                if (!name || !file) return;
+                this.newSite.isLoading = true;
+                this.importing = { pct: 0, phase: 'uploading' };
+                this.render();
+                const fd = new FormData();
+                fd.append('action', 'import_site');
+                fd.append('site_name', name);
+                fd.append('files[]', file, file.name);
+                const res = await new Promise(resolve => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('POST', '/api.php');
+                    xhr.upload.onprogress = (e) => { if (e.lengthComputable && this.importing) { this.importing.pct = Math.round(e.loaded / e.total * 100); if (this.importing.pct >= 100) this.importing.phase = 'importing'; this.renderImportProgress(); } };
+                    xhr.onload = () => { try { resolve(JSON.parse(xhr.responseText)); } catch (e) { resolve({ success: false, message: 'Import failed (' + xhr.status + ').' }); } };
+                    xhr.onerror = () => resolve({ success: false, message: 'Network error during the upload.' });
+                    xhr.send(fd);
+                });
+                this.importing = null;
+                this.newSite.isLoading = false;
+                if (!res.success) {
+                    this.showSnack(res.message || 'The import failed.', true);
+                    if (res.output) console.warn('cove import:', res.output);
+                    this.render();
+                    return;
+                }
+                this.sites.push({
+                    name,
+                    domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
+                    type: 'WordPress',
+                    display_path: '~/Cove/Sites/' + name + '.localhost',
+                    full_path: SITES_DIR + '/' + name + '.localhost',
+                    size_bytes: (typeof res.size_bytes === 'number') ? res.size_bytes : null,
+                    modified_at: Math.floor(Date.now() / 1000),
+                    isLoggingIn: false,
+                });
+                this.showSnack('Imported ' + name + '.localhost.');
+                this.setImportFile(null);
+                this.newSite.name = '';
+                $id('newSiteName').value = '';
+                this.adding = false;
+                this.apiPost('reload_server');
+                this.alerts.push({ id: Date.now() + Math.random(), name, isPlain: false, isLoggingIn: false });
+                this.render();
+                this.getSites();
+            },
+
+            renderImportProgress() {
+                const imp = this.importing;
+                show($id('addProgress'), !!imp);
+                $id('addRow').classList.toggle('is-importing', !!imp);
+                if (imp) $id('addProgressText').textContent = imp.phase === 'uploading' ? 'uploading ' + imp.pct + '%…' : 'importing — creating the site, restoring files and database, rewriting URLs. A large archive takes a few minutes.';
+                const label = $id('createLabel');
+                if (imp) label.textContent = imp.phase === 'uploading' ? 'uploading…' : 'importing…';
+                else if (this.importFile) label.textContent = 'create & import';
+            },
+
             async addSite() {
                 if (!this.newSite.name) return;
+                if (this.importFile) { this.importSite(); return; }
                 this.newSite.isLoading = true;
                 this.render();
                 const name = this.newSite.name;
@@ -12456,6 +12621,7 @@ show_general_help() {
     echo "  network          Lists the sites on a multisite network."
     echo "  wp               Runs WP-CLI inside a site from anywhere."
     echo "  snapshot         Take, list, restore, or delete snapshots of a site."
+    echo "  import           Create a new site from a backup archive (zip or tar.gz)."
     echo "  screenshot       Capture a site's front page with a headless browser."
     echo "  rename           Renames a site, its directory, and database."
     echo "  path             Outputs the full path to a site's directory."
@@ -12772,6 +12938,9 @@ display_command_help() {
             ;;
         snapshot)
             cove_snapshot --help
+            ;;
+        import)
+            cove_import --help
             ;;
         screenshot)
             cove_screenshot --help
@@ -13113,6 +13282,10 @@ main() {
         snapshot)
             check_dependencies
             cove_snapshot "$@"
+            ;;
+        import)
+            check_dependencies
+            cove_import "$@"
             ;;
         screenshot)
             cove_screenshot "$@"
