@@ -5341,6 +5341,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .st-cli-line:focus-within { border-color: var(--accent); }
         .st-cli-prompt { font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-faint); white-space: nowrap; }
         .st-cli-input { flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.82rem; }
+        /* JetBrains Mono ligates "--" into one long dash, which reads as a
+           missing character in a command line or code. Off wherever text
+           is typed or shown verbatim. */
+        .st-cli-line, .st-cli-input, .st-cli-out, .st-cli-examples, #siteCliMeta, .files-code, .files-code textarea, .files-hl, .db-sql-editor textarea, .log-msg, .log-detail, .tr-list, .filter-input, .modal-input, .file-name-input { font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }
         .st-cli-examples { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
         .st-cli-examples button { background: transparent; border: 1px solid var(--panel-border); border-radius: var(--radius-pill); color: var(--text-dim); font: inherit; padding: 0.1rem 0.55rem; cursor: pointer; }
         .st-cli-examples button:hover { color: var(--text); border-color: var(--text-faint); }
