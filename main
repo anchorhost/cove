@@ -5127,6 +5127,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .st-del { color: var(--text-faint); }
         .st-del.armed { color: white; background: var(--danger); border-color: var(--danger); }
         .st-busy { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
+        .bulk-list { list-style: none; margin: 0 0 0.9rem; padding: 0.5rem 0.8rem; max-height: 200px; overflow-y: auto; background: var(--bg-sunk); border: 1px solid var(--panel-border); border-radius: var(--radius-md); font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 0.15rem 1rem; }
+        .bulk-list li { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .st-snapshots { grid-template-columns: minmax(0, 1fr) auto auto minmax(10rem, auto); }
         .st-snapshots .st-title { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 500; }
         .st-snapshots.is-auto .st-title { font-weight: 400; color: var(--text-dim); }
@@ -6199,6 +6201,23 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
     <!-- Files view: the site root and public/ are the site — deleting them
          is the sites list's delete, behind a confirm, with its undo window. -->
+    <!-- Bulk delete from the sites list: lists what goes and asks for the
+         count to be typed, so a filter that matched more than intended
+         cannot be wiped by two quick clicks. -->
+    <div class="modal-backdrop" id="bulkDeleteModal" style="display: none;">
+        <div class="modal">
+            <h3 id="bulkDeleteTitle">Delete sites?</h3>
+            <p class="modal-sub" id="bulkDeleteSub"></p>
+            <ul class="bulk-list" id="bulkDeleteList"></ul>
+            <input class="modal-input" type="text" id="bulkDeleteInput" inputmode="numeric" spellcheck="false" autocomplete="off" placeholder="">
+            <div class="modal-hint" id="bulkDeleteHint">&nbsp;</div>
+            <div class="modal-actions">
+                <button type="button" class="pill" id="btnBulkDeleteCancel">cancel</button>
+                <button type="button" class="pill mail-delete-all armed" id="btnBulkDeleteConfirm" disabled>delete</button>
+            </div>
+        </div>
+    </div>
+
     <div class="modal-backdrop" id="siteDeleteModal" style="display: none;">
         <div class="modal">
             <h3>Delete <span id="siteDeleteName"></span>?</h3>
@@ -6323,6 +6342,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // merges into it and restarts the window.
             pendingDelete: null, // { sites: [...], timer }
             bulkArmed: false,
+            bulkConfirm: null, // { names: [...] } while the bulk-delete dialog is open
             bulkArmTimer: null,
             // Persistent dismissible banners for newly-created sites — the
             // snackbar only lives ~3.5s, not long enough to reach for the
@@ -6505,7 +6525,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         if (e.key === 'Escape') {
                             if (this.tabCtx.open) { this.closeTabCtx(); return; }
                             if (this.siteDeleteConfirm) { this.closeSiteDeleteConfirm(); return; }
-                            if (this.phpModal.open) { this.closePhpModal(); return; }
+                            if (this.bulkConfirm) { this.closeBulkConfirm(); return; }
+                        if (this.phpModal.open) { this.closePhpModal(); return; }
                             if (this.domainsModal.open) { this.closeDomainsModal(); return; }
                             if (this.rename.open) { this.closeRename(); return; }
                             if (this.showDbModal) { this.setDbModal(false); return; }
@@ -6593,6 +6614,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
                     if (e.key === 'Escape') {
                         if (this.ctxMenu.open) { this.closeRowMenu(); return; }
+                        if (this.bulkConfirm) { this.closeBulkConfirm(); return; }
                         if (this.phpModal.open) { this.closePhpModal(); return; }
                         if (this.domainsModal.open) { this.closeDomainsModal(); return; }
                         if (this.rename.open) { this.closeRename(); return; }
@@ -6683,6 +6705,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('typeChipClear').addEventListener('click', () => { this.setTypeFilter(null); filterInput.focus(); });
                 $id('btnFilterClear').addEventListener('click', () => { this.clearAllFilters(); filterInput.focus(); });
                 $id('btnBulkDelete').addEventListener('click', () => this.bulkDelete());
+                $id('btnBulkDeleteCancel').addEventListener('click', () => this.closeBulkConfirm());
+                $id('btnBulkDeleteConfirm').addEventListener('click', () => this.confirmBulkDelete());
+                $id('bulkDeleteModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) this.closeBulkConfirm(); });
+                $id('bulkDeleteInput').addEventListener('input', () => this.renderBulkConfirm());
+                $id('bulkDeleteInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this.confirmBulkDelete(); } if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.closeBulkConfirm(); } });
 
                 // Add-site form
                 const nameInput = $id('newSiteName');
@@ -6866,8 +6893,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const bulk = $id('btnBulkDelete');
                 const visible = this.filteredSites.length;
                 show(bulk, (this.filter || this.typeFilter) && visible > 0 && visible < this.sites.length);
-                bulk.classList.toggle('armed', this.bulkArmed);
-                bulk.textContent = this.bulkArmed ? ('sure? delete ' + visible) : ('delete ' + visible + ' shown');
+                bulk.textContent = 'delete ' + visible + ' shown…';
                 show($id('filterKbd'), !this.filter && !this.typeFilter);
                 show($id('btnFilterClear'), this.filter || this.typeFilter);
 
@@ -9631,8 +9657,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         else if (it.status === 'active-network') items.push({ label: 'Network deactivate', run: () => this.siteItemOp(tab, slug, 'deactivate', true) });
                     } else if (it.status === 'inactive') items.push({ label: 'Activate', run: () => this.siteItemOp(tab, slug, 'activate') });
                     if (it.update === 'available') items.push({ label: 'Update', meta: '→ ' + it.update_version, run: () => this.siteItemOp(tab, slug, 'update') });
-                    items.push({ label: it.auto_update === 'on' ? 'Turn auto-updates off' : 'Turn auto-updates on', run: () => this.siteItemOp(tab, slug, it.auto_update === 'on' ? 'auto-off' : 'auto-on') });
-                    items.push({ sep: true });
+                    if (it.status !== 'must-use') items.push({ label: it.auto_update === 'on' ? 'Turn auto-updates off' : 'Turn auto-updates on', run: () => this.siteItemOp(tab, slug, it.auto_update === 'on' ? 'auto-off' : 'auto-on') });
+                    if (items.length) items.push({ sep: true });
                     items.push({ label: 'Browse files', run: () => this.openFilesAt(site.name, dir) });
                     items.push({ label: 'Copy slug', run: () => this.copyText(slug, 'Slug copied') });
                     if (it.status !== 'must-use' && it.status !== 'active' && it.status !== 'active-network' && it.status !== 'parent') {
@@ -9786,7 +9812,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         li.innerHTML = '<div class="st-main"><span class="st-title">' + esc(it.title || it.name) + '</span><span class="st-sub">' + esc(it.name) + '</span></div>'
                             + '<span class="st-ver">' + esc(it.version || '') + (it.update === 'available' ? ' <span class="st-upd" title="Update available">→ ' + esc(it.update_version) + '</span>' : '') + '</span>'
                             + '<span class="st-chip st-status-' + esc(it.status) + '">' + esc(chip) + '</span>'
-                            + '<button type="button" class="st-auto' + (it.auto_update === 'on' ? ' is-on' : '') + '" data-op="' + (it.auto_update === 'on' ? 'auto-off' : 'auto-on') + '" title="Auto-updates ' + (it.auto_update === 'on' ? 'on — click to turn off' : 'off — click to turn on') + '">auto</button>'
+                            + (it.status === 'must-use' ? '<span></span>' : '<button type="button" class="st-auto' + (it.auto_update === 'on' ? ' is-on' : '') + '" data-op="' + (it.auto_update === 'on' ? 'auto-off' : 'auto-on') + '" title="Auto-updates ' + (it.auto_update === 'on' ? 'on — click to turn off' : 'off — click to turn on') + '">auto</button>')
                             + '<span class="st-actions">' + actions + '</span>';
                     } else if (tab === 'users') {
                         const supers = (t.extra && t.extra.super_admins) || [];
@@ -11775,18 +11801,48 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             bulkDelete() {
-                // Two-step inline confirm: first click arms the button for a
-                // few seconds, second click stages every filtered site. The
-                // undo snackbar is the safety net after that.
-                if (!this.bulkArmed) {
-                    this.bulkArmed = true;
-                    this.bulkArmTimer = setTimeout(() => { this.bulkArmed = false; this.renderChrome(); }, 3500);
-                    this.renderChrome();
-                    return;
-                }
-                clearTimeout(this.bulkArmTimer);
-                this.bulkArmed = false;
-                this.stageDeletes([...this.filteredSites]);
+                // A dialog, not an armed button: it names every site the
+                // filter matched and asks for the count to be typed before
+                // anything is staged. The undo snackbar still follows.
+                const sites = [...this.filteredSites];
+                if (!sites.length) return;
+                this.bulkConfirm = { names: sites.map(s => s.name) };
+                const n = sites.length;
+                $id('bulkDeleteTitle').textContent = 'Delete ' + n + ' site' + (n === 1 ? '' : 's') + '?';
+                $id('bulkDeleteSub').textContent = 'Every site below goes: its directory (public/, uploads, logs) and its database. You get a few seconds to undo afterwards.';
+                const list = $id('bulkDeleteList');
+                list.innerHTML = '';
+                for (const s of sites) { const li = document.createElement('li'); li.textContent = s.name + '.localhost'; list.appendChild(li); }
+                const input = $id('bulkDeleteInput');
+                input.value = '';
+                input.placeholder = 'type ' + n + ' to confirm';
+                this.renderBulkConfirm();
+                show($id('bulkDeleteModal'), true);
+                input.focus();
+            },
+
+            renderBulkConfirm() {
+                const c = this.bulkConfirm;
+                if (!c) return;
+                const n = c.names.length;
+                const ok = $id('bulkDeleteInput').value.trim() === String(n);
+                const btn = $id('btnBulkDeleteConfirm');
+                btn.disabled = !ok;
+                btn.textContent = 'delete ' + n + ' site' + (n === 1 ? '' : 's');
+                $id('bulkDeleteHint').textContent = ok ? 'Ready.' : 'Type the number of sites, ' + n + ', to enable the button.';
+            },
+
+            closeBulkConfirm() {
+                this.bulkConfirm = null;
+                show($id('bulkDeleteModal'), false);
+            },
+
+            confirmBulkDelete() {
+                const c = this.bulkConfirm;
+                if (!c || $id('bulkDeleteInput').value.trim() !== String(c.names.length)) return;
+                this.closeBulkConfirm();
+                const sites = this.sites.filter(s => c.names.includes(s.name));
+                this.stageDeletes(sites);
             },
 
             stageDeletes(sitesToDelete) {
