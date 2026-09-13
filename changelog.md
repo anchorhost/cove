@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [1.17] - 2026-09-13
+
+Cove arrives on the Linux desktop. The menu bar app now runs as a system tray on COSMIC, KDE, XFCE, MATE, Cinnamon and GNOME, and `cove trust` finally reaches Chrome on Linux. The dashboard gained a **Domains** item in every site's row menu, so a site can answer on extra hostnames, or on every subdomain with a one-click wildcard, without touching the CLI. New sites are created with `WP_ENVIRONMENT_TYPE` set to `local`.
 
 ### ✨ New Features
 
