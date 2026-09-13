@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### ✨ New Features
+
+* **Files, Inside the Dashboard:** A fifth view, `files`, is a file manager over each site's directory. Sites are listed on the left; pick one and its folder opens on the right under a breadcrumb bar, folders first, sortable by name, size, or modified time, with a filter for the current folder and a toggle for dotfiles. Click a text file and it opens in a plain-text editor — `⌘S` saves, **discard** drops the edit, **wrap** soft-wraps, `Tab` inserts a tab — and if the file changed on disk while it was open, save turns into **overwrite?** instead of silently clobbering the other change. Images preview in place; binary files and anything over 2 MB offer a download. **+ file** and **+ folder** add a row to type the name into (a name with slashes creates the folders on the way), every row has rename and a two-click delete, **upload** picks files or you can drop files and whole folders onto the listing, and **reveal** opens the folder in Finder or the desktop file manager. Every folder and file has a real URL (`/files/<site>/<path>`), a site's row menu gained **Browse files**, and the palette has **Files**. Keyboard: `↑`/`↓` to move, `↵` to open, `⌫` to go up, `Esc` to close, `/` to filter, `F2` to rename, `Delete` to delete. Every path the browser sends is checked segment by segment so nothing outside the site's directory can be named; symlinks are followed for reading and editing but a delete removes the link, never what it points at; and files served for preview or download carry a sandboxing CSP so an HTML or SVG file in a site can never run as the dashboard itself.
+
 ## [1.17] - 2026-09-13
 
 Cove arrives on the Linux desktop. The menu bar app now runs as a system tray on COSMIC, KDE, XFCE, MATE, Cinnamon and GNOME, and `cove trust` finally reaches Chrome on Linux. The dashboard gained a **Domains** item in every site's row menu, so a site can answer on extra hostnames, or on every subdomain with a one-click wildcard, without touching the CLI. New sites are created with `WP_ENVIRONMENT_TYPE` set to `local`.

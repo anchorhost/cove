@@ -2,12 +2,12 @@
 
 **The calm way to run local WordPress.**
 
-Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one-click admin login, zero Docker. It bundles Caddy, FrankenPHP, MariaDB, and Mailpit into one self-contained toolchain for WordPress and plain static sites, with a dashboard at `https://cove.localhost` for your sites, their mail, their databases, and their logs.
+Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one-click admin login, zero Docker. It bundles Caddy, FrankenPHP, MariaDB, and Mailpit into one self-contained toolchain for WordPress and plain static sites, with a dashboard at `https://cove.localhost` for your sites, their mail, their databases, their logs, and their files.
 
 ## ✨ Features
 
   * **Simple CLI**: Manage everything from your terminal with a handful of short commands.
-  * **Web Dashboard**: A built-in GUI at `https://cove.localhost` with four views. **Sites** to view, filter, sort, add, and delete sites with one-click admin logins; **Mail**, an inbox of everything your sites send, scoped per site; **Databases**, a browser with in-place editing and a SQL console; and **Logs**, PHP errors per site, `debug.log`, and access logs, live. Every view has a real URL.
+  * **Web Dashboard**: A built-in GUI at `https://cove.localhost` with five views. **Sites** to view, filter, sort, add, and delete sites with one-click admin logins; **Mail**, an inbox of everything your sites send, scoped per site; **Databases**, a browser with in-place editing and a SQL console; **Logs**, PHP errors per site, `debug.log`, and access logs, live; and **Files**, a file manager and editor over each site's directory. Every view has a real URL.
   * **Automatic HTTPS**: Every site is served over HTTPS using Caddy's internal CA — no cert wrangling.
   * **WordPress & Static Sites**: Spin up a fresh WordPress install — any version, nightly, or a multisite network — or a plain static site with one command.
   * **Per-site PHP**: Pin any site to an older PHP (`cove php mysite 8.2`); it runs on a native php-fpm behind the same Caddy, with TLS, logs, and URLs unchanged.
@@ -15,6 +15,7 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
   * **Database Management**: Browse and edit any table from the dashboard, run SQL with `⌘↵`, plus Adminer with passwordless auto-login for exports and schema work. `cove db backup` snapshots every site; `cove db list` shows credentials.
   * **Email Catching**: Built-in Mailpit catches every outgoing email so you never risk sending a test to a real inbox. Read it in the dashboard, filtered by site, with reset and login links lifted out of each message — and nothing is ever pruned.
   * **Logs, Parsed**: The shared PHP error log, each site's `debug.log`, Caddy access logs, and the service logs, read backwards in chunks so size never matters, with repeats folded and stack traces a click away.
+  * **Files, In Place**: Browse any site's directory from the dashboard, open a file in a plain-text editor and save with `⌘S`, preview images, create, rename, delete, download, and drop files or whole folders onto the listing to upload them.
   * **Custom Ports**: Run Cove alongside Local, Studio, DevKinsta, or MAMP — pick alternative HTTP/HTTPS ports and Cove migrates stored WordPress URLs automatically.
   * **LAN & Mobile Testing**: `cove lan` exposes sites to your phone via Bonjour/mDNS for iOS app sync.
   * **Tailscale Integration**: `cove tailscale enable` makes every site reachable from any device on your tailnet.
@@ -214,7 +215,7 @@ cove tailscale disable
 
 ## 🖥️ The Dashboard
 
-The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:8453` on alternative ports). It has four views, one keystroke apart, and every one has a real URL you can bookmark or paste.
+The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:8453` on alternative ports). It has five views, one keystroke apart, and every one has a real URL you can bookmark or paste.
 
 ### Sites — `/`
 
@@ -222,7 +223,7 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
   * Filter by name (press `/` from anywhere) or by type (click a `WP` / `STATIC` pill); sort by name, type, size, or last modified; pin the sites you are working on to the top.
   * `⌘K` opens a command palette that searches sites and commands from anywhere.
   * Add WordPress or plain sites from a form that offers real WordPress versions; delete with an undo window, or bulk-delete everything a filter matches.
-  * Right-click any row for the menu: open, one-time admin login, rename, reveal in Finder, database, PHP version, logs, mail, copy path, pin, delete.
+  * Right-click any row for the menu: open, one-time admin login, rename, reveal in Finder, browse files, database, PHP version, logs, mail, copy path, pin, delete.
   * The `caddy`, `mariadb`, and `mailpit` dots in the top bar open a panel with each service's status, version, ports, and credentials.
 
 ### Mail — `/mail`, `/mail/<site>`
@@ -245,6 +246,14 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
   * Pick a site for three tabs: **php errors** from the shared log scoped to that site, its own **debug.log**, and its Caddy **access** log. "View log" in a site's row menu opens whichever one the site actually writes to.
   * Entries are parsed into a level chip, the message, and `file:line`; consecutive repeats fold into one row with a count, and a click opens the stack trace. Filter by level, search, page back through **older**, or leave **live** on and watch the file grow.
   * Files are read backwards in chunks, so a 100 MB error log answers as fast as a small one.
+
+### Files — `/files`, `/files/<site>/<path>`
+
+  * Every site on the left; pick one and its directory opens on the right, with a breadcrumb bar that walks back up and copies the full path from its last crumb. Folders first, sortable by name, size, or modified time; a filter box narrows the current folder; dotfiles can be hidden.
+  * Click a text file and it opens in a plain-text editor: `⌘S` saves, **discard** throws the edit away, **wrap** soft-wraps long lines, `Tab` inserts a tab. If the file changed on disk while it was open, save turns into **overwrite?** rather than silently clobbering the other change. Images preview in place; anything binary or over 2 MB offers a download instead.
+  * **+ file** and **+ folder** add a row to type the name into (a name with slashes creates the folders on the way); rename and delete sit on every row, delete needing a second click; **upload** picks files, or drop files and whole folders onto the listing. **reveal** opens the folder in Finder or the desktop file manager.
+  * Keyboard: `↑`/`↓` or `j`/`k` to move, `↵` to open, `⌫` to go up, `Esc` to close the file, `/` to filter, `F2` to rename, `Delete` to delete.
+  * Everything stays inside the site's directory: paths are checked segment by segment, symlinks are followed for reading and editing but never recursed into on delete, and files served for preview or download are sandboxed so nothing in a site can run as the dashboard.
 
 ### Everywhere
 
