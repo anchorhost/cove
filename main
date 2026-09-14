@@ -3439,6 +3439,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($code !== 0) $__snap_fail($out, 'Could not delete that snapshot.');
             echo json_encode(['success' => true]);
             exit;
+        case 'history_sweep_status':
+            // The nightly history sweep as a whole (not one site): running
+            // and where, or when it last finished and whether it is waiting
+            // for an idle desktop. Polled by the nav indicator.
+            $__hs_lines = []; $__hs_code = 0;
+            exec('HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path) . ' history --status --format=json 2>/dev/null', $__hs_lines, $__hs_code);
+            $__hs = null;
+            foreach (array_reverse($__hs_lines) as $__l) { $__t = json_decode(trim($__l), true); if (is_array($__t)) { $__hs = $__t; break; } }
+            if ($__hs_code !== 0 || !is_array($__hs)) { echo json_encode(['success' => false, 'message' => 'Could not read the sweep status.']); exit; }
+            echo json_encode(['success' => true] + $__hs);
+            exit;
         case 'site_history':
         case 'site_history_save':
         case 'site_history_status':
@@ -5060,6 +5071,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .services { display: flex; gap: 1.1rem; flex-wrap: wrap; }
         .dot { display: inline-flex; align-items: center; gap: 0.45rem; color: var(--text-dim); text-decoration: none; background: transparent; border: 0; padding: 0; font-family: inherit; font-size: inherit; cursor: default; }
         .dot.link, .dot[role="button"] { cursor: pointer; }
+        .dot.is-busy::before { animation: dot-pulse 1.4s ease-in-out infinite; }
+        @keyframes dot-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(0.7); } }
+        .dot .dot-meta { color: var(--text-faint); }
         .dot.link:hover, .dot[role="button"]:hover { color: var(--text); }
         .dot::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px rgba(58, 151, 169, 0.6); box-shadow: 0 0 6px color-mix(in oklch, var(--accent) 60%, transparent); }
         .totals { display: inline-flex; align-items: center; gap: 0.5rem; }
@@ -5680,6 +5694,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 <button type="button" class="dot link" data-service="caddy" title="Caddy status">caddy</button>
                 <button type="button" class="dot link" data-service="mariadb" title="MariaDB status and credentials">mariadb</button>
                 <button type="button" class="dot link" data-service="mailpit" title="Mailpit status">mailpit</button>
+                <button type="button" class="dot link is-busy" id="navSweep" data-service="history" title="The nightly history sweep is running — click for the site it is on" style="display: none;">history</button>
             </div>
             <button class="theme-btn" id="btnTheme" title="Theme" aria-label="Theme" aria-haspopup="menu">
                 <svg class="icon-system" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor" stroke="none"/></svg>
@@ -6915,6 +6930,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.bindSiteEvents();
                 this.bindSiteTabEvents();
                 this.render();
+                this.sweepPoll();
 
                 // If the tab closes during an undo window, flush the staged
                 // deletes with keepalive requests so they aren't lost. No
@@ -7117,7 +7133,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 document.addEventListener('click', (e) => { if (this.themeMenuOpen && !e.target.closest('#themeMenu, #btnTheme')) this.closeThemeMenu(); });
                 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.themeMenuOpen) this.closeThemeMenu(); });
                 try { window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { if (this.themePref === 'system') { this.applyTheme(); this.renderChrome(); } }); } catch (e) {}
-                document.querySelectorAll('[data-service]').forEach(b => b.addEventListener('click', () => this.openService(b.dataset.service)));
+                document.querySelectorAll('[data-service]').forEach(b => b.addEventListener('click', () => b.dataset.service === 'history' ? this.sweepGo() : this.openService(b.dataset.service)));
                 $id('btnToggleAdd').addEventListener('click', () => this.toggleAdd());
                 $id('btnRefreshSizes').addEventListener('click', () => this.refreshSizes());
                 $id('btnDbClose').addEventListener('click', () => this.setDbModal(false));
@@ -9936,6 +9952,64 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 setTimeout(poll, 2500);
             },
 
+            // --- The nightly history sweep, as a whole -----------------------
+            // Polled every 10 s while it runs and every minute otherwise; the
+            // nav shows a pulsing "history 14/80" while it is on, and the
+            // history tab's footer says where things stand.
+            sweepPoll() {
+                clearTimeout(this.sweepTimer);
+                const tick = async () => {
+                    if (document.hidden) { this.sweepTimer = setTimeout(tick, 15000); return; }
+                    const st = await this.apiPost('history_sweep_status', {}, { quiet: true, timeoutMs: 15000 });
+                    if (st && st.success) {
+                        const prev = this.sweep;
+                        this.sweep = st;
+                        this.renderSweep();
+                        if (this.view === 'site' && this.sitePage.tab === 'history') {
+                            this.renderSiteTab();
+                            // The sweep just moved past this site, or ended:
+                            // its save (if any) belongs in the list now.
+                            const here = this.sitePage.name;
+                            if (prev && prev.running && ((prev.site === here && st.site !== here) || !st.running)) this.loadSiteTab({ force: true });
+                        }
+                    }
+                    this.sweepTimer = setTimeout(tick, this.sweep && this.sweep.running ? 10000 : 60000);
+                };
+                tick();
+            },
+
+            renderSweep() {
+                const b = $id('navSweep');
+                const s = this.sweep;
+                const on = !!(s && s.running);
+                show(b, on);
+                if (!on) return;
+                const n = Number(s.done) || 0, t = Number(s.total) || 0;
+                b.innerHTML = 'history' + (t ? ' <span class="dot-meta">' + n + '/' + t + '</span>' : '');
+                b.title = 'Nightly history sweep running' + (s.site ? ' — saving ' + s.site + '.localhost' : '') + (t ? ' (' + n + ' of ' + t + ' sites done, ' + (Number(s.saved) || 0) + ' saved)' : '') + '. Click to see it.';
+            },
+
+            sweepGo() {
+                const s = this.sweep;
+                if (!s || !s.running) return;
+                if (s.site && this.sites.some(x => x.name === s.site)) { this.openSitePage(s.site); this.setSiteTab('history'); }
+                else this.showSnack('The sweep is between sites — ' + (Number(s.done) || 0) + ' of ' + (Number(s.total) || 0) + ' done.');
+            },
+
+            // One line for the history tab's footer.
+            sweepLine() {
+                const s = this.sweep;
+                const rel = (t) => { const r = this.formatRelative(Number(t)); return r === 'now' ? 'just now' : r + ' ago'; };
+                if (!s) return 'the first nightly sweep has not run yet';
+                if (s.running) return 'nightly sweep running now' + (s.site ? ' · on ' + s.site : '') + (Number(s.total) ? ' · ' + (Number(s.done) || 0) + ' of ' + s.total + ' sites done, ' + (Number(s.saved) || 0) + ' saved' : '') + (Number(s.started) ? ' · started ' + rel(s.started) : '');
+                let line = Number(s.last_done) ? 'last nightly sweep finished ' + rel(s.last_done) : 'the first nightly sweep has not finished yet';
+                const doneToday = Number(s.last_done) && new Date(Number(s.last_done) * 1000).toDateString() === new Date().toDateString();
+                if (Number(s.waiting_since)) line += ' · waiting for an idle desktop since ' + new Date(Number(s.waiting_since) * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + ' (the watchdog retries every 5 min)';
+                else if (!doneToday && new Date().getHours() >= 1) line += ' · the watchdog tries every 5 min and runs once the desktop is idle';
+                else line += ' · next pass after 1 am once the desktop is idle';
+                return line;
+            },
+
             requestShotSweep() {
                 if (this._sweepAsked) return;
                 this._sweepAsked = true;
@@ -10753,9 +10827,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (tab === 'history') {
                     const x = t.extra || {};
                     const dir = (x.dir || '').replace(/^\/Users\/[^\/]+|^\/home\/[^\/]+/, '~');
-                    const swept = x.last_sweep ? 'the last nightly sweep finished ' + (this.formatRelative(x.last_sweep) === 'now' ? 'just now' : this.formatRelative(x.last_sweep) + ' ago') : 'the first nightly sweep has not run yet';
+                    const swept = this.sweepLine();
                     $id('histFoot').textContent = x.enabled === false ? 'This site has no wp-content, so there is nothing for history to save.'
-                        : (t.items.length ? dir + ' · ' + this.formatSize(x.bytes || 0) + ' · saved nightly from 1 am while the desktop is idle · ' + swept
+                        : (t.items.length ? dir + ' · ' + this.formatSize(x.bytes || 0) + ' · ' + swept
                             : 'Plugins, themes and mu-plugins are saved to ' + dir + ' every night while the desktop is idle, and whenever you press save now; ' + swept + '.');
                 }
                 if (tab === 'snapshots') {
