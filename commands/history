@@ -1,0 +1,802 @@
+# History: a git record of a site's plugins, themes and mu-plugins, kept at
+# <site>/history/.git beside public/ and logs/. A save is one commit holding
+# the three folders plus manifest.tsv (WordPress version, every component's
+# version and status), so any plugin or theme — or all of them — can be put
+# back the way it was on a given day. The watchdog saves every site nightly
+# while the desktop is idle; `cove history <site> save` does it on demand.
+#
+# There is no work tree: files are hashed straight out of public/wp-content
+# into a temporary index (git hash-object + update-index --index-info), so a
+# save costs only the compressed objects and nested .git folders inside a
+# plugin under development never turn into submodules.
+
+HISTORY_EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+history_gitdir() { echo "$SITES_DIR/$1.localhost/history/.git"; }
+history_content() { echo "$SITES_DIR/$1.localhost/public/wp-content"; }
+
+# git against a site's history, with a fixed identity so it works without
+# any global git config.
+history_git() {
+    local gitdir="$1"; shift
+    GIT_AUTHOR_NAME="Cove" GIT_AUTHOR_EMAIL="cove@localhost" GIT_COMMITTER_NAME="Cove" GIT_COMMITTER_EMAIL="cove@localhost" \
+        git --git-dir="$gitdir" -c core.quotepath=off -c gc.autoDetach=false "$@"
+}
+
+history_has_git() { command -v git >/dev/null 2>&1; }
+
+# The folders a save covers, those that exist.
+history_dirs() {
+    local content="$1" d out=""
+    for d in plugins themes mu-plugins; do [ -d "$content/$d" ] && out="$out $d"; done
+    echo "${out# }"
+}
+
+history_init() {
+    local site_name="$1"
+    local gitdir; gitdir=$(history_gitdir "$site_name")
+    [ -d "$gitdir/objects" ] && return 0
+    mkdir -p "$(dirname "$gitdir")"
+    git init -q --bare "$gitdir" || return 1
+    history_git "$gitdir" config user.name "Cove" >/dev/null
+    history_git "$gitdir" config user.email "cove@localhost" >/dev/null
+    history_git "$gitdir" config gc.auto 256 >/dev/null
+    mkdir -p "$gitdir/cove"
+    cat > "$(dirname "$gitdir")/README" << EOM
+This folder is Cove's history for $site_name.localhost: a git repository of
+the site's plugins, themes and mu-plugins, saved nightly and on demand.
+
+  cove history $site_name                       list the saves
+  cove history $site_name show <id>             what changed in one
+  cove history $site_name rollback <id> --plugin=<slug>
+  cove history $site_name rollback <id> --all
+
+There is no checkout here; the objects live in .git. Browse with
+\`git -C "$(dirname "$gitdir")" log --stat\`.
+EOM
+    return 0
+}
+
+# manifest.tsv for a WordPress site: one line per component,
+#   <type>\t<slug>\t<version>\t<status>\t<title>
+# with a "core" line first. Printed on stdout; nothing for a non-WP site.
+history_manifest() {
+    local site_dir="$1"
+    local public_dir="$site_dir/public"
+    [ -f "$public_dir/wp-config.php" ] || return 1
+    local wp_cmd; wp_cmd=$(get_wp_cmd "$site_dir")
+    local php='require_once ABSPATH . "wp-admin/includes/plugin.php";
+$active = (array) get_option("active_plugins", []);
+$net = is_multisite() ? array_keys((array) get_site_option("active_sitewide_plugins", [])) : [];
+$rows = [["core", "wordpress", $GLOBALS["wp_version"], is_multisite() ? "multisite" : "single", "WordPress"]];
+foreach (get_plugins() as $file => $h) {
+    $slug = dirname($file) === "." ? basename($file, ".php") : dirname($file);
+    $st = in_array($file, $net, true) ? "active-network" : (in_array($file, $active, true) ? "active" : "inactive");
+    $rows[] = ["plugin", $slug, $h["Version"], $st, $h["Name"]];
+}
+foreach (get_mu_plugins() as $file => $h) { $rows[] = ["mu-plugin", basename($file, ".php"), $h["Version"], "must-use", $h["Name"]]; }
+$ss = get_option("stylesheet"); $tp = get_option("template");
+foreach (wp_get_themes() as $slug => $t) { $rows[] = ["theme", $slug, $t->get("Version"), $slug === $ss ? "active" : ($slug === $tp ? "parent" : "inactive"), $t->get("Name")]; }
+foreach ($rows as $r) echo implode("\t", array_map(function ($v) { return str_replace(["\t", "\n", "\r"], " ", (string) $v); }, $r)), "\n";'
+    local out
+    out=$( (cd "$public_dir" && $wp_cmd eval "$php" --skip-plugins --skip-themes 2>/dev/null) ) || return 1
+    # Only the tab-separated lines: a plugin's notice would poison the file.
+    out=$(printf '%s\n' "$out" | grep $'\t' | grep -E '^(core|plugin|mu-plugin|theme)'$'\t')
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out" | sort -t $'\t' -k1,1 -k2,2
+}
+
+# Build a tree object from the live wp-content: every regular file and
+# symlink under plugins/, themes/, mu-plugins/ (skipping node_modules, VCS
+# folders, .DS_Store and logs), plus manifest.tsv from $2 when given.
+# Prints the tree hash.
+history_write_tree() {
+    local site_name="$1" manifest_file="$2"
+    local gitdir content dirs
+    gitdir=$(history_gitdir "$site_name")
+    content=$(history_content "$site_name")
+    dirs=$(history_dirs "$content")
+    local index; index=$(mktemp "${TMPDIR:-/tmp}/cove-history-index.XXXXXX")
+    rm -f "$index"
+    local list; list=$(mktemp "${TMPDIR:-/tmp}/cove-history-list.XXXXXX")
+    (
+        cd "$content" || exit 1
+        export GIT_INDEX_FILE="$index"
+        # Arrays keep '*.log' from globbing against wp-content itself.
+        local -a prune skip perm
+        prune=(-type d \( -name node_modules -o -name .git -o -name .svn -o -name .hg -o -name .sass-cache -o -name .cache \) -prune)
+        skip=(! -name .DS_Store ! -name error_log ! -name '*.log' ! -name Thumbs.db)
+        if [ -n "$dirs" ]; then
+            # Regular files, non-executable then executable, hashed in one
+            # pass each.
+            for mode in 100644 100755; do
+                if [ "$mode" == "100644" ]; then perm=(! -perm -u+x); else perm=(-perm -u+x); fi
+                # shellcheck disable=SC2086
+                find $dirs "${prune[@]}" -o -type f "${perm[@]}" "${skip[@]}" -print 2>/dev/null | LC_ALL=C sort > "$list"
+                if [ -s "$list" ]; then
+                    history_git "$gitdir" hash-object -w --no-filters --stdin-paths < "$list" \
+                        | paste -d '\t' - "$list" \
+                        | awk -F '\t' -v m="$mode" '{ printf "%s %s\t%s\n", m, $1, $2 }' \
+                        | history_git "$gitdir" update-index --add --index-info
+                fi
+            done
+            # Symlinks (a plugin linked in from a checkout elsewhere) are kept
+            # as links: the target path, mode 120000.
+            # shellcheck disable=SC2086
+            find $dirs "${prune[@]}" -o -type l -print 2>/dev/null | LC_ALL=C sort | while IFS= read -r link; do
+                target=$(readlink "$link") || continue
+                blob=$(printf '%s' "$target" | history_git "$gitdir" hash-object -w --no-filters --stdin)
+                printf '120000 %s\t%s\n' "$blob" "$link"
+            done | history_git "$gitdir" update-index --add --index-info
+        fi
+        if [ -n "$manifest_file" ] && [ -s "$manifest_file" ]; then
+            blob=$(history_git "$gitdir" hash-object -w --no-filters "$manifest_file")
+            printf '100644 %s\tmanifest.tsv\n' "$blob" | history_git "$gitdir" update-index --add --index-info
+        fi
+        history_git "$gitdir" write-tree
+    )
+    local rc=$?
+    rm -f "$index" "$list"
+    return $rc
+}
+
+# The cheap "did anything move?" test the nightly sweep runs before hashing
+# a whole site: any entry under the saved folders newer than the last save.
+history_files_changed_since() {
+    local content="$1" stamp="$2"
+    [ -f "$stamp" ] || return 0
+    local dirs; dirs=$(history_dirs "$content")
+    [ -n "$dirs" ] || return 1
+    # shellcheck disable=SC2086
+    [ -n "$(cd "$content" && find $dirs -newer "$stamp" -print -quit 2>/dev/null)" ]
+}
+
+# history_save <site> <note> <auto:0|1> [force:0|1] [quick:0|1]
+# Prints "<hash> new|unchanged|none" on the last line of stdout; progress on stderr.
+#   quick=1 skips the hashing when no file is newer than the last save and the
+#   manifest is the same (the sweep's fast path).
+history_save() {
+    local site_name="$1" note="$2" auto="${3:-0}" force="${4:-0}" quick="${5:-0}"
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    local content gitdir
+    content=$(history_content "$site_name")
+    gitdir=$(history_gitdir "$site_name")
+    if [ ! -d "$content" ] || [ -z "$(history_dirs "$content")" ]; then
+        echo "- none"
+        return 2
+    fi
+    history_init "$site_name" || { gum style --foreground red "❌ Error: Could not create $gitdir." >&2; return 1; }
+    local head; head=$(history_git "$gitdir" rev-parse --verify -q HEAD 2>/dev/null)
+
+    # The manifest: fresh from WordPress; if WordPress cannot answer right
+    # now, the last saved one is carried forward rather than dropped.
+    local manifest; manifest=$(mktemp "${TMPDIR:-/tmp}/cove-history-manifest.XXXXXX")
+    local manifest_note=""
+    if [ -f "$site_dir/public/wp-config.php" ]; then
+        if ! history_manifest "$site_dir" > "$manifest"; then
+            : > "$manifest"
+            if [ -n "$head" ] && history_git "$gitdir" cat-file -e "$head:manifest.tsv" 2>/dev/null; then
+                history_git "$gitdir" show "$head:manifest.tsv" > "$manifest"
+                manifest_note="manifest carried forward (WP-CLI failed)"
+            fi
+        fi
+    fi
+
+    if [ "$quick" == "1" ] && [ "$force" != "1" ] && [ -n "$head" ]; then
+        if ! history_files_changed_since "$content" "$gitdir/cove/last-save"; then
+            local same=1
+            if [ -s "$manifest" ]; then
+                local mh oh
+                mh=$(history_git "$gitdir" hash-object --no-filters "$manifest")
+                oh=$(history_git "$gitdir" rev-parse -q --verify "$head:manifest.tsv" 2>/dev/null)
+                [ "$mh" == "$oh" ] || same=0
+            fi
+            if [ "$same" == "1" ]; then
+                rm -f "$manifest"
+                touch "$gitdir/cove/last-save"
+                echo "$head unchanged"
+                return 0
+            fi
+        fi
+    fi
+
+    echo "   Hashing plugins, themes and mu-plugins…" >&2
+    local tree
+    if ! tree=$(history_write_tree "$site_name" "$manifest"); then
+        rm -f "$manifest"
+        gum style --foreground red "❌ Error: Could not build the tree for '$site_name.localhost'." >&2
+        return 1
+    fi
+    rm -f "$manifest"
+    if [ -n "$head" ] && [ "$force" != "1" ]; then
+        local head_tree; head_tree=$(history_git "$gitdir" rev-parse "$head^{tree}")
+        if [ "$tree" == "$head_tree" ]; then
+            touch "$gitdir/cove/last-save"
+            echo "$head unchanged"
+            return 0
+        fi
+    fi
+
+    local subject wp_version
+    subject="$note"
+    [ -n "$subject" ] || subject=$([ "$auto" == "1" ] && echo "Nightly save" || echo "Save")
+    wp_version=$(sed -n "s/^\$wp_version = '\([^']*\)';/\1/p" "$site_dir/public/wp-includes/version.php" 2>/dev/null | head -n 1)
+    local body="Auto: $auto"
+    [ -n "$wp_version" ] && body="$body"$'\n'"WP: $wp_version"
+    [ -n "$manifest_note" ] && body="$body"$'\n'"Note: $manifest_note"
+    local commit
+    if [ -n "$head" ]; then
+        commit=$(history_git "$gitdir" commit-tree "$tree" -p "$head" -m "$subject" -m "$body")
+    else
+        commit=$(history_git "$gitdir" commit-tree "$tree" -m "$subject" -m "$body")
+    fi
+    [ -n "$commit" ] || { gum style --foreground red "❌ Error: git commit-tree failed." >&2; return 1; }
+    history_git "$gitdir" update-ref HEAD "$commit" "${head:-}" || return 1
+    touch "$gitdir/cove/last-save"
+    # Summarise now, while the diff is small, and tidy the object store
+    # once it has grown enough for git to care.
+    history_summary "$site_name" "$commit" >/dev/null
+    history_git "$gitdir" gc --auto -q 2>/dev/null || true
+    echo "$commit new"
+}
+
+# What changed in one save, as JSON — computed once and cached under
+# .git/cove/. Components are compared through manifest.tsv (version and
+# status before and after) and through the file diff grouped by folder.
+history_summary() {
+    local site_name="$1" hash="$2"
+    local gitdir; gitdir=$(history_gitdir "$site_name")
+    hash=$(history_git "$gitdir" rev-parse --verify -q "$hash^{commit}" 2>/dev/null) || return 1
+    local cache="$gitdir/cove/summary-$hash.json"
+    if [ -s "$cache" ]; then cat "$cache"; return 0; fi
+    mkdir -p "$gitdir/cove"
+    local parent; parent=$(history_git "$gitdir" rev-parse --verify -q "$hash^" 2>/dev/null)
+    local initial=false base="$parent"
+    [ -n "$parent" ] || { initial=true; base="$HISTORY_EMPTY_TREE"; }
+    {
+        [ -n "$parent" ] && history_git "$gitdir" show "$parent:manifest.tsv" 2>/dev/null
+        echo $'\x1e'
+        history_git "$gitdir" show "$hash:manifest.tsv" 2>/dev/null
+        echo $'\x1e'
+        history_git "$gitdir" diff --name-status --no-renames "$base" "$hash" 2>/dev/null
+    } | awk -F '\t' -v hash="$hash" -v short="$(echo "$hash" | cut -c1-7)" -v parent="$parent" -v initial="$initial" '
+        function jesc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/\r/, "", s); return s }
+        function ctype(t) { return t == "plugin" ? "plugins" : (t == "theme" ? "themes" : (t == "mu-plugin" ? "mu-plugins" : t)) }
+        function ptype(d) { return d == "plugins" ? "plugin" : (d == "themes" ? "theme" : (d == "mu-plugins" ? "mu-plugin" : d)) }
+        function note(k) { if (!(k in seen)) { seen[k] = 1; order[++n] = k } }
+        function vercmp(a, b,   i, x, y, na, nb) { na = split(a, x, "."); nb = split(b, y, "."); for (i = 1; i <= (na > nb ? na : nb); i++) { if ((x[i] + 0) != (y[i] + 0)) return (x[i] + 0) < (y[i] + 0) ? -1 : 1 } return 0 }
+        BEGIN { part = 1; n = 0 }
+        $0 == "\036" { part++; next }
+        part == 1 && NF >= 4 { k = ctype($1) "/" $2; if ($1 == "core") { ocore = $3; next } ov[k] = $3; os[k] = $4; ot[k] = $5; note(k); next }
+        part == 2 && NF >= 4 { k = ctype($1) "/" $2; if ($1 == "core") { ncore = $3; next } nv[k] = $3; ns[k] = $4; nt[k] = $5; note(k); next }
+        part == 3 && NF >= 2 {
+            st = $1; p = $2
+            if (p == "manifest.tsv") { manifest = 1; next }
+            m = split(p, seg, "/")
+            if (m < 2) next
+            comp = seg[2]
+            k = seg[1] "/" comp
+            if (m == 2) {
+                # A loose file: a single-file plugin when the manifest knows
+                # it (hello.php → plugins/hello), otherwise just a file.
+                k2 = k; sub(/\.php$/, "", k2)
+                if ((k2 in nv) || (k2 in ov)) k = k2; else loose[k] = 1
+            }
+            note(k)
+            if (st == "A") { fa[k]++; ta++ } else if (st == "D") { fd[k]++; td++ } else { fm[k]++; tm++ }
+            if (nf[k] + 0 < 40) { files[k, nf[k] + 0] = p; nf[k]++ }
+            tf[k]++
+        }
+        END {
+            printf "{\"hash\":\"%s\",\"id\":\"%s\",\"parent\":%s,\"initial\":%s,\"manifest\":%s,", hash, short, (parent == "" ? "null" : "\"" parent "\""), initial, (manifest ? "true" : "false")
+            if (ocore != ncore && (ocore != "" || ncore != "")) printf "\"core\":{\"version\":\"%s\",\"version_from\":\"%s\"},", jesc(ncore), jesc(ocore)
+            printf "\"files\":{\"added\":%d,\"modified\":%d,\"deleted\":%d},\"components\":[", ta, tm, td
+            np = 0; nth = 0; for (k in nv) { if (k ~ /^plugins\//) np++; else if (k ~ /^themes\//) nth++ }
+            first = 1; shown = 0; more = 0
+            for (i = 1; i <= n; i++) {
+                k = order[i]
+                inold = (k in ov); innew = (k in nv); touched = (k in tf)
+                if (!touched && inold && innew && ov[k] == nv[k] && os[k] == ns[k] && ot[k] == nt[k]) continue
+                split(k, kk, "/")
+                if (innew || inold) {
+                    if (!inold && innew) change = "new"
+                    else if (inold && !innew) change = "deleted"
+                    else if (ov[k] != nv[k]) change = (vercmp(nv[k], ov[k]) < 0 ? "downgraded" : "updated")
+                    else if (touched) change = "changed"
+                    else change = "status"
+                } else {
+                    if (fa[k] > 0 && fm[k] == 0 && fd[k] == 0) change = "new"
+                    else if (fd[k] > 0 && fm[k] == 0 && fa[k] == 0) change = "deleted"
+                    else change = "changed"
+                }
+                if (!first) printf ","
+                first = 0
+                title = innew ? nt[k] : (inold ? ot[k] : kk[2])
+                printf "{\"path\":\"%s\",\"type\":\"%s\",\"slug\":\"%s\",\"title\":\"%s\",\"change\":\"%s\",\"version\":\"%s\",\"version_from\":\"%s\",\"status\":\"%s\",\"status_from\":\"%s\",\"added\":%d,\"modified\":%d,\"deleted\":%d,\"files\":[", jesc(k), (k in loose) ? "file" : ptype(kk[1]), jesc(kk[2]), jesc(title), change, jesc(nv[k]), jesc(ov[k]), jesc(ns[k]), jesc(os[k]), fa[k], fm[k], fd[k]
+                for (j = 0; j < nf[k]; j++) printf "%s\"%s\"", (j ? "," : ""), jesc(files[k, j])
+                printf "]%s}", (tf[k] > nf[k] ? ",\"more_files\":" (tf[k] - nf[k]) : "")
+                # A short line for the list: the first three, then "+N more".
+                if (shown < 3) {
+                    label = title != "" ? title : kk[2]
+                    if (change == "new") piece = "+ " label (nv[k] != "" ? " " nv[k] : "")
+                    else if (change == "deleted") piece = "− " label
+                    else if (change == "updated" || change == "downgraded") piece = label " " ov[k] " → " nv[k]
+                    else if (change == "status") piece = label " " (ns[k] == "inactive" ? "deactivated" : (ns[k] ~ /active/ ? "activated" : ns[k]))
+                    else piece = label " edited (" tf[k] " file" (tf[k] == 1 ? "" : "s") ")"
+                    summary = summary (shown ? " · " : "") piece
+                    shown++
+                } else more++
+            }
+            printf "]"
+            if (initial == "true") { summary = "First save" ((np + nth) ? " — " np " plugin" (np == 1 ? "" : "s") ", " nth " theme" (nth == 1 ? "" : "s") : "") }
+            else if (more > 0) summary = summary " · +" more " more"
+            else if (summary == "") summary = (ocore != ncore && ncore != "") ? "WordPress " ocore " → " ncore : (manifest ? "Versions or settings only" : "No component changes")
+            if (ocore != ncore && ncore != "" && initial != "true" && summary !~ /^WordPress/) summary = "WordPress " ocore " → " ncore " · " summary
+            printf ",\"summary\":\"%s\"}\n", jesc(summary)
+        }' > "$cache.tmp" && mv -f "$cache.tmp" "$cache"
+    cat "$cache"
+}
+
+# Every save, newest first, as JSON: metadata from the commit plus its summary.
+history_list_json() {
+    local site_name="$1" limit="${2:-0}"
+    local gitdir; gitdir=$(history_gitdir "$site_name")
+    printf '['
+    if [ -d "$gitdir/objects" ] && history_git "$gitdir" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        local args=(log --format='%H%x1f%ct%x1f%s%x1f%b%x1e')
+        [ "$limit" -gt 0 ] 2>/dev/null && args+=(-n "$limit")
+        local first=1 rec hash created subject body auto wp
+        while IFS= read -r -d $'\x1e' rec; do
+            rec="${rec#$'\n'}"
+            hash="${rec%%$'\x1f'*}"; rec="${rec#*$'\x1f'}"
+            created="${rec%%$'\x1f'*}"; rec="${rec#*$'\x1f'}"
+            subject="${rec%%$'\x1f'*}"; body="${rec#*$'\x1f'}"
+            [ -n "$hash" ] || continue
+            auto=false
+            printf '%s\n' "$body" | grep -q '^Auto: 1' && auto=true
+            wp=$(printf '%s\n' "$body" | sed -n 's/^WP: //p' | head -n 1)
+            [ $first -eq 1 ] || printf ','
+            first=0
+            printf '{"hash":"%s","id":"%s","created":%s,"note":"%s","auto":%s,"wp":"%s","summary":%s}' \
+                "$hash" "$(echo "$hash" | cut -c1-7)" "${created:-0}" "$(snapshot_json_escape "$subject")" "$auto" "$(snapshot_json_escape "$wp")" "$(history_summary "$site_name" "$hash")"
+        done < <(history_git "$gitdir" "${args[@]}")
+    fi
+    printf ']\n'
+}
+
+# Resolve a user-typed id (abbreviated hash, HEAD, latest) to a full hash.
+history_resolve() {
+    local gitdir="$1" id="$2"
+    case "$id" in
+        latest|HEAD|head) id="HEAD" ;;
+    esac
+    history_git "$gitdir" rev-parse --verify -q "$id^{commit}" 2>/dev/null
+}
+
+# Where a component lives in a commit: plugins/<slug>, or plugins/<slug>.php
+# for a single-file plugin. Prints the path found.
+history_component_path() {
+    local gitdir="$1" hash="$2" target="$3"
+    if history_git "$gitdir" cat-file -e "$hash:$target" 2>/dev/null; then echo "$target"; return 0; fi
+    if history_git "$gitdir" cat-file -e "$hash:$target.php" 2>/dev/null; then echo "$target.php"; return 0; fi
+    return 1
+}
+
+# Put one path from a commit back into the live wp-content. Prints one word:
+# restored | linked | skipped-symlink | skipped-git. A live folder's
+# node_modules (never saved) is carried into the restored copy; with force,
+# so is a nested .git, which then simply sees the rollback as local changes.
+history_restore_path() {
+    local gitdir="$1" hash="$2" rp="$3" content="$4" force="${5:-0}"
+    local live="$content/$rp"
+    if [ -L "$live" ]; then echo "skipped-symlink"; return 1; fi
+    if [ -d "$live/.git" ] && [ "$force" != "1" ]; then echo "skipped-git"; return 1; fi
+    local mode; mode=$(history_git "$gitdir" ls-tree "$hash" -- "$rp" | awk '{print $1; exit}')
+    [ -n "$mode" ] || { echo "missing"; return 1; }
+    mkdir -p "$(dirname "$live")"
+    if [ "$mode" == "120000" ]; then
+        local target; target=$(history_git "$gitdir" show "$hash:$rp")
+        rm -rf "$live"
+        ln -s "$target" "$live" && { echo "linked"; return 0; }
+        echo "failed"; return 1
+    fi
+    local staging; staging=$(mktemp -d "$content/.cove-rollback.XXXXXX") || { echo "failed"; return 1; }
+    if [ "$mode" == "040000" ]; then
+        if ! history_git "$gitdir" archive --format=tar "$hash" "$rp" | tar -xf - -C "$staging"; then rm -rf "$staging"; echo "failed"; return 1; fi
+    else
+        mkdir -p "$staging/$(dirname "$rp")"
+        history_git "$gitdir" show "$hash:$rp" > "$staging/$rp" || { rm -rf "$staging"; echo "failed"; return 1; }
+        [ "$mode" == "100755" ] && chmod +x "$staging/$rp"
+    fi
+    if [ -d "$live" ] && [ -d "$staging/$rp" ]; then
+        local keep
+        for keep in node_modules .git; do
+            [ -e "$live/$keep" ] && [ ! -e "$staging/$rp/$keep" ] && mv "$live/$keep" "$staging/$rp/$keep"
+        done
+    fi
+    local old="$content/.cove-rollback-old.$$"
+    rm -rf "$old"
+    if [ -e "$live" ]; then mv "$live" "$old" || { rm -rf "$staging"; echo "failed"; return 1; }; fi
+    if ! mv "$staging/$rp" "$live"; then
+        [ -e "$old" ] && mv "$old" "$live"
+        rm -rf "$staging"; echo "failed"; return 1
+    fi
+    rm -rf "$old" "$staging"
+    echo "restored"
+}
+
+# history_rollback <site> <hash> <target> <force> <format>
+#   target: all | plugins/<slug> | themes/<slug> | mu-plugins/<name> | file:<path>
+# Saves the current state first (so the rollback can be undone), then swaps
+# the component(s) in place. Progress on stderr; the result JSON on stdout
+# when format=json.
+history_rollback() {
+    local site_name="$1" hash="$2" target="$3" force="${4:-0}" format="${5:-table}"
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    local gitdir content
+    gitdir=$(history_gitdir "$site_name")
+    content=$(history_content "$site_name")
+    local short; short=$(echo "$hash" | cut -c1-7)
+
+    # What is being asked for has to exist in that save before anything moves.
+    local rp=""
+    if [[ "$target" == file:* ]]; then
+        rp="${target#file:}"
+        if ! history_git "$gitdir" cat-file -e "$hash:$rp" 2>/dev/null; then
+            gum style --foreground red "❌ Error: '$rp' is not in save $short." >&2
+            return 1
+        fi
+    elif [ "$target" != "all" ]; then
+        if ! rp=$(history_component_path "$gitdir" "$hash" "$target"); then
+            gum style --foreground red "❌ Error: '$target' is not in save $short." "Was it added later? Pick a save that has it, or check: cove history $site_name show $short" >&2
+            return 1
+        fi
+        if [ -L "$content/$rp" ]; then
+            gum style --foreground red "❌ Error: $rp is a symlink to a checkout elsewhere; Cove will not replace it." >&2
+            return 1
+        fi
+        if [ -d "$content/$rp/.git" ] && [ "$force" != "1" ]; then
+            gum style --foreground red "❌ Error: $rp holds its own .git; add --force to roll it back anyway (the .git folder is kept, so the rollback shows up as local changes)." >&2
+            return 1
+        fi
+    fi
+
+    echo "💾 Saving the current state first…" >&2
+    local saved; saved=$(history_save "$site_name" "Before rolling back to $short" 1 0 0) || return 1
+    saved="${saved##*$'\n'}"
+    local safety="${saved%% *}"
+    echo "   Saved as $(echo "$safety" | cut -c1-7)." >&2
+
+    local restored="" deleted="" skipped="" res
+    local rc=0
+    if [ "$target" == "all" ]; then
+        local d name in_commit live_list
+        for d in plugins themes mu-plugins; do
+            in_commit=$(history_git "$gitdir" ls-tree --name-only "$hash" "$d/" 2>/dev/null)
+            # A folder the save knows nothing about is left as it is.
+            [ -n "$in_commit" ] || continue
+            echo "   Restoring $d/…" >&2
+            while IFS= read -r rp; do
+                [ -n "$rp" ] || continue
+                res=$(history_restore_path "$gitdir" "$hash" "$rp" "$content" "$force")
+                case "$res" in
+                    restored|linked) restored="$restored"$'\n'"$rp" ;;
+                    skipped-*) skipped="$skipped"$'\n'"$rp:${res#skipped-}" ;;
+                    *) skipped="$skipped"$'\n'"$rp:failed"; rc=1 ;;
+                esac
+            done <<< "$in_commit"
+            # Components on disk that the save did not have go, unless they
+            # are a link or a checkout of their own — those are yours.
+            if [ -d "$content/$d" ]; then
+                live_list=$(cd "$content/$d" && ls -A1 2>/dev/null)
+                while IFS= read -r name; do
+                    [ -n "$name" ] || continue
+                    case "$name" in .DS_Store|error_log|*.log|Thumbs.db|.cove-rollback*) continue ;; esac
+                    rp="$d/$name"
+                    printf '%s\n' "$in_commit" | grep -qxF -- "$rp" && continue
+                    if [ -L "$content/$rp" ]; then skipped="$skipped"$'\n'"$rp:symlink"; continue; fi
+                    if [ -d "$content/$rp/.git" ] && [ "$force" != "1" ]; then skipped="$skipped"$'\n'"$rp:git"; continue; fi
+                    rm -rf "$content/$rp" && deleted="$deleted"$'\n'"$rp"
+                done <<< "$live_list"
+            fi
+        done
+    else
+        echo "   Restoring ${rp}…" >&2
+        res=$(history_restore_path "$gitdir" "$hash" "$rp" "$content" "$force")
+        case "$res" in
+            restored|linked) restored="$rp" ;;
+            skipped-symlink) gum style --foreground red "❌ Error: $rp is a symlink to a checkout elsewhere; Cove will not replace it." >&2; return 1 ;;
+            skipped-git) gum style --foreground red "❌ Error: $rp holds its own .git; add --force to roll it back anyway." >&2; return 1 ;;
+            *) gum style --foreground red "❌ Error: Could not restore $rp." >&2; return 1 ;;
+        esac
+    fi
+
+    if [ -f "$site_dir/public/wp-config.php" ]; then
+        local wp_cmd; wp_cmd=$(get_wp_cmd "$site_dir")
+        (cd "$site_dir/public" && $wp_cmd cache flush --skip-plugins --skip-themes >/dev/null 2>&1) || true
+    fi
+
+    # Record the result too, so the history reads as what actually happened
+    # and the next save compares against the state that is really on disk.
+    echo "   Saving the rolled-back state…" >&2
+    local after; after=$(history_save "$site_name" "Rolled back $([ "$target" == "all" ] && echo "everything" || echo "${target#file:}") to $short" 1 0 0 2>/dev/null) || true
+    after="${after##*$'\n'}"
+
+    restored="${restored#$'\n'}"; deleted="${deleted#$'\n'}"; skipped="${skipped#$'\n'}"
+    if [ "$format" == "json" ]; then
+        local j_r j_d j_s line
+        j_r=$(printf '%s\n' "$restored" | awk 'NF' | while IFS= read -r line; do printf '"%s",' "$(snapshot_json_escape "$line")"; done)
+        j_d=$(printf '%s\n' "$deleted" | awk 'NF' | while IFS= read -r line; do printf '"%s",' "$(snapshot_json_escape "$line")"; done)
+        j_s=$(printf '%s\n' "$skipped" | awk 'NF' | while IFS= read -r line; do printf '{"path":"%s","reason":"%s"},' "$(snapshot_json_escape "${line%:*}")" "${line##*:}"; done)
+        printf '{"rolled_back":"%s","safety":"%s","after":"%s","restored":[%s],"deleted":[%s],"skipped":[%s]}\n' "$hash" "$safety" "${after%% *}" "${j_r%,}" "${j_d%,}" "${j_s%,}"
+    else
+        local n_r n_d n_s
+        n_r=$(printf '%s\n' "$restored" | awk 'NF' | wc -l | tr -d ' ')
+        n_d=$(printf '%s\n' "$deleted" | awk 'NF' | wc -l | tr -d ' ')
+        n_s=$(printf '%s\n' "$skipped" | awk 'NF' | wc -l | tr -d ' ')
+        local lines=("✅ Rolled back to $short" "$n_r restored$([ "$n_d" -gt 0 ] && echo ", $n_d removed")$([ "$n_s" -gt 0 ] && echo ", $n_s skipped")")
+        [ "$n_s" -gt 0 ] && lines+=("Skipped (symlinks and checkouts of their own): $(printf '%s\n' "$skipped" | awk 'NF' | sed 's/:.*//' | tr '\n' ' ')")
+        lines+=("The state from just before is save $(echo "$safety" | cut -c1-7) — roll back to it to undo.")
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "${lines[@]}"
+    fi
+    return $rc
+}
+
+# Save every site that changed since its last save. Runs from the watchdog
+# nightly (idle-only), or by hand: cove history --sweep.
+history_sweep() {
+    local idle_only="$1" force="$2" max="$3" quiet="$4"
+    local lock="$COVE_DIR/.history-sweep.lock"
+    local done_stamp="$COVE_DIR/.history.done"
+    local log="$LOGS_DIR/history.log"
+    mkdir -p "$COVE_DIR" "$LOGS_DIR"
+    if [ -f "$lock" ]; then
+        local lpid; lpid=$(cat "$lock" 2>/dev/null)
+        if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
+            [ "$quiet" == "1" ] || echo "ℹ️  A history sweep is already running (pid $lpid)."
+            return 0
+        fi
+    fi
+    # Idle-only sweeps wait for a quiet desktop — but never more than a day
+    # and a half, so a machine that is busy every night still gets saved.
+    local last_done; last_done=$(cat "$done_stamp" 2>/dev/null || echo 0)
+    local overdue=0
+    [ $(( $(date +%s) - ${last_done:-0} )) -ge 129600 ] && overdue=1
+    if [ "$idle_only" == "1" ] && [ "$overdue" -eq 0 ] && ! cove_user_is_idle; then return 0; fi
+    echo $$ > "$lock"
+    trap 'rm -f "$lock"' EXIT
+    local ts site_path name saved state count=0 n_new=0 n_same=0 n_skip=0 complete=1
+    for site_path in "$SITES_DIR"/*/; do
+        site_path="${site_path%/}"
+        [ -d "$site_path/public/wp-content" ] || continue
+        name=$(basename "$site_path"); name="${name%.localhost}"
+        [ -n "$(history_dirs "$site_path/public/wp-content")" ] || continue
+        if [ "$max" -gt 0 ] 2>/dev/null && [ "$count" -ge "$max" ]; then complete=0; break; fi
+        if [ "$idle_only" == "1" ] && [ "$overdue" -eq 0 ] && ! cove_user_is_idle; then complete=0; break; fi
+        count=$((count + 1))
+        ts=$(date '+%Y-%m-%dT%H:%M:%S%z')
+        if saved=$(history_save "$name" "" 1 "$force" 1 2>/dev/null); then
+            saved="${saved##*$'\n'}"
+            state="${saved#* }"
+            if [ "$state" == "new" ]; then
+                n_new=$((n_new + 1))
+                echo "[$ts] $name: saved $(echo "${saved%% *}" | cut -c1-7)" >> "$log"
+                [ "$quiet" == "1" ] || echo "   💾 $name — saved $(echo "${saved%% *}" | cut -c1-7)"
+            else
+                n_same=$((n_same + 1))
+                [ "$quiet" == "1" ] || echo "   · $name — unchanged"
+            fi
+        else
+            n_skip=$((n_skip + 1))
+            echo "[$ts] $name: save failed" >> "$log"
+            [ "$quiet" == "1" ] || echo "   ⚠️  $name — save failed"
+        fi
+    done
+    if [ "$complete" -eq 1 ]; then date +%s > "$done_stamp"; fi
+    ts=$(date '+%Y-%m-%dT%H:%M:%S%z')
+    echo "[$ts] sweep: $count sites checked, $n_new saved, $n_same unchanged, $n_skip failed$([ "$complete" -eq 1 ] || echo ' (stopped early)')" >> "$log"
+    [ "$quiet" == "1" ] || echo "✅ $count site$([ "$count" -eq 1 ] || echo s) checked: $n_new saved, $n_same unchanged$([ "$n_skip" -gt 0 ] && echo ", $n_skip failed")."
+    # A 50MB cap on the log; a nightly line per site never gets there, a
+    # stuck loop might.
+    local lsize; lsize=$(stat -f%z "$log" 2>/dev/null || stat -c%s "$log" 2>/dev/null || echo 0)
+    if [ "$lsize" -gt 52428800 ]; then tail -c 5242880 "$log" > "$log.tmp" && mv "$log.tmp" "$log"; fi
+}
+
+history_human_size() {
+    awk -v b="$1" 'BEGIN{ s="B"; if (b>=1073741824){b/=1073741824; s="GB"} else if (b>=1048576){b/=1048576; s="MB"} else if (b>=1024){b/=1024; s="KB"}; printf (b>=10||s=="B") ? "%d %s" : "%.1f %s", b, s }'
+}
+
+cove_history() {
+    local site_name="" sub="" id="" note="" format="table" target="" force=0 sweep=0 idle_only=0 max=0 quiet=0 limit=0 stat_only=0
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --note=*)      note="${arg#*=}" ;;
+            --format=*)    format="${arg#*=}" ;;
+            --json)        format="json" ;;
+            --plugin=*)    target="plugins/${arg#*=}" ;;
+            --theme=*)     target="themes/${arg#*=}" ;;
+            --mu-plugin=*) target="mu-plugins/${arg#*=}" ;;
+            --file=*)      target="file:${arg#*=}" ;;
+            --target=*)    target="${arg#*=}" ;;
+            --all)         target="all" ;;
+            --force)       force=1 ;;
+            --sweep)       sweep=1 ;;
+            --idle-only)   idle_only=1 ;;
+            --max=*)       max="${arg#*=}" ;;
+            --limit=*)     limit="${arg#*=}" ;;
+            --quiet)       quiet=1 ;;
+            --stat)        stat_only=1 ;;
+            -h|--help)
+                echo "Usage: cove history <site>                         list the saves"
+                echo "       cove history <site> save [--note=\"…\"] [--force]"
+                echo "       cove history <site> show <id>               what changed in one save"
+                echo "       cove history <site> diff <id> [--plugin=<slug>|--theme=<slug>|--file=<path>] [--stat]"
+                echo "       cove history <site> rollback <id> (--plugin=<slug>|--theme=<slug>|--mu-plugin=<name>|--file=<path>|--all) [--force]"
+                echo "       cove history --sweep [--idle-only] [--max=N] [--force]"
+                echo ""
+                echo "A git record of a site's plugins, themes and mu-plugins at <site>/history/,"
+                echo "saved nightly while the desktop is idle and whenever you ask. Each save"
+                echo "carries every component's version and status, so a listing reads like a"
+                echo "changelog, and any plugin or theme — or all of them — can be rolled back to"
+                echo "how it was on a given day. A rollback saves the current state first, so it"
+                echo "can itself be undone. Symlinked components and folders with their own .git"
+                echo "are left alone unless --force. Ids are the short hashes the list shows;"
+                echo "'latest' and HEAD~1 work too. --format=json for scripts."
+                return
+                ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                exit 1
+                ;;
+            *)
+                if [ -z "$site_name" ]; then site_name="$arg"
+                elif [ -z "$sub" ]; then sub="$arg"
+                elif [ -z "$id" ]; then id="$arg"
+                elif [ -z "$target" ]; then target="$arg"
+                fi
+                ;;
+        esac
+    done
+
+    if ! history_has_git; then
+        if [ "$format" == "json" ]; then echo '{"success":false,"message":"git is not installed."}'; else
+            gum style --foreground red "❌ Error: History needs git, which was not found." "Install git (Xcode command line tools on macOS; apt/dnf on Linux) and try again."; fi
+        exit 1
+    fi
+
+    if [ "$sweep" -eq 1 ]; then
+        [[ "$max" =~ ^[0-9]+$ ]] || max=0
+        history_sweep "$idle_only" "$force" "$max" "$quiet"
+        return
+    fi
+
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove history <site> [save|show <id>|diff <id>|rollback <id> …]   ·   cove history --sweep"
+        exit 1
+    fi
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if [ ! -d "$site_dir/public" ]; then
+        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
+        exit 1
+    fi
+    local gitdir content
+    gitdir=$(history_gitdir "$site_name")
+    content=$(history_content "$site_name")
+    [ -z "$sub" ] && sub="list"
+    if [ -n "$id" ] && ! [[ "$id" =~ ^([0-9a-fA-F]{4,40}|HEAD(~[0-9]+)?|latest|head)$ ]]; then
+        gum style --foreground red "❌ Error: '$id' is not a save id."
+        exit 1
+    fi
+    if [ -n "$target" ] && [ "$target" != "all" ] && ! [[ "$target" =~ ^(plugins|themes|mu-plugins)/[A-Za-z0-9._-]+$ || "$target" =~ ^file:(plugins|themes|mu-plugins)/[^[:cntrl:]]+$ ]]; then
+        gum style --foreground red "❌ Error: '$target' is not a component. Use --plugin=<slug>, --theme=<slug>, --mu-plugin=<name>, --file=<path>, or --all."
+        exit 1
+    fi
+    if [[ "$target" == file:* ]] && [[ "$target" == *..* ]]; then
+        gum style --foreground red "❌ Error: '$target' is not a component path."
+        exit 1
+    fi
+
+    case "$sub" in
+        save|create)
+            if [ ! -d "$content" ] || [ -z "$(history_dirs "$content")" ]; then
+                if [ "$format" == "json" ]; then echo '{"success":false,"message":"This site has no wp-content/plugins or themes to save."}'; else
+                    gum style --foreground red "❌ Error: '$site_name.localhost' has no wp-content/plugins or themes to save."; fi
+                exit 1
+            fi
+            [ "$format" == "json" ] || echo "💾 Saving '$site_name.localhost'…" >&2
+            local out; out=$(history_save "$site_name" "$note" 0 "$force" 0) || exit 1
+            out="${out##*$'\n'}"
+            local hash="${out%% *}" state="${out#* }"
+            if [ "$format" == "json" ]; then
+                printf '{"state":"%s","hash":"%s","id":"%s","summary":%s}\n' "$state" "$hash" "$(echo "$hash" | cut -c1-7)" "$(history_summary "$site_name" "$hash")"
+            elif [ "$state" == "unchanged" ]; then
+                gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✓ Nothing changed since save $(echo "$hash" | cut -c1-7)" "Add --force to record a save anyway."
+            else
+                local summary; summary=$(history_summary "$site_name" "$hash" | sed -n 's/.*"summary":"\(.*\)"}$/\1/p' | sed 's/\\"/"/g')
+                gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Saved $(echo "$hash" | cut -c1-7)" "$summary" "Roll back with: cove history $site_name rollback $(echo "$hash" | cut -c1-7) --plugin=<slug>"
+            fi
+            ;;
+        list)
+            [[ "$limit" =~ ^[0-9]+$ ]] || limit=0
+            if [ "$format" == "json" ]; then history_list_json "$site_name" "$limit"; return; fi
+            if [ ! -d "$gitdir/objects" ] || ! history_git "$gitdir" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+                echo "ℹ️  No saves for '$site_name.localhost' yet. The nightly sweep makes the first one, or: cove history $site_name save"
+                return
+            fi
+            printf "  %-8s  %-17s  %s\n" "ID" "SAVED" "WHAT CHANGED"
+            local rec hash created subject body auto summary
+            while IFS= read -r -d $'\x1e' rec; do
+                rec="${rec#$'\n'}"
+                hash="${rec%%$'\x1f'*}"; rec="${rec#*$'\x1f'}"
+                created="${rec%%$'\x1f'*}"; rec="${rec#*$'\x1f'}"
+                subject="${rec%%$'\x1f'*}"; body="${rec#*$'\x1f'}"
+                [ -n "$hash" ] || continue
+                auto=""; printf '%s\n' "$body" | grep -q '^Auto: 1' && auto=" (auto)"
+                summary=$(history_summary "$site_name" "$hash" | sed -n 's/.*"summary":"\(.*\)"}$/\1/p' | sed 's/\\"/"/g')
+                printf "  %-8s  %-17s  %s%s\n" "$(echo "$hash" | cut -c1-7)" "$(date -r "${created:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@${created:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null)" "$summary" "$([ "$subject" != "Nightly save" ] && [ "$subject" != "Save" ] && echo " — $subject")$auto"
+            done < <(history_git "$gitdir" log --format='%H%x1f%ct%x1f%s%x1f%b%x1e' $( [ "$limit" -gt 0 ] && echo "-n $limit" ))
+            local size; size=$(du -sk "$gitdir" 2>/dev/null | cut -f1)
+            echo ""
+            local n_saves; n_saves=$(history_git "$gitdir" rev-list --count HEAD)
+            echo "  $n_saves save$([ "$n_saves" -eq 1 ] || echo s) · $(history_human_size $(( ${size:-0} * 1024 ))) in $(dirname "$gitdir")"
+            ;;
+        show)
+            [ -n "$id" ] || { gum style --foreground red "❌ Error: Which save? cove history $site_name show <id>"; exit 1; }
+            local hash; hash=$(history_resolve "$gitdir" "$id") || { gum style --foreground red "❌ Error: No save '$id'."; exit 1; }
+            if [ "$format" == "json" ]; then history_summary "$site_name" "$hash"; echo; return; fi
+            history_git "$gitdir" log -n 1 --format='%h  %ad  %s%n%b' --date=format:'%Y-%m-%d %H:%M' "$hash" | sed 's/^/  /' | awk 'NF'
+            echo ""
+            history_summary "$site_name" "$hash" | tr -d '\n' | sed 's/^.*"components":\[//; s/\],"summary".*$//' | awk '{ gsub(/\},\{/, "}\n{"); print }' | awk 'NF' | while IFS= read -r c; do
+                local ttl slug chg vf vt sf st fa fm fd
+                ttl=$(printf '%s' "$c" | sed -n 's/.*"title":"\([^"]*\)".*/\1/p'); slug=$(printf '%s' "$c" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
+                chg=$(printf '%s' "$c" | sed -n 's/.*"change":"\([^"]*\)".*/\1/p'); vt=$(printf '%s' "$c" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p'); vf=$(printf '%s' "$c" | sed -n 's/.*"version_from":"\([^"]*\)".*/\1/p')
+                st=$(printf '%s' "$c" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p'); sf=$(printf '%s' "$c" | sed -n 's/.*"status_from":"\([^"]*\)".*/\1/p')
+                fa=$(printf '%s' "$c" | sed -n 's/.*"added":\([0-9]*\).*/\1/p'); fm=$(printf '%s' "$c" | sed -n 's/.*"modified":\([0-9]*\).*/\1/p'); fd=$(printf '%s' "$c" | sed -n 's/.*"deleted":\([0-9]*\).*/\1/p')
+                local ver="" files=""
+                [ -n "$vf$vt" ] && { if [ "$vf" != "$vt" ]; then ver="${vf:-—} → ${vt:-—}"; else ver="$vt"; fi; }
+                [ "$sf" != "$st" ] && [ -n "$sf$st" ] && ver="$ver${ver:+ · }${sf:-—} → ${st:-—}"
+                files="+$fa ~$fm −$fd"
+                printf "  %-11s %-40s %-22s %s\n" "$chg" "${ttl:-$slug} ($slug)" "$ver" "$files"
+            done
+            echo ""
+            echo "  Files: +added ~modified −deleted. Diff one: cove history $site_name diff $(echo "$hash" | cut -c1-7) --plugin=<slug>"
+            ;;
+        diff)
+            [ -n "$id" ] || { gum style --foreground red "❌ Error: Which save? cove history $site_name diff <id>"; exit 1; }
+            local hash; hash=$(history_resolve "$gitdir" "$id") || { gum style --foreground red "❌ Error: No save '$id'."; exit 1; }
+            local parent; parent=$(history_git "$gitdir" rev-parse --verify -q "$hash^" 2>/dev/null)
+            [ -n "$parent" ] || parent="$HISTORY_EMPTY_TREE"
+            local -a dargs=(diff --no-renames)
+            [ -t 1 ] && [ "$format" != "json" ] && dargs+=(--color=always)
+            [ "$stat_only" -eq 1 ] && dargs+=(--stat)
+            dargs+=("$parent" "$hash")
+            if [ -n "$target" ] && [ "$target" != "all" ]; then
+                local rp
+                if [[ "$target" == file:* ]]; then rp="${target#file:}"; else rp=$(history_component_path "$gitdir" "$hash" "$target" 2>/dev/null || history_component_path "$gitdir" "$parent" "$target" 2>/dev/null || echo "$target"); fi
+                dargs+=(-- "$rp")
+            fi
+            history_git "$gitdir" "${dargs[@]}"
+            ;;
+        rollback|restore)
+            [ -n "$id" ] || { gum style --foreground red "❌ Error: Which save? cove history $site_name rollback <id> --plugin=<slug>"; exit 1; }
+            if [ -z "$target" ]; then
+                gum style --foreground red "❌ Error: Roll back what? --plugin=<slug>, --theme=<slug>, --mu-plugin=<name>, --file=<path>, or --all."
+                exit 1
+            fi
+            local hash; hash=$(history_resolve "$gitdir" "$id") || { gum style --foreground red "❌ Error: No save '$id'."; exit 1; }
+            [ "$format" == "json" ] || echo "⏪ Rolling back $([ "$target" == "all" ] && echo "plugins, themes and mu-plugins" || echo "$target") on '$site_name.localhost' to $(echo "$hash" | cut -c1-7)…" >&2
+            history_rollback "$site_name" "$hash" "$target" "$force" "$format"
+            ;;
+        *)
+            gum style --foreground red "❌ Error: Unknown subcommand '$sub'."
+            echo "Usage: cove history <site> [save|list|show <id>|diff <id>|rollback <id> …]"
+            exit 1
+            ;;
+    esac
+}

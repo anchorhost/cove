@@ -1468,6 +1468,26 @@ if [ \$((now_s - last_s)) -ge 300 ]; then
     nohup nice -n 15 "$watchdog_cove" screenshot --sweep --max=1 --idle-only >/dev/null 2>&1 &
 fi
 
+# History for the dashboard: once a day, from 01:00 local, save every site's
+# plugins, themes and mu-plugins that changed (cove history --sweep). The
+# sweep itself waits for an idle desktop and stamps .history.done when it
+# gets through every site; until then it is tried again every five minutes.
+hist_done="$COVE_DIR/.history.done"
+hist_try="$COVE_DIR/.history.try"
+hist_lock="$COVE_DIR/.history-sweep.lock"
+hist_hhmm=\$((10#\$(date +%H%M)))
+hist_today=\$(date +%Y-%m-%d)
+hist_done_day=\$(date -r "\$(cat "\$hist_done" 2>/dev/null || echo 0)" +%Y-%m-%d 2>/dev/null || date -d "@\$(cat "\$hist_done" 2>/dev/null || echo 0)" +%Y-%m-%d 2>/dev/null)
+hist_last_try=\$(cat "\$hist_try" 2>/dev/null || echo 0)
+if [ "\$hist_hhmm" -ge 100 ] && [ "\$hist_done_day" != "\$hist_today" ] && [ \$((now_s - hist_last_try)) -ge 300 ]; then
+    hist_running=0
+    if [ -f "\$hist_lock" ]; then hist_pid=\$(cat "\$hist_lock" 2>/dev/null); [ -n "\$hist_pid" ] && kill -0 "\$hist_pid" 2>/dev/null && hist_running=1; fi
+    if [ "\$hist_running" -eq 0 ] && command -v git >/dev/null 2>&1; then
+        echo "\$now_s" > "\$hist_try"
+        nohup nice -n 15 "$watchdog_cove" history --sweep --idle-only --quiet >/dev/null 2>&1 &
+    fi
+fi
+
 # Load prior state.
 s_pid=""; s_mode="starting"; s_count=0
 if [ -f "\$state_file" ]; then
@@ -3393,6 +3413,68 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             [$data, $code, $out, $ms] = $__snap(['delete', $id]);
             if ($code !== 0) $__snap_fail($out, 'Could not delete that snapshot.');
             echo json_encode(['success' => true]);
+            exit;
+        case 'site_history':
+        case 'site_history_save':
+        case 'site_history_rollback':
+        case 'site_history_diff':
+            // --- History: `cove history` with --format=json ------------------
+            // The nightly git record of plugins, themes and mu-plugins. Ids
+            // and targets are validated here; the CLI checks them again.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) { echo json_encode(['success' => false, 'message' => 'Invalid site name.']); exit; }
+            $__hist = function (array $args, $json = true) use ($user_home, $cove_path, $site_name) {
+                $cmd = 'HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path) . ' history ' . escapeshellarg($site_name);
+                foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string) $a);
+                $t0 = microtime(true);
+                exec($cmd . ($json ? ' --format=json' : '') . ' 2>&1', $lines, $code);
+                $out = preg_replace('/\x1b\[[0-9;]*m/', '', implode("\n", $lines));
+                $data = null;
+                if ($json) foreach (array_reverse(explode("\n", trim($out))) as $line) { $try = json_decode(trim($line), true); if (is_array($try)) { $data = $try; break; } }
+                return [$data, (int) $code, trim($out), round((microtime(true) - $t0) * 1000)];
+            };
+            $__hist_fail = function ($out, $fallback) { $lines = array_values(array_filter(array_map('trim', explode("\n", $out)))); echo json_encode(['success' => false, 'message' => $lines ? preg_replace('/^[^\w]*(Error: )?/u', '', end($lines)) : $fallback]); exit; };
+            $__hist_id = function ($id) { return is_string($id) && preg_match('/^[0-9a-f]{4,40}$/i', $id); };
+            $__hist_target = function ($t) { return $t === 'all' || (is_string($t) && (preg_match('#^(plugins|themes|mu-plugins)/[A-Za-z0-9._-]+$#', $t) || (preg_match('#^file:(plugins|themes|mu-plugins)/[^\x00-\x1f]+$#', $t) && strpos($t, '..') === false))); };
+            $__hist_dir = $user_home . '/Cove/Sites/' . $site_name . '.localhost/history';
+            if ($action === 'site_history') {
+                if (!is_dir($sitedir . '/' . $site_name . '.localhost/public/wp-content')) { echo json_encode(['success' => true, 'items' => [], 'enabled' => false, 'dir' => $__hist_dir]); exit; }
+                [$data, $code, $out, $ms] = $__hist(['list']);
+                if ($code !== 0 || !is_array($data)) $__hist_fail($out, 'Could not read the history.');
+                $bytes = 0;
+                if (is_dir($__hist_dir . '/.git')) { $du = []; exec('du -sk ' . escapeshellarg($__hist_dir . '/.git') . ' 2>/dev/null', $du); $bytes = ((int) strtok((string) ($du[0] ?? '0'), "\t ")) * 1024; }
+                $done = (int) @file_get_contents($user_home . '/Cove/.history.done');
+                echo json_encode(['success' => true, 'items' => $data, 'enabled' => true, 'ms' => $ms, 'dir' => $__hist_dir, 'bytes' => $bytes, 'last_sweep' => $done ?: null]);
+                exit;
+            }
+            if ($action === 'site_history_save') {
+                $note = trim((string) ($input['note'] ?? ''));
+                if (strlen($note) > 120 || preg_match('/[\x00-\x1f]/', $note)) { echo json_encode(['success' => false, 'message' => 'Keep the note short and on one line.']); exit; }
+                set_time_limit(0);
+                [$data, $code, $out, $ms] = $__hist($note !== '' ? ['save', '--note=' . $note] : ['save']);
+                if ($code !== 0 || !is_array($data)) $__hist_fail($out, 'The save failed.');
+                echo json_encode(['success' => true, 'state' => $data['state'] ?? '', 'id' => $data['id'] ?? '', 'summary' => $data['summary'] ?? null, 'ms' => $ms]);
+                exit;
+            }
+            $id = $input['id'] ?? '';
+            if (!$__hist_id($id)) { echo json_encode(['success' => false, 'message' => 'Invalid save id.']); exit; }
+            $target = $input['target'] ?? '';
+            if ($action === 'site_history_diff') {
+                // Plain text, capped; the browser colours it by line.
+                $args = ['diff', $id];
+                if ($target !== '') { if (!$__hist_target($target) || $target === 'all') { echo json_encode(['success' => false, 'message' => 'Invalid target.']); exit; } $args[] = '--target=' . $target; }
+                set_time_limit(0);
+                [, $code, $out, $ms] = $__hist($args, false);
+                if ($code !== 0) $__hist_fail($out, 'Could not build the diff.');
+                $cap = 300 * 1024; $trunc = strlen($out) > $cap;
+                if ($trunc) $out = substr($out, 0, $cap);
+                echo json_encode(['success' => true, 'diff' => $out, 'truncated' => $trunc, 'ms' => $ms], JSON_INVALID_UTF8_SUBSTITUTE);
+                exit;
+            }
+            if (!$__hist_target($target)) { echo json_encode(['success' => false, 'message' => 'Invalid target.']); exit; }
+            set_time_limit(0);
+            [$data, $code, $out, $ms] = $__hist(['rollback', $id, '--target=' . $target]);
+            if (!is_array($data)) $__hist_fail($out, 'The rollback failed.');
+            echo json_encode(['success' => $code === 0, 'restored' => $data['restored'] ?? [], 'deleted' => $data['deleted'] ?? [], 'skipped' => $data['skipped'] ?? [], 'safety' => isset($data['safety']) ? substr($data['safety'], 0, 7) : null, 'ms' => $ms]);
             exit;
         case 'import_site':
             // A new site from an uploaded backup archive: the upload is
@@ -5390,6 +5472,36 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .st-foot { padding: 0.6rem 1.5rem; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); border-top: 1px solid var(--panel-border); }
         .st-foot:empty { display: none; }
         .st-restore.armed { color: white; background: var(--danger); border-color: var(--danger); }
+        .st-toolbar .st-hist-note { flex: 0 1 260px; min-width: 160px; }
+        .st-history { grid-template-columns: minmax(0, 1fr) auto auto 1.2rem; cursor: pointer; }
+        .st-history .st-title { font-weight: 500; }
+        .st-history.is-auto .st-title { font-weight: 400; color: var(--text-dim); }
+        .st-history.is-open { background: var(--panel-hover); }
+        .st-history .st-when { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); white-space: nowrap; }
+        .st-hist-files { display: flex; gap: 0.35rem; font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); white-space: nowrap; }
+        .st-hist-files .f-add { color: #3d9a5c; } .st-hist-files .f-del { color: var(--danger); }
+        .st-chev { color: var(--text-faint); font-size: 0.8rem; transition: transform 0.15s; text-align: center; }
+        .st-history.is-open .st-chev { transform: rotate(90deg); }
+        .st-detail { list-style: none; margin: 0; padding: 0.35rem 1.5rem 0.7rem 2.2rem; border-bottom: 1px solid var(--panel-border); background: var(--bg-sunk); }
+        .st-detail-head { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; padding: 0.25rem 0 0.45rem; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .st-detail-head .pill { margin-left: auto; padding: 0.22rem 0.55rem; font-size: 0.72rem; }
+        .st-comp { display: grid; grid-template-columns: 5.6rem minmax(0, 1fr) auto auto auto; align-items: center; column-gap: 0.75rem; padding: 0.3rem 0; font-size: 0.82rem; }
+        .st-comp + .st-comp, .st-comp + .st-diff-wrap + .st-comp { border-top: 1px solid var(--panel-border); }
+        .st-comp .st-chip { justify-self: start; }
+        .st-chip.ch-new, .st-chip.ch-updated { background: var(--pill-wp-bg); color: var(--pill-wp-fg); border-color: transparent; }
+        .st-chip.ch-deleted { color: var(--danger); border-color: var(--danger); }
+        .st-chip.ch-downgraded { color: var(--pill-warn-fg, #d08c30); border-color: var(--pill-warn-fg, #d08c30); }
+        .st-comp-main { min-width: 0; display: flex; flex-direction: column; gap: 0.05rem; }
+        .st-comp-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+        .st-comp-sub { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .st-comp-ver { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); white-space: nowrap; }
+        .st-comp-ver .arrow { color: var(--text-faint); padding: 0 0.2rem; }
+        .st-comp .st-actions .pill.armed { color: white; background: var(--danger); border-color: var(--danger); }
+        .st-comp-more { padding: 0.35rem 0 0; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .st-diff-wrap { padding: 0.15rem 0 0.5rem; }
+        .st-diff { margin: 0; padding: 0.5rem 0.75rem; max-height: 380px; overflow: auto; background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); font-family: var(--font-mono); font-size: 0.7rem; line-height: 1.45; white-space: pre; font-variant-ligatures: none; color: var(--text-dim); }
+        .st-diff .d-add { color: #3d9a5c; } .st-diff .d-del { color: var(--danger); } .st-diff .d-hunk { color: var(--accent); } .st-diff .d-meta { color: var(--text-faint); }
+        .st-diff-note { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); padding: 0.2rem 0 0; }
         .site-cli { padding: 1rem 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 0.6rem; }
         .st-cli-line { display: flex; align-items: center; gap: 0.5rem; background: var(--input-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 0.35rem 0.5rem 0.35rem 0.8rem; }
         .st-cli-line:focus-within { border-color: var(--accent); }
@@ -6095,6 +6207,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     <button type="button" class="mail-part" role="tab" data-tab="users">users</button>
                     <button type="button" class="mail-part" role="tab" data-tab="cron">cron</button>
                     <button type="button" class="mail-part" role="tab" data-tab="traffic">traffic</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="history">history</button>
                     <button type="button" class="mail-part" role="tab" data-tab="snapshots">snapshots</button>
                     <button type="button" class="mail-part" role="tab" data-tab="cli">wp-cli</button>
                 </div>
@@ -6213,6 +6326,17 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     <button type="button" class="pill st-refresh" title="Read the log again">refresh</button>
                 </div>
                 <div class="tr-body" id="trafficBody"></div>
+            </div>
+            <div class="site-panel" id="sitePanel-history" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter by plugin, theme, or note…" spellcheck="false" autocomplete="off" aria-label="Filter saves">
+                    <input class="filter-input st-note st-hist-note" id="histNote" type="text" placeholder="note for this save (optional)…" maxlength="120" spellcheck="false" autocomplete="off" aria-label="Save note">
+                    <button type="button" class="pill primary" id="btnHistSave" title="Record the plugins, themes and mu-plugins as they are now">save now</button>
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill st-refresh" title="Re-read the list">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading history…</li><li class="empty st-error" style="display: none;"></li></ul>
+                <div class="st-foot" id="histFoot"></div>
             </div>
             <div class="site-panel" id="sitePanel-snapshots" style="display: none;">
                 <div class="st-toolbar">
@@ -7711,7 +7835,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : null; }
                     else { this.logs.site = null; this.logs.source = 'errors'; }
                     this.setView('logs', { force: true });
-                } else if ((m = /^\/site\/([a-z0-9-]+)(?:\/(plugins|themes|users|cron|traffic|snapshots|cli))?$/i.exec(p))) {
+                } else if ((m = /^\/site\/([a-z0-9-]+)(?:\/(plugins|themes|users|cron|traffic|history|snapshots|cli))?$/i.exec(p))) {
                     this.sitePage.name = m[1].toLowerCase();
                     this.sitePage.tab = m[2] ? m[2].toLowerCase() : 'overview';
                     this.setView('site', { force: true });
@@ -9563,9 +9687,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('spReveal').querySelector('.pill-label').textContent = this.revealLabel.toLowerCase();
                 $id('spPin').querySelector('.pill-label').textContent = this.isPinned(site.name) ? 'unpin' : 'pin to top';
                 // Tabs: WordPress only; a static site has just the overview.
-                if (!isWp && p.tab !== 'overview' && p.tab !== 'snapshots' && p.tab !== 'traffic') { p.tab = 'overview'; this.syncUrl({ replace: true }); }
+                if (!isWp && p.tab !== 'overview' && p.tab !== 'snapshots' && p.tab !== 'traffic' && p.tab !== 'history') { p.tab = 'overview'; this.syncUrl({ replace: true }); }
                 show($id('siteTabs'), true);
-                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); show(b, isWp || ['overview', 'snapshots', 'traffic'].includes(b.dataset.tab)); });
+                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); show(b, isWp || ['overview', 'snapshots', 'traffic', 'history'].includes(b.dataset.tab)); });
                 for (const tb of this.siteTabs) show($id('sitePanel-' + tb), p.tab === tb);
                 this.renderSiteTab();
             },
@@ -9901,13 +10025,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // --- Site page tabs: plugins, themes, users, cron, wp-cli --------
             // Each tab is a WP-CLI listing fetched when first shown and kept
             // per site; row actions run one command and refetch.
-            get siteTabs() { return ['overview', 'plugins', 'themes', 'users', 'cron', 'traffic', 'snapshots', 'cli']; },
+            get siteTabs() { return ['overview', 'plugins', 'themes', 'users', 'cron', 'traffic', 'history', 'snapshots', 'cli']; },
 
             setSiteTab(tab) {
                 const p = this.sitePage;
                 tab = this.siteTabs.includes(tab) ? tab : 'overview';
                 const site = this.pageSite;
-                if (site && site.type !== 'WordPress' && tab !== 'snapshots' && tab !== 'traffic') tab = 'overview';
+                if (site && site.type !== 'WordPress' && tab !== 'snapshots' && tab !== 'traffic' && tab !== 'history') tab = 'overview';
                 p.tab = tab;
                 this.syncUrl();
                 this.renderSitePage();
@@ -9927,14 +10051,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const site = this.pageSite;
                 if (tab === 'traffic') { this.loadTraffic(opts); return; }
                 if (tab === 'overview') { this.loadSiteHealth(); return; }
-                if (!site || !['plugins', 'themes', 'users', 'cron', 'snapshots'].includes(tab)) return;
-                if (site.type !== 'WordPress' && tab !== 'snapshots') return;
+                if (!site || !['plugins', 'themes', 'users', 'cron', 'snapshots', 'history'].includes(tab)) return;
+                if (site.type !== 'WordPress' && tab !== 'snapshots' && tab !== 'history') return;
                 const t = this.siteTabState(tab);
                 if (t.loadedFor === site.name && !opts.force) return;
-                if (t.loadedFor !== site.name) { t.items = []; t.loadedFor = null; t.filter = ''; t.status = 'all'; t.arm = null; }
+                if (t.loadedFor !== site.name) { t.items = []; t.loadedFor = null; t.filter = t.filterFor === site.name ? t.filter : ''; t.status = 'all'; t.arm = null; t.open = null; t.diff = null; }
                 t.loading = true; t.error = null;
                 this.renderSiteTab();
-                const action = { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron', snapshots: 'site_snapshots' }[tab];
+                const action = { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron', snapshots: 'site_snapshots', history: 'site_history' }[tab];
                 const res = await this.apiPost(action, { site_name: site.name, check: !!opts.check }, { quiet: true, timeoutMs: opts.check ? 180000 : 90000 });
                 if (this.sitePage.name !== site.name) return;
                 t.loading = false;
@@ -9979,6 +10103,172 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const last = (res.message || '').split('\n').filter(Boolean).pop() || '';
                 this.showSnack(last.replace(/^(Success|Error|Warning): /, '') || (res.success ? 'Ran.' : 'Failed.'), !res.success);
                 this.loadSiteTab({ force: true });
+            },
+
+            // --- History: nightly saves of plugins, themes and mu-plugins ----
+            // Each row is one save (a commit); opening it lists the components
+            // that changed with the way back for each.
+            historyClick(e, row) {
+                const t = this.siteTabState('history');
+                const roll = e.target.closest('.st-hist-roll');
+                if (roll) { this.historyRollback(roll.dataset.hash, roll.dataset.target, roll.dataset.key); return; }
+                const dif = e.target.closest('.st-hist-diff');
+                if (dif) { this.historyDiff(dif.dataset.hash, dif.dataset.target); return; }
+                if (e.target.closest('.st-comp-more button')) { t.showAll = t.open; this.renderSiteTab(); return; }
+                if (e.target.closest('.st-detail')) return;
+                if (row && row.dataset.id) this.historyToggle(row.dataset.id);
+            },
+
+            historyToggle(id) {
+                const t = this.siteTabState('history');
+                t.open = t.open === id ? null : id;
+                t.diff = null; t.showAll = null; t.arm = null;
+                this.renderSiteTab();
+            },
+
+            // From a plugin's or theme's menu: the history tab, filtered to it.
+            historyFocus(slug) {
+                const site = this.pageSite;
+                const t = this.siteTabState('history');
+                t.filter = slug; t.filterFor = site ? site.name : null;
+                const f = $id('sitePanel-history').querySelector('.st-filter');
+                if (f) f.value = slug;
+                this.setSiteTab('history');
+            },
+
+            async historySave() {
+                const site = this.pageSite;
+                const t = this.siteTabState('history');
+                if (!site || t.busy['+']) return;
+                const note = $id('histNote').value.trim();
+                t.busy['+'] = 'save';
+                this.renderSiteTab();
+                const res = await this.apiPost('site_history_save', { site_name: site.name, note }, { quiet: true, timeoutMs: 1800000 });
+                delete t.busy['+'];
+                if (this.sitePage.name !== site.name) return;
+                if (!res.success) { this.showSnack(res.message || 'The save failed.', true); this.renderSiteTab(); return; }
+                $id('histNote').value = '';
+                if (res.state === 'unchanged') { this.showSnack('Nothing has changed since save ' + res.id + '.'); this.renderSiteTab(); return; }
+                this.showSnack('Saved ' + res.id + (res.summary && res.summary.summary ? ' — ' + res.summary.summary : '') + '.');
+                t.open = res.id; t.diff = null;
+                this.loadSiteTab({ force: true });
+            },
+
+            // Two clicks: the first arms the button (keyed so only that button
+            // confirms), the second runs. The CLI saves the current state first.
+            async historyRollback(hash, target, key) {
+                const site = this.pageSite;
+                const t = this.siteTabState('history');
+                if (!site || t.busy[key] || t.busy['+']) return;
+                if (t.arm !== key) {
+                    t.arm = key;
+                    clearTimeout(t.armTimer);
+                    t.armTimer = setTimeout(() => { t.arm = null; this.renderSiteTab(); }, 4000);
+                    this.renderSiteTab();
+                    return;
+                }
+                t.arm = null;
+                t.busy[key] = 'rollback';
+                this.renderSiteTab();
+                const res = await this.apiPost('site_history_rollback', { site_name: site.name, id: hash, target }, { quiet: true, timeoutMs: 1800000 });
+                delete t.busy[key];
+                if (this.sitePage.name !== site.name) return;
+                if (!res.success) { this.showSnack(res.message || 'The rollback failed.', true); this.renderSiteTab(); return; }
+                const n = (res.restored || []).length, d = (res.deleted || []).length, sk = (res.skipped || []).length;
+                const what = target === 'all'
+                    ? 'Rolled back ' + n + ' component' + (n === 1 ? '' : 's') + (d ? ', removed ' + d : '') + (sk ? ', left ' + sk + ' alone (symlinks or checkouts of their own)' : '')
+                    : 'Rolled back ' + target.replace(/^file:/, '');
+                this.showSnack(what + '.' + (res.safety ? ' The state from just before is save ' + res.safety + '.' : ''));
+                for (const tab of ['plugins', 'themes', 'cron']) { const x = this.sitePage.tabs[tab]; if (x) x.loadedFor = null; }
+                t.diff = null;
+                this.getSites();
+                this.loadSiteTab({ force: true });
+            },
+
+            async historyDiff(hash, target) {
+                const site = this.pageSite;
+                const t = this.siteTabState('history');
+                const key = hash + ':' + target;
+                if (!site) return;
+                if (t.diff && t.diff.key === key) { t.diff = null; this.renderSiteTab(); return; }
+                t.diff = { key, loading: true, text: '', truncated: false, error: null };
+                this.renderSiteTab();
+                const res = await this.apiPost('site_history_diff', { site_name: site.name, id: hash, target }, { quiet: true, timeoutMs: 300000 });
+                if (this.sitePage.name !== site.name || !t.diff || t.diff.key !== key) return;
+                t.diff.loading = false;
+                if (!res.success) t.diff.error = res.message || 'Could not build the diff.';
+                else { t.diff.text = res.diff || ''; t.diff.truncated = !!res.truncated; }
+                this.renderSiteTab();
+            },
+
+            historyDiffHtml(text) {
+                const esc = (s) => this.escapeHtml(s);
+                return text.split('\n').map(l => {
+                    let c = '';
+                    if (/^(\+\+\+ |--- |diff |index |new file|deleted file|old mode|new mode|Binary)/.test(l)) c = 'd-meta';
+                    else if (l.startsWith('@@')) c = 'd-hunk';
+                    else if (l.startsWith('+')) c = 'd-add';
+                    else if (l.startsWith('-')) c = 'd-del';
+                    return c ? '<span class="' + c + '">' + esc(l) + '</span>' : esc(l);
+                }).join('\n');
+            },
+
+            // The opened save: header with the whole-save rollback, then one
+            // line per component — its change, versions before and after,
+            // file counts, **undo** (the files from just before this save),
+            // **restore this** (the files as they were in it), and **diff**.
+            historyDetail(it, t) {
+                const esc = (s) => this.escapeHtml(s == null ? '' : String(s));
+                const site = this.pageSite;
+                const sum = it.summary || {};
+                const comps = Array.isArray(sum.components) ? sum.components : [];
+                const li = document.createElement('li');
+                li.className = 'st-detail';
+                const f = sum.files || {};
+                const filesHtml = (a, m, d) => '<span class="st-hist-files"><span class="f-add">+' + (a || 0) + '</span><span>~' + (m || 0) + '</span><span class="f-del">−' + (d || 0) + '</span></span>';
+                let html = '<div class="st-detail-head"><span title="Full hash">' + esc(it.hash.slice(0, 12)) + '</span>'
+                    + (sum.core && sum.core.version_from && sum.core.version_from !== sum.core.version ? '<span>WordPress ' + esc(sum.core.version_from) + ' → ' + esc(sum.core.version) + '</span>' : (it.wp ? '<span>wp ' + esc(it.wp) + '</span>' : ''))
+                    + filesHtml(f.added, f.modified, f.deleted) + '<span>files</span>'
+                    + (sum.initial ? '<span>first save</span>' : '');
+                const allKey = it.hash + ':all';
+                html += t.busy[allKey] ? '<span class="st-busy" style="margin-left:auto">rolling back…</span>'
+                    : '<button type="button" class="pill st-hist-roll' + (t.arm === allKey ? ' armed' : '') + '" data-hash="' + esc(it.hash) + '" data-target="all" data-key="' + esc(allKey) + '" title="Make plugins, themes and mu-plugins exactly as they were in this save. Symlinks and folders with their own .git are left alone; the current state is saved first, so this can be undone.">' + (t.arm === allKey ? 'sure? roll back everything' : 'roll back everything to this save…') + '</button>';
+                html += '</div>';
+                const showAll = t.showAll === it.id;
+                const cap = showAll ? comps.length : 40;
+                const order = { deleted: 0, downgraded: 1, updated: 1, changed: 2, new: 3, status: 4 };
+                const sorted = [...comps].sort((a, b) => (order[a.change] ?? 5) - (order[b.change] ?? 5) || String(a.title || a.slug).localeCompare(String(b.title || b.slug)));
+                if (!comps.length) html += '<div class="st-comp-more">' + (sum.core && sum.core.version_from ? 'WordPress itself was updated; plugins and themes did not change.' : 'Nothing changed in plugins, themes or mu-plugins.') + '</div>';
+                for (const c of sorted.slice(0, cap)) {
+                    const target = c.type === 'file' ? 'file:' + c.path : c.path;
+                    const touched = !!(c.added || c.modified || c.deleted);
+                    const ver = c.change === 'new' ? esc(c.version) : c.change === 'deleted' ? '<s>' + esc(c.version_from) + '</s>'
+                        : (c.version_from && c.version_from !== c.version ? esc(c.version_from) + '<span class="arrow">→</span>' + esc(c.version) : esc(c.version || c.version_from || ''));
+                    const st = c.status_from && c.status && c.status_from !== c.status ? ' · ' + esc(c.status_from) + ' → ' + esc(c.status) : '';
+                    const chg = c.change === 'status' ? (c.status === 'inactive' ? 'deactivated' : /active/.test(c.status || '') ? 'activated' : 'status') : c.change;
+                    const kBefore = it.hash + ':before:' + c.path, kThis = it.hash + ':this:' + c.path;
+                    let actions = '';
+                    if (t.busy[kBefore] || t.busy[kThis]) actions = '<span class="st-busy">rolling back…</span>';
+                    else {
+                        if (sum.parent && c.change !== 'new' && touched) actions += '<button type="button" class="pill st-hist-roll' + (t.arm === kBefore ? ' armed' : '') + '" data-hash="' + esc(sum.parent) + '" data-target="' + esc(target) + '" data-key="' + esc(kBefore) + '" title="Put the files back as they were just before this save' + (c.version_from ? ' (' + esc(c.version_from) + ')' : '') + '">' + (t.arm === kBefore ? 'sure?' : (c.change === 'deleted' ? 'bring back' : 'undo') + (c.version_from && c.version_from !== c.version ? ' → ' + esc(c.version_from) : '')) + '</button>';
+                        if (c.change !== 'deleted' && (touched || c.change === 'new')) actions += '<button type="button" class="pill st-hist-roll' + (t.arm === kThis ? ' armed' : '') + '" data-hash="' + esc(it.hash) + '" data-target="' + esc(target) + '" data-key="' + esc(kThis) + '" title="Put the files back exactly as they were in this save' + (c.version ? ' (' + esc(c.version) + ')' : '') + '">' + (t.arm === kThis ? 'sure?' : 'restore this') + '</button>';
+                        if (touched) actions += '<button type="button" class="pill st-hist-diff' + (t.diff && t.diff.key === it.hash + ':' + target ? ' is-active' : '') + '" data-hash="' + esc(it.hash) + '" data-target="' + esc(target) + '" title="What changed in these files">diff</button>';
+                    }
+                    html += '<div class="st-comp"><span class="st-chip ch-' + esc(c.change) + '">' + esc(chg) + '</span>'
+                        + '<div class="st-comp-main"><span class="st-comp-name">' + esc(c.title || c.slug) + '</span><span class="st-comp-sub">' + esc(c.type) + ' · ' + esc(c.path) + st + '</span></div>'
+                        + '<span class="st-comp-ver">' + ver + '</span>'
+                        + (touched ? filesHtml(c.added, c.modified, c.deleted) : '<span></span>')
+                        + '<span class="st-actions">' + actions + '</span></div>';
+                    if (t.diff && t.diff.key === it.hash + ':' + target) {
+                        html += '<div class="st-diff-wrap">' + (t.diff.loading ? '<div class="st-diff-note">Building the diff…</div>'
+                            : t.diff.error ? '<div class="st-diff-note">' + esc(t.diff.error) + '</div>'
+                            : '<pre class="st-diff">' + (t.diff.text ? this.historyDiffHtml(t.diff.text) : '(no text changes — binary files only)') + '</pre>'
+                                + (t.diff.truncated ? '<div class="st-diff-note">Cut at 300 KB. The whole diff: cove history ' + esc(site ? site.name : '') + ' diff ' + esc(it.id) + ' --target=' + esc(target) + '</div>' : '')) + '</div>';
+                    }
+                }
+                if (comps.length > cap) html += '<div class="st-comp-more"><button type="button" class="pill">show all ' + comps.length + ' components</button></div>';
+                li.innerHTML = html;
+                return li;
             },
 
             // Snapshots: take, restore (two clicks — it replaces the live
@@ -10147,6 +10437,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (items.length) items.push({ sep: true });
                     items.push({ label: tab === 'plugins' && !(it.file || '').includes('/') ? 'Open file' : 'Browse files', run: () => this.openFilesAt(site.name, dir) });
                     items.push({ label: 'Copy slug', run: () => this.copyText(slug, 'Slug copied') });
+                    items.push({ label: 'Previous versions', run: () => this.historyFocus(slug) });
                     if (it.status !== 'must-use' && it.status !== 'active' && it.status !== 'active-network' && it.status !== 'parent') {
                         items.push({ sep: true });
                         items.push({ label: 'Delete…', danger: true, run: () => this.siteItemOp(tab, slug, 'delete') });
@@ -10176,6 +10467,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     items.push({ label: 'Copy id', run: () => this.copyText(it.id, 'Id copied') });
                     items.push({ sep: true });
                     items.push({ label: 'Delete…', danger: true, run: () => this.snapshotOp(it.id, 'delete') });
+                } else if (tab === 'history') {
+                    const t = this.siteTabState('history');
+                    items.push({ label: t.open === it.id ? 'Collapse' : 'What changed', run: () => this.historyToggle(it.id) });
+                    items.push({ label: 'Roll back everything to this save…', danger: true, run: () => { t.open = it.id; this.historyRollback(it.hash, 'all', it.hash + ':all'); } });
+                    items.push({ sep: true });
+                    items.push({ label: 'Copy id', run: () => this.copyText(it.id, 'Id copied') });
+                    items.push({ label: 'Copy hash', run: () => this.copyText(it.hash, 'Hash copied') });
                 }
                 return items;
             },
@@ -10228,6 +10526,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (q) rows = rows.filter(u => (u.user_login + ' ' + u.display_name + ' ' + u.user_email + ' ' + u.roles).toLowerCase().includes(q));
                 } else if (tab === 'cron') {
                     if (q) rows = rows.filter(e => (e.hook + ' ' + e.recurrence).toLowerCase().includes(q));
+                } else if (tab === 'history') {
+                    if (q) rows = rows.filter(s => { const sum = s.summary || {}; const comps = Array.isArray(sum.components) ? sum.components : []; return (s.id + ' ' + (s.note || '') + ' ' + (sum.summary || '') + ' ' + comps.map(c => c.slug + ' ' + (c.title || '')).join(' ')).toLowerCase().includes(q); });
                 }
                 return rows;
             },
@@ -10239,12 +10539,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (tab === 'cli') { this.renderSiteCli(); return; }
                 if (tab === 'traffic') { this.renderTraffic(); return; }
                 if (tab === 'overview') { this.renderSiteHealth(); return; }
-                if (!['plugins', 'themes', 'users', 'cron', 'snapshots'].includes(tab)) return;
+                if (!['plugins', 'themes', 'users', 'cron', 'snapshots', 'history'].includes(tab)) return;
                 const site = this.pageSite;
                 const t = this.siteTabState(tab);
                 const panel = $id('sitePanel-' + tab);
                 const list = panel.querySelector('.st-list');
-                list.querySelectorAll('.st-row, .st-empty').forEach(n => n.remove());
+                list.querySelectorAll('.st-row, .st-empty, .st-detail').forEach(n => n.remove());
                 const loaded = site && t.loadedFor === site.name;
                 show(panel.querySelector('.st-loading'), t.loading && !loaded);
                 const err = panel.querySelector('.st-error');
@@ -10254,6 +10554,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (filter && filter.value !== t.filter) filter.value = t.filter;
                 const take = panel.querySelector('#btnSnapCreate');
                 if (take) { take.disabled = !!t.busy['+']; take.textContent = t.busy['+'] ? 'snapshotting…' : 'take snapshot'; }
+                const hsave = panel.querySelector('#btnHistSave');
+                if (hsave) { hsave.disabled = !!t.busy['+']; hsave.textContent = t.busy['+'] ? 'saving…' : 'save now'; }
                 panel.querySelectorAll('.st-status').forEach(b => b.classList.toggle('is-active', b.dataset.status === t.status));
                 const refresh = panel.querySelector('.st-refresh');
                 if (refresh) refresh.disabled = t.loading;
@@ -10264,7 +10566,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const count = panel.querySelector('.st-count');
                 if (!loaded) { count.textContent = ''; return; }
                 const rows = this.siteTabVisible(tab);
-                const label = { plugins: 'plugin', themes: 'theme', users: 'user', cron: 'event', snapshots: 'snapshot' }[tab];
+                const label = { plugins: 'plugin', themes: 'theme', users: 'user', cron: 'event', snapshots: 'snapshot', history: 'save' }[tab];
                 const updates = (tab === 'plugins' || tab === 'themes') ? t.items.filter(i => i.update === 'available').length : 0;
                 count.textContent = (rows.length === t.items.length ? t.items.length : rows.length + ' of ' + t.items.length) + ' ' + label + (t.items.length === 1 ? '' : 's')
                     + (updates ? ' · ' + updates + ' update' + (updates === 1 ? '' : 's') : '')
@@ -10273,7 +10575,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const frag = document.createDocumentFragment();
                 const esc = (s) => this.escapeHtml(s == null ? '' : String(s));
                 const ms = site && site.multisite;
-                if (!rows.length) { const li = document.createElement('li'); li.className = 'st-empty'; li.textContent = t.items.length ? 'Nothing matches.' : 'Nothing here.'; frag.appendChild(li); }
+                if (!rows.length) { const li = document.createElement('li'); li.className = 'st-empty'; li.textContent = t.items.length ? 'Nothing matches.' : (tab === 'history' ? 'No saves yet — press save now, or wait for tonight.' : 'Nothing here.'); frag.appendChild(li); }
                 for (const it of rows) {
                     const li = document.createElement('li');
                     li.className = 'st-row st-' + tab;
@@ -10340,6 +10642,23 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                                 : '<button type="button" class="pill st-restore' + (armR ? ' armed' : '') + '" data-op="restore" title="Put these files and this database back in place (the current state is snapshotted first)">' + (armR ? 'sure? restore' : 'restore') + '</button>'
                                 + '<button type="button" class="pill st-dl" data-op="download" title="Pack files and database as a zip and download it">download</button>'
                                 + '<button type="button" class="pill st-del' + (armD ? ' armed' : '') + '" data-op="delete" title="Delete this snapshot">' + (armD ? 'sure? delete' : '×') + '</button>') + '</span>';
+                    } else if (tab === 'history') {
+                        const sum = it.summary || {};
+                        const f = sum.files || {};
+                        const rel = it.created ? this.formatRelative(it.created) : '';
+                        const when = rel === 'now' ? 'just now' : (rel ? rel + ' ago' : '');
+                        const note = it.note && it.note !== 'Nightly save' && it.note !== 'Save' ? it.note : '';
+                        li.dataset.id = it.id;
+                        li.classList.toggle('is-auto', !!it.auto && !note);
+                        li.classList.toggle('is-open', t.open === it.id);
+                        li.title = it.created ? new Date(it.created * 1000).toLocaleString() : '';
+                        li.innerHTML = '<div class="st-main"><span class="st-title">' + esc(sum.summary || note || 'Save') + '</span><span class="st-sub">' + esc(it.id) + (note && sum.summary ? ' · ' + esc(note) : '') + (it.auto ? ' · nightly' : '') + (it.wp ? ' · wp ' + esc(it.wp) : '') + '</span></div>'
+                            + '<span class="st-when">' + esc(when) + '</span>'
+                            + '<span class="st-hist-files" title="Files added, modified, deleted"><span class="f-add">+' + (f.added || 0) + '</span><span>~' + (f.modified || 0) + '</span><span class="f-del">−' + (f.deleted || 0) + '</span></span>'
+                            + '<span class="st-chev">›</span>';
+                        frag.appendChild(li);
+                        if (t.open === it.id) frag.appendChild(this.historyDetail(it, t));
+                        continue;
                     } else if (tab === 'cron') {
                         const busy = t.busy[it.hook];
                         const armX = t.arm === 'delete:' + it.hook;
@@ -10355,6 +10674,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     frag.appendChild(li);
                 }
                 list.appendChild(frag);
+                if (tab === 'history') {
+                    const x = t.extra || {};
+                    const dir = (x.dir || '').replace(/^\/Users\/[^\/]+|^\/home\/[^\/]+/, '~');
+                    const swept = x.last_sweep ? 'the last nightly sweep finished ' + (this.formatRelative(x.last_sweep) === 'now' ? 'just now' : this.formatRelative(x.last_sweep) + ' ago') : 'the first nightly sweep has not run yet';
+                    $id('histFoot').textContent = x.enabled === false ? 'This site has no wp-content, so there is nothing for history to save.'
+                        : (t.items.length ? dir + ' · ' + this.formatSize(x.bytes || 0) + ' · saved nightly from 1 am while the desktop is idle · ' + swept
+                            : 'Plugins, themes and mu-plugins are saved to ' + dir + ' every night while the desktop is idle, and whenever you press save now; ' + swept + '.');
+                }
                 if (tab === 'snapshots') {
                     const total = t.items.reduce((s, i) => s + (i.files_bytes || 0) + (i.db_bytes || 0), 0);
                     const dir = (t.extra && t.extra.dir ? t.extra.dir : '').replace(/^\/Users\/[^\/]+|^\/home\/[^\/]+/, '~');
@@ -10384,7 +10711,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     const b = e.target.closest('.mail-part');
                     if (b) this.setSiteTab(b.dataset.tab);
                 });
-                for (const tab of ['plugins', 'themes', 'users', 'cron', 'snapshots']) {
+                for (const tab of ['plugins', 'themes', 'users', 'cron', 'snapshots', 'history']) {
                     const panel = $id('sitePanel-' + tab);
                     const t = () => this.siteTabState(tab);
                     const filter = panel.querySelector('.st-filter');
@@ -10401,6 +10728,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (due) due.addEventListener('click', () => this.siteCronRun(null));
                     panel.querySelector('.st-list').addEventListener('click', (e) => {
                         const row = e.target.closest('.st-row');
+                        if (tab === 'history') { this.historyClick(e, row); return; }
                         if (!row) return;
                         const act = e.target.closest('.st-act');
                         if (act) { this.siteItemOp(tab, row.dataset.slug, act.dataset.op, !!act.dataset.network); return; }
@@ -10414,18 +10742,18 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         if (e.target.closest('.st-cron-del')) { this.siteCronDelete(row.dataset.hook); return; }
                     });
                 }
-                for (const tab of ['plugins', 'themes', 'users', 'cron', 'snapshots']) {
+                for (const tab of ['plugins', 'themes', 'users', 'cron', 'snapshots', 'history']) {
                     $id('sitePanel-' + tab).querySelector('.st-list').addEventListener('contextmenu', (e) => {
                         const row = e.target.closest('.st-row');
                         if (!row) return;
                         const t = this.siteTabState(tab);
-                        const key = tab === 'users' ? 'user_login' : tab === 'cron' ? 'hook' : tab === 'snapshots' ? 'id' : 'name';
+                        const key = tab === 'users' ? 'user_login' : tab === 'cron' ? 'hook' : (tab === 'snapshots' || tab === 'history') ? 'id' : 'name';
                         const val = row.dataset.login || row.dataset.hook || row.dataset.id || row.dataset.slug;
                         const it = t.items.find(x => String(x[key]) === val);
                         if (!it) return;
                         const items = this.tabCtxItemsFor(tab, it);
                         if (!items.length) return;
-                        const title = tab === 'users' ? it.user_login : tab === 'cron' ? it.hook : tab === 'snapshots' ? it.id : (it.title || it.name);
+                        const title = tab === 'users' ? it.user_login : tab === 'cron' ? it.hook : (tab === 'snapshots' || tab === 'history') ? it.id : (it.title || it.name);
                         this.openTabCtx(e, title, items);
                     });
                 }
@@ -10446,6 +10774,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('sitePanel-traffic').querySelector('.st-refresh').addEventListener('click', () => this.loadTraffic({ force: true }));
                 $id('siteHealth').addEventListener('click', (e) => { if (e.target.closest('.site-health-bit')) this.setSiteTab('traffic'); });
                 $id('btnSnapCreate').addEventListener('click', () => this.snapshotCreate());
+                $id('btnHistSave').addEventListener('click', () => this.historySave());
+                $id('histNote').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this.historySave(); } if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.target.blur(); } });
                 $id('snapNote').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this.snapshotCreate(); } if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.target.blur(); } });
                 const input = $id('siteCliInput');
                 input.addEventListener('keydown', (e) => {
@@ -12621,6 +12951,7 @@ show_general_help() {
     echo "  network          Lists the sites on a multisite network."
     echo "  wp               Runs WP-CLI inside a site from anywhere."
     echo "  snapshot         Take, list, restore, or delete snapshots of a site."
+    echo "  history          Nightly saves of plugins and themes; roll any of them back."
     echo "  import           Create a new site from a backup archive (zip or tar.gz)."
     echo "  screenshot       Capture a site's front page with a headless browser."
     echo "  rename           Renames a site, its directory, and database."
@@ -12938,6 +13269,9 @@ display_command_help() {
             ;;
         snapshot)
             cove_snapshot --help
+            ;;
+        history)
+            cove_history --help
             ;;
         import)
             cove_import --help
@@ -13282,6 +13616,10 @@ main() {
         snapshot)
             check_dependencies
             cove_snapshot "$@"
+            ;;
+        history)
+            check_dependencies
+            cove_history "$@"
             ;;
         import)
             check_dependencies
