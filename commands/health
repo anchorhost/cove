@@ -136,37 +136,15 @@ cove_health() {
     if ! $caddy_up; then
         echo "  ⏭️  skipped (Caddy not running)"
     else
-        local probe="_cove_health_oc_$$.php"
-        cat > "$GUI_DIR/$probe" 2>/dev/null <<'PHP'
-<?php
-header('Content-Type: text/plain');
-if (!function_exists('opcache_get_status')) { echo "noopcache\n"; exit; }
-$s = @opcache_get_status(false); $c = @opcache_get_configuration();
-if (!$s || !$c) { echo "disabled\n"; exit; }
-$st = $s['opcache_statistics']; $is = $s['interned_strings_usage'];
-$int_total = $is['used_memory'] + $is['free_memory'];
-printf("hit_rate=%.1f\n", $st['opcache_hit_rate']);
-printf("cached=%d\n", $st['num_cached_scripts']);
-printf("maxfiles=%d\n", $c['directives']['opcache.max_accelerated_files']);
-printf("interned_used_pct=%.0f\n", $int_total ? 100*$is['used_memory']/$int_total : 0);
-printf("interned_mb=%.0f\n", $int_total/1048576);
-printf("oom_restarts=%d\n", $st['oom_restarts']);
-printf("hash_restarts=%d\n", $st['hash_restarts']);
-printf("optimizer=%d\n", $c['directives']['opcache.optimization_level']);
-PHP
-        # Retry: a probe landing during a config reload hangs (the swap pauses
-        # serving on a large box), which would otherwise look like a failure.
-        local out="" attempt
-        for attempt in 1 2 3; do
-            out=$(curl -sk --max-time 12 "https://cove.localhost:${HTTPS_PORT}/$probe" 2>/dev/null)
-            [ -n "$out" ] && break
-            sleep 2
-        done
-        rm -f "$GUI_DIR/$probe" 2>/dev/null
+        local out
+        out=$(cove_opcache_probe)
         if [ -z "$out" ] || echo "$out" | grep -q "noopcache\|disabled"; then
             echo "  ⚠️  could not read OPcache status (${out:-no response; server may be mid-reload})"; warn=$((warn+1))
         else
-            local hit cached maxf ipct imb oom hashr opt
+            local hit cached maxf ipct imb oom hashr opt full misses hits
+            full=$(echo "$out"  | sed -n 's/^full=//p')
+            hits=$(echo "$out"  | sed -n 's/^hits=//p')
+            misses=$(echo "$out"| sed -n 's/^misses=//p')
             hit=$(echo "$out"   | sed -n 's/^hit_rate=//p')
             cached=$(echo "$out"| sed -n 's/^cached=//p')
             maxf=$(echo "$out"  | sed -n 's/^maxfiles=//p')
@@ -175,9 +153,20 @@ PHP
             oom=$(echo "$out"   | sed -n 's/^oom_restarts=//p')
             hashr=$(echo "$out" | sed -n 's/^hash_restarts=//p')
             opt=$(echo "$out"   | sed -n 's/^optimizer=//p')
-            echo "  interned buffer ${ipct}% full (${imb} MB) · cached ${cached}/${maxf} · hit ${hit}%"
+            echo "  interned buffer ${ipct}% full (${imb} MB) · cached ${cached}/${maxf} · hit ${hit}% (${hits:-0} hits / ${misses:-0} misses)"
             echo "  restarts: ${oom} OOM, ${hashr} max-files"
             local pressure=false
+            # The script arena reports FULL long before any restart counter
+            # moves: from then on every file not already cached is recompiled
+            # per request, which is the slow-site-plus-watchdog-kill pattern.
+            if [ "${full:-0}" = "1" ]; then
+                echo "  ❌ script cache is FULL"
+                pressure=true
+            fi
+            # A warm cache that still misses a fifth of the time is thrashing.
+            if [ "${cached:-0}" -ge 2000 ] 2>/dev/null && [ "${hit%%.*}" -lt 80 ] 2>/dev/null; then
+                pressure=true
+            fi
             [ "${ipct:-0}" -ge 85 ] 2>/dev/null && pressure=true
             [ "${oom:-0}" -gt 0 ] 2>/dev/null && pressure=true
             [ "${hashr:-0}" -gt 0 ] 2>/dev/null && pressure=true
@@ -187,15 +176,18 @@ PHP
             fi
             if $pressure; then
                 echo "  ⚠️  OPcache under pressure — SHM restarts under ZTS can segfault FrankenPHP."
-                echo "     Raise limits in $PHP_INI_FILE, then fully restart FrankenPHP:"
-                echo "       opcache.memory_consumption = 768"
-                echo "       opcache.interned_strings_buffer = 128"
-                echo "       opcache.max_accelerated_files = 200000"
-                if [ "$OS" = "macos" ]; then
-                    echo "     Restart: launchctl kickstart -k gui/\$(id -u)/com.cove.caddy"
-                else
-                    echo "     Restart: cove disable && cove enable"
-                fi
+                # Advise relative to what is configured: a box already at the
+                # old fixed numbers needs to go up from there, not be told them.
+                local cur_mem cur_int cur_files rec_mem rec_int rec_files
+                cur_mem=$(cove_ini_get opcache.memory_consumption 512)
+                cur_int=$(cove_ini_get opcache.interned_strings_buffer 64)
+                cur_files=$(cove_ini_get opcache.max_accelerated_files 100000)
+                rec_mem=$(( cur_mem * 2 )); [ "$rec_mem" -lt 768 ] && rec_mem=768
+                rec_int=$(( cur_int * 2 )); [ "$rec_int" -lt 128 ] && rec_int=128
+                rec_files=$cur_files; [ "$rec_files" -lt 200000 ] && rec_files=200000
+                echo "     Configured now: ${cur_mem} MB script cache, ${cur_int} MB interned strings, ${cur_files} files."
+                echo "     Raise it and restart FrankenPHP (the SHM is sized at start, a reload is not enough):"
+                echo "       cove opcache set ${rec_mem} --interned ${rec_int} --files ${rec_files}"
                 warn=$((warn+1))
             else
                 echo "  ✅ within healthy limits"
