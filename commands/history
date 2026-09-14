@@ -86,6 +86,32 @@ foreach ($rows as $r) echo implode("\t", array_map(function ($v) { return str_re
     printf '%s\n' "$out" | sort -t $'\t' -k1,1 -k2,2
 }
 
+# Progress for whoever is watching (the dashboard polls it): stage and
+# the number of files found, beside the lock that says a save is running.
+history_status() {
+    local gitdir="$1" stage="$2" files="${3:-}"
+    [ -d "$gitdir/cove" ] || return 0
+    { echo "stage=$stage"; [ -n "$files" ] && echo "files=$files"; } > "$gitdir/cove/save.status.tmp" && mv -f "$gitdir/cove/save.status.tmp" "$gitdir/cove/save.status"
+}
+
+# A save's failure, said once on stderr and kept for whoever started it in
+# the background (the dashboard reads .git/cove/save.error).
+history_fail() {
+    local gitdir="$1"; shift
+    gum style --foreground red "$@" >&2
+    [ -d "$gitdir/cove" ] && printf '%s\n' "$1" | sed 's/^[^A-Za-z]*\(Error: \)\{0,1\}//' > "$gitdir/cove/save.error"
+}
+
+# One save at a time per site. Prints the pid holding the lock when busy.
+history_lock_holder() {
+    local gitdir="$1" lock="$gitdir/cove/save.lock" lpid
+    [ -f "$lock" ] || return 1
+    lpid=$(cut -d ' ' -f 1 "$lock" 2>/dev/null)
+    if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then echo "$lpid"; return 0; fi
+    rm -f "$lock"
+    return 1
+}
+
 # Build a tree object from the live wp-content: every regular file and
 # symlink under plugins/, themes/, mu-plugins/ (skipping node_modules, VCS
 # folders, .DS_Store and logs), plus manifest.tsv from $2 when given.
@@ -109,17 +135,43 @@ history_write_tree() {
         if [ -n "$dirs" ]; then
             # Regular files, non-executable then executable, hashed in one
             # pass each.
+            # hash-object is single-threaded, so the list is cut into chunks
+            # hashed side by side — a 3 GB site's first save in minutes,
+            # not tens of them. Object writes are atomic renames, so
+            # concurrent writers are safe.
+            local jobs; jobs=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+            [ "$jobs" -gt 8 ] && jobs=8
+            [ "$jobs" -lt 1 ] && jobs=1
+            local total=0
             for mode in 100644 100755; do
                 if [ "$mode" == "100644" ]; then perm=(! -perm -u+x); else perm=(-perm -u+x); fi
                 # shellcheck disable=SC2086
                 find $dirs "${prune[@]}" -o -type f "${perm[@]}" "${skip[@]}" -print 2>/dev/null | LC_ALL=C sort > "$list"
                 if [ -s "$list" ]; then
-                    history_git "$gitdir" hash-object -w --no-filters --stdin-paths < "$list" \
-                        | paste -d '\t' - "$list" \
-                        | awk -F '\t' -v m="$mode" '{ printf "%s %s\t%s\n", m, $1, $2 }' \
+                    local n; n=$(wc -l < "$list" | tr -d ' ')
+                    total=$((total + n))
+                    history_status "$gitdir" "hashing" "$total"
+                    local chunk=$(( (n + jobs - 1) / jobs ))
+                    [ "$chunk" -lt 200 ] && chunk=200
+                    rm -f "$list.part."*
+                    split -l "$chunk" -a 3 "$list" "$list.part."
+                    local part
+                    for part in "$list.part."*; do
+                        history_git "$gitdir" hash-object -w --no-filters --stdin-paths < "$part" > "$part.sha" &
+                    done
+                    wait
+                    for part in "$list.part."*; do
+                        case "$part" in *.sha) continue ;; esac
+                        # A chunk whose hashing broke off (a file vanished mid-way)
+                        # would misalign hashes and paths; skip it rather than lie.
+                        [ "$(wc -l < "$part.sha")" -eq "$(wc -l < "$part")" ] || continue
+                        paste -d '\t' "$part.sha" "$part"
+                    done | awk -F '\t' -v m="$mode" '{ printf "%s %s\t%s\n", m, $1, $2 }' \
                         | history_git "$gitdir" update-index --add --index-info
+                    rm -f "$list.part."*
                 fi
             done
+            history_status "$gitdir" "writing" "$total"
             # Symlinks (a plugin linked in from a checkout elsewhere) are kept
             # as links: the target path, mode 120000.
             # shellcheck disable=SC2086
@@ -165,7 +217,18 @@ history_save() {
         echo "- none"
         return 2
     fi
-    history_init "$site_name" || { gum style --foreground red "❌ Error: Could not create $gitdir." >&2; return 1; }
+    history_init "$site_name" || { history_fail "$gitdir" "❌ Error: Could not create $gitdir."; return 1; }
+    local holder
+    if holder=$(history_lock_holder "$gitdir"); then
+        gum style --foreground red "❌ Error: A save of '$site_name.localhost' is already running (pid $holder)." >&2
+        echo "- busy"
+        return 3
+    fi
+    # Callers run this in a subshell, so the trap ends with the save.
+    echo "$$ $(date +%s) $note" > "$gitdir/cove/save.lock"
+    rm -f "$gitdir/cove/save.error"
+    trap "rm -f '$gitdir/cove/save.lock' '$gitdir/cove/save.status'" EXIT
+    history_status "$gitdir" "manifest"
     local head; head=$(history_git "$gitdir" rev-parse --verify -q HEAD 2>/dev/null)
 
     # The manifest: fresh from WordPress; if WordPress cannot answer right
@@ -204,7 +267,7 @@ history_save() {
     local tree
     if ! tree=$(history_write_tree "$site_name" "$manifest"); then
         rm -f "$manifest"
-        gum style --foreground red "❌ Error: Could not build the tree for '$site_name.localhost'." >&2
+        history_fail "$gitdir" "❌ Error: Could not build the tree for '$site_name.localhost'."
         return 1
     fi
     rm -f "$manifest"
@@ -230,13 +293,18 @@ history_save() {
     else
         commit=$(history_git "$gitdir" commit-tree "$tree" -m "$subject" -m "$body")
     fi
-    [ -n "$commit" ] || { gum style --foreground red "❌ Error: git commit-tree failed." >&2; return 1; }
+    [ -n "$commit" ] || { history_fail "$gitdir" "❌ Error: git commit-tree failed."; return 1; }
     history_git "$gitdir" update-ref HEAD "$commit" "${head:-}" || return 1
     touch "$gitdir/cove/last-save"
+    history_status "$gitdir" "summarising"
     # Summarise now, while the diff is small, and tidy the object store
     # once it has grown enough for git to care.
     history_summary "$site_name" "$commit" >/dev/null
-    history_git "$gitdir" gc --auto -q 2>/dev/null || true
+    history_status "$gitdir" "packing"
+    history_git "$gitdir" -c gc.autoDetach=true gc --auto -q 2>/dev/null || true
+    # Size on disk, measured here rather than on every listing: walking a
+    # fresh first save's loose objects can take half a minute.
+    echo $(( $(du -sk "$gitdir" 2>/dev/null | cut -f1 | tr -d ' ' || echo 0) * 1024 )) > "$gitdir/cove/size" 2>/dev/null
     echo "$commit new"
 }
 
@@ -461,6 +529,11 @@ history_rollback() {
         fi
     fi
 
+    local holder
+    if holder=$(history_lock_holder "$gitdir"); then
+        gum style --foreground red "❌ Error: A save of '$site_name.localhost' is running (pid $holder); try again when it is done." >&2
+        return 1
+    fi
     echo "💾 Saving the current state first…" >&2
     local saved; saved=$(history_save "$site_name" "Before rolling back to $short" 1 0 0) || return 1
     saved="${saved##*$'\n'}"
@@ -561,18 +634,22 @@ history_sweep() {
     # and a half, so a machine that is busy every night still gets saved.
     local last_done; last_done=$(cat "$done_stamp" 2>/dev/null || echo 0)
     local overdue=0
-    [ $(( $(date +%s) - ${last_done:-0} )) -ge 129600 ] && overdue=1
-    if [ "$idle_only" == "1" ] && [ "$overdue" -eq 0 ] && ! cove_user_is_idle; then return 0; fi
+    [ "${last_done:-0}" -gt 0 ] && [ $(( $(date +%s) - last_done )) -ge 129600 ] && overdue=1
+    if [ "$idle_only" == "1" ] && [ "$overdue" -eq 0 ] && ! cove_user_is_idle; then
+        echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] sweep: desktop in use, waiting for an idle moment" >> "$log"
+        return 0
+    fi
     echo $$ > "$lock"
-    trap 'rm -f "$lock"' EXIT
+    trap "rm -f '$lock'" EXIT
     local ts site_path name saved state count=0 n_new=0 n_same=0 n_skip=0 complete=1
+    echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] sweep: started$([ "$idle_only" == "1" ] && echo ' (idle-only)')$([ "$overdue" -eq 1 ] && echo ' (overdue)')" >> "$log"
     for site_path in "$SITES_DIR"/*/; do
         site_path="${site_path%/}"
         [ -d "$site_path/public/wp-content" ] || continue
         name=$(basename "$site_path"); name="${name%.localhost}"
         [ -n "$(history_dirs "$site_path/public/wp-content")" ] || continue
         if [ "$max" -gt 0 ] 2>/dev/null && [ "$count" -ge "$max" ]; then complete=0; break; fi
-        if [ "$idle_only" == "1" ] && [ "$overdue" -eq 0 ] && ! cove_user_is_idle; then complete=0; break; fi
+        if [ "$idle_only" == "1" ] && [ "$overdue" -eq 0 ] && ! cove_user_is_idle; then complete=0; echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] sweep: desktop in use, stopping after $count sites" >> "$log"; break; fi
         count=$((count + 1))
         ts=$(date '+%Y-%m-%dT%H:%M:%S%z')
         if saved=$(history_save "$name" "" 1 "$force" 1 2>/dev/null); then
@@ -586,6 +663,9 @@ history_sweep() {
                 n_same=$((n_same + 1))
                 [ "$quiet" == "1" ] || echo "   · $name — unchanged"
             fi
+        elif [ "${saved##*$'\n'}" == "- busy" ]; then
+            n_skip=$((n_skip + 1))
+            [ "$quiet" == "1" ] || echo "   · $name — a save is already running"
         else
             n_skip=$((n_skip + 1))
             echo "[$ts] $name: save failed" >> "$log"
@@ -607,7 +687,7 @@ history_human_size() {
 }
 
 cove_history() {
-    local site_name="" sub="" id="" note="" format="table" target="" force=0 sweep=0 idle_only=0 max=0 quiet=0 limit=0 stat_only=0
+    local site_name="" sub="" id="" note="" format="table" target="" force=0 sweep=0 idle_only=0 max=0 quiet=0 limit=0 stat_only=0 background=0 result_file=0 holder=""
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -627,9 +707,12 @@ cove_history() {
             --limit=*)     limit="${arg#*=}" ;;
             --quiet)       quiet=1 ;;
             --stat)        stat_only=1 ;;
+            --background)  background=1 ;;
+            --result-file) result_file=1 ;;
             -h|--help)
                 echo "Usage: cove history <site>                         list the saves"
-                echo "       cove history <site> save [--note=\"…\"] [--force]"
+                echo "       cove history <site> save [--note=\"…\"] [--force] [--background]"
+                echo "       cove history <site> status                   is a save running?"
                 echo "       cove history <site> show <id>               what changed in one save"
                 echo "       cove history <site> diff <id> [--plugin=<slug>|--theme=<slug>|--file=<path>] [--stat]"
                 echo "       cove history <site> rollback <id> (--plugin=<slug>|--theme=<slug>|--mu-plugin=<name>|--file=<path>|--all) [--force]"
@@ -703,16 +786,61 @@ cove_history() {
     fi
 
     case "$sub" in
+        status)
+            # Is a save running, and how far along; plus the outcome of the
+            # last background save (written by --background).
+            local lock="$gitdir/cove/save.lock" running=false pid="" started=0 lnote="" stage="" files=0
+            if pid=$(history_lock_holder "$gitdir"); then
+                running=true
+                started=$(cut -d ' ' -f 2 "$lock" 2>/dev/null); lnote=$(cut -d ' ' -f 3- "$lock" 2>/dev/null)
+                stage=$(sed -n 's/^stage=//p' "$gitdir/cove/save.status" 2>/dev/null); files=$(sed -n 's/^files=//p' "$gitdir/cove/save.status" 2>/dev/null)
+            fi
+            local result="null"
+            [ -s "$gitdir/cove/save.result" ] && result=$(cat "$gitdir/cove/save.result")
+            if [ "$format" == "json" ]; then
+                printf '{"running":%s,"pid":"%s","started":%s,"note":"%s","stage":"%s","files":%s,"result":%s}\n' "$running" "$pid" "${started:-0}" "$(snapshot_json_escape "$lnote")" "$stage" "${files:-0}" "$result"
+            elif [ "$running" == "true" ]; then
+                echo "💾 A save is running (pid $pid, ${stage:-starting}${files:+, $files files})."
+            else
+                echo "No save is running."
+            fi
+            ;;
         save|create)
+            if [ "$background" -eq 1 ]; then
+                # Detach: the dashboard asks for this and polls `status`. The
+                # outcome lands in .git/cove/save.result for it to read.
+                history_init "$site_name" || exit 1
+                if holder=$(history_lock_holder "$gitdir"); then
+                    if [ "$format" == "json" ]; then echo '{"started":false,"running":true}'; else echo "ℹ️  A save is already running (pid $holder)."; fi
+                    return
+                fi
+                rm -f "$gitdir/cove/save.result"
+                local -a bg=("$0" history "$site_name" save --format=json --result-file)
+                [ -n "$note" ] && bg+=("--note=$note")
+                [ "$force" -eq 1 ] && bg+=(--force)
+                nohup nice -n 5 "${bg[@]}" >/dev/null 2>&1 &
+                if [ "$format" == "json" ]; then echo '{"started":true,"running":true}'; else echo "💾 Saving '$site_name.localhost' in the background — cove history $site_name status"; fi
+                return
+            fi
             if [ ! -d "$content" ] || [ -z "$(history_dirs "$content")" ]; then
                 if [ "$format" == "json" ]; then echo '{"success":false,"message":"This site has no wp-content/plugins or themes to save."}'; else
                     gum style --foreground red "❌ Error: '$site_name.localhost' has no wp-content/plugins or themes to save."; fi
                 exit 1
             fi
             [ "$format" == "json" ] || echo "💾 Saving '$site_name.localhost'…" >&2
-            local out; out=$(history_save "$site_name" "$note" 0 "$force" 0) || exit 1
+            local out
+            if ! out=$(history_save "$site_name" "$note" 0 "$force" 0); then
+                if [ "$result_file" -eq 1 ]; then
+                    local msg; msg=$(head -n 1 "$gitdir/cove/save.error" 2>/dev/null)
+                    printf '{"ok":false,"finished":%s,"message":"%s"}\n' "$(date +%s)" "$(snapshot_json_escape "${msg:-The save failed.}")" > "$gitdir/cove/save.result"
+                fi
+                exit 1
+            fi
             out="${out##*$'\n'}"
             local hash="${out%% *}" state="${out#* }"
+            if [ "$result_file" -eq 1 ]; then
+                printf '{"ok":true,"finished":%s,"state":"%s","hash":"%s","id":"%s","summary":%s}\n' "$(date +%s)" "$state" "$hash" "$(echo "$hash" | cut -c1-7)" "$(history_summary "$site_name" "$hash")" > "$gitdir/cove/save.result"
+            fi
             if [ "$format" == "json" ]; then
                 printf '{"state":"%s","hash":"%s","id":"%s","summary":%s}\n' "$state" "$hash" "$(echo "$hash" | cut -c1-7)" "$(history_summary "$site_name" "$hash")"
             elif [ "$state" == "unchanged" ]; then

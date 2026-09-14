@@ -7,7 +7,14 @@
 
 # --- Configuration ---
 # The final, compiled script that will be generated.
-OUTPUT_FILE="cove.sh"
+# Built into a scratch file and moved over cove.sh at the end: an atomic
+# rename gives the new build its own inode, so a cove process still running
+# from the old file (a long history save, the watchdog's sweeps) keeps
+# reading the script it started with. Bash reads scripts incrementally, and
+# truncating cove.sh underneath one had it re-run its command when the
+# function it was in returned.
+FINAL_FILE="cove.sh"
+OUTPUT_FILE="cove.sh.build"
 
 # The main script file containing the entry point, helpers, and globals.
 MAIN_SCRIPT="main"
@@ -35,7 +42,7 @@ for menubar_file in Sources/main.m Resources/Info.plist Resources/Assets/cove-lo
     fi
 done
 
-echo "🚀 Starting compilation of ${OUTPUT_FILE}..."
+echo "🚀 Starting compilation of ${FINAL_FILE}..."
 
 # 1. Start with the main script content, but EXCLUDE the final line that calls the main function.
 #    This ensures all functions are defined before any are called.
@@ -112,9 +119,10 @@ if ! bash -n "$OUTPUT_FILE"; then
     exit 1
 fi
 
-# 7. Make the final script executable.
+# 7. Make the final script executable and put it in place atomically.
 chmod +x "$OUTPUT_FILE"
+mv -f "$OUTPUT_FILE" "$FINAL_FILE"
 
 echo ""
 echo "✅ Compilation complete!"
-echo "   Distribution script created at: $(pwd)/${OUTPUT_FILE}"
+echo "   Distribution script created at: $(pwd)/${FINAL_FILE}"

@@ -3416,6 +3416,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         case 'site_history':
         case 'site_history_save':
+        case 'site_history_status':
         case 'site_history_rollback':
         case 'site_history_diff':
             // --- History: `cove history` with --format=json ------------------
@@ -3440,19 +3441,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!is_dir($sitedir . '/' . $site_name . '.localhost/public/wp-content')) { echo json_encode(['success' => true, 'items' => [], 'enabled' => false, 'dir' => $__hist_dir]); exit; }
                 [$data, $code, $out, $ms] = $__hist(['list']);
                 if ($code !== 0 || !is_array($data)) $__hist_fail($out, 'Could not read the history.');
-                $bytes = 0;
-                if (is_dir($__hist_dir . '/.git')) { $du = []; exec('du -sk ' . escapeshellarg($__hist_dir . '/.git') . ' 2>/dev/null', $du); $bytes = ((int) strtok((string) ($du[0] ?? '0'), "\t ")) * 1024; }
+                // Written by the save itself; a du here would walk every loose object.
+                $bytes = (int) @file_get_contents($__hist_dir . '/.git/cove/size');
                 $done = (int) @file_get_contents($user_home . '/Cove/.history.done');
-                echo json_encode(['success' => true, 'items' => $data, 'enabled' => true, 'ms' => $ms, 'dir' => $__hist_dir, 'bytes' => $bytes, 'last_sweep' => $done ?: null]);
+                [$st] = $__hist(['status']);
+                echo json_encode(['success' => true, 'items' => $data, 'enabled' => true, 'ms' => $ms, 'dir' => $__hist_dir, 'bytes' => $bytes, 'last_sweep' => $done ?: null, 'saving' => is_array($st) ? $st : null]);
                 exit;
             }
             if ($action === 'site_history_save') {
+                // A first save of a big site takes minutes, so it runs
+                // detached; the page polls site_history_status.
                 $note = trim((string) ($input['note'] ?? ''));
                 if (strlen($note) > 120 || preg_match('/[\x00-\x1f]/', $note)) { echo json_encode(['success' => false, 'message' => 'Keep the note short and on one line.']); exit; }
-                set_time_limit(0);
-                [$data, $code, $out, $ms] = $__hist($note !== '' ? ['save', '--note=' . $note] : ['save']);
-                if ($code !== 0 || !is_array($data)) $__hist_fail($out, 'The save failed.');
-                echo json_encode(['success' => true, 'state' => $data['state'] ?? '', 'id' => $data['id'] ?? '', 'summary' => $data['summary'] ?? null, 'ms' => $ms]);
+                [$data, $code, $out] = $__hist($note !== '' ? ['save', '--background', '--note=' . $note] : ['save', '--background']);
+                if ($code !== 0 || !is_array($data)) $__hist_fail($out, 'Could not start the save.');
+                echo json_encode(['success' => true, 'started' => !empty($data['started']), 'running' => !empty($data['running'])]);
+                exit;
+            }
+            if ($action === 'site_history_status') {
+                [$data, $code, $out] = $__hist(['status']);
+                if ($code !== 0 || !is_array($data)) $__hist_fail($out, 'Could not read the status.');
+                echo json_encode(['success' => true] + $data);
                 exit;
             }
             $id = $input['id'] ?? '';
@@ -10064,6 +10073,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 t.loading = false;
                 if (!res.success) t.error = res.message || 'wp-cli failed.';
                 else { t.items = res.items || []; t.loadedFor = site.name; t.ms = res.ms || 0; t.extra = res; if (opts.check) t.checked = true; }
+                if (tab === 'history') {
+                    const sv = res.saving;
+                    if (sv && sv.running) { t.busy['+'] = 'save'; t.saving = { started: Number(sv.started) || Date.now() / 1000, stage: sv.stage || '', files: Number(sv.files) || 0 }; this.historyPoll(site.name, true); }
+                    else if (!t.busy['+']) t.saving = null;
+                }
                 this.renderSiteTab();
             },
 
@@ -10136,22 +10150,51 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.setSiteTab('history');
             },
 
+            // The save runs detached (a big site's first one takes minutes);
+            // the tab polls for progress and reloads when it lands.
             async historySave() {
                 const site = this.pageSite;
                 const t = this.siteTabState('history');
                 if (!site || t.busy['+']) return;
                 const note = $id('histNote').value.trim();
-                t.busy['+'] = 'save';
+                t.busy['+'] = 'save'; t.saving = { started: Date.now() / 1000, stage: 'starting', files: 0 };
                 this.renderSiteTab();
-                const res = await this.apiPost('site_history_save', { site_name: site.name, note }, { quiet: true, timeoutMs: 1800000 });
-                delete t.busy['+'];
+                const res = await this.apiPost('site_history_save', { site_name: site.name, note }, { quiet: true, timeoutMs: 60000 });
                 if (this.sitePage.name !== site.name) return;
-                if (!res.success) { this.showSnack(res.message || 'The save failed.', true); this.renderSiteTab(); return; }
+                if (!res.success) { delete t.busy['+']; t.saving = null; this.showSnack(res.message || 'Could not start the save.', true); this.renderSiteTab(); return; }
                 $id('histNote').value = '';
-                if (res.state === 'unchanged') { this.showSnack('Nothing has changed since save ' + res.id + '.'); this.renderSiteTab(); return; }
-                this.showSnack('Saved ' + res.id + (res.summary && res.summary.summary ? ' — ' + res.summary.summary : '') + '.');
-                t.open = res.id; t.diff = null;
-                this.loadSiteTab({ force: true });
+                this.historyPoll(site.name, true);
+            },
+
+            // Poll site_history_status every two seconds while a save runs —
+            // also picked up when the tab opens on a site whose save is
+            // already under way (from the terminal, or the nightly sweep).
+            historyPoll(siteName, fresh) {
+                const t = this.siteTabState('history');
+                clearTimeout(t.pollTimer);
+                if (fresh) t.pollMisses = 0;
+                t.pollTimer = setTimeout(async () => {
+                    if (this.sitePage.name !== siteName) return;
+                    const st = await this.apiPost('site_history_status', { site_name: siteName }, { quiet: true, timeoutMs: 30000 });
+                    if (this.sitePage.name !== siteName) return;
+                    if (st.success && st.running) {
+                        t.busy['+'] = 'save';
+                        t.saving = { started: Number(st.started) || t.saving && t.saving.started || Date.now() / 1000, stage: st.stage || '', files: Number(st.files) || 0 };
+                        this.renderSiteTab();
+                        this.historyPoll(siteName, false);
+                        return;
+                    }
+                    // Not running: the result file lands a moment after the
+                    // lock goes, so give it a couple of polls.
+                    const r = st.success ? st.result : null;
+                    if (!r && t.pollMisses < 3 && t.busy['+']) { t.pollMisses++; this.historyPoll(siteName, false); return; }
+                    delete t.busy['+']; t.saving = null;
+                    if (r && r.ok === false) this.showSnack(r.message || 'The save failed.', true);
+                    else if (r && r.state === 'unchanged') this.showSnack('Nothing has changed since save ' + r.id + '.');
+                    else if (r && r.id) { this.showSnack('Saved ' + r.id + (r.summary && r.summary.summary ? ' — ' + r.summary.summary : '') + '.'); t.open = r.id; t.diff = null; }
+                    if (r && r.finished) t.seenResult = r.finished;
+                    this.loadSiteTab({ force: true });
+                }, fresh ? 800 : 2000);
             },
 
             // Two clicks: the first arms the button (keyed so only that button
@@ -10556,6 +10599,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (take) { take.disabled = !!t.busy['+']; take.textContent = t.busy['+'] ? 'snapshotting…' : 'take snapshot'; }
                 const hsave = panel.querySelector('#btnHistSave');
                 if (hsave) { hsave.disabled = !!t.busy['+']; hsave.textContent = t.busy['+'] ? 'saving…' : 'save now'; }
+                let savingText = '';
+                if (tab === 'history' && t.busy['+'] && t.saving) {
+                    const sv = t.saving;
+                    const secs = Math.max(0, Math.round(Date.now() / 1000 - sv.started));
+                    const stage = { manifest: 'reading versions', hashing: 'hashing', writing: 'writing the tree', summarising: 'summarising', packing: 'packing' }[sv.stage] || 'starting';
+                    savingText = 'saving: ' + stage + (sv.files ? ' · ' + sv.files.toLocaleString() + ' files' : '') + ' · ' + (secs >= 60 ? Math.floor(secs / 60) + 'm ' + (secs % 60) + 's' : secs + 's');
+                }
                 panel.querySelectorAll('.st-status').forEach(b => b.classList.toggle('is-active', b.dataset.status === t.status));
                 const refresh = panel.querySelector('.st-refresh');
                 if (refresh) refresh.disabled = t.loading;
@@ -10564,13 +10614,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const due = panel.querySelector('.st-due');
                 if (due) { due.disabled = !!t.busy['*']; due.textContent = t.busy['*'] ? 'running…' : 'run all due'; }
                 const count = panel.querySelector('.st-count');
-                if (!loaded) { count.textContent = ''; return; }
+                if (!loaded) { count.textContent = savingText; return; }
                 const rows = this.siteTabVisible(tab);
                 const label = { plugins: 'plugin', themes: 'theme', users: 'user', cron: 'event', snapshots: 'snapshot', history: 'save' }[tab];
                 const updates = (tab === 'plugins' || tab === 'themes') ? t.items.filter(i => i.update === 'available').length : 0;
                 count.textContent = (rows.length === t.items.length ? t.items.length : rows.length + ' of ' + t.items.length) + ' ' + label + (t.items.length === 1 ? '' : 's')
                     + (updates ? ' · ' + updates + ' update' + (updates === 1 ? '' : 's') : '')
                     + (t.ms ? ' · ' + (t.ms >= 1000 ? (t.ms / 1000).toFixed(1) + ' s' : t.ms + ' ms') : '');
+                if (savingText) count.textContent = savingText;
                 if (check) check.title = t.checked ? 'Checked wp.org this visit — click to check again' : 'Updates shown are as WordPress last saw them; click to ask wp.org now (loads the site\'s plugins, so it can take a while)';
                 const frag = document.createDocumentFragment();
                 const esc = (s) => this.escapeHtml(s == null ? '' : String(s));
