@@ -648,7 +648,7 @@ history_sweep() {
     fi
     local queue_file="$COVE_DIR/.history-sweep.queue" results_file="$COVE_DIR/.history-sweep.results"
     echo $$ > "$lock"
-    trap "rm -f '$lock' '$status_file' '$queue_file' '$results_file'" EXIT
+    trap "[ \"\$(cat '$lock' 2>/dev/null)\" == '$$' ] && rm -f '$lock' '$status_file' '$queue_file' '$results_file'" EXIT
     local ts site_path name saved state count=0 n_new=0 n_same=0 n_skip=0 complete=1
     echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] sweep: started$([ "$idle_only" == "1" ] && echo ' (idle-only)')$([ "$overdue" -eq 1 ] && echo ' (overdue)')" >> "$log"
     # How many sites are in scope, so progress can say "14 of 80".

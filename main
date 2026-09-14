@@ -10045,7 +10045,12 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 }
                 html += '</div>';
                 const rows = $id('svcRows');
+                // Re-rendered on every poll: keep the reader's place in the list.
+                const prevList = rows.querySelector('.sweep-list');
+                const keep = prevList ? prevList.scrollTop : 0;
                 rows.innerHTML = html;
+                const list = rows.querySelector('.sweep-list');
+                if (list && keep) list.scrollTop = keep;
                 rows.querySelectorAll('.sweep-name').forEach(b => b.addEventListener('click', () => { this.sweepModalOpen = false; this.setDbModal(false); this.openSitePage(b.dataset.site); this.setSiteTab('history'); }));
                 $id('svcNote').textContent = 'Sites without plugins or themes are not in the pass. Each result is a save only when something changed.';
             },
