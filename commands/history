@@ -139,8 +139,12 @@ history_write_tree() {
             # hashed side by side — a 3 GB site's first save in minutes,
             # not tens of them. Object writes are atomic renames, so
             # concurrent writers are safe.
+            # HISTORY_JOBS caps it: the nightly sweep hashes gently so the
+            # dev server it shares the disk with is not starved (the watchdog
+            # once killed FrankenPHP for missing three probes mid-sweep).
             local jobs; jobs=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
             [ "$jobs" -gt 8 ] && jobs=8
+            [ -n "$HISTORY_JOBS" ] && [ "$HISTORY_JOBS" -lt "$jobs" ] 2>/dev/null && jobs=$HISTORY_JOBS
             [ "$jobs" -lt 1 ] && jobs=1
             local total=0
             for mode in 100644 100755; do
@@ -642,17 +646,22 @@ history_sweep() {
         [ -f "$waiting_stamp" ] || date +%s > "$waiting_stamp"
         return 0
     fi
+    local queue_file="$COVE_DIR/.history-sweep.queue" results_file="$COVE_DIR/.history-sweep.results"
     echo $$ > "$lock"
-    trap "rm -f '$lock' '$status_file'" EXIT
+    trap "rm -f '$lock' '$status_file' '$queue_file' '$results_file'" EXIT
     local ts site_path name saved state count=0 n_new=0 n_same=0 n_skip=0 complete=1
     echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] sweep: started$([ "$idle_only" == "1" ] && echo ' (idle-only)')$([ "$overdue" -eq 1 ] && echo ' (overdue)')" >> "$log"
     # How many sites are in scope, so progress can say "14 of 80".
     local total=0
+    : > "$queue_file"; : > "$results_file"
     for site_path in "$SITES_DIR"/*/; do
         site_path="${site_path%/}"
-        [ -d "$site_path/public/wp-content" ] && [ -n "$(history_dirs "$site_path/public/wp-content")" ] && total=$((total + 1))
+        if [ -d "$site_path/public/wp-content" ] && [ -n "$(history_dirs "$site_path/public/wp-content")" ]; then
+            total=$((total + 1)); name=$(basename "$site_path"); echo "${name%.localhost}" >> "$queue_file"
+        fi
     done
     local sweep_started; sweep_started=$(date +%s)
+    export HISTORY_JOBS="${HISTORY_JOBS:-2}"
     # Live progress for the dashboard (cove history --status).
     history_sweep_status_write() { printf 'started=%s\nsite=%s\ndone=%s\ntotal=%s\nsaved=%s\n' "$sweep_started" "$1" "$2" "$total" "$3" > "$status_file.tmp" && mv -f "$status_file.tmp" "$status_file"; }
     history_sweep_status_write "" 0 0
@@ -672,17 +681,21 @@ history_sweep() {
             if [ "$state" == "new" ]; then
                 n_new=$((n_new + 1))
                 echo "[$ts] $name: saved $(echo "${saved%% *}" | cut -c1-7)" >> "$log"
+                echo "$name saved $(echo "${saved%% *}" | cut -c1-7)" >> "$results_file"
                 [ "$quiet" == "1" ] || echo "   💾 $name — saved $(echo "${saved%% *}" | cut -c1-7)"
             else
                 n_same=$((n_same + 1))
+                echo "$name unchanged $(echo "${saved%% *}" | cut -c1-7)" >> "$results_file"
                 [ "$quiet" == "1" ] || echo "   · $name — unchanged"
             fi
         elif [ "${saved##*$'\n'}" == "- busy" ]; then
             n_skip=$((n_skip + 1))
+            echo "$name busy" >> "$results_file"
             [ "$quiet" == "1" ] || echo "   · $name — a save is already running"
         else
             n_skip=$((n_skip + 1))
             echo "[$ts] $name: save failed" >> "$log"
+            echo "$name failed" >> "$results_file"
             [ "$quiet" == "1" ] || echo "   ⚠️  $name — save failed"
         fi
     done
@@ -784,8 +797,18 @@ cove_history() {
         waiting_since=$(cat "$COVE_DIR/.history.waiting" 2>/dev/null || echo 0)
         [ "$running" == "true" ] && waiting_since=0
         if [ "$format" == "json" ]; then
-            printf '{"running":%s,"pid":"%s","started":%s,"site":"%s","done":%s,"total":%s,"saved":%s,"last_done":%s,"last_try":%s,"waiting_since":%s}\n' \
-                "$running" "$spid" "${sstarted:-0}" "$ssite" "${sdone:-0}" "${stotal:-0}" "${ssaved:-0}" "${last_done:-0}" "${last_try:-0}" "${waiting_since:-0}"
+            # Every site in the pass, in order: its result so far, running, or pending.
+            local sites_json="[]"
+            if [ "$running" == "true" ] && [ -f "$COVE_DIR/.history-sweep.queue" ]; then
+                # (FILENAME, not FNR==NR: the results file is empty at the start of a pass.)
+                sites_json=$(awk -v cur="$ssite" -v rf="$COVE_DIR/.history-sweep.results" '
+                    FILENAME == rf { st[$1] = $2; id[$1] = ($3 == "" ? "" : $3); next }
+                    { n++; state = ($1 in st) ? st[$1] : ($1 == cur ? "running" : "pending"); printf "%s{\"name\":\"%s\",\"state\":\"%s\",\"id\":\"%s\"}", (n > 1 ? "," : "["), $1, state, id[$1] }
+                    END { if (n) printf "]"; else printf "[]" }' "$COVE_DIR/.history-sweep.results" "$COVE_DIR/.history-sweep.queue" 2>/dev/null)
+                [ -n "$sites_json" ] || sites_json="[]"
+            fi
+            printf '{"running":%s,"pid":"%s","started":%s,"site":"%s","done":%s,"total":%s,"saved":%s,"last_done":%s,"last_try":%s,"waiting_since":%s,"sites":%s}\n' \
+                "$running" "$spid" "${sstarted:-0}" "$ssite" "${sdone:-0}" "${stotal:-0}" "${ssaved:-0}" "${last_done:-0}" "${last_try:-0}" "${waiting_since:-0}" "$sites_json"
         elif [ "$running" == "true" ]; then
             echo "💾 Nightly sweep running (pid $spid): ${ssite:-starting}, $sdone of $stotal sites done, $ssaved saved."
         else

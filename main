@@ -5028,6 +5028,18 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
            page — the most glanceable status was the least reachable thing. */
         .nav-services { display: flex; align-items: center; gap: 0.85rem; margin-left: auto; margin-right: 0.85rem; font-family: var(--font-mono); font-size: 0.74rem; white-space: nowrap; flex-shrink: 0; }
         .dot.sweep-dot { gap: 0.35rem; color: var(--text-faint); }
+        .sweep-list { display: flex; flex-direction: column; gap: 0; max-height: 52vh; overflow-y: auto; margin: -0.3rem -0.4rem; }
+        .sweep-group { font-family: var(--font-mono); font-size: 0.64rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); padding: 0.6rem 0.4rem 0.25rem; }
+        .sweep-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 0.75rem; padding: 0.22rem 0.4rem; font-family: var(--font-mono); font-size: 0.78rem; border-radius: var(--radius-sm, 4px); }
+        .sweep-row:hover { background: var(--panel-hover); }
+        .sweep-row.is-pending { color: var(--text-faint); }
+        .sweep-row.is-running { color: var(--text); }
+        .sweep-name { background: transparent; border: 0; padding: 0; font: inherit; color: inherit; text-align: left; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sweep-name:hover { color: var(--accent); }
+        .sweep-id { color: var(--text-faint); font-size: 0.7rem; }
+        .sweep-row .st-chip.ch-saved { background: var(--pill-wp-bg); color: var(--pill-wp-fg); border-color: transparent; }
+        .sweep-row .st-chip.ch-failed { color: var(--danger); border-color: var(--danger); }
+        .sweep-row .st-chip.ch-running { color: var(--accent); border-color: var(--accent); }
         .dot.sweep-dot:hover { color: var(--text); }
 
         /* Keyboard selection. Distinct from :hover so the two can coexist. */
@@ -9967,6 +9979,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         const prev = this.sweep;
                         this.sweep = st;
                         this.renderSweep();
+                        if (this.sweepModalOpen) { if (st.running) this.renderSweepModal(); else { $id('svcStatus').textContent = 'The pass has finished.'; } }
                         if (this.view === 'site' && this.sitePage.tab === 'history') {
                             this.renderSiteTab();
                             // The sweep just moved past this site, or ended:
@@ -9992,11 +10005,49 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 b.title = 'History: nightly sweep running' + (s.site ? ' — saving ' + s.site + '.localhost' : '') + (t ? ' (' + n + ' of ' + t + ' sites done, ' + (Number(s.saved) || 0) + ' saved)' : '') + '. Click to see it.';
             },
 
+            // The dot opens a modal: every site in the pass — done (with its
+            // result), running, upcoming — refreshed by the poll while open.
             sweepGo() {
-                const s = this.sweep;
-                if (!s || !s.running) return;
-                if (s.site && this.sites.some(x => x.name === s.site)) { this.openSitePage(s.site); this.setSiteTab('history'); }
-                else this.showSnack('The sweep is between sites — ' + (Number(s.done) || 0) + ' of ' + (Number(s.total) || 0) + ' done.');
+                if (!this.sweep || !this.sweep.running) return;
+                this.sweepModalOpen = true;
+                this.showDbModal = true;
+                show($id('dbModal'), true);
+                $id('svcActions').innerHTML = '<button class="pill" id="btnDbClose">close</button>';
+                $id('btnDbClose').addEventListener('click', () => { this.sweepModalOpen = false; this.setDbModal(false); });
+                this.renderSweepModal();
+            },
+
+            renderSweepModal() {
+                if (!this.sweepModalOpen) return;
+                const s = this.sweep || {};
+                const esc = (v) => this.escapeHtml(String(v == null ? '' : v));
+                $id('svcTitle').textContent = 'History sweep';
+                const st = $id('svcStatus');
+                st.classList.remove('is-down');
+                const n = Number(s.done) || 0, t = Number(s.total) || 0;
+                if (!s.running) { st.textContent = 'The pass has finished.'; }
+                else {
+                    const rel = Number(s.started) ? this.formatRelative(Number(s.started)) : '';
+                    st.textContent = (s.site ? 'Saving ' + s.site + '.localhost' : 'Starting') + ' · ' + n + ' of ' + t + ' done · ' + (Number(s.saved) || 0) + ' saved' + (rel ? ' · started ' + (rel === 'now' ? 'just now' : rel + ' ago') : '');
+                }
+                const sites = Array.isArray(s.sites) ? s.sites : [];
+                const groups = [['done', sites.filter(x => x.state !== 'running' && x.state !== 'pending')], ['now', sites.filter(x => x.state === 'running')], ['upcoming', sites.filter(x => x.state === 'pending')]];
+                let html = '<div class="sweep-list">';
+                for (const [label, rows] of groups) {
+                    if (!rows.length) continue;
+                    html += '<div class="sweep-group">' + label + ' · ' + rows.length + '</div>';
+                    for (const r of rows) {
+                        const chip = r.state === 'saved' ? 'saved' : r.state === 'unchanged' ? 'unchanged' : r.state === 'failed' ? 'failed' : r.state === 'busy' ? 'skipped' : r.state === 'running' ? 'saving…' : '';
+                        html += '<div class="sweep-row is-' + esc(r.state) + '"><button type="button" class="sweep-name" data-site="' + esc(r.name) + '" title="Open the site\'s history">' + esc(r.name) + '</button>'
+                            + '<span class="sweep-id">' + esc(r.state === 'saved' ? r.id : '') + '</span>'
+                            + (chip ? '<span class="st-chip ch-' + esc(r.state) + '">' + esc(chip) + '</span>' : '<span></span>') + '</div>';
+                    }
+                }
+                html += '</div>';
+                const rows = $id('svcRows');
+                rows.innerHTML = html;
+                rows.querySelectorAll('.sweep-name').forEach(b => b.addEventListener('click', () => { this.sweepModalOpen = false; this.setDbModal(false); this.openSitePage(b.dataset.site); this.setSiteTab('history'); }));
+                $id('svcNote').textContent = 'Sites without plugins or themes are not in the pass. Each result is a save only when something changed.';
             },
 
             // One line for the history tab's footer.
@@ -12174,6 +12225,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             setDbModal(on) {
                 if (on) { this.openService('mariadb'); return; }
+                this.sweepModalOpen = false;
                 this.showDbModal = false;
                 show($id('dbModal'), false);
             },
