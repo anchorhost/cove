@@ -125,7 +125,10 @@ cove_opcache() {
     fi
 
     # --- set ---------------------------------------------------------------
-    [ -t 0 ] || auto_yes=true
+    # Without a terminal there is nobody to ask, and "yes" here means dropping
+    # every site for a few seconds — so a script gets the write and the hint,
+    # and restarts only when it says --yes.
+    if ! [ -t 0 ] && ! $auto_yes; then no_restart=true; fi
     if [[ ! "$mem" =~ ^[0-9]+$ ]] || [ "$mem" -lt 64 ]; then
         gum style --foreground red "❌ Size must be a whole number of MB, 64 or more (e.g. 2048)."
         exit 1
@@ -160,7 +163,8 @@ cove_opcache() {
     echo ""
     if $no_restart; then
         echo "ℹ️  Not restarting. The new size applies on the next full restart of FrankenPHP:"
-        [ "$OS" = "macos" ] && echo "   launchctl kickstart -k gui/\$(id -u)/com.cove.caddy" || echo "   cove disable && cove enable"
+        echo "   cove opcache set $mem --yes"
+        [ "$OS" = "macos" ] && echo "   or: launchctl kickstart -k gui/\$(id -u)/com.cove.caddy" || echo "   or: cove disable && cove enable"
         return 0
     fi
     echo "OPcache's shared memory is sized when PHP starts, so this needs a full"

@@ -13554,7 +13554,8 @@ display_command_help() {
             echo "interned-strings buffer and the file cap, regenerates the Caddyfile"
             echo "and restarts FrankenPHP, which the resize needs (a reload is not"
             echo "enough). --no-restart writes without restarting; --yes skips the"
-            echo "confirmation."
+            echo "confirmation. Without a terminal (a script, the dashboard) nothing"
+            echo "is restarted unless --yes is given."
             ;;
         memory)
             echo "Usage: cove memory [set <value>] [--yes]"
