@@ -5026,7 +5026,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         /* Service dots in the top bar. They used to live only in the footer,
            which on an install with hundreds of sites sits ~14,000px down the
            page — the most glanceable status was the least reachable thing. */
-        .nav-services { display: flex; align-items: center; gap: 0.85rem; margin-left: auto; margin-right: 0.85rem; font-family: var(--font-mono); font-size: 0.74rem; }
+        .nav-services { display: flex; align-items: center; gap: 0.85rem; margin-left: auto; margin-right: 0.85rem; font-family: var(--font-mono); font-size: 0.74rem; white-space: nowrap; flex-shrink: 0; }
+        .dot.sweep-dot { gap: 0.35rem; color: var(--text-faint); }
+        .dot.sweep-dot:hover { color: var(--text); }
 
         /* Keyboard selection. Distinct from :hover so the two can coexist. */
         /* Selected rows: fill plus a hairline, never an accent stripe. */
@@ -5694,7 +5696,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 <button type="button" class="dot link" data-service="caddy" title="Caddy status">caddy</button>
                 <button type="button" class="dot link" data-service="mariadb" title="MariaDB status and credentials">mariadb</button>
                 <button type="button" class="dot link" data-service="mailpit" title="Mailpit status">mailpit</button>
-                <button type="button" class="dot link is-busy" id="navSweep" data-service="history" title="The nightly history sweep is running — click for the site it is on" style="display: none;">history</button>
+                <button type="button" class="dot link is-busy sweep-dot" id="navSweep" data-service="history" title="The nightly history sweep is running — click for the site it is on" style="display: none;">6/80</button>
             </div>
             <button class="theme-btn" id="btnTheme" title="Theme" aria-label="Theme" aria-haspopup="menu">
                 <svg class="icon-system" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor" stroke="none"/></svg>
@@ -9985,8 +9987,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 show(b, on);
                 if (!on) return;
                 const n = Number(s.done) || 0, t = Number(s.total) || 0;
-                b.innerHTML = 'history' + (t ? ' <span class="dot-meta">' + n + '/' + t + '</span>' : '');
-                b.title = 'Nightly history sweep running' + (s.site ? ' — saving ' + s.site + '.localhost' : '') + (t ? ' (' + n + ' of ' + t + ' sites done, ' + (Number(s.saved) || 0) + ' saved)' : '') + '. Click to see it.';
+                // Compact on purpose: the services row must stay on one line.
+                b.textContent = t ? n + '/' + t : 'saving';
+                b.title = 'History: nightly sweep running' + (s.site ? ' — saving ' + s.site + '.localhost' : '') + (t ? ' (' + n + ' of ' + t + ' sites done, ' + (Number(s.saved) || 0) + ' saved)' : '') + '. Click to see it.';
             },
 
             sweepGo() {
