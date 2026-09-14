@@ -1,4 +1,6 @@
 cove_reload() {
+    # Keep the watchdog's copy of cove current with the file just run.
+    [ -f "$COVE_DIR/watchdog.sh" ] && refresh_watchdog_copy >/dev/null
     # Auto-heal any root-owned state left over from a pre-1.10 install.
     heal_cove_state_ownership
     # Serialize reloads to keep Caddy's admin server healthy. The dashboard
