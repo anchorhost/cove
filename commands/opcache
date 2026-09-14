@@ -1,0 +1,175 @@
+# cove opcache — size and inspect FrankenPHP's shared OPcache.
+#
+# Every local site is served by ONE FrankenPHP, so its OPcache holds every
+# site's PHP at once and fills as the fleet grows. When it is full, files that
+# are not already cached compile on every request: the sites cached first stay
+# fast, the plugin-heavy one you are working on crawls, and the watchdog ends up
+# restarting a server that was only busy. The limits live in ~/Cove/php.ini
+# (read by regenerate_caddyfile through cove_ini_get) and only take effect on
+# a full restart, because the shared memory is sized when PHP starts.
+
+# Ask the RUNNING server about its OPcache (a fresh php-cli would report an
+# empty cache). Prints key=value lines, or nothing when the server did not
+# answer. Contained to Cove's own dashboard docroot, never a user's site.
+# On ZTS builds opcache.memory_consumption can read back as 0 and used_memory
+# can go negative; cache_full, free_memory, hits and misses stay trustworthy.
+cove_opcache_probe() {
+    local probe="_cove_opcache_$$.php" out="" attempt
+    cat > "$GUI_DIR/$probe" 2>/dev/null <<'PHP'
+<?php
+header('Content-Type: text/plain');
+if (!function_exists('opcache_get_status')) { echo "noopcache\n"; exit; }
+$s = @opcache_get_status(false); $c = @opcache_get_configuration();
+if (!$s || !$c) { echo "disabled\n"; exit; }
+$st = $s['opcache_statistics']; $is = $s['interned_strings_usage']; $m = $s['memory_usage'];
+$int_total = $is['used_memory'] + $is['free_memory'];
+printf("hit_rate=%.1f\n", $st['opcache_hit_rate']);
+printf("hits=%d\n", $st['hits']);
+printf("misses=%d\n", $st['misses']);
+printf("cached=%d\n", $st['num_cached_scripts']);
+printf("maxfiles=%d\n", $c['directives']['opcache.max_accelerated_files']);
+printf("full=%d\n", !empty($s['cache_full']) ? 1 : 0);
+printf("free_mb=%d\n", max(0, $m['free_memory']) / 1048576);
+printf("used_mb=%d\n", max(0, $m['used_memory']) / 1048576);
+printf("wasted_pct=%.0f\n", is_finite($m['current_wasted_percentage']) ? $m['current_wasted_percentage'] : 0);
+printf("interned_used_pct=%.0f\n", $int_total ? 100*$is['used_memory']/$int_total : 0);
+printf("interned_mb=%.0f\n", $int_total/1048576);
+printf("oom_restarts=%d\n", $st['oom_restarts']);
+printf("hash_restarts=%d\n", $st['hash_restarts']);
+printf("optimizer=%d\n", $c['directives']['opcache.optimization_level']);
+PHP
+    # A probe landing during a config reload hangs; retry rather than misreport.
+    for attempt in 1 2 3; do
+        out=$(curl -sk --max-time 12 "https://cove.localhost:${HTTPS_PORT}/$probe" 2>/dev/null)
+        [ -n "$out" ] && break
+        sleep 2
+    done
+    rm -f "$GUI_DIR/$probe" 2>/dev/null
+    printf '%s\n' "$out"
+}
+
+# The configured limits, php.ini value or Cove's default.
+cove_opcache_configured() {
+    echo "memory=$(cove_ini_get opcache.memory_consumption 512)"
+    echo "interned=$(cove_ini_get opcache.interned_strings_buffer 64)"
+    echo "files=$(cove_ini_get opcache.max_accelerated_files 100000)"
+}
+
+# Restart FrankenPHP so a resized shared memory takes effect. `cove reload`
+# only re-reads the Caddyfile; PHP's SHM is allocated at process start.
+cove_opcache_restart() {
+    if [ "$OS" = "macos" ]; then
+        launchctl kickstart -k "gui/$(id -u)/com.cove.caddy" 2>/dev/null
+    elif [ "$IS_WSL" = true ]; then
+        cove_disable >/dev/null 2>&1; cove_enable >/dev/null 2>&1
+    else
+        $SUDO_CMD systemctl restart cove.service 2>/dev/null
+    fi
+}
+
+cove_opcache() {
+    local action="show" mem="" interned="" files="" auto_yes=false no_restart=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) display_command_help opcache; exit 0 ;;
+            show) action="show"; shift ;;
+            set)
+                action="set"
+                mem="$2"
+                shift 2 || { gum style --foreground red "❌ 'set' needs a size in MB (e.g. cove opcache set 2048)"; exit 1; }
+                ;;
+            --interned) interned="$2"; shift 2 ;;
+            --interned=*) interned="${1#*=}"; shift ;;
+            --files) files="$2"; shift 2 ;;
+            --files=*) files="${1#*=}"; shift ;;
+            --no-restart) no_restart=true; shift ;;
+            -y|--yes) auto_yes=true; shift ;;
+            *) gum style --foreground red "❌ Unknown option: $1"; echo "Usage: cove opcache [show | set <mb> [--interned <mb>] [--files <n>] [--no-restart] [--yes]]"; exit 1 ;;
+        esac
+    done
+
+    if [ "$action" = "show" ]; then
+        local cfg mem_c int_c files_c
+        cfg=$(cove_opcache_configured)
+        mem_c=$(echo "$cfg" | sed -n 's/^memory=//p'); int_c=$(echo "$cfg" | sed -n 's/^interned=//p'); files_c=$(echo "$cfg" | sed -n 's/^files=//p')
+        echo ""
+        gum style --foreground "212" --bold "OPcache"
+        echo "  configured in $PHP_INI_FILE"
+        echo "    opcache.memory_consumption     = ${mem_c} MB"
+        echo "    opcache.interned_strings_buffer = ${int_c} MB"
+        echo "    opcache.max_accelerated_files   = ${files_c}"
+        local out
+        out=$(cove_opcache_probe)
+        if [ -z "$out" ] || echo "$out" | grep -q "noopcache\|disabled"; then
+            echo "  live: could not read the running server (${out:-no response; is Caddy up?})"
+            return 0
+        fi
+        local full free hit hits misses cached maxf ipct imb
+        full=$(echo "$out" | sed -n 's/^full=//p'); free=$(echo "$out" | sed -n 's/^free_mb=//p')
+        hit=$(echo "$out" | sed -n 's/^hit_rate=//p'); hits=$(echo "$out" | sed -n 's/^hits=//p'); misses=$(echo "$out" | sed -n 's/^misses=//p')
+        cached=$(echo "$out" | sed -n 's/^cached=//p'); maxf=$(echo "$out" | sed -n 's/^maxfiles=//p')
+        ipct=$(echo "$out" | sed -n 's/^interned_used_pct=//p'); imb=$(echo "$out" | sed -n 's/^interned_mb=//p')
+        echo "  live"
+        if [ "$full" = "1" ]; then
+            echo "    ❌ cache FULL — files not already cached compile on every request"
+        else
+            echo "    ✅ not full (${free} MB free)"
+        fi
+        echo "    scripts ${cached}/${maxf} · hits ${hits} · misses ${misses} · hit rate ${hit}%"
+        echo "    interned strings ${ipct}% of ${imb} MB"
+        if [ "$full" = "1" ]; then
+            echo ""
+            echo "  Raise it: cove opcache set $(( mem_c * 2 )) --interned $(( int_c * 2 ))"
+        fi
+        return 0
+    fi
+
+    # --- set ---------------------------------------------------------------
+    [ -t 0 ] || auto_yes=true
+    if [[ ! "$mem" =~ ^[0-9]+$ ]] || [ "$mem" -lt 64 ]; then
+        gum style --foreground red "❌ Size must be a whole number of MB, 64 or more (e.g. 2048)."
+        exit 1
+    fi
+    if [ -n "$interned" ] && { [[ ! "$interned" =~ ^[0-9]+$ ]] || [ "$interned" -lt 8 ]; }; then
+        gum style --foreground red "❌ --interned must be a whole number of MB, 8 or more."
+        exit 1
+    fi
+    if [ -n "$files" ] && { [[ ! "$files" =~ ^[0-9]+$ ]] || [ "$files" -lt 1000 ]; }; then
+        gum style --foreground red "❌ --files must be a whole number, 1000 or more."
+        exit 1
+    fi
+    echo ""
+    gum style --foreground "212" --bold "Setting opcache.memory_consumption = ${mem} MB"
+    mkdir -p "$(dirname "$PHP_INI_FILE")"
+    touch "$PHP_INI_FILE"
+    echo "📁 Updating $PHP_INI_FILE"
+    local k v
+    for pair in "opcache.memory_consumption=$mem" "opcache.interned_strings_buffer=$interned" "opcache.max_accelerated_files=$files"; do
+        k="${pair%%=*}"; v="${pair#*=}"
+        [ -z "$v" ] && continue
+        if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
+            sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${v}|" "$PHP_INI_FILE"
+        else
+            echo "${k} = ${v}" >> "$PHP_INI_FILE"
+        fi
+        echo "   ✓ ${k} = ${v}"
+    done
+    rm -f "${PHP_INI_FILE}.bak"
+    echo ""
+    regenerate_caddyfile
+    echo ""
+    if $no_restart; then
+        echo "ℹ️  Not restarting. The new size applies on the next full restart of FrankenPHP:"
+        [ "$OS" = "macos" ] && echo "   launchctl kickstart -k gui/\$(id -u)/com.cove.caddy" || echo "   cove disable && cove enable"
+        return 0
+    fi
+    echo "OPcache's shared memory is sized when PHP starts, so this needs a full"
+    echo "restart of FrankenPHP (every local site is served by that one process;"
+    echo "requests in flight are dropped, a few seconds of downtime)."
+    if $auto_yes || gum confirm "Restart FrankenPHP now?"; then
+        cove_opcache_restart
+        echo "✅ FrankenPHP restarted with the new limits."
+    else
+        echo "⏭️  Skipped. Restart later with: cove opcache set $mem --yes"
+    fi
+}

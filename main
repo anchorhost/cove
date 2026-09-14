@@ -13180,6 +13180,7 @@ show_general_help() {
     echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  ports            Reconfigure HTTP/HTTPS ports + update site URLs."
     echo "  memory           Show or raise PHP memory_limit across Cove + Homebrew PHPs."
+    echo "  opcache          Show or resize FrankenPHP's shared OPcache (all sites share it)."
     echo "  php              Pin a site to an older PHP (native php-fpm behind FrankenPHP)."
     echo "  log              View logs for a site or the global error log."
     echo "  share            Create a temporary public tunnel to share a site."
@@ -13539,6 +13540,21 @@ display_command_help() {
             echo "  cove ports --dry-run                Preview the effect of a port change"
             echo ""
             echo "Tip: run 'cove db backup' first if you want a safety net before the DB update."
+            ;;
+        opcache)
+            echo "Usage: cove opcache [show | set <mb> [--interned <mb>] [--files <n>] [--no-restart] [--yes]]"
+            echo ""
+            echo "Every local site is served by one FrankenPHP, so its OPcache holds"
+            echo "every site's PHP at once and fills as the fleet grows. Once it is"
+            echo "full, files that are not already cached compile on every request:"
+            echo "the plugin-heavy site you are working on crawls while others stay"
+            echo "fast. 'show' reports the configured limits and the running server's"
+            echo "live state (full or not, hits and misses). 'set' writes"
+            echo "opcache.memory_consumption (MB) to ~/Cove/php.ini, optionally the"
+            echo "interned-strings buffer and the file cap, regenerates the Caddyfile"
+            echo "and restarts FrankenPHP, which the resize needs (a reload is not"
+            echo "enough). --no-restart writes without restarting; --yes skips the"
+            echo "confirmation."
             ;;
         memory)
             echo "Usage: cove memory [set <value>] [--yes]"
@@ -13963,6 +13979,10 @@ main() {
         memory)
             check_dependencies
             cove_memory "$@"
+            ;;
+        opcache)
+            check_dependencies
+            cove_opcache "$@"
             ;;
         php)
             check_dependencies
