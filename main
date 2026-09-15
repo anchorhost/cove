@@ -10425,6 +10425,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const comps = Array.isArray(sum.components) ? sum.components : [];
                 const li = document.createElement('li');
                 li.className = 'st-detail';
+                li.dataset.id = it.id;
                 const f = sum.files || {};
                 const filesHtml = (a, m, d) => '<span class="st-hist-files"><span class="f-add">+' + (a || 0) + '</span><span>~' + (m || 0) + '</span><span class="f-del">−' + (d || 0) + '</span></span>';
                 let html = '<div class="st-detail-head"><span title="Full hash">' + esc(it.hash.slice(0, 12)) + '</span>'
@@ -10455,7 +10456,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         if (c.change !== 'deleted' && (touched || c.change === 'new')) actions += '<button type="button" class="pill st-hist-roll' + (t.arm === kThis ? ' armed' : '') + '" data-hash="' + esc(it.hash) + '" data-target="' + esc(target) + '" data-key="' + esc(kThis) + '" title="Put the files back exactly as they were in this save' + (c.version ? ' (' + esc(c.version) + ')' : '') + '">' + (t.arm === kThis ? 'sure?' : 'restore this') + '</button>';
                         if (touched) actions += '<button type="button" class="pill st-hist-diff' + (t.diff && t.diff.key === it.hash + ':' + target ? ' is-active' : '') + '" data-hash="' + esc(it.hash) + '" data-target="' + esc(target) + '" title="What changed in these files">diff</button>';
                     }
-                    html += '<div class="st-comp"><span class="st-chip ch-' + esc(c.change) + '">' + esc(chg) + '</span>'
+                    html += '<div class="st-comp" data-path="' + esc(c.path) + '"><span class="st-chip ch-' + esc(c.change) + '">' + esc(chg) + '</span>'
                         + '<div class="st-comp-main"><span class="st-comp-name">' + esc(c.title || c.slug) + '</span><span class="st-comp-sub">' + esc(c.type) + ' · ' + esc(c.path) + st + '</span></div>'
                         + '<span class="st-comp-ver">' + ver + '</span>'
                         + (touched ? filesHtml(c.added, c.modified, c.deleted) : '<span></span>')
@@ -10668,6 +10669,21 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     items.push({ label: 'Copy id', run: () => this.copyText(it.id, 'Id copied') });
                     items.push({ sep: true });
                     items.push({ label: 'Delete…', danger: true, run: () => this.snapshotOp(it.id, 'delete') });
+                } else if (tab === 'history' && it.component) {
+                    // A component row inside an opened save.
+                    const save = it.save, c = it.component, sum = save.summary || {};
+                    const target = c.type === 'file' ? 'file:' + c.path : c.path;
+                    const touched = !!(c.added || c.modified || c.deleted);
+                    const kBefore = save.hash + ':before:' + c.path, kThis = save.hash + ':this:' + c.path;
+                    if (sum.parent && c.change !== 'new' && touched) items.push({ label: (c.change === 'deleted' ? 'Bring back' : 'Undo') + (c.version_from && c.version_from !== c.version ? ' → ' + c.version_from : '') + '…', run: () => { const t = this.siteTabState('history'); t.open = save.id; this.historyRollback(sum.parent, target, kBefore); } });
+                    if (c.change !== 'deleted' && (touched || c.change === 'new')) items.push({ label: 'Restore as saved' + (c.version ? ' (' + c.version + ')' : '') + '…', run: () => { const t = this.siteTabState('history'); t.open = save.id; this.historyRollback(save.hash, target, kThis); } });
+                    if (touched) items.push({ label: 'Diff', run: () => { const t = this.siteTabState('history'); t.open = save.id; this.historyDiff(save.hash, target); } });
+                    if (items.length) items.push({ sep: true });
+                    if (c.change !== 'deleted') items.push({ label: c.type === 'file' ? 'Open file' : 'Browse files', run: () => this.openFilesAt(site.name, 'public/wp-content/' + c.path) });
+                    items.push({ label: 'Previous versions', run: () => this.historyFocus(c.slug) });
+                    items.push({ sep: true });
+                    items.push({ label: 'Copy slug', run: () => this.copyText(c.slug, 'Slug copied') });
+                    items.push({ label: 'Copy path', run: () => this.copyText('public/wp-content/' + c.path, 'Path copied') });
                 } else if (tab === 'history') {
                     const t = this.siteTabState('history');
                     items.push({ label: t.open === it.id ? 'Collapse' : 'What changed', run: () => this.historyToggle(it.id) });
@@ -10953,6 +10969,19 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 }
                 for (const tab of ['plugins', 'themes', 'users', 'cron', 'snapshots', 'history']) {
                     $id('sitePanel-' + tab).querySelector('.st-list').addEventListener('contextmenu', (e) => {
+                        if (tab === 'history') {
+                            const comp = e.target.closest('.st-comp');
+                            const detail = comp && comp.closest('.st-detail');
+                            if (comp && detail) {
+                                const t = this.siteTabState('history');
+                                const save = t.items.find(x => x.id === detail.dataset.id);
+                                const c = save && Array.isArray((save.summary || {}).components) ? save.summary.components.find(x => x.path === comp.dataset.path) : null;
+                                if (!save || !c) return;
+                                const items = this.tabCtxItemsFor('history', { component: c, save });
+                                if (items.length) this.openTabCtx(e, c.title || c.slug, items);
+                                return;
+                            }
+                        }
                         const row = e.target.closest('.st-row');
                         if (!row) return;
                         const t = this.siteTabState(tab);
