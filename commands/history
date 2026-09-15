@@ -8,7 +8,10 @@
 # There is no work tree: files are hashed straight out of public/wp-content
 # into a temporary index (git hash-object + update-index --index-info), so a
 # save costs only the compressed objects and nested .git folders inside a
-# plugin under development never turn into submodules.
+# plugin under development never turn into submodules. Symlinked components
+# (a plugin linked in from a checkout elsewhere) are saved by content, so a
+# version bump there shows its diff like any other; a rollback still leaves
+# the link itself alone.
 
 HISTORY_EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
@@ -112,9 +115,9 @@ history_lock_holder() {
     return 1
 }
 
-# Build a tree object from the live wp-content: every regular file and
-# symlink under plugins/, themes/, mu-plugins/ (skipping node_modules, VCS
-# folders, .DS_Store and logs), plus manifest.tsv from $2 when given.
+# Build a tree object from the live wp-content: every regular file under
+# plugins/, themes/, mu-plugins/ — through symlinks — (skipping node_modules,
+# VCS folders, .DS_Store and logs), plus manifest.tsv from $2 when given.
 # Prints the tree hash.
 history_write_tree() {
     local site_name="$1" manifest_file="$2"
@@ -150,7 +153,7 @@ history_write_tree() {
             for mode in 100644 100755; do
                 if [ "$mode" == "100644" ]; then perm=(! -perm -u+x); else perm=(-perm -u+x); fi
                 # shellcheck disable=SC2086
-                find $dirs "${prune[@]}" -o -type f "${perm[@]}" "${skip[@]}" -print 2>/dev/null | LC_ALL=C sort > "$list"
+                find -L $dirs "${prune[@]}" -o -type f "${perm[@]}" "${skip[@]}" -print 2>/dev/null | LC_ALL=C sort > "$list"
                 if [ -s "$list" ]; then
                     local n; n=$(wc -l < "$list" | tr -d ' ')
                     total=$((total + n))
@@ -176,14 +179,6 @@ history_write_tree() {
                 fi
             done
             history_status "$gitdir" "writing" "$total"
-            # Symlinks (a plugin linked in from a checkout elsewhere) are kept
-            # as links: the target path, mode 120000.
-            # shellcheck disable=SC2086
-            find $dirs "${prune[@]}" -o -type l -print 2>/dev/null | LC_ALL=C sort | while IFS= read -r link; do
-                target=$(readlink "$link") || continue
-                blob=$(printf '%s' "$target" | history_git "$gitdir" hash-object -w --no-filters --stdin)
-                printf '120000 %s\t%s\n' "$blob" "$link"
-            done | history_git "$gitdir" update-index --add --index-info
         fi
         if [ -n "$manifest_file" ] && [ -s "$manifest_file" ]; then
             blob=$(history_git "$gitdir" hash-object -w --no-filters "$manifest_file")
@@ -204,7 +199,7 @@ history_files_changed_since() {
     local dirs; dirs=$(history_dirs "$content")
     [ -n "$dirs" ] || return 1
     # shellcheck disable=SC2086
-    [ -n "$(cd "$content" && find $dirs -newer "$stamp" -print -quit 2>/dev/null)" ]
+    [ -n "$(cd "$content" && find -L $dirs -newer "$stamp" -print -quit 2>/dev/null)" ]
 }
 
 # history_save <site> <note> <auto:0|1> [force:0|1] [quick:0|1]
@@ -275,7 +270,9 @@ history_save() {
         return 1
     fi
     rm -f "$manifest"
-    if [ -n "$head" ] && [ "$force" != "1" ]; then
+    # An identical tree is never recorded, --force or not: the history is a
+    # list of changes, and --force only skips the cheap "anything newer?" check.
+    if [ -n "$head" ]; then
         local head_tree; head_tree=$(history_git "$gitdir" rev-parse "$head^{tree}")
         if [ "$tree" == "$head_tree" ]; then
             touch "$gitdir/cove/last-save"
@@ -754,7 +751,9 @@ cove_history() {
                 echo "how it was on a given day. A rollback saves the current state first, so it"
                 echo "can itself be undone. Symlinked components and folders with their own .git"
                 echo "are left alone unless --force. Ids are the short hashes the list shows;"
-                echo "'latest' and HEAD~1 work too. --format=json for scripts."
+                echo "'latest' and HEAD~1 work too. --format=json for scripts. A save records"
+                echo "nothing when nothing changed; --force only skips the quick 'anything"
+                echo "newer?' check and hashes everything."
                 return
                 ;;
             -*)
@@ -910,7 +909,7 @@ cove_history() {
             if [ "$format" == "json" ]; then
                 printf '{"state":"%s","hash":"%s","id":"%s","summary":%s}\n' "$state" "$hash" "$(echo "$hash" | cut -c1-7)" "$(history_summary "$site_name" "$hash")"
             elif [ "$state" == "unchanged" ]; then
-                gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✓ Nothing changed since save $(echo "$hash" | cut -c1-7)" "Add --force to record a save anyway."
+                gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✓ Nothing changed since save $(echo "$hash" | cut -c1-7)"
             else
                 local summary; summary=$(history_summary "$site_name" "$hash" | sed -n 's/.*"summary":"\(.*\)"}$/\1/p' | sed 's/\\"/"/g')
                 gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Saved $(echo "$hash" | cut -c1-7)" "$summary" "Roll back with: cove history $site_name rollback $(echo "$hash" | cut -c1-7) --plugin=<slug>"
