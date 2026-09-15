@@ -158,14 +158,27 @@ cove_screenshot() {
     # page still waiting on the server paints nothing — a black preview. A
     # site's first load after a restart (or a cold OPcache at night) can take
     # half a minute; this request pays it so the capture itself is quick.
-    local http
-    http=$(curl -sk -o /dev/null --max-time 60 -w '%{http_code}' "$url" 2>/dev/null)
+    local http ctype
+    http=$(curl -sk -o /dev/null --max-time 60 -w '%{http_code}\n%{content_type}' "$url" 2>/dev/null)
+    ctype="${http#*$'\n'}"; http="${http%%$'\n'*}"
     if [ -z "$http" ] || [ "$http" == "000" ] || [ "${http:0:1}" == "5" ]; then
         rm -f "$tmp_out"
         [ "$quiet" -eq 1 ] && exit 1
         gum style --foreground red "❌ Error: $url did not answer (HTTP ${http:-none}); the preview was left as it was."
         exit 1
     fi
+    # A front page that is a PDF, an image, or JSON has nothing for the
+    # browser to paint; a blank preview left from before goes too.
+    case "$ctype" in
+        ""|text/html*|application/xhtml*) ;;
+        *)
+            rm -f "$tmp_out"
+            [ -f "$out" ] && [ "$(stat -f%z "$out" 2>/dev/null || stat -c%s "$out" 2>/dev/null || echo 0)" -lt 8192 ] && rm -f "$out"
+            [ "$quiet" -eq 1 ] && exit 1
+            gum style --foreground yellow "ℹ️  $url serves ${ctype%%;*}, not a page — nothing to preview."
+            exit 1
+            ;;
+    esac
     [ "$quiet" -eq 1 ] || echo "📷 Capturing $url with $(basename "${browser%% *}")…"
     # A throwaway profile: headless refuses to start on a profile the user's
     # open browser holds, and nothing from the user's session should leak
@@ -206,6 +219,8 @@ cove_screenshot() {
     local bytes; bytes=$(stat -f%z "$tmp_out" 2>/dev/null || stat -c%s "$tmp_out" 2>/dev/null || echo 0)
     if [ "$bytes" -lt 8192 ]; then
         rm -f "$tmp_out"
+        # Do not keep an earlier blank either.
+        [ -f "$out" ] && [ "$(stat -f%z "$out" 2>/dev/null || stat -c%s "$out" 2>/dev/null || echo 0)" -lt 8192 ] && rm -f "$out"
         [ "$quiet" -eq 1 ] && exit 1
         gum style --foreground red "❌ Error: The page had not painted when the capture was taken; the preview was left as it was."
         exit 1
