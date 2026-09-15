@@ -4,6 +4,9 @@
 # dashboard says so instead of showing a preview.
 
 SCREENSHOTS_DIR="${SCREENSHOTS_DIR:-$COVE_DIR/cache/screenshots}"
+# Where capture profiles live. macOS sets TMPDIR with a trailing slash;
+# one form for both mktemp and find, so a path names the same processes.
+SHOT_TMP="${TMPDIR:-/tmp}"; SHOT_TMP="${SHOT_TMP%/}"
 
 find_headless_browser() {
     local c
@@ -47,6 +50,36 @@ cove_user_is_idle() {
     return 0
 }
 
+# Stop one capture's browser. Every Chrome helper carries the profile path
+# in its arguments, so the path names the whole tree: TERM it, give it a
+# moment, then KILL whatever ignored that. Never an unbounded `wait` — a
+# headless Chrome that ignores SIGTERM once held a process for an hour.
+cove_screenshot_stop() {
+    local profile="$1"
+    [ -n "$profile" ] || return 0
+    pkill -TERM -f -- "$profile" 2>/dev/null
+    local i=0
+    while [ $i -lt 30 ] && pgrep -f -- "$profile" >/dev/null 2>&1; do sleep 0.1; i=$((i + 1)); done
+    if pgrep -f -- "$profile" >/dev/null 2>&1; then
+        pkill -KILL -f -- "$profile" 2>/dev/null
+        sleep 0.2
+    fi
+}
+
+# Strays from earlier runs: capture browsers whose profile is older than
+# three minutes (no capture takes that long), their profile directories,
+# and any capture lock file that outlived its capture.
+cove_screenshot_reap() {
+    local d
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        cove_screenshot_stop "$d"
+        rm -rf "$d"
+    done < <(find "$SHOT_TMP" -maxdepth 1 -name 'cove-shot-profile.*' -mmin +3 2>/dev/null)
+    [ -d "$SCREENSHOTS_DIR" ] && find "$SCREENSHOTS_DIR" -maxdepth 1 -name '*.png.tmp.png' -mmin +2 -delete 2>/dev/null
+    return 0
+}
+
 # Refresh previews that are missing, older than the site's public/ tree,
 # or older than a day — up to --max of them, one after another, at low
 # priority, under a lock so two sweeps never overlap.
@@ -61,6 +94,7 @@ cove_screenshot_sweep() {
     fi
     echo $$ > "$lock"
     trap 'rm -f "$lock"' EXIT
+    cove_screenshot_reap
     local done=0 site_path name png now site_m
     now=$(date +%s)
     for site_path in "$SITES_DIR"/*/; do
@@ -141,10 +175,11 @@ cove_screenshot() {
     fi
 
     [ -z "$out" ] && { mkdir -p "$SCREENSHOTS_DIR"; out="$SCREENSHOTS_DIR/$site_name.png"; }
+    cove_screenshot_reap
     local url
     url=$(url_for "$site_name.localhost")
     local tmp_profile tmp_out
-    tmp_profile=$(mktemp -d "${TMPDIR:-/tmp}/cove-shot-profile.XXXXXX")
+    tmp_profile=$(mktemp -d "$SHOT_TMP/cove-shot-profile.XXXXXX")
     tmp_out="$out.tmp.png"
     # Another capture of this site is under way (the file is its lock).
     if [ -f "$tmp_out" ]; then
@@ -153,6 +188,8 @@ cove_screenshot() {
         rm -f "$tmp_out"
     fi
     touch "$tmp_out"
+    # If this script is stopped part-way, the browser and the lock go with it.
+    trap 'cove_screenshot_stop "$tmp_profile"; rm -rf "$tmp_profile" "$tmp_out"' EXIT
     # Warm the page first, and give up when the site does not answer: Chrome
     # screenshots whatever is painted when its load budget runs out, and a
     # page still waiting on the server paints nothing — a black preview. A
@@ -203,11 +240,12 @@ cove_screenshot() {
         sleep 0.1
         waited=$((waited + 1))
     done
-    # Let the write finish, then stop the browser if it is still around.
+    # Let the write finish, then stop the browser — the whole tree, KILL
+    # behind the TERM, and no open-ended wait.
     [ -s "$tmp_out" ] && sleep 0.5
-    kill "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
+    cove_screenshot_stop "$tmp_profile"
     rm -rf "$tmp_profile"
+    trap - EXIT
     if [ ! -s "$tmp_out" ]; then
         rm -f "$tmp_out"
         gum style --foreground red "❌ Error: The capture failed (is the site answering at $url?)."
