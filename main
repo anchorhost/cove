@@ -10414,6 +10414,22 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 }).join('\n');
             },
 
+            // One line that always fits: the CLI's sentence when it names one or
+            // two components, otherwise WordPress (if it moved) plus counts by
+            // kind of change. The full sentence stays in the row's tooltip.
+            historyHeadline(sum) {
+                if (!sum) return '';
+                const comps = Array.isArray(sum.components) ? sum.components : [];
+                if (sum.initial || comps.length <= 2) return sum.summary || '';
+                const parts = [];
+                if (sum.core && sum.core.version_from && sum.core.version_from !== sum.core.version) parts.push('WordPress ' + sum.core.version_from + ' → ' + sum.core.version);
+                const n = {};
+                for (const c of comps) n[c.change] = (n[c.change] || 0) + 1;
+                const word = (k, one, many) => n[k] ? n[k] + ' ' + (n[k] === 1 ? one : many) : '';
+                for (const w of [word('updated', 'updated', 'updated'), word('downgraded', 'downgraded', 'downgraded'), word('new', 'added', 'added'), word('deleted', 'removed', 'removed'), word('changed', 'edited', 'edited'), word('status', 'toggled', 'toggled')]) if (w) parts.push(w);
+                return parts.join(' · ');
+            },
+
             // The opened save: header with the whole-save rollback, then one
             // line per component — its change, versions before and after,
             // file counts, **undo** (the files from just before this save),
@@ -10876,8 +10892,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         li.dataset.id = it.id;
                         li.classList.toggle('is-auto', !!it.auto && !note);
                         li.classList.toggle('is-open', t.open === it.id);
-                        li.title = it.created ? new Date(it.created * 1000).toLocaleString() : '';
-                        li.innerHTML = '<div class="st-main"><span class="st-title">' + esc(sum.summary || note || 'Save') + '</span><span class="st-sub">' + esc(it.id) + (note && sum.summary ? ' · ' + esc(note) : '') + (it.auto ? ' · nightly' : '') + (it.wp ? ' · wp ' + esc(it.wp) : '') + '</span></div>'
+                        const headline = this.historyHeadline(sum) || note || 'Save';
+                        li.title = (sum.summary && sum.summary !== headline ? sum.summary + '\n' : '') + (it.created ? new Date(it.created * 1000).toLocaleString() : '');
+                        li.innerHTML = '<div class="st-main"><span class="st-title">' + esc(headline) + '</span><span class="st-sub">' + esc(it.id) + (note && sum.summary ? ' · ' + esc(note) : '') + (it.auto ? ' · nightly' : '') + (it.wp ? ' · wp ' + esc(it.wp) : '') + '</span></div>'
                             + '<span class="st-when">' + esc(when) + '</span>'
                             + '<span class="st-hist-files" title="Files added, modified, deleted"><span class="f-add">+' + (f.added || 0) + '</span><span>~' + (f.modified || 0) + '</span><span class="f-del">−' + (f.deleted || 0) + '</span></span>'
                             + '<span class="st-chev">›</span>';
