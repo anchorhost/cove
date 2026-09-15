@@ -10059,7 +10059,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             sweepLine() {
                 const s = this.sweep;
                 const rel = (t) => { const r = this.formatRelative(Number(t)); return r === 'now' ? 'just now' : r + ' ago'; };
-                if (!s) return 'the first nightly sweep has not run yet';
+                if (!s) return '';
                 if (s.running) return 'nightly sweep running now' + (s.site ? ' · on ' + s.site : '') + (Number(s.total) ? ' · ' + (Number(s.done) || 0) + ' of ' + s.total + ' sites done, ' + (Number(s.saved) || 0) + ' saved' : '') + (Number(s.started) ? ' · started ' + rel(s.started) : '');
                 let line = Number(s.last_done) ? 'last nightly sweep finished ' + rel(s.last_done) : 'the first nightly sweep has not finished yet';
                 const doneToday = Number(s.last_done) && new Date(Number(s.last_done) * 1000).toDateString() === new Date().toDateString();
@@ -10904,8 +10904,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     const dir = (x.dir || '').replace(/^\/Users\/[^\/]+|^\/home\/[^\/]+/, '~');
                     const swept = this.sweepLine();
                     $id('histFoot').textContent = x.enabled === false ? 'This site has no wp-content, so there is nothing for history to save.'
-                        : (t.items.length ? dir + ' · ' + this.formatSize(x.bytes || 0) + ' · ' + swept
-                            : 'Plugins, themes and mu-plugins are saved to ' + dir + ' every night while the desktop is idle, and whenever you press save now; ' + swept + '.');
+                        : (t.items.length ? [dir, this.formatSize(x.bytes || 0), swept].filter(Boolean).join(' · ')
+                            : 'Plugins, themes and mu-plugins are saved to ' + dir + ' every night while the desktop is idle, and whenever you press save now' + (swept ? '; ' + swept : '') + '.');
                 }
                 if (tab === 'snapshots') {
                     const total = t.items.reduce((s, i) => s + (i.files_bytes || 0) + (i.db_bytes || 0), 0);
