@@ -153,6 +153,19 @@ cove_screenshot() {
         rm -f "$tmp_out"
     fi
     touch "$tmp_out"
+    # Warm the page first, and give up when the site does not answer: Chrome
+    # screenshots whatever is painted when its load budget runs out, and a
+    # page still waiting on the server paints nothing — a black preview. A
+    # site's first load after a restart (or a cold OPcache at night) can take
+    # half a minute; this request pays it so the capture itself is quick.
+    local http
+    http=$(curl -sk -o /dev/null --max-time 60 -w '%{http_code}' "$url" 2>/dev/null)
+    if [ -z "$http" ] || [ "$http" == "000" ] || [ "${http:0:1}" == "5" ]; then
+        rm -f "$tmp_out"
+        [ "$quiet" -eq 1 ] && exit 1
+        gum style --foreground red "❌ Error: $url did not answer (HTTP ${http:-none}); the preview was left as it was."
+        exit 1
+    fi
     [ "$quiet" -eq 1 ] || echo "📷 Capturing $url with $(basename "${browser%% *}")…"
     # A throwaway profile: headless refuses to start on a profile the user's
     # open browser holds, and nothing from the user's session should leak
@@ -168,10 +181,10 @@ cove_screenshot() {
         --headless=new --disable-gpu --hide-scrollbars --no-first-run --no-default-browser-check \
         --ignore-certificate-errors --disable-features=MacAppCodeSignClone,TranslateUI \
         --user-data-dir="$tmp_profile" --window-size="${width},${height}" \
-        --timeout=20000 --screenshot="$tmp_out" "$url" >/dev/null 2>&1 &
+        --timeout=45000 --screenshot="$tmp_out" "$url" >/dev/null 2>&1 &
     local pid=$!
     local waited=0
-    while [ $waited -lt 300 ]; do
+    while [ $waited -lt 600 ]; do
         [ -s "$tmp_out" ] && break
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.1
@@ -185,6 +198,16 @@ cove_screenshot() {
     if [ ! -s "$tmp_out" ]; then
         rm -f "$tmp_out"
         gum style --foreground red "❌ Error: The capture failed (is the site answering at $url?)."
+        exit 1
+    fi
+    # A solid-colour image (nothing painted) compresses to a few KB; a real
+    # page never does. Keep the previous preview rather than replace it with
+    # a black rectangle.
+    local bytes; bytes=$(stat -f%z "$tmp_out" 2>/dev/null || stat -c%s "$tmp_out" 2>/dev/null || echo 0)
+    if [ "$bytes" -lt 8192 ]; then
+        rm -f "$tmp_out"
+        [ "$quiet" -eq 1 ] && exit 1
+        gum style --foreground red "❌ Error: The page had not painted when the capture was taken; the preview was left as it was."
         exit 1
     fi
     mv -f "$tmp_out" "$out"
