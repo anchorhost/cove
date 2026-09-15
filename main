@@ -3573,6 +3573,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $range = (string) ($input['range'] ?? '24h');
             $span = ['24h' => 86400, '7d' => 604800, 'all' => 0][$range] ?? 86400;
             $light = !empty($input['light']);
+            // Drill-down: 'slow' keeps the N slowest with request details,
+            // 'path' collects the newest hits of one path, and the three top
+            // lists grow to N rows. All ride the same backwards scan.
+            $detail = (string) ($input['detail'] ?? '');
+            if (!in_array($detail, ['', 'slow', 'path', 'paths', 'notfound', 'errors5'], true)) $detail = '';
+            $limit = max(10, min(500, (int) ($input['limit'] ?? 200)));
+            $want_path = $detail === 'path' ? (string) ($input['path'] ?? '') : '';
+            if ($detail === 'path' && ($want_path === '' || strlen($want_path) > 2000 || preg_match('/[\x00-\x1f]/', $want_path))) { echo json_encode(['success' => false, 'message' => 'Invalid path.']); exit; }
+            $slow_keep = $detail === 'slow' ? $limit : 10;
+            $top_n = in_array($detail, ['paths', 'notfound', 'errors5'], true) ? $limit : 10;
+            $hits = []; $hit_stats = ['n' => 0, 'sum' => 0.0, 'max' => 0.0, 'status' => []];
             $now = time();
             $cutoff = $span ? $now - $span : 0;
             $bucket = $span === 86400 ? 3600 : ($span === 604800 ? 21600 : 86400);
@@ -3635,11 +3646,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             if ($status === 404) $agg['notfound'][$path] = ($agg['notfound'][$path] ?? 0) + 1;
                             if ($status >= 500) $agg['errors5'][$path] = ($agg['errors5'][$path] ?? 0) + 1;
                             $agg['durations'][] = $dur;
-                            // Keep the ten slowest; a small insertion keeps memory flat.
-                            if (count($agg['slow']) < 10 || $dur > $agg['slow'][9]['d']) {
-                                $agg['slow'][] = ['d' => $dur, 'uri' => $uri, 'status' => $status, 'ts' => $ts, 'method' => $m];
+                            // Keep the slowest few (ten, or the drill-down's N) with the
+                            // details the request panel shows; a small insertion keeps
+                            // memory flat.
+                            if (count($agg['slow']) < $slow_keep || $dur > $agg['slow'][$slow_keep - 1]['d']) {
+                                $h = $req['headers'] ?? [];
+                                $agg['slow'][] = ['d' => $dur, 'uri' => $uri, 'status' => $status, 'ts' => $ts, 'method' => $m, 'ip' => (string) ($req['client_ip'] ?? $req['remote_ip'] ?? ''), 'ua' => (string) ($h['User-Agent'][0] ?? ''), 'ref' => (string) ($h['Referer'][0] ?? ''), 'bytes' => (int) ($e['size'] ?? 0), 'proto' => (string) ($req['proto'] ?? ''), 'ct' => (string) ($e['resp_headers']['Content-Type'][0] ?? '')];
                                 usort($agg['slow'], fn($a, $b) => $b['d'] <=> $a['d']);
-                                if (count($agg['slow']) > 10) array_pop($agg['slow']);
+                                if (count($agg['slow']) > $slow_keep) array_pop($agg['slow']);
+                            }
+                            if ($want_path !== '' && $path === $want_path) {
+                                $hit_stats['n']++; $hit_stats['sum'] += $dur; if ($dur > $hit_stats['max']) $hit_stats['max'] = $dur;
+                                $hit_stats['status'][$status] = ($hit_stats['status'][$status] ?? 0) + 1;
+                                if (count($hits) < $limit) { $h = $req['headers'] ?? []; $hits[] = ['d' => $dur, 'uri' => $uri, 'status' => $status, 'ts' => $ts, 'method' => $m, 'ip' => (string) ($req['client_ip'] ?? $req['remote_ip'] ?? ''), 'ua' => (string) ($h['User-Agent'][0] ?? ''), 'ref' => (string) ($h['Referer'][0] ?? ''), 'bytes' => (int) ($e['size'] ?? 0)]; }
                             }
                         }
                     }
@@ -3683,12 +3702,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ksort($agg['buckets']);
                 $out['bucket'] = $bucket;
                 $out['buckets'] = array_values($agg['buckets']);
-                $top = function ($arr) { arsort($arr); $o = []; foreach (array_slice($arr, 0, 10, true) as $k => $v) $o[] = ['path' => $k, 'n' => $v]; return $o; };
+                $top = function ($arr) use ($top_n) { arsort($arr); $o = []; foreach (array_slice($arr, 0, $top_n, true) as $k => $v) $o[] = ['path' => $k, 'n' => $v]; return $o; };
                 $out['paths'] = $top($agg['paths']);
                 $out['notfound'] = $top($agg['notfound']);
                 $out['errors5'] = $top($agg['errors5']);
                 $out['methods'] = $agg['methods'];
                 $out['slow'] = $agg['slow'];
+                if ($want_path !== '') { $out['hits'] = $hits; $out['hit_stats'] = ['n' => $hit_stats['n'], 'avg_ms' => $hit_stats['n'] ? round($hit_stats['sum'] / $hit_stats['n'] * 1000, 1) : 0, 'max_ms' => round($hit_stats['max'] * 1000, 1), 'status' => $hit_stats['status']]; }
                 $d = $agg['durations'];
                 if ($d) { sort($d); $n = count($d); $out['avg_ms'] = round(array_sum($d) / $n * 1000, 1); $out['p95_ms'] = round($d[(int) floor($n * 0.95) >= $n ? $n - 1 : (int) floor($n * 0.95)] * 1000, 1); $out['max_ms'] = round($d[$n - 1] * 1000, 1); }
             }
@@ -5113,6 +5133,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
         /* Modal */
         .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: grid; place-items: center; z-index: 80; padding: 1rem; }
+        .modal-backdrop.is-wide .modal { max-width: min(1040px, 94vw); width: min(1040px, 94vw); }
+        /* One tooltip for the whole dashboard: any element with data-tip. */
+        .ui-tip { position: fixed; z-index: 200; pointer-events: none; max-width: min(520px, 90vw); padding: 0.4rem 0.6rem; background: var(--panel); color: var(--text); border: 1px solid var(--panel-border); border-radius: var(--radius-md); box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25); font-family: var(--font-mono); font-size: 0.7rem; line-height: 1.45; white-space: pre-line; overflow-wrap: anywhere; }
+        .ui-tip[hidden] { display: none; }
         html[data-theme="light"] .modal-backdrop { background: rgba(20,20,18,0.35); }
         .modal { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-lg); padding: 1.5rem; min-width: min(420px, 90vw); max-width: 540px; }
         .modal h3 { font-family: var(--font-serif); font-style: italic; font-weight: 500; font-size: 1.25rem; margin: 0 0 0.3rem; }
@@ -5521,6 +5545,23 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .tr-list ul { list-style: none; margin: 0; padding: 0.3rem 0; }
         .tr-list li { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; padding: 0.28rem 0.9rem; font-family: var(--font-mono); font-size: 0.74rem; min-width: 0; }
         .tr-list li:hover { background: var(--panel-hover); }
+        .tr-list li.is-click { cursor: pointer; }
+        .tr-list .site-section-head { justify-content: space-between; }
+        .tr-more { background: transparent; border: 0; padding: 0; font: inherit; letter-spacing: inherit; text-transform: inherit; color: var(--text-faint); cursor: pointer; }
+        .tr-more:hover { color: var(--accent); }
+        .tr-detail { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 0.4rem 0.8rem; font-family: var(--font-mono); font-size: 0.78rem; }
+        .tr-detail dt { color: var(--text-dim); } .tr-detail dd { margin: 0; color: var(--text); overflow-wrap: anywhere; }
+        .tr-detail a { color: var(--accent); text-decoration: none; } .tr-detail a:hover { text-decoration: underline; }
+        .tr-table-wrap { max-height: 56vh; overflow: auto; margin: 0 -0.4rem; }
+        .tr-table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 0.74rem; }
+        .tr-table th { position: sticky; top: 0; background: var(--input-bg); text-align: left; font-weight: 500; font-size: 0.62rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); padding: 0.35rem 0.4rem; border-bottom: 1px solid var(--panel-border); }
+        .tr-table td { padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--panel-border); white-space: nowrap; vertical-align: baseline; }
+        .tr-table td.tr-cell-path { white-space: normal; overflow-wrap: anywhere; max-width: 520px; }
+        .tr-table tr.is-click { cursor: pointer; } .tr-table tr.is-click:hover td { background: var(--panel-hover); }
+        .tr-table .num { text-align: right; color: var(--text-dim); }
+        .tr-modal-tools { display: flex; align-items: center; gap: 0.6rem; margin: 0 0 0.6rem; }
+        .tr-modal-tools .filter-input { flex: 1; }
+        .tr-back { background: transparent; border: 0; padding: 0; font: inherit; color: var(--text-dim); cursor: pointer; } .tr-back:hover { color: var(--text); }
         .tr-path { color: var(--text); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
         a.tr-path:hover { color: var(--accent); }
         .tr-n { flex: none; color: var(--text-faint); }
@@ -6943,6 +6984,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.bindFilesEvents();
                 this.bindSiteEvents();
                 this.bindSiteTabEvents();
+                this.bindTips();
                 this.render();
                 this.sweepPoll();
 
@@ -9849,7 +9891,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     return;
                 }
                 const k = d.kinds || {};
-                const tile = (label, value, sub, cls) => '<div class="tr-tile' + (cls ? ' ' + cls : '') + '"><span class="tr-tile-v">' + value + '</span><span class="tr-tile-l">' + esc(label) + '</span>' + (sub ? '<span class="tr-tile-s">' + sub + '</span>' : '') + '</div>';
+                const tile = (label, value, sub, cls) => '<div class="tr-tile' + (cls ? ' ' + cls : '') + '"' + (sub ? ' data-tip="' + esc(sub) + '"' : '') + '><span class="tr-tile-v">' + value + '</span><span class="tr-tile-l">' + esc(label) + '</span>' + (sub ? '<span class="tr-tile-s">' + sub + '</span>' : '') + '</div>';
                 const errors = (d.status['5xx'] || 0);
                 const tiles = [
                     tile('requests', fmtN(d.requests), fmtN(k.page || 0) + ' pages · ' + fmtN(k.asset || 0) + ' assets'),
@@ -9875,19 +9917,155 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     bars = '<div class="tr-chart" style="--n:' + all.length + '">' + all.map(b => {
                         const h = Math.round(b.n / max * 100);
                         const eh = b.n ? Math.round(b.err / b.n * h) : 0;
-                        return '<div class="tr-bar" title="' + esc(label(b.t)) + ' — ' + fmtN(b.n) + ' request' + (b.n === 1 ? '' : 's') + (b.err ? ', ' + fmtN(b.err) + ' × 5xx' : '') + '"><span class="tr-bar-fill" style="height:' + h + '%"></span>' + (eh ? '<span class="tr-bar-err" style="height:' + eh + '%"></span>' : '') + '</div>';
+                        return '<div class="tr-bar" data-tip="' + esc(label(b.t)) + ' — ' + fmtN(b.n) + ' request' + (b.n === 1 ? '' : 's') + (b.err ? ', ' + fmtN(b.err) + ' × 5xx' : '') + (b.pages ? '\n' + fmtN(b.pages) + ' page view' + (b.pages === 1 ? '' : 's') : '') + '"><span class="tr-bar-fill" style="height:' + h + '%"></span>' + (eh ? '<span class="tr-bar-err" style="height:' + eh + '%"></span>' : '') + '</div>';
                     }).join('') + '</div><div class="tr-axis"><span>' + esc(label(all[0].t)) + '</span><span>' + esc(label(all[all.length - 1].t)) + '</span></div>';
                 }
-                const list = (title, rows, empty, fmt) => '<div class="tr-list"><div class="site-section-head"><span>' + esc(title) + '</span></div>' + (rows.length ? '<ul>' + rows.map(fmt).join('') + '</ul>' : '<div class="tr-empty small">' + esc(empty) + '</div>') + '</div>';
-                const pathRow = (r) => '<li><a href="' + esc(site.domain + r.path) + '" target="_blank" rel="noopener" class="tr-path" title="' + esc(r.path) + '">' + esc(r.path) + '</a><span class="tr-n">' + fmtN(r.n) + '</span></li>';
-                const slowRow = (r) => '<li><span class="tr-path" title="' + esc(r.uri) + '">' + esc(r.method ? r.method + ' ' : '') + esc(r.uri) + '</span><span class="tr-n' + (r.status >= 500 ? ' is-bad' : '') + '">' + esc(r.status) + ' · ' + esc((r.d * 1000).toFixed(0)) + ' ms</span></li>';
+                const list = (key, title, rows, empty, fmt) => '<div class="tr-list"><div class="site-section-head"><span>' + esc(title) + '</span>' + (rows.length ? '<button type="button" class="tr-more" data-list="' + key + '" title="Every entry in this window, with details">all ›</button>' : '') + '</div>' + (rows.length ? '<ul>' + rows.map(fmt).join('') + '</ul>' : '<div class="tr-empty small">' + esc(empty) + '</div>') + '</div>';
+                const pathRow = (r) => '<li class="is-click" data-path="' + esc(r.path) + '" data-tip="' + esc(r.path) + '\n' + fmtN(r.n) + ' request' + (r.n === 1 ? '' : 's') + ' — click for recent hits"><a href="' + esc(site.domain + r.path) + '" target="_blank" rel="noopener" class="tr-path">' + esc(r.path) + '</a><span class="tr-n">' + fmtN(r.n) + '</span></li>';
+                const slowRow = (r, i) => '<li class="is-click" data-slow="' + i + '" data-tip="' + esc(r.method ? r.method + ' ' : '') + esc(r.uri) + '\n' + esc(r.status) + ' · ' + esc((r.d * 1000).toFixed(0)) + ' ms · ' + esc(new Date(r.ts * 1000).toLocaleString()) + ' — click for details"><span class="tr-path">' + esc(r.method ? r.method + ' ' : '') + esc(r.uri) + '</span><span class="tr-n' + (r.status >= 500 ? ' is-bad' : '') + '">' + esc(r.status) + ' · ' + esc((r.d * 1000).toFixed(0)) + ' ms</span></li>';
                 body.innerHTML = '<div class="tr-tiles">' + tiles + '</div>' + bars
                     + '<div class="tr-lists">'
-                    + list('top pages', d.paths || [], 'No page views in this window.', pathRow)
-                    + list('slowest requests', d.slow || [], 'Nothing recorded.', slowRow)
-                    + list('404s', d.notfound || [], 'None — nothing missing.', pathRow)
-                    + list('5xx', d.errors5 || [], 'None — no server errors.', pathRow)
+                    + list('paths', 'top pages', d.paths || [], 'No page views in this window.', pathRow)
+                    + list('slow', 'slowest requests', d.slow || [], 'Nothing recorded.', slowRow)
+                    + list('notfound', '404s', d.notfound || [], 'None — nothing missing.', pathRow)
+                    + list('errors5', '5xx', d.errors5 || [], 'None — no server errors.', pathRow)
                     + '</div>';
+            },
+
+            // --- Traffic drill-down ------------------------------------------
+            // One modal, three views: a list (every entry of one of the four
+            // lists, filterable), one request, or one path's recent hits.
+            trafficOpen(view, arg) {
+                const site = this.pageSite;
+                const t = this.siteTabState('traffic');
+                if (!site || !t.data) return;
+                this.trafficModal = { open: true, view, site: site.name, range: t.range || '24h', list: null, rows: null, filter: '', loading: false, error: null, request: null, path: null, hits: null, stats: null, from: null };
+                const m = this.trafficModal;
+                this.showDbModal = true;
+                $id('dbModal').classList.add('is-wide');
+                show($id('dbModal'), true);
+                $id('svcActions').innerHTML = '<button class="pill" id="btnDbClose">close</button>';
+                $id('btnDbClose').addEventListener('click', () => this.setDbModal(false));
+                if (view === 'request') { m.request = arg; this.renderTrafficModal(); return; }
+                if (view === 'path') { m.path = arg; this.trafficFetch({ detail: 'path', path: arg }, (res) => { m.hits = res.hits || []; m.stats = res.hit_stats || null; }); return; }
+                m.list = arg;
+                this.trafficFetch({ detail: arg }, (res) => { m.rows = arg === 'slow' ? (res.slow || []) : (res[arg] || []); });
+            },
+
+            async trafficFetch(extra, apply) {
+                const m = this.trafficModal;
+                m.loading = true; m.error = null;
+                this.renderTrafficModal();
+                const res = await this.apiPost('site_traffic', { site_name: m.site, range: m.range, limit: 300, ...extra }, { quiet: true, timeoutMs: 120000 });
+                if (!this.trafficModal || this.trafficModal !== m) return;
+                m.loading = false;
+                if (!res.success) m.error = res.message || 'Could not read the access log.';
+                else apply(res);
+                this.renderTrafficModal();
+            },
+
+            renderTrafficModal() {
+                const m = this.trafficModal;
+                if (!m || !m.open) return;
+                const esc = (s) => this.escapeHtml(s == null ? '' : String(s));
+                const fmtN = (n) => (n == null ? '—' : Number(n).toLocaleString());
+                const ms = (d) => (Number(d) * 1000).toFixed(0) + ' ms';
+                const when = (ts) => new Date(Number(ts) * 1000).toLocaleString();
+                const site = this.sites.find(x => x.name === m.site);
+                const domain = site ? site.domain : '';
+                const rangeLabel = { '24h': 'last 24 hours', '7d': 'last 7 days', all: 'whole log' }[m.range];
+                const title = $id('svcTitle'), st = $id('svcStatus'), rows = $id('svcRows'), note = $id('svcNote');
+                st.classList.remove('is-down');
+                const back = m.from ? '<button type="button" class="tr-back" data-act="back">← back</button>' : '';
+                if (m.loading) { title.textContent = 'Traffic'; st.textContent = 'Reading the access log…'; rows.innerHTML = ''; note.textContent = ''; return; }
+                if (m.error) { title.textContent = 'Traffic'; st.textContent = m.error; st.classList.add('is-down'); rows.innerHTML = ''; note.textContent = ''; return; }
+                if (m.view === 'request') {
+                    const r = m.request;
+                    const url = domain + r.uri;
+                    title.textContent = 'Request';
+                    st.textContent = (r.method || '') + ' ' + r.uri.split('?')[0] + ' · ' + r.status + ' · ' + ms(r.d);
+                    rows.innerHTML = back + '<dl class="tr-detail">'
+                        + '<dt>url</dt><dd><a href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(url) + '</a></dd>'
+                        + '<dt>when</dt><dd>' + esc(when(r.ts)) + ' (' + esc(this.formatRelative(r.ts)) + ' ago)</dd>'
+                        + '<dt>status</dt><dd>' + esc(r.status) + (r.ct ? ' · ' + esc(r.ct) : '') + '</dd>'
+                        + '<dt>duration</dt><dd>' + esc(ms(r.d)) + '</dd>'
+                        + '<dt>response</dt><dd>' + esc(this.formatSize(r.bytes || 0)) + (r.proto ? ' · ' + esc(r.proto) : '') + '</dd>'
+                        + '<dt>client</dt><dd>' + esc(r.ip || '—') + '</dd>'
+                        + '<dt>user agent</dt><dd>' + esc(r.ua || '—') + '</dd>'
+                        + '<dt>referer</dt><dd>' + (r.ref ? '<a href="' + esc(r.ref) + '" target="_blank" rel="noopener">' + esc(r.ref) + '</a>' : '—') + '</dd>'
+                        + '</dl>';
+                    note.innerHTML = '<button type="button" class="tr-back" data-act="path" data-path="' + esc(r.uri.split('?')[0]) + '">recent hits of this path ›</button>';
+                    return;
+                }
+                if (m.view === 'path') {
+                    const hits = m.hits || [], s = m.stats || {};
+                    title.textContent = 'Path';
+                    const statuses = Object.entries(s.status || {}).sort((a, b) => b[1] - a[1]).map(([k, v]) => v + ' × ' + k).join(', ');
+                    st.textContent = m.path + ' · ' + fmtN(s.n || hits.length) + ' request' + ((s.n || hits.length) === 1 ? '' : 's') + ' in the ' + rangeLabel + (s.n ? ' · avg ' + s.avg_ms + ' ms · max ' + s.max_ms + ' ms' : '') + (statuses ? ' · ' + statuses : '');
+                    const q = m.filter.trim().toLowerCase();
+                    const vis = q ? hits.filter(h => (h.uri + ' ' + h.status + ' ' + h.ip + ' ' + h.ua + ' ' + h.ref).toLowerCase().includes(q)) : hits;
+                    rows.innerHTML = back + '<div class="tr-modal-tools"><input class="filter-input" id="trModalFilter" type="text" placeholder="filter by query, status, client, user agent…" value="' + esc(m.filter) + '" spellcheck="false" autocomplete="off"><a class="pill" href="' + esc(domain + m.path) + '" target="_blank" rel="noopener">open ↗</a></div>'
+                        + '<div class="tr-table-wrap"><table class="tr-table"><thead><tr><th>when</th><th>method</th><th>status</th><th class="num">ms</th><th class="num">size</th><th>client</th><th>query · user agent</th></tr></thead><tbody>'
+                        + (vis.length ? vis.map((h, i) => '<tr class="is-click" data-hit="' + hits.indexOf(h) + '"><td>' + esc(when(h.ts)) + '</td><td>' + esc(h.method) + '</td><td' + (h.status >= 500 ? ' class="is-bad"' : '') + '>' + esc(h.status) + '</td><td class="num">' + esc((h.d * 1000).toFixed(0)) + '</td><td class="num">' + esc(this.formatSize(h.bytes || 0)) + '</td><td>' + esc(h.ip) + '</td><td class="tr-cell-path">' + esc((h.uri.includes('?') ? h.uri.slice(h.uri.indexOf('?')) + ' · ' : '') + (h.ua || '')) + '</td></tr>').join('') : '<tr><td colspan="7" class="num">Nothing matches.</td></tr>')
+                        + '</tbody></table></div>';
+                    note.textContent = hits.length >= 300 ? 'The newest 300 hits are shown; narrow the range for older ones.' : 'Newest first. Click a row for the full request.';
+                    return;
+                }
+                // A whole list.
+                const labels = { slow: 'slowest requests', paths: 'top pages', notfound: '404s', errors5: '5xx' };
+                const all = m.rows || [];
+                title.textContent = labels[m.list] || 'Traffic';
+                st.textContent = fmtN(all.length) + (m.list === 'slow' ? ' slowest requests' : ' paths') + ' · ' + rangeLabel;
+                const q = m.filter.trim().toLowerCase();
+                let html = '<div class="tr-modal-tools"><input class="filter-input" id="trModalFilter" type="text" placeholder="filter…" value="' + esc(m.filter) + '" spellcheck="false" autocomplete="off"></div><div class="tr-table-wrap"><table class="tr-table">';
+                if (m.list === 'slow') {
+                    const vis = q ? all.filter(r => (r.method + ' ' + r.uri + ' ' + r.status + ' ' + r.ip + ' ' + r.ua).toLowerCase().includes(q)) : all;
+                    html += '<thead><tr><th class="num">#</th><th class="num">ms</th><th>method</th><th>status</th><th>path</th><th>when</th><th>client</th></tr></thead><tbody>'
+                        + (vis.length ? vis.map(r => '<tr class="is-click" data-slow="' + all.indexOf(r) + '"><td class="num">' + (all.indexOf(r) + 1) + '</td><td class="num">' + esc((r.d * 1000).toFixed(0)) + '</td><td>' + esc(r.method) + '</td><td' + (r.status >= 500 ? ' class="is-bad"' : '') + '>' + esc(r.status) + '</td><td class="tr-cell-path">' + esc(r.uri) + '</td><td>' + esc(when(r.ts)) + '</td><td>' + esc(r.ip) + '</td></tr>').join('') : '<tr><td colspan="7" class="num">Nothing matches.</td></tr>');
+                } else {
+                    const vis = q ? all.filter(r => r.path.toLowerCase().includes(q)) : all;
+                    html += '<thead><tr><th class="num">#</th><th>path</th><th class="num">requests</th></tr></thead><tbody>'
+                        + (vis.length ? vis.map(r => '<tr class="is-click" data-path="' + esc(r.path) + '"><td class="num">' + (all.indexOf(r) + 1) + '</td><td class="tr-cell-path">' + esc(r.path) + '</td><td class="num">' + fmtN(r.n) + '</td></tr>').join('') : '<tr><td colspan="3" class="num">Nothing matches.</td></tr>');
+                }
+                rows.innerHTML = back + html + '</tbody></table></div>';
+                note.textContent = 'Up to 300 entries from this window. Click a row for ' + (m.list === 'slow' ? 'the request' : 'its recent hits') + '.';
+            },
+
+            bindTrafficModalEvents() {
+                const rows = $id('svcRows');
+                rows.addEventListener('input', (e) => { if (e.target.id === 'trModalFilter' && this.trafficModal) { this.trafficModal.filter = e.target.value; const pos = e.target.selectionStart; this.renderTrafficModal(); const f = $id('trModalFilter'); if (f) { f.focus(); f.setSelectionRange(pos, pos); } } });
+                const onClick = (e) => {
+                    const m = this.trafficModal;
+                    if (!m || !m.open) return;
+                    const back = e.target.closest('[data-act="back"]');
+                    if (back && m.from) { const prev = m.from; prev.from = null; this.trafficModal = prev; this.renderTrafficModal(); return; }
+                    const toPath = e.target.closest('[data-act="path"]');
+                    const hit = e.target.closest('tr[data-hit]');
+                    const slow = e.target.closest('tr[data-slow]');
+                    const pathRow = e.target.closest('tr[data-path]');
+                    let next = null;
+                    if (toPath) next = { view: 'path', path: toPath.dataset.path };
+                    else if (hit) next = { view: 'request', request: (m.hits || [])[Number(hit.dataset.hit)] };
+                    else if (slow) next = { view: 'request', request: (m.rows || [])[Number(slow.dataset.slow)] };
+                    else if (pathRow) next = { view: 'path', path: pathRow.dataset.path };
+                    if (!next) return;
+                    const prev = m;
+                    this.trafficModal = { ...m, ...next, from: prev, filter: '', hits: next.view === 'path' ? null : m.hits, stats: null, loading: false, error: null };
+                    if (next.view === 'path') this.trafficFetch({ detail: 'path', path: next.path }, (res) => { this.trafficModal.hits = res.hits || []; this.trafficModal.stats = res.hit_stats || null; });
+                    else this.renderTrafficModal();
+                };
+                rows.addEventListener('click', onClick);
+                $id('svcNote').addEventListener('click', onClick);
+                $id('trafficBody').addEventListener('click', (e) => {
+                    const t = this.siteTabState('traffic');
+                    const more = e.target.closest('.tr-more');
+                    if (more) { this.trafficOpen('list', more.dataset.list); return; }
+                    if (e.target.closest('a')) return;
+                    const slow = e.target.closest('li[data-slow]');
+                    if (slow && t.data) { this.trafficOpen('request', (t.data.slow || [])[Number(slow.dataset.slow)]); return; }
+                    const p = e.target.closest('li[data-path]');
+                    if (p) this.trafficOpen('path', p.dataset.path);
+                });
             },
 
             // The overview's one-line health strip: same numbers, light mode.
@@ -9964,6 +10142,36 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (this.view === 'site' && this.pageSite && this.pageSite.name === name) this.renderSiteShot(this.pageSite);
                 };
                 setTimeout(poll, 2500);
+            },
+
+            // --- Tooltips ------------------------------------------------------
+            // One element for the page; anything with data-tip shows it at once
+            // on hover, above the element (below when there is no room).
+            bindTips() {
+                const tip = document.createElement('div');
+                tip.className = 'ui-tip'; tip.hidden = true;
+                document.body.appendChild(tip);
+                let cur = null;
+                const hide = () => { cur = null; tip.hidden = true; };
+                const showFor = (el) => {
+                    const text = el.dataset.tip;
+                    if (!text) { hide(); return; }
+                    cur = el;
+                    tip.textContent = text; tip.hidden = false;
+                    tip.style.left = '0px'; tip.style.top = '0px';
+                    const r = el.getBoundingClientRect(), tr = tip.getBoundingClientRect();
+                    const x = Math.max(8, Math.min(r.left + r.width / 2 - tr.width / 2, window.innerWidth - tr.width - 8));
+                    let y = r.top - tr.height - 8;
+                    if (y < 8) y = r.bottom + 8;
+                    tip.style.left = x + 'px'; tip.style.top = y + 'px';
+                };
+                document.addEventListener('mouseover', (e) => {
+                    const el = e.target.closest && e.target.closest('[data-tip]');
+                    if (el) { if (el !== cur) showFor(el); } else if (cur) hide();
+                });
+                document.addEventListener('mouseout', (e) => { if (cur && !(e.relatedTarget && cur.contains(e.relatedTarget))) hide(); });
+                window.addEventListener('scroll', hide, { passive: true, capture: true });
+                document.addEventListener('mousedown', hide, true);
             },
 
             // --- The nightly history sweep, as a whole -----------------------
@@ -11027,6 +11235,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 window.addEventListener('resize', () => { if (this.tabCtx.open) this.closeTabCtx(); });
                 $id('sitePanel-traffic').querySelectorAll('.st-status').forEach(b => b.addEventListener('click', () => this.setTrafficRange(b.dataset.range)));
                 $id('sitePanel-traffic').querySelector('.st-refresh').addEventListener('click', () => this.loadTraffic({ force: true }));
+                this.bindTrafficModalEvents();
                 $id('siteHealth').addEventListener('click', (e) => { if (e.target.closest('.site-health-bit')) this.setSiteTab('traffic'); });
                 $id('btnSnapCreate').addEventListener('click', () => this.snapshotCreate());
                 $id('btnHistSave').addEventListener('click', () => this.historySave());
@@ -12277,6 +12486,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             setDbModal(on) {
                 if (on) { this.openService('mariadb'); return; }
                 this.sweepModalOpen = false;
+                if (this.trafficModal) this.trafficModal.open = false;
+                this.trafficModal = null;
+                $id('dbModal').classList.remove('is-wide');
                 this.showDbModal = false;
                 show($id('dbModal'), false);
             },
