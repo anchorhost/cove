@@ -9994,7 +9994,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     tile('server errors', fmtN(errors), fmtN(d.status['4xx'] || 0) + ' × 4xx · ' + fmtN(d.status['3xx'] || 0) + ' × 3xx', errors ? 'is-bad' : ''),
                     tile('php errors', fmtN(d.php_errors), 'error log + debug.log', d.php_errors ? 'is-warn' : ''),
                     tile('response time', d.avg_ms != null ? esc(d.avg_ms) + ' ms' : '—', d.p95_ms != null ? 'p95 ' + esc(d.p95_ms) + ' ms · max ' + esc(d.max_ms) + ' ms' : ''),
-                    tile('served', this.formatSize(d.bytes), (d.last_cron ? 'cron ran ' + this.formatRelative(d.last_cron) + ' ago' : 'cron not seen')),
+                    tile('served', this.formatSize(d.bytes), (d.last_cron ? 'cron ran ' + (this.formatRelative(d.last_cron) === 'now' ? 'just now' : this.formatRelative(d.last_cron) + ' ago') : 'cron not seen')),
                     tile('mail sent', d.mail == null ? '—' : fmtN(d.mail), d.mail == null ? 'Mailpit did not answer' : 'by whole days'),
                 ].join('');
                 // Bars: one per bucket, empty buckets filled in so gaps show.
@@ -10197,7 +10197,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     + bit('5xx', d.status['5xx'], d.status['5xx'] ? 'is-bad' : '')
                     + bit('php errors', d.php_errors, d.php_errors ? 'is-warn' : '')
                     + (h.mail == null ? '' : bit('mail', h.mail))
-                    + (d.last_cron ? '<span class="fact" title="' + new Date(d.last_cron * 1000).toLocaleString() + '">cron ' + this.formatRelative(d.last_cron) + ' ago</span>' : '<span class="fact">cron not seen</span>');
+                    + (d.last_cron ? '<span class="fact" title="' + new Date(d.last_cron * 1000).toLocaleString() + '">cron ' + (this.formatRelative(d.last_cron) === 'now' ? 'just now' : this.formatRelative(d.last_cron) + ' ago') + '</span>' : '<span class="fact">cron not seen</span>');
             },
 
             // --- Previews in the background ---------------------------------
