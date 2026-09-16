@@ -66,7 +66,7 @@ cove list                      # shows every site Cove manages
 cove db backup                 # snapshots every site's database to .sql
 ```
 
-Open `https://cove.localhost` in your browser to see the dashboard. Fresh installs trust Cove's local certificate authority automatically; if a browser still warns you, run `cove trust` once (see [Troubleshooting](#-troubleshooting)).
+Open `https://cove.localhost` in your browser to see the dashboard. It answers only on the machine running Cove (private addresses too under WSL2, and tailnet addresses over `cove tailscale`); shared sites are unaffected. Fresh installs trust Cove's local certificate authority automatically; if a browser still warns you, run `cove trust` once (see [Troubleshooting](#-troubleshooting)).
 
 ## 💻 Usage
 
