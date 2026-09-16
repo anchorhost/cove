@@ -98,7 +98,10 @@ cove_list() {
                     // would under-pad the column and skew the box border.
                     "wp" => $version === null ? "-" : $version . ($status === "insecure" ? " !" : ""),
                     // Per-site PHP pin (`cove php`); "-" = Cove default PHP.
-                    "php" => is_file($site_path . "/php_version") ? trim((string) @file_get_contents($site_path . "/php_version")) : "-",
+                    // The PHP the site runs on: a `cove php` pin, else the Cove default
+                    // (this script runs under it, so PHP_VERSION is that).
+                    "php" => is_file($site_path . "/php_version") ? trim((string) @file_get_contents($site_path . "/php_version")) . " pin" : preg_replace("/^(\\d+\\.\\d+).*$/", "$1", PHP_VERSION),
+                    "php_pinned" => is_file($site_path . "/php_version"),
                 ];
             }
         }
@@ -110,7 +113,7 @@ cove_list() {
         // Sort the array: first by type, then by name
         if (getenv("LIST_FORMAT") === "json") {
             usort($sites, fn($a, $b) => strcmp($a["name"], $b["name"]));
-            echo json_encode(array_map(fn($s) => ["name" => $s["name"], "domain" => $s["domain"], "type" => $s["type"], "multisite" => $s["multisite"], "wp_version" => $s["wp_version"], "wp_status" => $s["wp_status"], "php" => $s["php"] === "-" ? null : $s["php"], "path" => $s["path"], "size_bytes" => $s["size_bytes"]], $sites), JSON_UNESCAPED_SLASHES) . "\n";
+            echo json_encode(array_map(fn($s) => ["name" => $s["name"], "domain" => $s["domain"], "type" => $s["type"], "multisite" => $s["multisite"], "wp_version" => $s["wp_version"], "wp_status" => $s["wp_status"], "php" => preg_replace("/ pin$/", "", $s["php"]), "php_pinned" => $s["php_pinned"], "path" => $s["path"], "size_bytes" => $s["size_bytes"]], $sites), JSON_UNESCAPED_SLASHES) . "\n";
             exit;
         }
         array_multisort(
