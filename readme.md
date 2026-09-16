@@ -278,6 +278,21 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
   * System, light, or dark theme — right-click the toggle to pick, and the choice is remembered.
   * Views crossfade into each other, the wordmark returns you to sites without a reload, and Back and Forward walk through what you opened.
 
+## 🤖 Headless use (scripts and agents)
+
+Every command runs without a terminal. When stdin is not a TTY, confirmations default to yes where that is safe (`delete`, `push`, `directive delete`, `core update`, cloudflared install) and a prompt that cannot be avoided stops with a message naming the flag to pass instead. The flags to know:
+
+| Need | Use |
+|---|---|
+| Confirm a destructive step | `--yes` on `delete`, `push`, `pull`, `core update`, `opcache set`, `memory set` |
+| Pick what a prompt would ask | `pull --ssh "user@host -p 22" --site <name> --path <dir>`, `push --site <name> --ssh …`, `proxy add <name> <domain> <target>`, `tailscale enable <hostname>`, `install --http 80 --https 443 --db-root-user … --db-root-pass …` |
+| Machine-readable output | `list --format=json`, `status --porcelain`, `login --plain`, `network --format=json`, `snapshot <site> list --format=json`, `share --format=json`, `backup --format=json` |
+| A tunnel without a foreground process | `share <site> --background`, then `share <site> stop` |
+| Edit Caddy rules non-interactively | pipe them: `printf 'header X-Test 1\n' \| cove directive set <site>` |
+| Anything sudo needs on Linux | run that command with `sudo` (`sudo cove upgrade`); `/etc/hosts` lines are skipped and reported when nothing can ask for a password |
+
+The dashboard's API answers only from this machine, so agents run the CLI, not the API.
+
 ## 🛠️ Development
 
 Cove is built from modular source files that are compiled into a single distributable script.
