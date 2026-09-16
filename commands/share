@@ -7,18 +7,50 @@ SHARE_PROXY_PORT=19876
 cove_share() {
     local site_name=""
     local auto_yes=false
+    local background=false stop=false format="text"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --yes|-y|--force) auto_yes=true; shift ;;
+            --background|--detach|-d) background=true; shift ;;
+            --stop|stop) stop=true; shift ;;
+            --format=*) format="${1#*=}"; shift ;;
+            --json) format="json"; shift ;;
             -h|--help) display_command_help share; exit 0 ;;
             -*)
                 gum style --foreground red "Error: Unknown option: $1" >&2
-                echo "Usage: cove share [<name>] [--yes]" >&2
+                echo "Usage: cove share [<name>] [--yes] [--background] [stop]" >&2
                 exit 1
                 ;;
             *) [ -z "$site_name" ] && site_name="$1"; shift ;;
         esac
     done
+    [ -t 0 ] || auto_yes=true
+    local share_dir="$APP_DIR/share"
+    # --format=json: stdout carries only the JSON line; narration goes to stderr.
+    if [ "$format" == "json" ]; then exec 3>&1 1>&2; fi
+    # `cove share <site> stop`: end a tunnel that --background left running.
+    if $stop; then
+        if [ -z "$site_name" ]; then
+            gum style --foreground red "Error: Which site? cove share <name> stop" >&2
+            exit 1
+        fi
+        site_name="${site_name%.localhost}"
+        local state="$share_dir/$site_name"
+        if [ ! -f "$state" ]; then
+            [ "$format" == "json" ] && { echo >&3 '{"stopped":false,"reason":"not running"}'; exit 0; }
+            echo "ℹ️  No background share is running for ${site_name}.localhost."
+            exit 0
+        fi
+        local sp tp so
+        sp=$(sed -n 's/^proxy_pid=//p' "$state"); tp=$(sed -n 's/^tunnel_pid=//p' "$state"); so=$(sed -n 's/^tunnel_output=//p' "$state")
+        [ -n "$sp" ] && kill "$sp" 2>/dev/null
+        [ -n "$tp" ] && kill "$tp" 2>/dev/null
+        [ -n "$so" ] && rm -f "$so"
+        rm -f "$state"
+        [ "$format" == "json" ] && { printf >&3 '{"stopped":true,"site":"%s"}\n' "$site_name"; exit 0; }
+        echo "✅ Stopped sharing ${site_name}.localhost."
+        exit 0
+    fi
 
     # --- 1. Validate Site ---
     if [ -z "$site_name" ]; then
@@ -53,6 +85,18 @@ cove_share() {
     if [ ! -d "$site_dir" ]; then
         gum style --foreground red "Error: Site '${site_name}.localhost' not found."
         exit 1
+    fi
+    # Already shared in the background: say where, do not start a second tunnel.
+    if [ -f "$share_dir/$site_name" ]; then
+        local running_url running_pid
+        running_url=$(sed -n 's/^url=//p' "$share_dir/$site_name"); running_pid=$(sed -n 's/^tunnel_pid=//p' "$share_dir/$site_name")
+        if [ -n "$running_pid" ] && kill -0 "$running_pid" 2>/dev/null; then
+            [ "$format" == "json" ] && { printf >&3 '{"site":"%s","url":"%s","background":true,"already":true}\n' "$site_name" "$running_url"; exit 0; }
+            gum style --foreground 212 --bold "Already sharing: $running_url"
+            echo "Stop it with: cove share $site_name stop"
+            exit 0
+        fi
+        rm -f "$share_dir/$site_name"
     fi
     
     local local_hostname="${site_name}.localhost"
@@ -338,6 +382,23 @@ PYTHON_PROXY
         gum style --foreground red "Error: Failed to start local proxy."
         exit 1
     fi
+
+    # --background: leave the tunnel and proxy running, record them, and
+    # return — for scripts and agents that need the URL, not a foreground
+    # process. `cove share <site> stop` ends it.
+    if $background; then
+        mkdir -p "$share_dir"
+        { echo "url=$public_url"; echo "tunnel_pid=$tunnel_pid"; echo "proxy_pid=$proxy_pid"; echo "tunnel_output=$tunnel_output"; echo "started=$(date +%s)"; } > "$share_dir/$site_name"
+        disown "$tunnel_pid" 2>/dev/null; disown "$proxy_pid" 2>/dev/null
+        trap - EXIT
+        if [ "$format" == "json" ]; then
+            printf >&3 '{"site":"%s","url":"%s","background":true}\n' "$site_name" "$public_url"
+        else
+            echo "Sharing in the background. Stop it with: cove share $site_name stop"
+        fi
+        return 0
+    fi
+    [ "$format" == "json" ] && printf >&3 '{"site":"%s","url":"%s","background":false}\n' "$site_name" "$public_url"
     
     echo "Tunnel is active. Press Ctrl+C to stop."
     echo ""

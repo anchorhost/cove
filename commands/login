@@ -2,10 +2,12 @@ cove_login() {
     local site_name=""
     local user_identifier="" # Optional: the user to log in as
     local subsite_url=""     # Optional: a subsite of a multisite network
+    local plain=false        # --plain: print only the URL, for scripts and agents
     local arg
     for arg in "$@"; do
         case "$arg" in
             --url=*) subsite_url="${arg#*=}" ;;
+            --plain|--url-only) plain=true ;;
             -*)
                 gum style --foreground red "❌ Error: Unknown option '$arg'."
                 echo "Usage: cove login <site> [<user>] [--url=<subsite-url>]"
@@ -70,7 +72,7 @@ cove_login() {
 
     local admin_to_login
     if [ -n "$user_identifier" ]; then
-        echo "🔎 Verifying user '$user_identifier' for '$label'..."
+        [ "$plain" = true ] || echo "🔎 Verifying user '$user_identifier' for '$label'..."
         local user_roles
         user_roles=$( (cd "$public_dir" && $wp_cmd user get "$user_identifier" --field=roles --format=json "${url_flag[@]}" --skip-plugins --skip-themes 2>/dev/null) )
 
@@ -88,9 +90,9 @@ cove_login() {
         fi
         
         admin_to_login="$user_identifier"
-        echo "✅ User '$admin_to_login' verified."
+        [ "$plain" = true ] || echo "✅ User '$admin_to_login' verified."
     else
-        echo "🔎 Finding an administrator for '$label'..."
+        [ "$plain" = true ] || echo "🔎 Finding an administrator for '$label'..."
         admin_to_login=$( (cd "$public_dir" && $wp_cmd user list --role=administrator --field=user_login --format=csv "${url_flag[@]}" --skip-plugins --skip-themes | head -n 1) )
         # A subsite with no administrator of its own still has the network's
         # super admins.
@@ -102,22 +104,24 @@ cove_login() {
             gum style --foreground red "❌ Error: Could not find any administrator users for this site."
             exit 1
         fi
-        echo "✅ Found admin: '$admin_to_login'."
+        [ "$plain" = true ] || echo "✅ Found admin: '$admin_to_login'."
     fi
 
     # 3. Refresh the MU-plugin before generating the URL. Always overwrite
     # the file so sites created with older Cove versions pick up changes to
     # the plugin (token format, query-arg name, etc.) without needing a
     # re-add. The file is small and idempotent to regenerate.
-    inject_mu_plugin "$public_dir"
+    if [ "$plain" = true ]; then inject_mu_plugin "$public_dir" >/dev/null 2>&1; else inject_mu_plugin "$public_dir"; fi
 
     # 4. Generate the login URL.
-    echo "   Generating login link..."
+    [ "$plain" = true ] || echo "   Generating login link..."
     local login_url
     login_url=$( (cd "$public_dir" && $wp_cmd user login "$admin_to_login" "${url_flag[@]}" --skip-plugins --skip-themes) )
 
     # 5. Display the final URL or an error message.
-    if [ -n "$login_url" ]; then
+    if [ -n "$login_url" ] && [ "$plain" = true ]; then
+        echo "$login_url"
+    elif [ -n "$login_url" ]; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🔗 One-Time Login URL for '$admin_to_login'" "$login_url"
     else
         gum style --foreground red "❌ Error: Failed to generate the login link after all checks."

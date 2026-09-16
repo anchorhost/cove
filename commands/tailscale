@@ -15,6 +15,7 @@ cove_tailscale_enable() {
 
     # Interactive mode if still no hostname
     if [ -z "$hostname" ]; then
+        require_interactive "The Tailscale hostname (not auto-detected)" "it as an argument: cove tailscale enable <machine.tailnet.ts.net>"
         echo "📝 Enter your Tailscale machine hostname"
         echo "   (e.g., mycomputer.tail1234.ts.net)"
         hostname=$(gum input --width 0 --placeholder "your-machine.tailnet.ts.net")

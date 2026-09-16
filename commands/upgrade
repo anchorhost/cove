@@ -67,6 +67,11 @@ upgrade_frankenphp() {
         local temp_binary="/tmp/frankenphp_new"
         if curl -L --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${binary_name}" -o "$temp_binary"; then
             chmod +x "$temp_binary"
+            if [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
+                rm -f "$temp_binary"
+                gum style --foreground red "❌ Replacing $target_bin_dir/frankenphp needs sudo, and there is no terminal to ask on." "Run: sudo cove upgrade"
+                return 1
+            fi
             if sudo mv "$temp_binary" "$target_bin_dir/frankenphp"; then
                 # Set capability to bind to low ports without root
                 if command -v setcap &>/dev/null; then

@@ -1,12 +1,17 @@
 cove_list() {
-    local show_totals=false
-    if [[ "$1" == "--totals" ]]; then
-        show_totals=true
-    fi
+    local show_totals=false format="table"
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --totals) show_totals=true ;;
+            --format=*) format="${arg#*=}" ;;
+            --json) format="json" ;;
+        esac
+    done
 
     # PHP script to find, sort, and format the site list with box-drawing characters
     local php_output
-    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" HTTPS_PORT_SUFFIX="$(https_port_suffix)" WPVER_CACHE="$COVE_WPVER_CACHE" frankenphp php-cli -r '
+    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" LIST_FORMAT="$format" HTTPS_PORT_SUFFIX="$(https_port_suffix)" WPVER_CACHE="$COVE_WPVER_CACHE" frankenphp php-cli -r '
         function getDirectorySize(string $path): int {
             if (!is_dir($path)) return 0;
             $total_size = 0;
@@ -82,6 +87,11 @@ cove_list() {
                     "domain" => "https://" . $item . $port_suffix,
                     "type" => file_exists($site_path . "/multisite") ? "Multisite" : (file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain"),
                     "size" => $size,
+                    "size_bytes" => $show_totals && is_dir($public_path) ? getDirectorySize($public_path) : null,
+                    "wp_version" => $version,
+                    "wp_status" => $status,
+                    "path" => $site_path,
+                    "multisite" => file_exists($site_path . "/multisite") ? trim((string) @file_get_contents($site_path . "/multisite")) : null,
                     // "!" marks a release wp.org considers insecure. Local sites
                     // are not exposed, so this is a nudge rather than an alarm.
                     // ASCII only: str_pad counts bytes, so a multibyte dash here
@@ -98,6 +108,11 @@ cove_list() {
         }
 
         // Sort the array: first by type, then by name
+        if (getenv("LIST_FORMAT") === "json") {
+            usort($sites, fn($a, $b) => strcmp($a["name"], $b["name"]));
+            echo json_encode(array_map(fn($s) => ["name" => $s["name"], "domain" => $s["domain"], "type" => $s["type"], "multisite" => $s["multisite"], "wp_version" => $s["wp_version"], "wp_status" => $s["wp_status"], "php" => $s["php"] === "-" ? null : $s["php"], "path" => $s["path"], "size_bytes" => $s["size_bytes"]], $sites), JSON_UNESCAPED_SLASHES) . "\n";
+            exit;
+        }
         array_multisort(
             array_column($sites, "type"), SORT_ASC,
             array_column($sites, "name"), SORT_ASC,
@@ -173,6 +188,11 @@ cove_list() {
         echo $bot_line . "\n";
     ')
 
+    if [ "$format" == "json" ]; then
+        # Scripts and agents: the JSON array and nothing else.
+        echo "${php_output:-[]}"
+        return
+    fi
     if [ -z "$php_output" ]; then
         gum style --padding "1 2" "No sites found. Add one with 'cove add <name>'."
     else
