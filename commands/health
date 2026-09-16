@@ -235,6 +235,56 @@ cove_health() {
     done
     [ "$biglog" -eq 0 ] && echo "  ✅ logs within size limits"
 
+    # Snapshots, backups, previews, and imports: the state Cove keeps
+    # outside the site directories. Copy-on-write snapshots grow as their
+    # sites change, and du counts every clone in full.
+    local hsize
+    hsize() { local kb; kb=$(du -sk "$1" 2>/dev/null | cut -f1); kb=${kb:-0}; if [ "$kb" -ge 1048576 ]; then awk -v k="$kb" 'BEGIN{printf "%.1f GB", k/1048576}'; elif [ "$kb" -ge 1024 ]; then echo "$((kb/1024)) MB"; else echo "${kb} KB"; fi; }
+    if [ -d "$COVE_DIR/Snapshots" ]; then
+        local snap_sites=0 snap_n=0 orphans="" sd sn
+        for sd in "$COVE_DIR/Snapshots"/*/; do
+            [ -d "$sd" ] || continue
+            sn=$(basename "$sd")
+            local here; here=$(ls -1d "$sd"*/ 2>/dev/null | wc -l | tr -d ' ')
+            [ "$here" -gt 0 ] || continue
+            snap_sites=$((snap_sites+1))
+            snap_n=$((snap_n + here))
+            [ -d "$SITES_DIR/$sn.localhost" ] || orphans="$orphans $sn"
+        done
+        if [ "$snap_n" -gt 0 ]; then
+            echo "  ℹ️  $snap_n snapshot(s) of $snap_sites site(s), $(hsize "$COVE_DIR/Snapshots") as du counts them (clones share blocks)"
+            echo "     Review with: cove snapshot <site> list   ·   delete with: cove snapshot <site> delete <id>"
+        fi
+        if [ -n "$orphans" ]; then
+            echo "  ⚠️  snapshots of sites that no longer exist:$orphans"
+            echo "     Remove with: rm -rf ~/Cove/Snapshots/<site>"
+            warn=$((warn+1))
+        fi
+    fi
+    if [ -d "$COVE_DIR/Backups" ] && ls "$COVE_DIR/Backups"/*.zip >/dev/null 2>&1; then
+        echo "  ℹ️  $(ls -1 "$COVE_DIR/Backups"/*.zip 2>/dev/null | wc -l | tr -d ' ') backup zip(s), $(hsize "$COVE_DIR/Backups") in ~/Cove/Backups"
+    fi
+    if [ -d "$COVE_DIR/cache/screenshots" ] && ls "$COVE_DIR/cache/screenshots"/*.png >/dev/null 2>&1; then
+        local shots stale_shots=0 sp
+        shots=$(ls -1 "$COVE_DIR/cache/screenshots"/*.png 2>/dev/null | grep -vc 'tmp.png$')
+        for sp in "$COVE_DIR/cache/screenshots"/*.png; do
+            case "$sp" in *.tmp.png) continue ;; esac
+            sn=$(basename "$sp" .png)
+            [ -d "$SITES_DIR/$sn.localhost" ] || stale_shots=$((stale_shots+1))
+        done
+        echo "  ℹ️  $shots site preview(s), $(hsize "$COVE_DIR/cache/screenshots")$([ "$stale_shots" -gt 0 ] && echo " — $stale_shots for sites that no longer exist (the next capture sweep removes them)")"
+    fi
+    if [ -d "$COVE_DIR/cache/imports" ] && ls "$COVE_DIR/cache/imports"/* >/dev/null 2>&1; then
+        echo "  ⚠️  $(ls -1 "$COVE_DIR/cache/imports" | wc -l | tr -d ' ') archive(s) left by failed imports, $(hsize "$COVE_DIR/cache/imports") in ~/Cove/cache/imports"
+        echo "     Retry with: cove import <site> <archive>   ·   or remove the folder"
+        warn=$((warn+1))
+    fi
+    local strays; strays=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cove-shot-profile.*' -mmin +3 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$strays" -gt 0 ]; then
+        echo "  ⚠️  $strays stale capture profile(s) in the temp folder (cleared by the next cove screenshot)"
+        warn=$((warn+1))
+    fi
+
     # --- Verdict ------------------------------------------------------------
     echo ""
     if [ "$crit" -gt 0 ]; then

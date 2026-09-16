@@ -313,6 +313,7 @@ cove_snapshot() {
                 exit 1
             fi
             rm -rf "$SNAPSHOTS_DIR/$site_name/$id"
+            rmdir "$SNAPSHOTS_DIR/$site_name" 2>/dev/null || true
             if [ "$format" == "json" ]; then printf '{"deleted":"%s"}\n' "$id"; else echo "🗑️  Deleted snapshot $id."; fi
             ;;
         *)

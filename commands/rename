@@ -119,6 +119,14 @@ cove_rename() {
         mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
     fi
 
+    # --- Snapshots and the dashboard preview follow the name ---
+    if [ -d "$COVE_DIR/Snapshots/$old_name" ]; then
+        mv "$COVE_DIR/Snapshots/$old_name" "$COVE_DIR/Snapshots/$new_name" && echo "   - Snapshots moved."
+    fi
+    if [ -f "$COVE_DIR/cache/screenshots/$old_name.png" ]; then
+        mv "$COVE_DIR/cache/screenshots/$old_name.png" "$COVE_DIR/cache/screenshots/$new_name.png" 2>/dev/null || true
+    fi
+
     # --- Rename Custom Caddy Directives File ---
     local old_custom_conf_file="$CUSTOM_CADDY_DIR/$old_name.localhost"
     local new_custom_conf_file="$CUSTOM_CADDY_DIR/$new_name.localhost"

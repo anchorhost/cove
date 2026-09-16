@@ -77,6 +77,14 @@ cove_screenshot_reap() {
         rm -rf "$d"
     done < <(find "$SHOT_TMP" -maxdepth 1 -name 'cove-shot-profile.*' -mmin +3 2>/dev/null)
     [ -d "$SCREENSHOTS_DIR" ] && find "$SCREENSHOTS_DIR" -maxdepth 1 -name '*.png.tmp.png' -mmin +2 -delete 2>/dev/null
+    # Previews of sites that no longer exist.
+    local sp sn
+    for sp in "$SCREENSHOTS_DIR"/*.png; do
+        [ -f "$sp" ] || continue
+        case "$sp" in *.tmp.png) continue ;; esac
+        sn=$(basename "$sp" .png)
+        [ -d "$SITES_DIR/$sn.localhost" ] || rm -f "$sp"
+    done
     return 0
 }
 

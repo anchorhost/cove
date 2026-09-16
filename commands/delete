@@ -80,6 +80,20 @@ cove_delete() {
     fi
     echo "✅ Directory deleted."
 
+    # What Cove kept about the site outside its directory: snapshots, the
+    # dashboard preview, and any archive an import left behind. Backups in
+    # ~/Cove/Backups are the user's own files and stay.
+    if [ -d "$COVE_DIR/Snapshots/$site_name" ]; then
+        local snaps; snaps=$(ls -1d "$COVE_DIR/Snapshots/$site_name"/*/ 2>/dev/null | wc -l | tr -d ' ')
+        rm -rf "$COVE_DIR/Snapshots/$site_name"
+        echo "📸 Removed $snaps snapshot(s)."
+    fi
+    rm -f "$COVE_DIR/cache/screenshots/$site_name.png" "$COVE_DIR/cache/screenshots/$site_name.png.tmp.png" 2>/dev/null
+    rm -f "$COVE_DIR/cache/imports/$site_name"-*.zip "$COVE_DIR/cache/imports/$site_name"-*.tar.gz "$COVE_DIR/cache/imports/$site_name"-*.tgz 2>/dev/null
+    if ls "$COVE_DIR/Backups/$site_name"-*.zip >/dev/null 2>&1; then
+        echo "💾 Backups in ~/Cove/Backups were kept: $(ls -1 "$COVE_DIR/Backups/$site_name"-*.zip 2>/dev/null | wc -l | tr -d ' ') file(s)."
+    fi
+
     # A reload already in flight snapshotted the Sites listing while this
     # site still existed. When that stale Caddyfile applies, Caddy re-creates
     # the site's logs/ skeleton — which resurrects the site in the dashboard.
