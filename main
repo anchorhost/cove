@@ -3016,6 +3016,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         echo json_encode($sites_info);
         exit;
     }
+    if ($action === 'backup_download') {
+        // A zip from ~/Cove/Backups, as an attachment.
+        $name = (string) ($_GET['name'] ?? '');
+        $file = preg_match('/^[a-zA-Z0-9-]+-\d{8}-\d{6}\.zip$/', $name) ? $user_home . '/Cove/Backups/' . $name : '';
+        if ($file === '' || !is_file($file)) { http_response_code(404); echo json_encode(['success' => false, 'message' => 'No such backup.']); exit; }
+        header('Content-Type: application/octet-stream');
+        header('Content-Length: ' . filesize($file));
+        header('X-Content-Type-Options: nosniff');
+        header('Content-Security-Policy: sandbox');
+        header('Content-Disposition: attachment; filename="' . basename($file) . '"');
+        readfile($file);
+        exit;
+    }
     if ($action === 'snapshot_download') {
         // The packed snapshot archive, as an attachment. Built by the
         // site_snapshot_export action first; 404 until then.
@@ -3606,6 +3619,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exec('du -sk ' . escapeshellarg($sitedir . '/' . $site_name . '.localhost') . ' 2>/dev/null', $du);
             if ($du && preg_match('/^(\d+)/', $du[0], $mm)) $size = (int) $mm[1] * 1024;
             echo json_encode(['success' => true, 'size_bytes' => $size, 'output' => $out]);
+            exit;
+        case 'site_backup':
+            // One zip of the site's files and database, via `cove backup`,
+            // kept in ~/Cove/Backups and then offered as a download.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) { echo json_encode(['success' => false, 'message' => 'Invalid site name.']); exit; }
+            if (!is_dir($sitedir . '/' . $site_name . '.localhost/public')) { echo json_encode(['success' => false, 'message' => 'Site not found.']); exit; }
+            set_time_limit(0);
+            exec(sprintf('HOME=%s %s backup %s --format=json 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name)), $bk_lines, $bk_code);
+            $bk_out = preg_replace('/\x1b\[[0-9;]*m/', '', implode("\n", $bk_lines));
+            $bk = null;
+            foreach (array_reverse(explode("\n", trim($bk_out))) as $line) { $try = json_decode(trim($line), true); if (is_array($try)) { $bk = $try; break; } }
+            if ($bk_code !== 0 || !is_array($bk) || empty($bk['file'])) {
+                $lines = array_values(array_filter(array_map('trim', explode("\n", $bk_out))));
+                echo json_encode(['success' => false, 'message' => $lines ? preg_replace('/^[^\w]*(Error: )?/u', '', end($lines)) : 'The backup failed.']);
+                exit;
+            }
+            echo json_encode(['success' => true, 'name' => basename($bk['file']), 'bytes' => (int) ($bk['bytes'] ?? 0)]);
             exit;
         case 'site_traffic':
             // --- Traffic: aggregates over the site's Caddy access log --------
@@ -6418,6 +6448,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         <button type="button" class="pill" id="spRename"><span class="pill-label">rename…</span></button>
                         <button type="button" class="pill" id="spReveal"><span class="pill-label">reveal</span></button>
                         <button type="button" class="pill" id="spCopy"><span class="pill-label">copy path</span></button>
+                        <button type="button" class="pill" id="spBackup" title="Files and database as one zip, saved in ~/Cove/Backups and downloaded"><span class="pill-label">backup zip</span></button>
                         <button type="button" class="pill" id="spPin"><span class="pill-label">pin to top</span></button>
                         <button type="button" class="pill danger" id="spDelete"><span class="pill-label">delete site…</span></button>
                     </div>
@@ -7771,7 +7802,19 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.setThemePref(this.theme === 'light' ? 'dark' : 'light');
             },
 
-            openThemeMenu() { const m = $id('themeMenu'); if (m) { m.style.display = ''; this.themeMenuOpen = true; } },
+            openThemeMenu() {
+                const m = $id('themeMenu');
+                if (!m) return;
+                m.style.display = '';
+                this.themeMenuOpen = true;
+                // Open to the right of the toggle when the viewport has the
+                // room, otherwise hang from its right edge as before.
+                const btn = $id('btnTheme').getBoundingClientRect();
+                const base = (m.offsetParent || document.body).getBoundingClientRect();
+                const fits = btn.left + m.offsetWidth <= window.innerWidth - 12;
+                m.style.right = 'auto';
+                m.style.left = Math.round((fits ? btn.left : btn.right - m.offsetWidth) - base.left) + 'px';
+            },
             closeThemeMenu() { const m = $id('themeMenu'); if (m) { m.style.display = 'none'; this.themeMenuOpen = false; } },
 
             toggleAdd() {
@@ -10445,6 +10488,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('spRename').addEventListener('click', withSite(s => this.promptRename(s)));
                 $id('spReveal').addEventListener('click', withSite(s => this.revealSite(s.name)));
                 $id('spCopy').addEventListener('click', withSite(s => this.copyPath(s.full_path)));
+                $id('spBackup').addEventListener('click', withSite(s => this.backupSite(s.name)));
                 $id('spPin').addEventListener('click', withSite(s => { this.togglePin(s.name); this.renderSitePage(); }));
                 $id('spDelete').addEventListener('click', withSite(s => this.openSiteDeleteConfirm(s.name)));
             },
@@ -11917,6 +11961,19 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.showSnack('Deleted ' + name + '.');
                 this.renderFiles();
                 this.loadFilesDir();
+            },
+
+            async backupSite(name) {
+                const btn = $id('spBackup');
+                if (btn.disabled) return;
+                btn.disabled = true;
+                btn.querySelector('.pill-label').textContent = 'packing…';
+                const res = await this.apiPost('site_backup', { site_name: name }, { quiet: true, timeoutMs: 1800000 });
+                btn.disabled = false;
+                btn.querySelector('.pill-label').textContent = 'backup zip';
+                if (!res.success) { this.showSnack(res.message || 'The backup failed.', true); return; }
+                this.showSnack('Backup ' + res.name + ' (' + this.formatSize(res.bytes) + ') saved to ~/Cove/Backups — downloading.');
+                window.location.href = '/api.php?action=backup_download&name=' + encodeURIComponent(res.name);
             },
 
             async revealFiles() {
@@ -13488,6 +13545,7 @@ show_general_help() {
     help_cmd php "Pin a site to an older PHP (native php-fpm behind FrankenPHP)."
     echo ""
     help_section "Backups & transfer"
+    help_cmd backup "A site's files and database as one zip, in ~/Cove/Backups."
     help_cmd snapshot "Take, list, restore, or delete snapshots of a site."
     help_cmd history "Nightly saves of plugins and themes; roll any of them back."
     help_cmd db "Manage databases (e.g., 'cove db backup')."
@@ -13825,6 +13883,9 @@ display_command_help() {
             ;;
         import)
             cove_import --help
+            ;;
+        backup)
+            cove_backup --help
             ;;
         screenshot)
             cove_screenshot --help
@@ -14190,6 +14251,10 @@ main() {
         import)
             check_dependencies
             cove_import "$@"
+            ;;
+        backup)
+            check_dependencies
+            cove_backup "$@"
             ;;
         screenshot)
             cove_screenshot "$@"

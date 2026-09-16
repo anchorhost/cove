@@ -1,0 +1,70 @@
+cove_backup() {
+    local site_name="" out="" keep=false format="table"
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --out=*)    out="${arg#*=}" ;;
+            --keep)     keep=true ;;
+            --format=*) format="${arg#*=}" ;;
+            --json)     format="json" ;;
+            -h|--help)
+                echo "Usage: cove backup <site> [--out=<file.zip>] [--keep]"
+                echo ""
+                echo "A site's files and database as one zip, ready to hand to someone or feed"
+                echo "to cove import. Without --out it lands in ~/Cove/Backups/<site>-<stamp>.zip."
+                echo "Under the hood a snapshot is taken and packed; --keep leaves that snapshot"
+                echo "in place afterwards (otherwise only the zip remains)."
+                return
+                ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                exit 1
+                ;;
+            *) [ -z "$site_name" ] && site_name="$arg" ;;
+        esac
+    done
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove backup <site> [--out=<file.zip>] [--keep]"
+        exit 1
+    fi
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+    if [ ! -d "$SITES_DIR/$site_name.localhost/public" ]; then
+        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    local backups_dir="$COVE_DIR/Backups"
+    [ -z "$out" ] && { mkdir -p "$backups_dir"; out="$backups_dir/$site_name-$(date +%Y%m%d-%H%M%S).zip"; }
+    case "$out" in
+        *.zip) ;;
+        *) out="$out.zip" ;;
+    esac
+
+    [ "$format" == "json" ] || echo "💾 Backing up '$site_name.localhost'…"
+    local id
+    id=$(snapshot_create "$site_name" "backup" 1) || exit 1
+    id="${id##*$'\n'}"
+    local src="$SNAPSHOTS_DIR/$site_name/$id"
+    local tmp="$out.tmp"
+    rm -f "$tmp"
+    if command -v zip >/dev/null 2>&1; then
+        ( cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; [ "$keep" = true ] || rm -rf "$src"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
+    else
+        gum style --foreground red "❌ Error: 'zip' is not installed." "Use cove snapshot $site_name export $id for a tar.gz instead."
+        [ "$keep" = true ] || rm -rf "$src"
+        exit 1
+    fi
+    mv -f "$tmp" "$out"
+    [ "$keep" = true ] || rm -rf "$src"
+    local bytes
+    bytes=$(stat -f%z "$out" 2>/dev/null || stat -c%s "$out" 2>/dev/null || echo 0)
+    if [ "$format" == "json" ]; then
+        printf '{"file":"%s","bytes":%s,"snapshot":%s}\n' "$(snapshot_json_escape "$out")" "$bytes" "$([ "$keep" = true ] && printf '"%s"' "$id" || echo null)"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Backup saved" "$out" "$(awk -v b="$bytes" 'BEGIN{ s="B"; if (b>=1073741824){b/=1073741824; s="GB"} else if (b>=1048576){b/=1048576; s="MB"} else if (b>=1024){b/=1024; s="KB"}; printf (b>=10||s=="B") ? "%d %s" : "%.1f %s", b, s }')  ·  restore anywhere with: cove import <name> $(basename "$out")"
+    fi
+}
