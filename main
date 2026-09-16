@@ -13437,6 +13437,7 @@ show_general_help() {
     echo "  share            Create a temporary public tunnel to share a site."
     echo "  lan              Enable LAN access to sites for mobile app sync."
     echo "  tailscale        Expose all sites to your Tailscale network."
+    echo "  mappings         Extra domains a site answers on; a '*.' entry covers every subdomain."
     echo "  directive        Add or remove custom Caddyfile rules for a site."
     echo "  proxy            Manage standalone reverse proxy entries."
     echo "  ports            Reconfigure HTTP/HTTPS ports + update site URLs."
