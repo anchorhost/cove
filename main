@@ -2391,6 +2391,12 @@ regenerate_caddyfile() {
     esac
 
     # Write the static header of the Caddyfile
+    # Who may reach the dashboard, Adminer, and Mailpit: this machine. Under
+    # WSL2's default NAT networking the Windows browser arrives from the
+    # virtual adapter's private address, so private ranges are allowed there
+    # (mirrored networking arrives as loopback, which is always allowed).
+    local local_only='remote_ip 127.0.0.1 ::1'
+    [ "$IS_WSL" = true ] && local_only='remote_ip private_ranges'
     cat > "$CADDYFILE_PATH" <<- EOM
 {
 ${port_directives}    frankenphp {
@@ -2456,17 +2462,32 @@ ${port_directives}    frankenphp {
 # --- Global Services ---
 
 mail.cove.localhost {
+    @outside not $local_only
+    handle @outside {
+        respond "This answers only on the machine running Cove." 403
+    }
     reverse_proxy 127.0.0.1:8025
     tls internal
 }
 
 db.cove.localhost {
+    @outside not $local_only
+    handle @outside {
+        respond "This answers only on the machine running Cove." 403
+    }
     root * "$ADMINER_DIR"
     php_server
     tls internal
 }
 
 cove.localhost {
+    # The dashboard edits files, runs WP-CLI, and imports archives: it must
+    # answer this machine only. Caddy listens on every interface, and the
+    # Origin check in api.php is a browser courtesy, not authentication.
+    @outside not $local_only
+    handle @outside {
+        respond "This answers only on the machine running Cove." 403
+    }
     root * "$GUI_DIR"
     # Mailpit's REST API, same-origin for the dashboard's Mail view:
     # /mail-api/v1/... -> 127.0.0.1:8025/api/v1/... (the websocket at
@@ -2715,6 +2736,10 @@ EOM
         # Mail on port 9901
         echo "# Tailscale: mail -> port 9901" >> "$CADDYFILE_PATH"
         echo "https://${tailscale_hostname}:9901 {" >> "$CADDYFILE_PATH"
+        echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
+        echo "    handle @outside {" >> "$CADDYFILE_PATH"
+        echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
+        echo "    }" >> "$CADDYFILE_PATH"
         echo "    tls internal" >> "$CADDYFILE_PATH"
         echo "    reverse_proxy 127.0.0.1:8025" >> "$CADDYFILE_PATH"
         echo "}" >> "$CADDYFILE_PATH"
@@ -2723,6 +2748,10 @@ EOM
         # DB on port 9902 - serve directly
         echo "# Tailscale: db -> port 9902" >> "$CADDYFILE_PATH"
         echo "https://${tailscale_hostname}:9902 {" >> "$CADDYFILE_PATH"
+        echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
+        echo "    handle @outside {" >> "$CADDYFILE_PATH"
+        echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
+        echo "    }" >> "$CADDYFILE_PATH"
         echo "    tls internal" >> "$CADDYFILE_PATH"
         echo "    root * \"$ADMINER_DIR\"" >> "$CADDYFILE_PATH"
         echo "    php_server" >> "$CADDYFILE_PATH"
@@ -2732,6 +2761,10 @@ EOM
         # Dashboard on port 9900 - serve directly
         echo "# Tailscale: cove dashboard -> port 9900" >> "$CADDYFILE_PATH"
         echo "https://${tailscale_hostname}:9900 {" >> "$CADDYFILE_PATH"
+        echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
+        echo "    handle @outside {" >> "$CADDYFILE_PATH"
+        echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
+        echo "    }" >> "$CADDYFILE_PATH"
         echo "    tls internal" >> "$CADDYFILE_PATH"
         echo "    root * \"$GUI_DIR\"" >> "$CADDYFILE_PATH"
         echo "    php_server" >> "$CADDYFILE_PATH"
@@ -2803,6 +2836,19 @@ if (file_exists($__cove_cfg_path)) {
     }
 }
 $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_port;
+
+// Second line behind the Caddy matcher: only this machine, a private
+// address (WSL2's virtual adapter), or the tailnet may talk to the API.
+$__cove_ra = $_SERVER['REMOTE_ADDR'] ?? '';
+$__cove_wsl = 'IS_WSL_PLACEHOLDER' === 'true';
+$__cove_ok = in_array($__cove_ra, ['127.0.0.1', '::1', '::ffff:127.0.0.1', ''], true)
+    || preg_match('/^(100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|fd7a:115c:a1e0:)/i', $__cove_ra)
+    || ($__cove_wsl && preg_match('/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|fe80:|fd|fc|::ffff:(10\.|192\.168\.))/i', $__cove_ra));
+if (!$__cove_ok) {
+    http_response_code(403);
+    echo json_encode(['success' => false, 'message' => 'This answers only on the machine running Cove.']);
+    exit;
+}
 
 // Per-site disk sizes are cached so list_sites stays fast even on hosts with
 // ~100 sites. The cache is refreshed on demand by the dashboard's 'refresh_sizes'
@@ -3721,6 +3767,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) { echo json_encode(['success' => false, 'message' => 'Invalid site name.']); exit; }
             if (!is_dir($sitedir . '/' . $site_name . '.localhost/public')) { echo json_encode(['success' => false, 'message' => 'Site not found.']); exit; }
             $png = $user_home . '/Cove/cache/screenshots/' . $site_name . '.png';
+            // Is there a browser at all? Quick, and the answer the page needs
+            // right away rather than after a fruitless wait.
+            exec(sprintf('HOME=%s %s screenshot --check 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path)), $chk_lines, $chk_code);
+            if ($chk_code === 2) { echo json_encode(['success' => false, 'unsupported' => true, 'message' => trim(implode(' ', $chk_lines)) ?: 'No Chromium-family browser found.']); exit; }
             exec(sprintf('HOME=%s nohup nice -n 10 %s screenshot %s --quiet > /dev/null 2>&1 &', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name)));
             clearstatcache(true, $png);
             echo json_encode(['success' => true, 'queued' => true, 'mtime' => is_file($png) ? filemtime($png) : 0]);
@@ -3735,6 +3785,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         case 'site_shot_sweep':
             // Refresh a few stale previews in the background, at low priority.
+            exec(sprintf('HOME=%s %s screenshot --check > /dev/null 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path)), $chk_lines, $chk_code);
+            if ($chk_code === 2) { echo json_encode(['success' => false, 'unsupported' => true]); exit; }
             exec(sprintf('HOME=%s nohup nice -n 15 %s screenshot --sweep --max=3 > /dev/null 2>&1 &', escapeshellarg($user_home), escapeshellarg($cove_path)));
             echo json_encode(['success' => true]);
             exit;
@@ -13385,6 +13437,7 @@ EOM
     sed -e "s/COVE_EXECUTABLE_PATH_PLACEHOLDER/${escaped_path}/g" \
         -e "s/SITES_DIR_PLACEHOLDER/${escaped_sites_dir}/g" \
         -e "s/USER_HOME_PLACEHOLDER/${escaped_home}/g" \
+        -e "s/IS_WSL_PLACEHOLDER/${IS_WSL}/g" \
         "$GUI_DIR/api.php.tmp" > "$GUI_DIR/api.php"
 
     sed -e "s/SITES_DIR_PLACEHOLDER/${escaped_sites_dir}/g" \

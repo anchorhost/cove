@@ -115,7 +115,7 @@ cove_screenshot_sweep() {
 }
 
 cove_screenshot() {
-    local site_name="" out="" width=1280 height=800 quiet=0 sweep=0 max=3 idle_only=0
+    local site_name="" out="" width=1280 height=800 quiet=0 sweep=0 max=3 idle_only=0 check=0
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -124,6 +124,7 @@ cove_screenshot() {
             --height=*) height="${arg#*=}" ;;
             --quiet)    quiet=1 ;;
             --sweep)    sweep=1 ;;
+            --check)    check=1 ;;
             --max=*)    max="${arg#*=}" ;;
             --idle-only) idle_only=1 ;;
             -h|--help)
@@ -133,6 +134,7 @@ cove_screenshot() {
                 echo "(Chrome, Chromium, Brave, Edge, Arc, Vivaldi). Without --out the image"
                 echo "goes to ~/Cove/cache/screenshots/<site>.png, where the dashboard shows it."
                 echo ""
+                echo "  --check       Print the browser that would be used; exit 2 when there is none."
                 echo "  --sweep [--max=N] [--idle-only]"
                 echo "        Refresh up to N stale previews (missing, older than the site, or older"
                 echo "        than a day) in the background; --idle-only waits for an idle desktop."
@@ -145,6 +147,12 @@ cove_screenshot() {
             *) [ -z "$site_name" ] && site_name="$arg" ;;
         esac
     done
+    if [ "$check" -eq 1 ]; then
+        local found
+        if found=$(find_headless_browser); then echo "$found"; return 0; fi
+        echo "No Chromium-family browser found (Chrome, Chromium, Brave, Edge, Arc, Vivaldi)."
+        exit 2
+    fi
     if [ "$sweep" -eq 1 ]; then
         [[ "$max" =~ ^[0-9]+$ ]] || max=3
         cove_screenshot_sweep "$max" "$idle_only"
