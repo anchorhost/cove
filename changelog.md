@@ -1,6 +1,9 @@
 # Changelog
 
-## [Unreleased]
+## [2.0] - 2026-09-15
+
+Every site gets a page of its own. Click a site and you land on it: a live preview of the front page, its plugins and themes with one-click activate, update and delete, its users with a one-time login as any of them, cron with run-now, traffic from the access log, snapshots you can take, restore and download, and a WP-CLI console — with multisite networks listing every subsite and a login for each. Beside it a **files** view browses and edits any site's directory with syntax highlighting, uploads, and right-click menus. New from the terminal: `cove snapshot`, `cove backup`, `cove import` (create a site from any backup zip), `cove wp`, `cove network`, `cove history`, `cove screenshot`, and `cove opcache`; every command runs headless for scripts and agents. Because the dashboard can now edit files and run WP-CLI, it answers only from the machine running Cove.
+
 
 ### ✨ New Features
 
