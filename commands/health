@@ -45,7 +45,9 @@ cove_health() {
         # without SA_ONSTACK, which turns any fault in a PHP thread into a
         # process death (commands/signals). Reading it is a short debugger
         # attach; "unknown" means no debugger (or no parallel in this build).
-        case "$(cove_signals_status "$fpid")" in
+        local sig_state="unknown"
+        if cove_signals_lock; then sig_state=$(cove_signals_status "$fpid"); cove_signals_unlock; fi
+        case "$sig_state" in
             ok) echo "  ✅ SIGSEGV handler is Go's own (faults recover per request)" ;;
             crash-prone) echo "  ⚠️  SIGSEGV handler belongs to the parallel extension; run 'cove signals apply'"; warn=$((warn+1)) ;;
             *) echo "  ℹ️  SIGSEGV handler not readable (no debugger available)" ;;

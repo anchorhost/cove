@@ -27,6 +27,23 @@ cove_signals_to() {
     if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else "$@"; fi
 }
 
+# One debugger at a time. Two attaches on the same process (the watchdog's
+# tick, the reload hook, a hand-run status) must never overlap: evaluating an
+# expression in the target while another debugger detaches has killed the
+# server. mkdir is the atomic lock; a lock older than two minutes is stale.
+cove_signals_lock() {
+    local lock="$COVE_DIR/.signals.lock" age
+    if [ -d "$lock" ]; then
+        age=$(( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0) ))
+        [ "$age" -lt 120 ] && return 1
+        rmdir "$lock" 2>/dev/null || rm -rf "$lock" 2>/dev/null
+    fi
+    mkdir "$lock" 2>/dev/null
+}
+cove_signals_unlock() {
+    rmdir "$COVE_DIR/.signals.lock" 2>/dev/null || true
+}
+
 # The pid the service manager wrote for the running server, or nothing.
 cove_signals_pid() {
     local pid
@@ -109,6 +126,11 @@ cove_signals() {
     for a in "$@"; do [ "$a" = "--quiet" ] && quiet=true; done
     local pid
     pid=$(cove_signals_pid) || { $quiet || echo "No running FrankenPHP (no live pid on file)."; return 1; }
+    if ! cove_signals_lock; then
+        $quiet || echo "ℹ️  Another signals check is attached right now; try again in a moment."
+        return 3
+    fi
+    trap 'cove_signals_unlock' RETURN EXIT
     case "$action" in
         status)
             local st
