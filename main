@@ -1526,6 +1526,20 @@ if curl -sk --max-time 10 -o /dev/null \\
     # Healthy: mark this pid up, clear the failure streak.
     echo "\$pid up 0" > "\$state_file"
 
+    # --- SIGSEGV handler guard (commands/signals) ------------------------
+    # The bundled parallel extension replaces Go's SIGSEGV handler at every
+    # PHP module startup (process start, and any reload whose config
+    # changed). Restore Go's own once per pid as soon as it is healthy, and
+    # again every 10 minutes as a safety net; it is a short debugger attach,
+    # skipped silently where no debugger is available.
+    sig_stamp="$COVE_DIR/.signals.last"
+    sig_pid=\$(awk '{print \$1}' "\$sig_stamp" 2>/dev/null)
+    sig_at=\$(awk '{print \$2}' "\$sig_stamp" 2>/dev/null)
+    if [ "\$sig_pid" != "\$pid" ] || [ \$(( \$(date +%s) - \${sig_at:-0} )) -ge 600 ]; then
+        echo "\$pid \$(date +%s)" > "\$sig_stamp"
+        nohup "$watchdog_cove" signals apply --quiet >/dev/null 2>&1 &
+    fi
+
     # --- Nightly hygiene restart -----------------------------------------
     # Under ZTS every recompile of a changed file wastes its old OPcache
     # slot, and waste is only reclaimed by a shared-memory *restart* — the
@@ -2790,6 +2804,12 @@ EOM
         # shell_exec) running as the invoking user.
         if "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log"; then
             echo "✅ Caddy configuration reloaded."
+            # A changed config re-runs PHP module startup, and the parallel
+            # extension re-installs its SIGSEGV handler with it (see
+            # commands/signals). Put Go's back once the new config is live;
+            # a plain reload of an unchanged config is a no-op here too.
+            ( sleep 3; cove_signals apply --quiet >/dev/null 2>&1 ) &
+            disown 2>/dev/null || true
         else
             # A `caddy reload` adapts the Caddyfile with the *on-disk* binary
             # and POSTs that JSON at the *running* process. After
@@ -13578,6 +13598,7 @@ show_general_help() {
     help_cmd reload "Regenerates the Caddyfile and reloads the Caddy server."
     help_cmd memory "Show or raise PHP memory_limit across Cove + Homebrew PHPs."
     help_cmd opcache "Show or resize FrankenPHP's shared OPcache (all sites share it)."
+    help_cmd signals "Check or repair FrankenPHP's SIGSEGV handler (parallel extension crash guard)."
     echo ""
     help_section "Cove itself"
     help_cmd install "Installs and configures Homebrew dependencies."
@@ -13940,6 +13961,19 @@ display_command_help() {
             echo "  cove ports --dry-run                Preview the effect of a port change"
             echo ""
             echo "Tip: run 'cove db backup' first if you want a safety net before the DB update."
+            ;;
+        signals)
+            echo "Usage: cove signals [status | apply] [--quiet]"
+            echo ""
+            echo "FrankenPHP's static builds bundle the parallel PHP extension, which"
+            echo "replaces the Go runtime's SIGSEGV handler with one that lacks"
+            echo "SA_ONSTACK. Any segfault in a PHP thread then takes the whole server"
+            echo "down (\"non-Go code set up signal handler without SA_ONSTACK flag\")"
+            echo "where Go would have recovered the request. This command reads the"
+            echo "handler from the running process and, with 'apply', puts Go's own"
+            echo "back through a debugger (lldb on macOS, gdb on Linux). The watchdog"
+            echo "applies it once per server start; nothing happens without a debugger."
+            echo "Upstream: krakjoe/parallel#406, php/frankenphp#2650."
             ;;
         opcache)
             echo "Usage: cove opcache [show | set <mb> [--interned <mb>] [--files <n>] [--no-restart] [--yes]]"
@@ -14392,6 +14426,9 @@ main() {
         opcache)
             check_dependencies
             cove_opcache "$@"
+            ;;
+        signals)
+            cove_signals "$@"
             ;;
         php)
             check_dependencies

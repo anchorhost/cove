@@ -1,0 +1,148 @@
+# cove signals — keep FrankenPHP's SIGSEGV handler Go's own.
+#
+# FrankenPHP's static builds compile in the `parallel` PHP extension, whose
+# module init installs a SIGSEGV handler with SA_SIGINFO only (no SA_ONSTACK),
+# replacing the handler the Go runtime installed. Any later segfault in a PHP
+# thread runs that handler on the thread stack, it chains into Go's from the
+# wrong stack, and Go aborts the whole process:
+#   fatal error: non-Go code set up signal handler without SA_ONSTACK flag
+# Faults Go would have turned into a recoverable per-request panic become a
+# server death, a respawn and a watchdog SIGKILL, a few times an hour under
+# load (plugin updates, plugin-heavy admin requests). Reported upstream as
+# krakjoe/parallel#406 and php/frankenphp#2650.
+#
+# No php.ini or Caddyfile setting can undo it: it is C code in a compiled-in
+# extension. parallel does keep Go's original in its
+# php_parallel_old_sigsegv_action global (its own shutdown restores it), so one
+# sigaction() call in the live process puts Go's handler back, exactly. Until
+# upstream ships a fix, that call is made with a debugger: lldb on macOS (Xcode
+# Command Line Tools, which Homebrew already requires), gdb on Linux. Where no
+# debugger is available, or the attach is refused, nothing happens and nothing
+# is printed unless asked. The repair lasts for the life of the process, so it
+# is re-applied once per pid: the watchdog runs it when a server first turns
+# healthy, and `cove reload` keeps the process, so a reload never loses it.
+
+# GNU timeout is not on stock macOS; run bare when it is missing.
+cove_signals_to() {
+    if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else "$@"; fi
+}
+
+# The pid the service manager wrote for the running server, or nothing.
+cove_signals_pid() {
+    local pid
+    pid=$(cat "$COVE_DIR/caddy.pid" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+# The debugger command that answers a batch of expressions, or nothing.
+cove_signals_debugger() {
+    if [ "$OS" = "macos" ]; then
+        command -v lldb >/dev/null 2>&1 && echo "lldb" && return 0
+        [ -x /usr/bin/lldb ] && echo "/usr/bin/lldb" && return 0
+        return 1
+    fi
+    command -v gdb >/dev/null 2>&1 && echo "gdb" && return 0
+    return 1
+}
+
+# Read the handler addresses: prints "current=<addr> go=<addr>" where current
+# is the installed SIGSEGV handler and go the one parallel saved, or nothing
+# when the process could not be read (no debugger, attach refused, symbol
+# absent because the build does not ship parallel).
+cove_signals_read() {
+    local pid="$1" dbg out
+    dbg=$(cove_signals_debugger) || return 1
+    if [ "$OS" = "macos" ]; then
+        out=$(cove_signals_to "$dbg" -p "$pid" --batch \
+            -o 'expr -l c -- unsigned long cove_sa[4]; (int)sigaction(11, 0, cove_sa); (void*)cove_sa[0]' \
+            -o 'expr -l c -- (void*)*(void**)&php_parallel_old_sigsegv_action' \
+            -o 'process detach' -o 'quit' 2>/dev/null) || return 1
+        # Two "(void *) $N = 0x…" lines, in order.
+        local cur go
+        cur=$(echo "$out" | sed -n 's/^(void \*) \$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 1p)
+        go=$(echo "$out"  | sed -n 's/^(void \*) \$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 2p)
+    else
+        out=$(cove_signals_to "$dbg" -p "$pid" -batch -q \
+            -ex 'set confirm off' \
+            -ex 'set $cove_sa = (unsigned long*)malloc(64)' \
+            -ex 'call (int)sigaction(11, 0, $cove_sa)' \
+            -ex 'print/x $cove_sa[0]' \
+            -ex 'print/x *(unsigned long*)&php_parallel_old_sigsegv_action' \
+            -ex 'detach' -ex 'quit' 2>/dev/null) || return 1
+        local cur go
+        # "$N = 0x…" lines: the sigaction call's result comes first, then the two addresses.
+        cur=$(echo "$out" | sed -n 's/^\$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 1p)
+        go=$(echo "$out"  | sed -n 's/^\$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 2p)
+    fi
+    [ -n "$cur" ] && [ -n "$go" ] || return 1
+    echo "current=$cur go=$go"
+}
+
+# Put Go's handler back. Returns 0 when the process now carries it.
+cove_signals_apply() {
+    local pid="$1" dbg
+    dbg=$(cove_signals_debugger) || return 1
+    if [ "$OS" = "macos" ]; then
+        cove_signals_to "$dbg" -p "$pid" --batch \
+            -o 'expr -l c -- (int)sigaction(11, (void*)&php_parallel_old_sigsegv_action, (void*)0)' \
+            -o 'process detach' -o 'quit' >/dev/null 2>&1 || return 1
+    else
+        cove_signals_to "$dbg" -p "$pid" -batch -q -ex 'set confirm off' \
+            -ex 'call (int)sigaction(11, &php_parallel_old_sigsegv_action, 0)' \
+            -ex 'detach' -ex 'quit' >/dev/null 2>&1 || return 1
+    fi
+    [ "$(cove_signals_status "$pid")" = "ok" ]
+}
+
+# One-line status for health and the CLI: ok | crash-prone | unknown.
+cove_signals_status() {
+    local pid="$1" state cur go
+    state=$(cove_signals_read "$pid") || { echo "unknown"; return 0; }
+    cur=$(echo "$state" | sed 's/.*current=\([^ ]*\).*/\1/')
+    go=$(echo "$state"  | sed 's/.*go=\([^ ]*\).*/\1/')
+    if [ "$cur" = "$go" ]; then echo "ok"; else echo "crash-prone"; fi
+}
+
+cove_signals() {
+    local action="${1:-status}" quiet=false
+    shift 2>/dev/null
+    for a in "$@"; do [ "$a" = "--quiet" ] && quiet=true; done
+    local pid
+    pid=$(cove_signals_pid) || { $quiet || echo "No running FrankenPHP (no live pid on file)."; return 1; }
+    case "$action" in
+        status)
+            local st
+            st=$(cove_signals_status "$pid")
+            case "$st" in
+                ok) echo "✅ SIGSEGV handler is Go's own (pid $pid): faults in PHP threads are handled normally." ;;
+                crash-prone) echo "⚠️  SIGSEGV handler belongs to the parallel extension (pid $pid): a fault in a PHP thread will take the server down."; echo "   Run 'cove signals apply' (the watchdog does this once per start when a debugger is available)." ;;
+                *) echo "ℹ️  Could not read the handler (no debugger, attach refused, or this build has no parallel extension)." ;;
+            esac
+            ;;
+        apply)
+            local st stamp="$COVE_DIR/.signals.last"
+            st=$(cove_signals_status "$pid")
+            if [ "$st" = "ok" ]; then
+                echo "$pid $(date +%s)" > "$stamp" 2>/dev/null
+                $quiet || echo "✅ Already Go's own handler (pid $pid)."
+                return 0
+            fi
+            if [ "$st" = "unknown" ]; then
+                $quiet || echo "ℹ️  Skipped: no debugger available or the process could not be read."
+                return 2
+            fi
+            if cove_signals_apply "$pid"; then
+                echo "$pid $(date +%s)" > "$stamp" 2>/dev/null
+                echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] signals: restored Go's SIGSEGV handler in pid $pid" >> "$LOGS_DIR/watchdog.log" 2>/dev/null
+                $quiet || echo "✅ Restored Go's SIGSEGV handler in pid $pid."
+            else
+                $quiet || echo "❌ Could not restore the handler (debugger attach refused?)."
+                return 1
+            fi
+            ;;
+        *)
+            echo "Usage: cove signals [status | apply] [--quiet]"
+            return 1
+            ;;
+    esac
+}

@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### 🔒 Security & Bug Fixes
+
+* **FrankenPHP no longer dies on every segfault in a PHP thread:** the static builds bundle the `parallel` PHP extension, whose module startup replaces the Go runtime's SIGSEGV handler with one that lacks `SA_ONSTACK`. Any fault in a PHP thread that Go would have recovered as a per-request error then killed the whole server (`fatal error: non-Go code set up signal handler without SA_ONSTACK flag`), a few times an hour under load, most visibly during plugin installs and updates; the fault had been misattributed to imagick and to heap corruption. Nothing in php.ini or the Caddyfile can undo it, so a new `cove signals` command reads the handler from the running process and puts Go's own back through a debugger (lldb on macOS, gdb on Linux; nothing happens without one). The watchdog applies it once per server start and every ten minutes, and every reload re-applies it, since a changed config re-runs PHP module startup. `cove health` reports the handler's state. Reported upstream as krakjoe/parallel#406 and php/frankenphp#2650.
+
 ## [2.0] - 2026-09-15
 
 Every site gets a page of its own. Click a site and you land on it: a live preview of the front page, its plugins and themes with one-click activate, update and delete, its users with a one-time login as any of them, cron with run-now, traffic from the access log, snapshots you can take, restore and download, and a WP-CLI console — with multisite networks listing every subsite and a login for each. Beside it a **files** view browses and edits any site's directory with syntax highlighting, uploads, and right-click menus. New from the terminal: `cove snapshot`, `cove backup`, `cove import` (create a site from any backup zip), `cove wp`, `cove network`, `cove history`, `cove screenshot`, and `cove opcache`; every command runs headless for scripts and agents. Because the dashboard can now edit files and run WP-CLI, it answers only from the machine running Cove.

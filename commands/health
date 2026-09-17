@@ -41,6 +41,15 @@ cove_health() {
         # Uptime via ps etime (portable enough for display).
         local up; up=$(ps -o etime= -p "$fpid" 2>/dev/null | tr -d ' ')
         echo "  ✅ pid $fpid up ${up:-?}"
+        # The bundled parallel extension swaps Go's SIGSEGV handler for one
+        # without SA_ONSTACK, which turns any fault in a PHP thread into a
+        # process death (commands/signals). Reading it is a short debugger
+        # attach; "unknown" means no debugger (or no parallel in this build).
+        case "$(cove_signals_status "$fpid")" in
+            ok) echo "  ✅ SIGSEGV handler is Go's own (faults recover per request)" ;;
+            crash-prone) echo "  ⚠️  SIGSEGV handler belongs to the parallel extension; run 'cove signals apply'"; warn=$((warn+1)) ;;
+            *) echo "  ℹ️  SIGSEGV handler not readable (no debugger available)" ;;
+        esac
     else
         echo "  ⚠️  no live FrankenPHP pid on file"; warn=$((warn+1))
     fi
