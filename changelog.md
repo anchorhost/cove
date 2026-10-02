@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [2.1] - 2026-10-02
+
+A stability release. FrankenPHP's bundled `parallel` extension turned faults that should fail one request into crashes of the whole server, several times an hour under load, and a new `cove signals` guard puts Go's own handler back whenever lldb or gdb is installed. The watchdog applies it on its own, no longer restarts a server that is only warming up, and one broken site can no longer stall the preview sweep. WordPress uses Imagick again, so iPhone photos get thumbnails and PDFs get previews once Ghostscript is installed.
 
 ### 🛠️ Improvements & Changes
 
