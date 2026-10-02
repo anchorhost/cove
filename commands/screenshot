@@ -85,12 +85,21 @@ cove_screenshot_reap() {
         sn=$(basename "$sp" .png)
         [ -d "$SITES_DIR/$sn.localhost" ] || rm -f "$sp"
     done
+    for sp in "$SCREENSHOTS_DIR"/.*.failed; do
+        [ -f "$sp" ] || continue
+        sn=$(basename "$sp" .failed); sn="${sn#.}"
+        [ -d "$SITES_DIR/$sn.localhost" ] || rm -f "$sp"
+    done
     return 0
 }
 
 # Refresh previews that are missing, older than the site's public/ tree,
 # or older than a day — up to --max of them, one after another, at low
-# priority, under a lock so two sweeps never overlap.
+# priority, under a lock so two sweeps never overlap. A site whose capture
+# fails (front page down or 5xx) is stamped `.<site>.failed` and skipped for
+# a day: the sweep walks sites in name order, so without the stamp one
+# broken site is picked again every tick, its front page (and its wp-cron)
+# is hit every five minutes, and no site after it is ever refreshed.
 cove_screenshot_sweep() {
     local max="$1" idle_only="$2"
     if [ "$idle_only" -eq 1 ] && ! cove_user_is_idle; then return 0; fi
@@ -116,8 +125,17 @@ cove_screenshot_sweep() {
             local png_m; png_m=$(stat -f%m "$png" 2>/dev/null || stat -c%Y "$png" 2>/dev/null || echo 0)
             [ "$png_m" -ge "$site_m" ] && [ $((now - png_m)) -lt 86400 ] && continue
         fi
+        local failed="$SCREENSHOTS_DIR/.$name.failed"
+        if [ -f "$failed" ]; then
+            local fail_m; fail_m=$(stat -f%m "$failed" 2>/dev/null || stat -c%Y "$failed" 2>/dev/null || echo 0)
+            [ "$fail_m" -ge "$site_m" ] && [ $((now - fail_m)) -lt 86400 ] && continue
+        fi
         if [ "$idle_only" -eq 1 ] && ! cove_user_is_idle; then break; fi
-        nice -n 15 "$0" screenshot "$name" --quiet >/dev/null 2>&1 || true
+        if nice -n 15 "$0" screenshot "$name" --quiet >/dev/null 2>&1; then
+            rm -f "$failed"
+        else
+            touch "$failed"
+        fi
         done=$((done + 1))
     done
 }
