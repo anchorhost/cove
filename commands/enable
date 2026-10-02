@@ -64,11 +64,6 @@ LimitNOFILE=65536
 User=$current_user
 Environment=HOME=/home/$current_user
 Environment=PHPRC=$PHP_INI_FILE
-# ImageMagick installs process-wide signal handlers without SA_ONSTACK; in
-# FrankenPHP's threaded (ZTS) server that trips the Go runtime's "non-Go code
-# set up signal handler without SA_ONSTACK flag" fatal (and the "panic during
-# panic" 100%-CPU wedge). Disabling them lets a fault crash cleanly + restart.
-Environment=MAGICK_SIGNAL_HANDLERS=0
 
 [Install]
 WantedBy=multi-user.target

@@ -2210,37 +2210,39 @@ heal_cove_state_ownership() {
     done
 }
 
-# (Re)start the Caddy/FrankenPHP service. Safe to call when already running —
-# both platforms stop any existing instance first. Called from `cove enable`
-# and from regenerate_caddyfile when Caddy isn't up yet.
-start_caddy_service() {
-    echo "   - Starting Caddy/FrankenPHP..."
-    mkdir -p "$LOGS_DIR"
+# PATH for the FrankenPHP service. launchd starts a job with
+# /usr/bin:/bin:/usr/sbin:/sbin, and anything PHP runs by name is looked up
+# there. ImageMagick runs Ghostscript (`gs`) that way to read a PDF, so
+# without Homebrew's bin WordPress never gets a PDF preview. The same dirs the
+# top of this script adds for cove itself, Homebrew first, keeping only those
+# that exist so the plist changes only when the machine does.
+cove_service_path() {
+    local p="" d
+    for d in /opt/homebrew/bin /opt/nanobrew/bin /opt/nanobrew/prefix/bin /usr/local/bin /usr/local/sbin "$HOME/.local/bin"; do
+        [ -d "$d" ] && p="$p$d:"
+    done
+    echo "${p}/usr/bin:/bin:/usr/sbin:/sbin"
+}
 
-    if [ "$OS" == "macos" ]; then
-        local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
-        local frankenphp_bin
-        frankenphp_bin=$(command -v "$CADDY_CMD")
+# Write the FrankenPHP launchd plist (macOS). Returns 0 when the file changed.
+# launchd keeps the copy it loaded, so a change only takes effect once the job
+# is unloaded and loaded again, which start_caddy_service does.
+write_caddy_plist() {
+    local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
+    local frankenphp_bin
+    frankenphp_bin=$(command -v "$CADDY_CMD")
 
-        launchctl unload "$caddy_plist_path" &>/dev/null
-        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
-
-        cat > "$caddy_plist_path" << EOM
+    cat > "$caddy_plist_path.new" << EOM
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
         <key>EnvironmentVariables</key>
         <dict>
-                <!-- ImageMagick installs process-wide SIGSEGV/SIGABRT handlers
-                     without SA_ONSTACK. In FrankenPHP's threaded (ZTS) server a
-                     fault on a Go worker thread then trips the Go runtime's
-                     "non-Go code set up signal handler without SA_ONSTACK flag"
-                     fatal — and the "panic during panic" path wedges a core at
-                     100% for minutes. Disabling IM's handlers lets a fault
-                     surface as a clean crash the service manager restarts fast. -->
-                <key>MAGICK_SIGNAL_HANDLERS</key>
-                <string>0</string>
+                <!-- launchd's default PATH has no Homebrew. ImageMagick runs
+                     Ghostscript by name to read a PDF, so PDF previews need it. -->
+                <key>PATH</key>
+                <string>$(cove_service_path)</string>
         </dict>
         <!-- launchd's default soft file-descriptor limit is 256. FrankenPHP
              holds ~1 FD per site (listener/cert) plus one per in-flight
@@ -2281,6 +2283,25 @@ start_caddy_service() {
 </dict>
 </plist>
 EOM
+    if cmp -s "$caddy_plist_path.new" "$caddy_plist_path"; then
+        rm -f "$caddy_plist_path.new"
+        return 1
+    fi
+    mv "$caddy_plist_path.new" "$caddy_plist_path"
+}
+
+# (Re)start the Caddy/FrankenPHP service. Safe to call when already running —
+# both platforms stop any existing instance first. Called from `cove enable`
+# and from regenerate_caddyfile when Caddy isn't up yet.
+start_caddy_service() {
+    echo "   - Starting Caddy/FrankenPHP..."
+    mkdir -p "$LOGS_DIR"
+
+    if [ "$OS" == "macos" ]; then
+        local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
+        launchctl unload "$caddy_plist_path" &>/dev/null
+        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
+        write_caddy_plist || true
         launchctl load "$caddy_plist_path"
         launchctl start com.cove.caddy
     fi
@@ -2301,9 +2322,7 @@ EOM
             "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
                 || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
                 || true
-            # MAGICK_SIGNAL_HANDLERS=0: see the macOS plist above — keeps an
-            # ImageMagick fault from tripping the Go runtime's SA_ONSTACK fatal.
-            MAGICK_SIGNAL_HANDLERS=0 "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
+            "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
         fi
     fi
 }
@@ -14340,6 +14359,17 @@ main() {
             # Orphan-clearing mailpit runner + throttled KeepAlive. Safe to
             # re-run: rewrites the unit and restarts mailpit once.
             install_mailpit_service
+            # The FrankenPHP plist is otherwise only written when the service
+            # starts, and launchd keeps the copy it loaded. Rewrite it, and if
+            # it changed (PATH for Ghostscript) restart once, waiting for the
+            # admin port so the reload that follows doesn't restart again. No
+            # is_caddy_running gate: a change written while the server was
+            # down (a FrankenPHP swap) would otherwise never get loaded.
+            if [ "$OS" = "macos" ] && write_caddy_plist; then
+                echo "   - Restarting FrankenPHP to apply its updated service definition..."
+                start_caddy_service
+                for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
+            fi
             # Regenerate per-version php-fpm configs/units so pinned sites pick
             # up pool-template changes. Restart-shy: unchanged configs with a
             # live master are left alone.
