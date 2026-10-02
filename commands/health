@@ -82,8 +82,8 @@ cove_health() {
 
     # --- Recent hard crashes (macOS DiagnosticReports) ----------------------
     # Each .ips is one hard segfault. Classify by the culprit frames: the
-    # OPcache-SHM path (this box's common cause) vs Imagick's signal-handler
-    # bug vs anything else. grep the raw report — no JSON parser dependency.
+    # OPcache-SHM path (this box's common cause) vs a fault inside ImageMagick
+    # vs anything else. grep the raw report — no JSON parser dependency.
     if [ "$OS" = "macos" ]; then
         echo ""
         echo "Hard crashes (last 24h)"
@@ -133,7 +133,7 @@ cove_health() {
                 warn=$((warn+1))
             fi
             [ "$oc_n"    -gt 0 ] && echo "     • $oc_n OPcache shared-memory (see OPcache section below)"
-            [ "$im_n"    -gt 0 ] && echo "     • $im_n Imagick signal-handler (GD-editor MU-plugin should prevent — verify it's active)"
+            [ "$im_n"    -gt 0 ] && echo "     • $im_n in ImageMagick code (if one site's images keep doing it: add_filter( 'cove_force_gd_editor', '__return_true' ))"
             [ "$other_n" -gt 0 ] && echo "     • $other_n other (bystander thread; usually the same OPcache instability)"
         fi
     fi

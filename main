@@ -195,7 +195,7 @@ WHOOPS_VERSION="2.18.0"
 # MUST match the `Version:` header in build_mu_plugin's heredoc — refresh_all_mu_plugins
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
-MU_PLUGIN_VERSION="0.6.1"
+MU_PLUGIN_VERSION="0.7.0"
 # Version of the menu bar companion apps (menubar/, embedded at compile
 # time): the macOS app under Sources/ and the Linux tray under Linux/ share
 # this one number. Bump whenever anything under menubar/ changes — post-upgrade
@@ -647,7 +647,7 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.6.1
+ * Version: 0.7.0
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
@@ -836,24 +836,20 @@ add_filter( 'option_home', 'cove_maybe_override_site_url' );
 add_filter( 'option_siteurl', 'cove_maybe_override_site_url' );
 
 /**
- * Force the GD image editor instead of Imagick.
+ * Opt-in: force the GD image editor instead of Imagick.
  *
- * FrankenPHP embeds a ZTS PHP (built by static-php-cli) with the imagick
- * extension baked in. The first time any request constructs an Imagick
- * object, ImageMagick's MagickWandGenesis() installs its own SIGSEGV /
- * SIGBUS / SIGABRT handlers WITHOUT the SA_ONSTACK flag. Go — FrankenPHP's
- * runtime — owns SIGSEGV for goroutine stack-growth guard pages, so the
- * very next stack-growth signal trips "fatal error: non-Go code set up
- * signal handler without SA_ONSTACK flag" and the whole server aborts. On
- * WordPress every thumbnail/resize/upload instantiates Imagick (it's the
- * default editor when available), so an image-heavy site under load crashes
- * FrankenPHP repeatedly. Never instantiating Imagick avoids the handler
- * install entirely; GD covers every core WordPress image need. A site that
- * truly needs Imagick (and accepts the crash risk) can opt out with
- * add_filter( 'cove_force_gd_editor', '__return_false' ).
+ * Cove 1.12 through 2.0 forced GD on every site, blaming FrankenPHP's
+ * "non-Go code set up signal handler without SA_ONSTACK flag" crashes on
+ * ImageMagick. That was the wrong suspect: the handler behind them belongs
+ * to the bundled parallel extension (see `cove signals`), and ImageMagick
+ * installs none (MagickWandGenesis() passes establish_signal_handlers=false).
+ * Imagick is WordPress's default again, which is what converts HEIC uploads
+ * and renders PDF previews (with Ghostscript installed). A site that wants
+ * GD anyway can still force it with
+ * add_filter( 'cove_force_gd_editor', '__return_true' ).
  */
 add_filter( 'wp_image_editors', function ( $editors ) {
-	if ( ! apply_filters( 'cove_force_gd_editor', true ) ) {
+	if ( ! apply_filters( 'cove_force_gd_editor', false ) ) {
 		return $editors;
 	}
 	return array( 'WP_Image_Editor_GD' );
