@@ -186,7 +186,7 @@ RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="2.0"
+COVE_VERSION="2.1"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -195,7 +195,7 @@ WHOOPS_VERSION="2.18.0"
 # MUST match the `Version:` header in build_mu_plugin's heredoc — refresh_all_mu_plugins
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
-MU_PLUGIN_VERSION="0.6.1"
+MU_PLUGIN_VERSION="0.7.0"
 # Version of the menu bar companion apps (menubar/, embedded at compile
 # time): the macOS app under Sources/ and the Linux tray under Linux/ share
 # this one number. Bump whenever anything under menubar/ changes — post-upgrade
@@ -647,7 +647,7 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.6.1
+ * Version: 0.7.0
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
@@ -836,24 +836,20 @@ add_filter( 'option_home', 'cove_maybe_override_site_url' );
 add_filter( 'option_siteurl', 'cove_maybe_override_site_url' );
 
 /**
- * Force the GD image editor instead of Imagick.
+ * Opt-in: force the GD image editor instead of Imagick.
  *
- * FrankenPHP embeds a ZTS PHP (built by static-php-cli) with the imagick
- * extension baked in. The first time any request constructs an Imagick
- * object, ImageMagick's MagickWandGenesis() installs its own SIGSEGV /
- * SIGBUS / SIGABRT handlers WITHOUT the SA_ONSTACK flag. Go — FrankenPHP's
- * runtime — owns SIGSEGV for goroutine stack-growth guard pages, so the
- * very next stack-growth signal trips "fatal error: non-Go code set up
- * signal handler without SA_ONSTACK flag" and the whole server aborts. On
- * WordPress every thumbnail/resize/upload instantiates Imagick (it's the
- * default editor when available), so an image-heavy site under load crashes
- * FrankenPHP repeatedly. Never instantiating Imagick avoids the handler
- * install entirely; GD covers every core WordPress image need. A site that
- * truly needs Imagick (and accepts the crash risk) can opt out with
- * add_filter( 'cove_force_gd_editor', '__return_false' ).
+ * Cove 1.12 through 2.0 forced GD on every site, blaming FrankenPHP's
+ * "non-Go code set up signal handler without SA_ONSTACK flag" crashes on
+ * ImageMagick. That was the wrong suspect: the handler behind them belongs
+ * to the bundled parallel extension (see `cove signals`), and ImageMagick
+ * installs none (MagickWandGenesis() passes establish_signal_handlers=false).
+ * Imagick is WordPress's default again, which is what converts HEIC uploads
+ * and renders PDF previews (with Ghostscript installed). A site that wants
+ * GD anyway can still force it with
+ * add_filter( 'cove_force_gd_editor', '__return_true' ).
  */
 add_filter( 'wp_image_editors', function ( $editors ) {
-	if ( ! apply_filters( 'cove_force_gd_editor', true ) ) {
+	if ( ! apply_filters( 'cove_force_gd_editor', false ) ) {
 		return $editors;
 	}
 	return array( 'WP_Image_Editor_GD' );
@@ -1452,6 +1448,11 @@ log_file="$LOGS_DIR/watchdog.log"
 state_file="$COVE_DIR/.watchdog.state"
 process_log="$LOGS_DIR/caddy-process.log"
 fail_threshold=3          # ~15s of sustained failure (3 x 5s) before a kill
+warmup_ticks=60           # ~5min after a pid first answers a probe. Until then
+                          # the box is still compiling into the shared OPcache,
+                          # so a probe can queue behind cold sites and time out
+                          # with nothing actually wedged.
+fail_threshold_warm=24    # ~2min of sustained failure inside that warmup window
 never_healthy_ticks=120   # ~10min (120 x 5s) stuck in startup -> retry once
 log_cap_bytes=52428800    # 50MB — a restart storm must not fill the disk
 
@@ -1506,12 +1507,13 @@ if [ "\$hist_hhmm" -ge 100 ] && [ "\$hist_done_day" != "\$hist_today" ] && [ \$(
 fi
 
 # Load prior state.
-s_pid=""; s_mode="starting"; s_count=0
+s_pid=""; s_mode="starting"; s_count=0; s_up=0
 if [ -f "\$state_file" ]; then
-    read -r s_pid s_mode s_count < "\$state_file" 2>/dev/null
+    read -r s_pid s_mode s_count s_up < "\$state_file" 2>/dev/null
 fi
 [ -n "\$s_count" ] || s_count=0
 [ -n "\$s_mode" ] || s_mode="starting"
+[ -n "\$s_up" ] || s_up=0
 
 # HTTP-level probe: in the panic-during-panic case the kernel still accepts
 # TCP connects on the listener fd while the Go runtime is dead, so a plain
@@ -1523,8 +1525,24 @@ fi
 if curl -sk --max-time 10 -o /dev/null \\
     --resolve "cove.localhost:\$https_port:127.0.0.1" \\
     "https://cove.localhost:\$https_port/" 2>/dev/null; then
-    # Healthy: mark this pid up, clear the failure streak.
-    echo "\$pid up 0" > "\$state_file"
+    # Healthy: mark this pid up, clear the failure streak. s_up counts ticks
+    # since this pid first answered, and drives the warmup grace below.
+    if [ "\$s_pid" = "\$pid" ]; then s_up=\$((s_up + 1)); else s_up=1; fi
+    echo "\$pid up 0 \$s_up" > "\$state_file"
+
+    # --- SIGSEGV handler guard (commands/signals) ------------------------
+    # The bundled parallel extension replaces Go's SIGSEGV handler at every
+    # PHP module startup (process start, and any reload whose config
+    # changed). Restore Go's own once per pid as soon as it is healthy, and
+    # again every 10 minutes as a safety net; it is a short debugger attach,
+    # skipped silently where no debugger is available.
+    sig_stamp="$COVE_DIR/.signals.last"
+    sig_pid=\$(awk '{print \$1}' "\$sig_stamp" 2>/dev/null)
+    sig_at=\$(awk '{print \$2}' "\$sig_stamp" 2>/dev/null)
+    if [ "\$sig_pid" != "\$pid" ] || [ \$(( \$(date +%s) - \${sig_at:-0} )) -ge 600 ]; then
+        echo "\$pid \$(date +%s)" > "\$sig_stamp"
+        nohup "$watchdog_cove" signals apply --quiet >/dev/null 2>&1 &
+    fi
 
     # --- Nightly hygiene restart -----------------------------------------
     # Under ZTS every recompile of a changed file wastes its old OPcache
@@ -1606,9 +1624,16 @@ fi
 # Require a sustained streak before killing so a single transient timeout under
 # load can't trigger a respawn.
 s_count=\$((s_count + 1))
-echo "\$pid up \$s_count" > "\$state_file"
-if [ "\$s_count" -lt "\$fail_threshold" ]; then
-    echo "[\$ts] watchdog: pid=\$pid probe failed (\$s_count/\$fail_threshold)" >> "\$log_file"
+s_up=\$((s_up + 1))
+echo "\$pid up \$s_count \$s_up" > "\$state_file"
+# A pid that has only just become healthy is still warming a cold OPcache.
+# The heavy sites compile for 10s+ apiece and can hold every worker thread,
+# so the probe times out while nothing is actually wedged. Killing there just
+# restarts the cold start, forever. Stay patient until warmup closes.
+kill_at=\$fail_threshold
+[ "\$s_up" -lt "\$warmup_ticks" ] && kill_at=\$fail_threshold_warm
+if [ "\$s_count" -lt "\$kill_at" ]; then
+    echo "[\$ts] watchdog: pid=\$pid probe failed (\$s_count/\$kill_at)" >> "\$log_file"
     exit 0
 fi
 
@@ -2185,37 +2210,39 @@ heal_cove_state_ownership() {
     done
 }
 
-# (Re)start the Caddy/FrankenPHP service. Safe to call when already running —
-# both platforms stop any existing instance first. Called from `cove enable`
-# and from regenerate_caddyfile when Caddy isn't up yet.
-start_caddy_service() {
-    echo "   - Starting Caddy/FrankenPHP..."
-    mkdir -p "$LOGS_DIR"
+# PATH for the FrankenPHP service. launchd starts a job with
+# /usr/bin:/bin:/usr/sbin:/sbin, and anything PHP runs by name is looked up
+# there. ImageMagick runs Ghostscript (`gs`) that way to read a PDF, so
+# without Homebrew's bin WordPress never gets a PDF preview. The same dirs the
+# top of this script adds for cove itself, Homebrew first, keeping only those
+# that exist so the plist changes only when the machine does.
+cove_service_path() {
+    local p="" d
+    for d in /opt/homebrew/bin /opt/nanobrew/bin /opt/nanobrew/prefix/bin /usr/local/bin /usr/local/sbin "$HOME/.local/bin"; do
+        [ -d "$d" ] && p="$p$d:"
+    done
+    echo "${p}/usr/bin:/bin:/usr/sbin:/sbin"
+}
 
-    if [ "$OS" == "macos" ]; then
-        local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
-        local frankenphp_bin
-        frankenphp_bin=$(command -v "$CADDY_CMD")
+# Write the FrankenPHP launchd plist (macOS). Returns 0 when the file changed.
+# launchd keeps the copy it loaded, so a change only takes effect once the job
+# is unloaded and loaded again, which start_caddy_service does.
+write_caddy_plist() {
+    local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
+    local frankenphp_bin
+    frankenphp_bin=$(command -v "$CADDY_CMD")
 
-        launchctl unload "$caddy_plist_path" &>/dev/null
-        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
-
-        cat > "$caddy_plist_path" << EOM
+    cat > "$caddy_plist_path.new" << EOM
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
         <key>EnvironmentVariables</key>
         <dict>
-                <!-- ImageMagick installs process-wide SIGSEGV/SIGABRT handlers
-                     without SA_ONSTACK. In FrankenPHP's threaded (ZTS) server a
-                     fault on a Go worker thread then trips the Go runtime's
-                     "non-Go code set up signal handler without SA_ONSTACK flag"
-                     fatal — and the "panic during panic" path wedges a core at
-                     100% for minutes. Disabling IM's handlers lets a fault
-                     surface as a clean crash the service manager restarts fast. -->
-                <key>MAGICK_SIGNAL_HANDLERS</key>
-                <string>0</string>
+                <!-- launchd's default PATH has no Homebrew. ImageMagick runs
+                     Ghostscript by name to read a PDF, so PDF previews need it. -->
+                <key>PATH</key>
+                <string>$(cove_service_path)</string>
         </dict>
         <!-- launchd's default soft file-descriptor limit is 256. FrankenPHP
              holds ~1 FD per site (listener/cert) plus one per in-flight
@@ -2256,6 +2283,25 @@ start_caddy_service() {
 </dict>
 </plist>
 EOM
+    if cmp -s "$caddy_plist_path.new" "$caddy_plist_path"; then
+        rm -f "$caddy_plist_path.new"
+        return 1
+    fi
+    mv "$caddy_plist_path.new" "$caddy_plist_path"
+}
+
+# (Re)start the Caddy/FrankenPHP service. Safe to call when already running —
+# both platforms stop any existing instance first. Called from `cove enable`
+# and from regenerate_caddyfile when Caddy isn't up yet.
+start_caddy_service() {
+    echo "   - Starting Caddy/FrankenPHP..."
+    mkdir -p "$LOGS_DIR"
+
+    if [ "$OS" == "macos" ]; then
+        local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
+        launchctl unload "$caddy_plist_path" &>/dev/null
+        "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
+        write_caddy_plist || true
         launchctl load "$caddy_plist_path"
         launchctl start com.cove.caddy
     fi
@@ -2276,9 +2322,7 @@ EOM
             "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
                 || $SUDO_CMD -n "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null \
                 || true
-            # MAGICK_SIGNAL_HANDLERS=0: see the macOS plist above — keeps an
-            # ImageMagick fault from tripping the Go runtime's SA_ONSTACK fatal.
-            MAGICK_SIGNAL_HANDLERS=0 "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
+            "$CADDY_CMD" start --config "$CADDYFILE_PATH" --pidfile "$COVE_DIR/caddy.pid" >> "$LOGS_DIR/caddy-process.log" 2>&1
         fi
     fi
 }
@@ -2790,6 +2834,12 @@ EOM
         # shell_exec) running as the invoking user.
         if "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log"; then
             echo "✅ Caddy configuration reloaded."
+            # A changed config re-runs PHP module startup, and the parallel
+            # extension re-installs its SIGSEGV handler with it (see
+            # commands/signals). Put Go's back once the new config is live;
+            # a plain reload of an unchanged config is a no-op here too.
+            ( sleep 3; cove_signals apply --quiet >/dev/null 2>&1 ) &
+            disown 2>/dev/null || true
         else
             # A `caddy reload` adapts the Caddyfile with the *on-disk* binary
             # and POSTs that JSON at the *running* process. After
@@ -9994,7 +10044,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     tile('server errors', fmtN(errors), fmtN(d.status['4xx'] || 0) + ' × 4xx · ' + fmtN(d.status['3xx'] || 0) + ' × 3xx', errors ? 'is-bad' : ''),
                     tile('php errors', fmtN(d.php_errors), 'error log + debug.log', d.php_errors ? 'is-warn' : ''),
                     tile('response time', d.avg_ms != null ? esc(d.avg_ms) + ' ms' : '—', d.p95_ms != null ? 'p95 ' + esc(d.p95_ms) + ' ms · max ' + esc(d.max_ms) + ' ms' : ''),
-                    tile('served', this.formatSize(d.bytes), (d.last_cron ? 'cron ran ' + this.formatRelative(d.last_cron) + ' ago' : 'cron not seen')),
+                    tile('served', this.formatSize(d.bytes), (d.last_cron ? 'cron ran ' + (this.formatRelative(d.last_cron) === 'now' ? 'just now' : this.formatRelative(d.last_cron) + ' ago') : 'cron not seen')),
                     tile('mail sent', d.mail == null ? '—' : fmtN(d.mail), d.mail == null ? 'Mailpit did not answer' : 'by whole days'),
                 ].join('');
                 // Bars: one per bucket, empty buckets filled in so gaps show.
@@ -10197,7 +10247,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     + bit('5xx', d.status['5xx'], d.status['5xx'] ? 'is-bad' : '')
                     + bit('php errors', d.php_errors, d.php_errors ? 'is-warn' : '')
                     + (h.mail == null ? '' : bit('mail', h.mail))
-                    + (d.last_cron ? '<span class="fact" title="' + new Date(d.last_cron * 1000).toLocaleString() + '">cron ' + this.formatRelative(d.last_cron) + ' ago</span>' : '<span class="fact">cron not seen</span>');
+                    + (d.last_cron ? '<span class="fact" title="' + new Date(d.last_cron * 1000).toLocaleString() + '">cron ' + (this.formatRelative(d.last_cron) === 'now' ? 'just now' : this.formatRelative(d.last_cron) + ' ago') + '</span>' : '<span class="fact">cron not seen</span>');
             },
 
             // --- Previews in the background ---------------------------------
@@ -13578,6 +13628,7 @@ show_general_help() {
     help_cmd reload "Regenerates the Caddyfile and reloads the Caddy server."
     help_cmd memory "Show or raise PHP memory_limit across Cove + Homebrew PHPs."
     help_cmd opcache "Show or resize FrankenPHP's shared OPcache (all sites share it)."
+    help_cmd signals "Check or repair FrankenPHP's SIGSEGV handler (parallel extension crash guard)."
     echo ""
     help_section "Cove itself"
     help_cmd install "Installs and configures Homebrew dependencies."
@@ -13941,6 +13992,19 @@ display_command_help() {
             echo ""
             echo "Tip: run 'cove db backup' first if you want a safety net before the DB update."
             ;;
+        signals)
+            echo "Usage: cove signals [status | apply] [--quiet]"
+            echo ""
+            echo "FrankenPHP's static builds bundle the parallel PHP extension, which"
+            echo "replaces the Go runtime's SIGSEGV handler with one that lacks"
+            echo "SA_ONSTACK. Any segfault in a PHP thread then takes the whole server"
+            echo "down (\"non-Go code set up signal handler without SA_ONSTACK flag\")"
+            echo "where Go would have recovered the request. This command reads the"
+            echo "handler from the running process and, with 'apply', puts Go's own"
+            echo "back through a debugger (lldb on macOS, gdb on Linux). The watchdog"
+            echo "applies it once per server start; nothing happens without a debugger."
+            echo "Upstream: krakjoe/parallel#406, php/frankenphp#2650."
+            ;;
         opcache)
             echo "Usage: cove opcache [show | set <mb> [--interned <mb>] [--files <n>] [--no-restart] [--yes]]"
             echo ""
@@ -14295,6 +14359,17 @@ main() {
             # Orphan-clearing mailpit runner + throttled KeepAlive. Safe to
             # re-run: rewrites the unit and restarts mailpit once.
             install_mailpit_service
+            # The FrankenPHP plist is otherwise only written when the service
+            # starts, and launchd keeps the copy it loaded. Rewrite it, and if
+            # it changed (PATH for Ghostscript) restart once, waiting for the
+            # admin port so the reload that follows doesn't restart again. No
+            # is_caddy_running gate: a change written while the server was
+            # down (a FrankenPHP swap) would otherwise never get loaded.
+            if [ "$OS" = "macos" ] && write_caddy_plist; then
+                echo "   - Restarting FrankenPHP to apply its updated service definition..."
+                start_caddy_service
+                for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
+            fi
             # Regenerate per-version php-fpm configs/units so pinned sites pick
             # up pool-template changes. Restart-shy: unchanged configs with a
             # live master are left alone.
@@ -14392,6 +14467,9 @@ main() {
         opcache)
             check_dependencies
             cove_opcache "$@"
+            ;;
+        signals)
+            cove_signals "$@"
             ;;
         php)
             check_dependencies
@@ -16137,11 +16215,6 @@ LimitNOFILE=65536
 User=$current_user
 Environment=HOME=/home/$current_user
 Environment=PHPRC=$PHP_INI_FILE
-# ImageMagick installs process-wide signal handlers without SA_ONSTACK; in
-# FrankenPHP's threaded (ZTS) server that trips the Go runtime's "non-Go code
-# set up signal handler without SA_ONSTACK flag" fatal (and the "panic during
-# panic" 100%-CPU wedge). Disabling them lets a fault crash cleanly + restart.
-Environment=MAGICK_SIGNAL_HANDLERS=0
 
 [Install]
 WantedBy=multi-user.target
@@ -16251,6 +16324,18 @@ cove_health() {
         # Uptime via ps etime (portable enough for display).
         local up; up=$(ps -o etime= -p "$fpid" 2>/dev/null | tr -d ' ')
         echo "  ✅ pid $fpid up ${up:-?}"
+        # The bundled parallel extension swaps Go's SIGSEGV handler for one
+        # without SA_ONSTACK, which turns any fault in a PHP thread into a
+        # process death (commands/signals). Reading it is a short debugger
+        # attach; "unknown" means no debugger (or no parallel in this build).
+        local sig_state="busy"
+        if cove_signals_lock; then sig_state=$(cove_signals_status "$fpid"); cove_signals_unlock; fi
+        case "$sig_state" in
+            ok) echo "  ✅ SIGSEGV handler is Go's own (faults recover per request)" ;;
+            crash-prone) echo "  ⚠️  SIGSEGV handler belongs to the parallel extension; run 'cove signals apply'"; warn=$((warn+1)) ;;
+            busy) echo "  ℹ️  SIGSEGV handler check is running right now (the watchdog re-applies it); run 'cove signals status' in a moment" ;;
+            *) echo "  ℹ️  SIGSEGV handler not readable (no debugger available)" ;;
+        esac
     else
         echo "  ⚠️  no live FrankenPHP pid on file"; warn=$((warn+1))
     fi
@@ -16280,8 +16365,8 @@ cove_health() {
 
     # --- Recent hard crashes (macOS DiagnosticReports) ----------------------
     # Each .ips is one hard segfault. Classify by the culprit frames: the
-    # OPcache-SHM path (this box's common cause) vs Imagick's signal-handler
-    # bug vs anything else. grep the raw report — no JSON parser dependency.
+    # OPcache-SHM path (this box's common cause) vs a fault inside ImageMagick
+    # vs anything else. grep the raw report — no JSON parser dependency.
     if [ "$OS" = "macos" ]; then
         echo ""
         echo "Hard crashes (last 24h)"
@@ -16331,7 +16416,7 @@ cove_health() {
                 warn=$((warn+1))
             fi
             [ "$oc_n"    -gt 0 ] && echo "     • $oc_n OPcache shared-memory (see OPcache section below)"
-            [ "$im_n"    -gt 0 ] && echo "     • $im_n Imagick signal-handler (GD-editor MU-plugin should prevent — verify it's active)"
+            [ "$im_n"    -gt 0 ] && echo "     • $im_n in ImageMagick code (if one site's images keep doing it: add_filter( 'cove_force_gd_editor', '__return_true' ))"
             [ "$other_n" -gt 0 ] && echo "     • $other_n other (bystander thread; usually the same OPcache instability)"
         fi
     fi
@@ -21479,12 +21564,21 @@ cove_screenshot_reap() {
         sn=$(basename "$sp" .png)
         [ -d "$SITES_DIR/$sn.localhost" ] || rm -f "$sp"
     done
+    for sp in "$SCREENSHOTS_DIR"/.*.failed; do
+        [ -f "$sp" ] || continue
+        sn=$(basename "$sp" .failed); sn="${sn#.}"
+        [ -d "$SITES_DIR/$sn.localhost" ] || rm -f "$sp"
+    done
     return 0
 }
 
 # Refresh previews that are missing, older than the site's public/ tree,
 # or older than a day — up to --max of them, one after another, at low
-# priority, under a lock so two sweeps never overlap.
+# priority, under a lock so two sweeps never overlap. A site whose capture
+# fails (front page down or 5xx) is stamped `.<site>.failed` and skipped for
+# a day: the sweep walks sites in name order, so without the stamp one
+# broken site is picked again every tick, its front page (and its wp-cron)
+# is hit every five minutes, and no site after it is ever refreshed.
 cove_screenshot_sweep() {
     local max="$1" idle_only="$2"
     if [ "$idle_only" -eq 1 ] && ! cove_user_is_idle; then return 0; fi
@@ -21510,8 +21604,17 @@ cove_screenshot_sweep() {
             local png_m; png_m=$(stat -f%m "$png" 2>/dev/null || stat -c%Y "$png" 2>/dev/null || echo 0)
             [ "$png_m" -ge "$site_m" ] && [ $((now - png_m)) -lt 86400 ] && continue
         fi
+        local failed="$SCREENSHOTS_DIR/.$name.failed"
+        if [ -f "$failed" ]; then
+            local fail_m; fail_m=$(stat -f%m "$failed" 2>/dev/null || stat -c%Y "$failed" 2>/dev/null || echo 0)
+            [ "$fail_m" -ge "$site_m" ] && [ $((now - fail_m)) -lt 86400 ] && continue
+        fi
         if [ "$idle_only" -eq 1 ] && ! cove_user_is_idle; then break; fi
-        nice -n 15 "$0" screenshot "$name" --quiet >/dev/null 2>&1 || true
+        if nice -n 15 "$0" screenshot "$name" --quiet >/dev/null 2>&1; then
+            rm -f "$failed"
+        else
+            touch "$failed"
+        fi
         done=$((done + 1))
     done
 }
@@ -22093,6 +22196,177 @@ PYTHON_PROXY
         echo ""
         gum style --foreground yellow "Cloudflare tunnel disconnected."
     fi
+}
+
+# cove signals — keep FrankenPHP's SIGSEGV handler Go's own.
+#
+# FrankenPHP's static builds compile in the `parallel` PHP extension, whose
+# module init installs a SIGSEGV handler with SA_SIGINFO only (no SA_ONSTACK),
+# replacing the handler the Go runtime installed. Any later segfault in a PHP
+# thread runs that handler on the thread stack, it chains into Go's from the
+# wrong stack, and Go aborts the whole process:
+#   fatal error: non-Go code set up signal handler without SA_ONSTACK flag
+# Faults Go would have turned into a recoverable per-request panic become a
+# server death, a respawn and a watchdog SIGKILL, a few times an hour under
+# load (plugin updates, plugin-heavy admin requests). Reported upstream as
+# krakjoe/parallel#406 and php/frankenphp#2650.
+#
+# No php.ini or Caddyfile setting can undo it: it is C code in a compiled-in
+# extension. parallel does keep Go's original in its
+# php_parallel_old_sigsegv_action global (its own shutdown restores it), so one
+# sigaction() call in the live process puts Go's handler back, exactly. Until
+# upstream ships a fix, that call is made with a debugger: lldb on macOS (Xcode
+# Command Line Tools, which Homebrew already requires), gdb on Linux. Where no
+# debugger is available, or the attach is refused, nothing happens and nothing
+# is printed unless asked. The repair lasts for the life of the process, so it
+# is re-applied once per pid: the watchdog runs it when a server first turns
+# healthy, and `cove reload` keeps the process, so a reload never loses it.
+
+# GNU timeout is not on stock macOS; run bare when it is missing.
+cove_signals_to() {
+    if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else "$@"; fi
+}
+
+# One debugger at a time. Two attaches on the same process (the watchdog's
+# tick, the reload hook, a hand-run status) must never overlap: evaluating an
+# expression in the target while another debugger detaches has killed the
+# server. mkdir is the atomic lock; a lock older than two minutes is stale.
+cove_signals_lock() {
+    local lock="$COVE_DIR/.signals.lock" age
+    if [ -d "$lock" ]; then
+        age=$(( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0) ))
+        [ "$age" -lt 120 ] && return 1
+        rmdir "$lock" 2>/dev/null || rm -rf "$lock" 2>/dev/null
+    fi
+    mkdir "$lock" 2>/dev/null
+}
+cove_signals_unlock() {
+    rmdir "$COVE_DIR/.signals.lock" 2>/dev/null || true
+}
+
+# The pid the service manager wrote for the running server, or nothing.
+cove_signals_pid() {
+    local pid
+    pid=$(cat "$COVE_DIR/caddy.pid" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+# The debugger command that answers a batch of expressions, or nothing.
+cove_signals_debugger() {
+    if [ "$OS" = "macos" ]; then
+        command -v lldb >/dev/null 2>&1 && echo "lldb" && return 0
+        [ -x /usr/bin/lldb ] && echo "/usr/bin/lldb" && return 0
+        return 1
+    fi
+    command -v gdb >/dev/null 2>&1 && echo "gdb" && return 0
+    return 1
+}
+
+# Read the handler addresses: prints "current=<addr> go=<addr>" where current
+# is the installed SIGSEGV handler and go the one parallel saved, or nothing
+# when the process could not be read (no debugger, attach refused, symbol
+# absent because the build does not ship parallel).
+cove_signals_read() {
+    local pid="$1" dbg out
+    dbg=$(cove_signals_debugger) || return 1
+    if [ "$OS" = "macos" ]; then
+        out=$(cove_signals_to "$dbg" -p "$pid" --batch \
+            -o 'expr -l c -- unsigned long cove_sa[4]; (int)sigaction(11, 0, cove_sa); (void*)cove_sa[0]' \
+            -o 'expr -l c -- (void*)*(void**)&php_parallel_old_sigsegv_action' \
+            -o 'process detach' -o 'quit' 2>/dev/null) || return 1
+        # Two "(void *) $N = 0x…" lines, in order.
+        local cur go
+        cur=$(echo "$out" | sed -n 's/^(void \*) \$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 1p)
+        go=$(echo "$out"  | sed -n 's/^(void \*) \$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 2p)
+    else
+        out=$(cove_signals_to "$dbg" -p "$pid" -batch -q \
+            -ex 'set confirm off' \
+            -ex 'set $cove_sa = (unsigned long*)malloc(64)' \
+            -ex 'call (int)sigaction(11, 0, $cove_sa)' \
+            -ex 'print/x $cove_sa[0]' \
+            -ex 'print/x *(unsigned long*)&php_parallel_old_sigsegv_action' \
+            -ex 'detach' -ex 'quit' 2>/dev/null) || return 1
+        local cur go
+        # "$N = 0x…" lines: the sigaction call's result comes first, then the two addresses.
+        cur=$(echo "$out" | sed -n 's/^\$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 1p)
+        go=$(echo "$out"  | sed -n 's/^\$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 2p)
+    fi
+    [ -n "$cur" ] && [ -n "$go" ] || return 1
+    echo "current=$cur go=$go"
+}
+
+# Put Go's handler back. Returns 0 when the process now carries it.
+cove_signals_apply() {
+    local pid="$1" dbg
+    dbg=$(cove_signals_debugger) || return 1
+    if [ "$OS" = "macos" ]; then
+        cove_signals_to "$dbg" -p "$pid" --batch \
+            -o 'expr -l c -- (int)sigaction(11, (void*)&php_parallel_old_sigsegv_action, (void*)0)' \
+            -o 'process detach' -o 'quit' >/dev/null 2>&1 || return 1
+    else
+        cove_signals_to "$dbg" -p "$pid" -batch -q -ex 'set confirm off' \
+            -ex 'call (int)sigaction(11, &php_parallel_old_sigsegv_action, 0)' \
+            -ex 'detach' -ex 'quit' >/dev/null 2>&1 || return 1
+    fi
+    [ "$(cove_signals_status "$pid")" = "ok" ]
+}
+
+# One-line status for health and the CLI: ok | crash-prone | unknown.
+cove_signals_status() {
+    local pid="$1" state cur go
+    state=$(cove_signals_read "$pid") || { echo "unknown"; return 0; }
+    cur=$(echo "$state" | sed 's/.*current=\([^ ]*\).*/\1/')
+    go=$(echo "$state"  | sed 's/.*go=\([^ ]*\).*/\1/')
+    if [ "$cur" = "$go" ]; then echo "ok"; else echo "crash-prone"; fi
+}
+
+cove_signals() {
+    local action="${1:-status}" quiet=false
+    shift 2>/dev/null
+    for a in "$@"; do [ "$a" = "--quiet" ] && quiet=true; done
+    local pid
+    pid=$(cove_signals_pid) || { $quiet || echo "No running FrankenPHP (no live pid on file)."; return 1; }
+    if ! cove_signals_lock; then
+        $quiet || echo "ℹ️  Another signals check is attached right now; try again in a moment."
+        return 3
+    fi
+    trap 'cove_signals_unlock' RETURN EXIT
+    case "$action" in
+        status)
+            local st
+            st=$(cove_signals_status "$pid")
+            case "$st" in
+                ok) echo "✅ SIGSEGV handler is Go's own (pid $pid): faults in PHP threads are handled normally." ;;
+                crash-prone) echo "⚠️  SIGSEGV handler belongs to the parallel extension (pid $pid): a fault in a PHP thread will take the server down."; echo "   Run 'cove signals apply' (the watchdog does this once per start when a debugger is available)." ;;
+                *) echo "ℹ️  Could not read the handler (no debugger, attach refused, or this build has no parallel extension)." ;;
+            esac
+            ;;
+        apply)
+            local st stamp="$COVE_DIR/.signals.last"
+            st=$(cove_signals_status "$pid")
+            if [ "$st" = "ok" ]; then
+                echo "$pid $(date +%s)" > "$stamp" 2>/dev/null
+                $quiet || echo "✅ Already Go's own handler (pid $pid)."
+                return 0
+            fi
+            if [ "$st" = "unknown" ]; then
+                $quiet || echo "ℹ️  Skipped: no debugger available or the process could not be read."
+                return 2
+            fi
+            if cove_signals_apply "$pid"; then
+                echo "$pid $(date +%s)" > "$stamp" 2>/dev/null
+                echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] signals: restored Go's SIGSEGV handler in pid $pid" >> "$LOGS_DIR/watchdog.log" 2>/dev/null
+                $quiet || echo "✅ Restored Go's SIGSEGV handler in pid $pid."
+            else
+                $quiet || echo "❌ Could not restore the handler (debugger attach refused?)."
+                return 1
+            fi
+            ;;
+        *)
+            echo "Usage: cove signals [status | apply] [--quiet]"
+            return 1
+            ;;
+    esac
 }
 
 # Snapshots: a point-in-time copy of a site's public/ tree and its database
