@@ -2935,31 +2935,38 @@ EOM
         echo "}" >> "$CADDYFILE_PATH"
         echo "" >> "$CADDYFILE_PATH"
         
-        # DB on port 9902 - serve directly
-        echo "# Tailscale: db -> port 9902" >> "$CADDYFILE_PATH"
-        echo "https://${tailscale_hostname}:9902 {" >> "$CADDYFILE_PATH"
-        echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
-        echo "    handle @outside {" >> "$CADDYFILE_PATH"
-        echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
-        echo "    }" >> "$CADDYFILE_PATH"
-        echo "    tls internal" >> "$CADDYFILE_PATH"
-        echo "    root * \"$ADMINER_DIR\"" >> "$CADDYFILE_PATH"
-        echo "    php_server" >> "$CADDYFILE_PATH"
-        echo "}" >> "$CADDYFILE_PATH"
-        echo "" >> "$CADDYFILE_PATH"
+        # Adminer (9902) and the dashboard (9900) only when asked for with
+        # `cove tailscale enable --dashboard`. Both are this machine's
+        # control panel: the dashboard runs shell commands and WP-CLI, and
+        # Adminer signs itself in with full database privileges. The tailnet
+        # can include devices shared in from other accounts.
+        if [ -f "$APP_DIR/tailscale-dashboard" ]; then
+            # DB on port 9902 - serve directly
+            echo "# Tailscale: db -> port 9902" >> "$CADDYFILE_PATH"
+            echo "https://${tailscale_hostname}:9902 {" >> "$CADDYFILE_PATH"
+            echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
+            echo "    handle @outside {" >> "$CADDYFILE_PATH"
+            echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
+            echo "    }" >> "$CADDYFILE_PATH"
+            echo "    tls internal" >> "$CADDYFILE_PATH"
+            echo "    root * \"$ADMINER_DIR\"" >> "$CADDYFILE_PATH"
+            echo "    php_server" >> "$CADDYFILE_PATH"
+            echo "}" >> "$CADDYFILE_PATH"
+            echo "" >> "$CADDYFILE_PATH"
         
-        # Dashboard on port 9900 - serve directly
-        echo "# Tailscale: cove dashboard -> port 9900" >> "$CADDYFILE_PATH"
-        echo "https://${tailscale_hostname}:9900 {" >> "$CADDYFILE_PATH"
-        echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
-        echo "    handle @outside {" >> "$CADDYFILE_PATH"
-        echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
-        echo "    }" >> "$CADDYFILE_PATH"
-        echo "    tls internal" >> "$CADDYFILE_PATH"
-        echo "    root * \"$GUI_DIR\"" >> "$CADDYFILE_PATH"
-        echo "    php_server" >> "$CADDYFILE_PATH"
-        echo "}" >> "$CADDYFILE_PATH"
-        echo "" >> "$CADDYFILE_PATH"
+            # Dashboard on port 9900 - serve directly
+            echo "# Tailscale: cove dashboard -> port 9900" >> "$CADDYFILE_PATH"
+            echo "https://${tailscale_hostname}:9900 {" >> "$CADDYFILE_PATH"
+            echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
+            echo "    handle @outside {" >> "$CADDYFILE_PATH"
+            echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
+            echo "    }" >> "$CADDYFILE_PATH"
+            echo "    tls internal" >> "$CADDYFILE_PATH"
+            echo "    root * \"$GUI_DIR\"" >> "$CADDYFILE_PATH"
+            echo "    php_server" >> "$CADDYFILE_PATH"
+            echo "}" >> "$CADDYFILE_PATH"
+            echo "" >> "$CADDYFILE_PATH"
+        fi
     fi
 
     # If Caddy is already running, reload against the new config. If it isn't,
@@ -14023,16 +14030,20 @@ display_command_help() {
             echo "your local development sites via their Tailscale hostname."
             echo ""
             echo "Subcommands:"
-            echo "  enable [hostname]    Enable Tailscale access (auto-detects if omitted)"
+            echo "  enable [hostname] [--dashboard]"
+            echo "                       Enable Tailscale access (auto-detects the hostname if omitted)."
+            echo "                       --dashboard also shares the Cove dashboard (9900) and Adminer"
+            echo "                       (9902), which can run commands on this machine."
             echo "  disable              Disable Tailscale access"
-            echo "  status               Show current Tailscale configuration"
+            echo "  status               Show current Tailscale configuration and URLs"
             echo ""
-            echo "After enabling, your sites will be accessible at:"
-            echo "  https://<site>.<your-tailscale-hostname>"
+            echo "After enabling, each site answers on its own port (from 9001), and mail on 9901:"
+            echo "  https://<your-tailscale-hostname>:<port>"
             echo ""
             echo "Examples:"
             echo "  cove tailscale enable"
             echo "  cove tailscale enable mycomputer.tail1234.ts.net"
+            echo "  cove tailscale enable --dashboard"
             echo "  cove tailscale status"
             ;;
         menubar)
