@@ -3024,6 +3024,10 @@ EOM
             echo "⚠️  Caddy reload rejected by the running process — restarting with the on-disk binary..."
             echo "   (see $LOGS_DIR/caddy-reload.log)"
             start_caddy_service
+            # Give it the same 15 s post-upgrade does: the service manager
+            # needs a moment to bring it up, and checking straight away
+            # reported a restart that worked as a failure.
+            for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
             if ! is_caddy_running; then
                 gum style --foreground red "❌ Caddy failed to restart. See $LOGS_DIR/caddy-process.log for details."
                 return 1
