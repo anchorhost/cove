@@ -3,6 +3,8 @@ cove_enable() {
 
     # Ensure log directory exists
     mkdir -p "$LOGS_DIR"
+    # Closed to other accounts (see cove_install).
+    chmod 700 "$COVE_DIR" 2>/dev/null
 
     if [ "$OS" == "macos" ]; then
         echo "   - Starting MariaDB..."

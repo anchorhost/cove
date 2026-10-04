@@ -498,6 +498,10 @@ cove_install() {
     # --- Directory and Service Setup (Copied from original file) ---
     echo "📁 Creating Cove directory structure..."
     mkdir -p "$SITES_DIR" "$LOGS_DIR" "$GUI_DIR" "$ADMINER_DIR" "$CUSTOM_CADDY_DIR"
+    # ~/Cove holds every site's wp-config.php (with the database password
+    # that opens them all), backups, caught mail, and logs. Only this user's
+    # processes (FrankenPHP, php-fpm, Mailpit, the menu bar app) need it.
+    chmod 700 "$COVE_DIR" 2>/dev/null
 
     # Write the PHP ini that wp-cli (via `frankenphp php-cli`) will load.
     # See the comment on $PHPRC export in main for the rationale.
