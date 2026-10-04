@@ -52,7 +52,7 @@ cove_backup() {
     local tmp="$out.tmp"
     rm -f "$tmp"
     if command -v zip >/dev/null 2>&1; then
-        ( cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; [ "$keep" = true ] || rm -rf "$src"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
+        ( umask 077; cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; [ "$keep" = true ] || rm -rf "$src"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
     else
         gum style --foreground red "❌ Error: 'zip' is not installed." "Use cove snapshot $site_name export $id for a tar.gz instead."
         [ "$keep" = true ] || rm -rf "$src"

@@ -292,9 +292,9 @@ cove_snapshot() {
             rm -f "$tmp"
             if [ "$format" != "json" ]; then echo "📦 Packing snapshot $id…"; fi
             if [[ "$archive" == *.zip ]]; then
-                ( cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
+                ( umask 077; cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
             else
-                ( cd "$src" && tar -czf "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: tar failed."; exit 1; }
+                ( umask 077; cd "$src" && tar -czf "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: tar failed."; exit 1; }
             fi
             mv -f "$tmp" "$archive"
             local bytes

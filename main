@@ -1862,6 +1862,11 @@ if [ ! -x "\$mailpit_bin" ]; then
     exit 127
 fi
 
+# The database holds every caught message, password resets included: this
+# user only, for new files and the ones already there.
+umask 077
+chmod 600 "\$db_path" "\$db_path-wal" "\$db_path-shm" 2>/dev/null
+
 # --max 0 lifts Mailpit's default cap of 500 stored messages; local mail is
 # small and the point of catching it is to still have it later.
 # Loopback only. Mailpit's defaults are [::]:8025 and [::]:1025, which put
