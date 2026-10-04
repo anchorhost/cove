@@ -8033,6 +8033,16 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
             },
 
+            // A URL that came from data (a request's Referer, a site's own
+            // options) may only become a link if it is http(s). escapeHtml
+            // keeps it inside the attribute but does nothing about the scheme,
+            // and a javascript: link clicked here runs as the dashboard, which
+            // can run shell commands. Returns '' for anything else.
+            safeUrl(u) {
+                const s = String(u == null ? '' : u).trim();
+                return /^https?:\/\//i.test(s) ? s : '';
+            },
+
             // Wrap every case-insensitive occurrence of `query` in <mark> while
             // escaping every other substring. Safe for innerHTML use because the
             // inner text comes from the trusted domain, not from query (query
@@ -9282,8 +9292,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (wp) {
                     const stat = (k, v, title) => '<div class="db-ov-stat"' + (title ? ' title="' + esc(title) + '"' : '') + '><span class="k">' + k + '</span><span class="v">' + v + '</span></div>';
                     html += '<div class="db-ov-grid">'
-                        + stat('site url', wp.siteurl ? '<a href="' + esc(wp.siteurl) + '" target="_blank" rel="noopener">' + esc(wp.siteurl.replace(/^https?:\/\//, '')) + '</a>' : '—', wp.siteurl)
-                        + stat('home', wp.home ? '<a href="' + esc(wp.home) + '" target="_blank" rel="noopener">' + esc(wp.home.replace(/^https?:\/\//, '')) + '</a>' : '—', wp.home)
+                        + stat('site url', this.safeUrl(wp.siteurl) ? '<a href="' + esc(wp.siteurl) + '" target="_blank" rel="noopener">' + esc(wp.siteurl.replace(/^https?:\/\//, '')) + '</a>' : (wp.siteurl ? esc(wp.siteurl) : '—'), wp.siteurl)
+                        + stat('home', this.safeUrl(wp.home) ? '<a href="' + esc(wp.home) + '" target="_blank" rel="noopener">' + esc(wp.home.replace(/^https?:\/\//, '')) + '</a>' : (wp.home ? esc(wp.home) : '—'), wp.home)
                         + stat('prefix', esc(wp.prefix))
                         + stat('theme', esc(wp.stylesheet || wp.template || '—'))
                         + stat('posts · users · comments', esc(this.formatCount(wp.posts)) + ' · ' + esc(this.formatCount(wp.users)) + ' · ' + esc(this.formatCount(wp.comments)))
@@ -10243,7 +10253,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         + '<dt>response</dt><dd>' + esc(this.formatSize(r.bytes || 0)) + (r.proto ? ' · ' + esc(r.proto) : '') + '</dd>'
                         + '<dt>client</dt><dd>' + esc(r.ip || '—') + '</dd>'
                         + '<dt>user agent</dt><dd>' + esc(r.ua || '—') + '</dd>'
-                        + '<dt>referer</dt><dd>' + (r.ref ? '<a href="' + esc(r.ref) + '" target="_blank" rel="noopener">' + esc(r.ref) + '</a>' : '—') + '</dd>'
+                        + '<dt>referer</dt><dd>' + (this.safeUrl(r.ref) ? '<a href="' + esc(r.ref) + '" target="_blank" rel="noopener">' + esc(r.ref) + '</a>' : (r.ref ? esc(r.ref) : '—')) + '</dd>'
                         + '</dl>';
                     note.innerHTML = '<button type="button" class="tr-back" data-act="path" data-path="' + esc(r.uri.split('?')[0]) + '">recent hits of this path ›</button>';
                     return;
@@ -10557,12 +10567,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (s.status !== 'public') { const c = document.createElement('span'); c.className = 'net-main-chip net-status'; c.textContent = s.status; name.appendChild(c); }
                     const url = row.querySelector('.net-url');
                     url.textContent = s.url.replace(/^https?:\/\//, '');
-                    url.href = s.url;
+                    // A subsite's URL comes from its own options: link it only if http(s).
+                    const safe = this.safeUrl(s.url);
+                    if (safe) url.href = safe; else url.removeAttribute('href');
                     const upd = row.querySelector('.net-updated');
                     const ts = s.updated ? Date.parse(s.updated.replace(' ', 'T') + 'Z') / 1000 : 0;
                     upd.textContent = ts ? this.formatRelative(ts) : '';
                     upd.title = ts ? 'Last updated ' + new Date(ts * 1000).toLocaleString() : 'Never updated';
-                    row.querySelector('.net-open').href = s.url;
+                    if (safe) row.querySelector('.net-open').href = safe; else row.querySelector('.net-open').removeAttribute('href');
                     const btn = row.querySelector('.net-login');
                     btn.disabled = !!p.busy;
                     btn.textContent = p.busy === s.url ? 'opening…' : 'log in';
