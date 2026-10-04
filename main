@@ -8110,6 +8110,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 return /^https?:\/\//i.test(s) ? s : '';
             },
 
+            // window.open for a URL that came from data (a login link built
+            // from a site's own siteurl, a subsite address): http(s) only.
+            openUrl(u, features) {
+                const safe = this.safeUrl(u);
+                if (!safe) { this.showSnack('Not opening that link: it is not a web address.', true); return null; }
+                return features ? window.open(safe, '_blank', features) : window.open(safe, '_blank');
+            },
+
             // Wrap every case-insensitive occurrence of `query` in <mark> while
             // escaping every other substring. Safe for innerHTML use because the
             // inner text comes from the trusted domain, not from query (query
@@ -10677,7 +10685,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderSiteNetwork();
                 const res = await this.apiPost('get_login_link', { site_name: name, url });
                 if (res.success && res.url) {
-                    window.open(res.url, '_blank');
+                    this.openUrl(res.url);
                     this.showSnack('Login link opened in a new tab.');
                 }
                 p.busy = null;
@@ -10715,7 +10723,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (e.target.closest('a')) return;
                     // The row itself opens the subsite, like the ↗ on a sites row.
                     if (window.getSelection && window.getSelection().toString()) return;
-                    window.open(row.dataset.url, '_blank', 'noopener');
+                    this.openUrl(row.dataset.url, 'noopener');
                 });
                 const withSite = (fn) => () => { const s = this.pageSite; if (s) fn(s); };
                 $id('spDomains').addEventListener('click', withSite(s => this.openDomainsModal(s)));
@@ -11258,7 +11266,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderSiteTab();
                 const res = await this.apiPost('get_login_link', url ? { site_name: site.name, user: login, url } : { site_name: site.name, user: login });
                 delete t.busy[login];
-                if (res.success && res.url) { window.open(res.url, '_blank'); this.showSnack('Login link for ' + login + ' opened in a new tab.'); }
+                if (res.success && res.url) { this.openUrl(res.url); this.showSnack('Login link for ' + login + ' opened in a new tab.'); }
                 if (this.sitePage.name === site.name) this.renderSiteTab();
             },
 
@@ -13511,7 +13519,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderAlerts();
                 const res = await this.apiPost('get_login_link', { site_name: alert.name });
                 if (res.success && res.url) {
-                    window.open(res.url, '_blank');
+                    this.openUrl(res.url);
                     // Acted on — banner's job is done. The new tab has the
                     // one-time URL; dashboard can drop the prompt.
                     this.dismissAlert(alert.id);
@@ -13675,7 +13683,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderSitePage();
                 const res = await this.apiPost('get_login_link', { site_name: name });
                 if (res.success && res.url) {
-                    window.open(res.url, '_blank');
+                    this.openUrl(res.url);
                     this.showSnack('Login link opened in a new tab.');
                 }
                 site.isLoggingIn = false;
