@@ -195,7 +195,7 @@ WHOOPS_VERSION="2.18.0"
 # MUST match the `Version:` header in build_mu_plugin's heredoc — refresh_all_mu_plugins
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
-MU_PLUGIN_VERSION="0.7.0"
+MU_PLUGIN_VERSION="0.8.0"
 # Version of the menu bar companion apps (menubar/, embedded at compile
 # time): the macOS app under Sources/ and the Linux tray under Linux/ share
 # this one number. Bump whenever anything under menubar/ changes — post-upgrade
@@ -578,6 +578,14 @@ create_whoops_bootstrap() {
 // This script is automatically included before any other PHP script.
 // It registers a simple PSR-4 autoloader for the Whoops library.
 
+// Tells Cove's mu-plugin that this request runs under Cove's own PHP. The
+// mu-plugin's local-only behavior (taking home/siteurl from the LAN or
+// Tailscale address a request arrived on) stays off anywhere this file isn't
+// prepended — a site exported to a real host, for one.
+if (!defined('COVE_RUNTIME')) {
+    define('COVE_RUNTIME', true);
+}
+
 spl_autoload_register(function ($class) {
     $prefix = 'Whoops\\';
     $base_dir = __DIR__ . '/whoops/src/Whoops/';
@@ -647,51 +655,21 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.7.0
+ * Version: 0.8.0
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
  */
 
 /**
- * Registers AJAX callback for quick logins
+ * Forget a user's one-time login token, its mint time, and its miss count.
  */
-function captaincore_quick_login_action_callback() {
-
-	$post = json_decode( file_get_contents( 'php://input' ) );
-	// Error if token not valid. Use hash_equals with a string cast: a loose
-	// `!=` let a JSON `{"token":true}` coerce to `true != <hash>` → false and
-	// bypass the check entirely, minting an admin login link unauthenticated.
-	if ( ! isset( $post->token ) || ! is_string( $post->token ) || ! hash_equals( md5( AUTH_KEY ), $post->token ) ) {
-		wp_die( '', '', [ 'response' => 404 ] );
-	}
-
-	$post->user_login = str_replace( "%20", " ", $post->user_login );
-	$user     = get_user_by( 'login', $post->user_login );
-	$password = wp_generate_password();
-	// Short token: sha1 is 40 hex chars; 7 is still 16^7 ≈ 268M combinations,
-	// plenty for a one-time-use local-dev login link, and short enough to fit
-	// a narrow terminal without wrapping.
-	$token    = substr( sha1( $password ), 0, 7 );
-
-	update_user_meta( $user->ID, 'cove_login_token', $token );
-	// Stamp the mint time so the token can expire — see the TTL check in
-	// captaincore_login_handle_token(). Without it an unused link stayed a
-	// valid standing credential forever.
-	update_user_meta( $user->ID, 'cove_login_token_time', time() );
-	$query_args = [
-			'user_id'          => $user->ID,
-			'cove_login_token' => $token,
-		];
-	$login_url    = wp_login_url();
-		$one_time_url = add_query_arg( $query_args, $login_url );
-
-	echo $one_time_url;
-	wp_die();
-
+function cove_login_token_clear( $user_id ) {
+	delete_user_meta( $user_id, 'cove_login_token' );
+	delete_user_meta( $user_id, 'cove_login_token_time' );
+	delete_user_meta( $user_id, 'cove_login_token_misses' );
 }
 
-add_action( 'wp_ajax_nopriv_captaincore_quick_login', 'captaincore_quick_login_action_callback' );
 /**
  * Login a request in as a user if the token is valid.
  */
@@ -720,17 +698,24 @@ function captaincore_login_handle_token() {
 	// Expire stale/unused tokens (15 min) so a cove login link that was never
 	// clicked can't be replayed later as a standing credential.
 	if ( '' === $token || ( time() - $token_time ) > 15 * MINUTE_IN_SECONDS ) {
-		delete_user_meta( $user->ID, 'cove_login_token' );
-		delete_user_meta( $user->ID, 'cove_login_token_time' );
+		cove_login_token_clear( $user->ID );
 		wp_die( $error );
 	}
 
+	// Five wrong guesses burn the token. It is only 7 hex characters, short
+	// enough to paste; the cap is what keeps it from being guessable by anyone
+	// who can reach the site (a LAN, Tailscale, or share visitor).
 	if ( ! hash_equals( $token, (string) $_GET['cove_login_token'] ) ) {
+		$misses = (int) get_user_meta( $user->ID, 'cove_login_token_misses', true ) + 1;
+		if ( $misses >= 5 ) {
+			cove_login_token_clear( $user->ID );
+		} else {
+			update_user_meta( $user->ID, 'cove_login_token_misses', $misses );
+		}
 		wp_die( $error );
 	}
 
-	delete_user_meta( $user->ID, 'cove_login_token' );
-	delete_user_meta( $user->ID, 'cove_login_token_time' );
+	cove_login_token_clear( $user->ID );
 	wp_set_auth_cookie( $user->ID, 1 );
 	wp_safe_redirect( admin_url() );
 	exit;
@@ -786,6 +771,8 @@ if (defined('WP_CLI') && WP_CLI) {
         // `wp user login` / `cove add` link read as already expired.
         update_user_meta( $user->ID, 'cove_login_token', $token );
         update_user_meta( $user->ID, 'cove_login_token_time', time() );
+        // A fresh link starts with a clean slate of wrong guesses.
+        delete_user_meta( $user->ID, 'cove_login_token_misses' );
         // Construct the one-time login URL
         $query_args = [
             'user_id'          => $user->ID,
@@ -820,7 +807,16 @@ function cove_maybe_override_site_url( $value ) {
     if ( defined( 'WP_CLI' ) && WP_CLI ) {
         return $value;
     }
-    
+
+    // Only under Cove's own PHP, whose prepended bootstrap defines this. A
+    // site moved to a real host by a migration plugin brings its mu-plugins
+    // along, and there this filter would take home and siteurl from whatever
+    // Host header a request sends: password-reset links and cached pages
+    // pointing wherever an attacker likes.
+    if ( ! defined( 'COVE_RUNTIME' ) ) {
+        return $value;
+    }
+
     $host = isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : '';
     
     // Skip if no host or if it ends with .localhost (normal local access)
