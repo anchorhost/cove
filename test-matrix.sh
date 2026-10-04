@@ -236,7 +236,10 @@ lane_a() {
         if cx "$c" cove status >/dev/null; then res "$c" status PASS; else res "$c" status FAIL; fi
         if cx "$c" cove health >/dev/null; then res "$c" health PASS; else res "$c" health FAIL; fi
 
-        if cx "$c" curl -s --max-time 10 localhost:8025/api/v1/messages | grep -q "total\|messages\|\["; then
+        # Through Caddy, which supplies Mailpit's web UI password; the bare
+        # port must refuse a request that has none (DNS-rebinding guard).
+        if cx "$c" curl -sk --max-time 10 https://mail.cove.localhost/api/v1/messages | grep -q "total\|messages\|\[" \
+            && [ "$(cx "$c" curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8025/api/v1/messages)" = "401" ]; then
             res "$c" mailpit PASS
         else
             res "$c" mailpit FAIL
