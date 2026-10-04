@@ -2834,6 +2834,10 @@ EOM
                 if [ -n "$proxy_domain" ] && [ -n "$proxy_target" ]; then
                     echo "# Proxy: $proxy_name" >> "$CADDYFILE_PATH"
                     echo "$proxy_domain {" >> "$CADDYFILE_PATH"
+                    # Same rule as a site: this machine only. A dev server
+                    # behind `cove proxy` was reachable by anyone on the
+                    # network who sent its hostname.
+                    emit_site_local_guard "$local_only"
                     echo "    reverse_proxy $proxy_target" >> "$CADDYFILE_PATH"
                     if [ "$proxy_tls" = "internal" ]; then
                         echo "    tls internal" >> "$CADDYFILE_PATH"
