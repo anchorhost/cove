@@ -573,7 +573,7 @@ deploy_whoops() {
 # --- Whoops Bootstrap Generation ---
 create_whoops_bootstrap() {
     echo "📜 Creating Whoops bootstrap file..."
-    cat > "$APP_DIR/whoops_bootstrap.php" << 'EOM'
+    cat > "$APP_DIR/whoops_bootstrap.php.tmp" << 'EOM'
 <?php
 // This script is automatically included before any other PHP script.
 // It registers a simple PSR-4 autoloader for the Whoops library.
@@ -603,6 +603,29 @@ spl_autoload_register(function ($class) {
     }
 });
 
+// The pretty page shows the request's superglobals and the source around
+// every stack frame, so only the person at this machine gets it. A visitor
+// from the LAN or the tailnet arrives from their own address; a `cove share`
+// visitor arrives from loopback but through the share proxy, which marks the
+// request (and Cloudflare adds its own headers). Anyone else gets WordPress's
+// plain error page. Under WSL the Windows browser arrives from the virtual
+// adapter's private address, so private ranges count as this machine there.
+$__cove_ra = $_SERVER['REMOTE_ADDR'] ?? '';
+$__cove_local = in_array($__cove_ra, ['127.0.0.1', '::1', '::ffff:127.0.0.1'], true)
+    || ('IS_WSL_PLACEHOLDER' === 'true'
+        && preg_match('/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|fe80:|fd|fc|::ffff:(10\.|192\.168\.))/i', $__cove_ra));
+foreach (['HTTP_X_COVE_SHARE', 'HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_FORWARDED'] as $__cove_h) {
+    if (isset($_SERVER[$__cove_h])) {
+        $__cove_local = false;
+    }
+}
+unset($__cove_ra, $__cove_h);
+if (!$__cove_local) {
+    unset($__cove_local);
+    return;
+}
+unset($__cove_local);
+
 // Whoops is a dev-time convenience (pretty error pages), not essential to
 // serving a request — so it must never be able to take a site down. A bundled
 // Whoops incompatible with the running PHP (e.g. 2.15.3 under PHP 8.5) threw a
@@ -631,12 +654,27 @@ try {
     );
 
     // The PrettyPageHandler will now only be triggered for fatal errors.
-    $whoops->pushHandler(new \Whoops\Handler\PrettyPageHandler);
+    // Session cookies and credentials stay off the page: it ends up in
+    // screenshots and screen shares, and a WordPress auth cookie is a login.
+    $handler = new \Whoops\Handler\PrettyPageHandler;
+    foreach (array_keys($_COOKIE) as $__cove_k) {
+        $handler->hideSuperglobalKey('_COOKIE', $__cove_k);
+    }
+    foreach (['HTTP_COOKIE', 'HTTP_AUTHORIZATION', 'PHP_AUTH_PW'] as $__cove_k) {
+        $handler->hideSuperglobalKey('_SERVER', $__cove_k);
+    }
+    unset($__cove_k);
+    $whoops->pushHandler($handler);
     $whoops->register();
 } catch (\Throwable $e) {
     error_log('Cove: Whoops failed to initialize, continuing without it: ' . $e->getMessage());
 }
 EOM
+    # Bake the WSL flag in (see the remote-address gate above), then swap the
+    # file into place whole so no request ever prepends a half-written copy.
+    sed -e "s/IS_WSL_PLACEHOLDER/${IS_WSL}/g" "$APP_DIR/whoops_bootstrap.php.tmp" > "$APP_DIR/whoops_bootstrap.php.new" \
+        && mv "$APP_DIR/whoops_bootstrap.php.new" "$APP_DIR/whoops_bootstrap.php"
+    rm -f "$APP_DIR/whoops_bootstrap.php.tmp"
 }
 
 # --- Helper Functions ---
