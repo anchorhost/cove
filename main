@@ -1332,6 +1332,16 @@ write_mariadb_config() {
 loose-character_set_collations = utf8mb3=utf8mb3_unicode_ci,utf8mb4=utf8mb4_unicode_ci
 CNF
 )
+    # Loopback only. Homebrew's MariaDB (and Fedora/RHEL's) listens on every
+    # interface, which puts any account with a '%' host — a WP-CLI test user,
+    # a hand-made app user — on the local network. Sites connect over the
+    # socket ('localhost'), so nothing of Cove's needs TCP from elsewhere.
+    # WSL is left alone: Windows-side database tools reach the VM from its
+    # virtual adapter, and under NAT the VM isn't on the LAN anyway.
+    if [ "$IS_WSL" != true ]; then
+        content+=$'\n'"# Only this machine. A later drop-in can set bind-address to open it up."
+        content+=$'\n'"bind-address = 127.0.0.1"
+    fi
 
     if [ -f "$conf_file" ] && [ "$(cat "$conf_file" 2>/dev/null)" = "$content" ]; then
         return 1
@@ -1806,7 +1816,13 @@ fi
 
 # --max 0 lifts Mailpit's default cap of 500 stored messages; local mail is
 # small and the point of catching it is to still have it later.
-exec "\$mailpit_bin" --database "\$db_path" --label Cove --max 0
+# Loopback only. Mailpit's defaults are [::]:8025 and [::]:1025, which put
+# every caught message (password resets included) one request away from
+# anyone on the same Wi-Fi. Everything Cove routes to Mailpit (the mail and
+# dashboard vhosts, the Tailscale mail port, sendmail_path) arrives over
+# 127.0.0.1 already.
+exec "\$mailpit_bin" --database "\$db_path" --label Cove --max 0 \\
+    --listen 127.0.0.1:8025 --smtp 127.0.0.1:1025
 EOM
     chmod +x "$script_path"
     echo "$script_path"
@@ -1949,7 +1965,7 @@ catch_workers_output = yes
 ; Mirror of the frankenphp{} php_ini block. The ZTS OPcache sizing there is
 ; deliberately NOT replicated: this is NTS php-fpm with a per-pool cache, so
 ; PHP's stock OPcache defaults are correct here.
-php_admin_value[sendmail_path] = $mailpit_path sendmail -t
+php_admin_value[sendmail_path] = $mailpit_path sendmail -t -S 127.0.0.1:1025
 php_admin_flag[log_errors] = on
 php_admin_flag[display_errors] = off
 php_admin_value[error_log] = $LOGS_DIR/errors.log
@@ -2371,6 +2387,39 @@ emit_site_php_handler() {
     fi
 }
 
+# Files no site should hand to a browser: WordPress's debug.log (WP_DEBUG_LOG
+# writes it inside the web root), plugin logs in uploads, database dumps, and
+# version-control or env files. Apache keeps most of these private through
+# .htaccess; Caddy ignores .htaccess, so without this they download to anyone
+# who can reach the site — a `cove share` visitor included. A `handle` block,
+# not a bare `respond`: php_server is ordered ahead of respond.
+emit_site_deny_rules() {
+    cat >> "$CADDYFILE_PATH" <<'EOM'
+    @cove_private path *.log *.sql *.sql.gz */.git/* */.env */.env.*
+    handle @cove_private {
+        respond 404
+    }
+EOM
+}
+
+# A site's own hostname block answers this machine only — the same rule the
+# dashboard has (pass the generator's $local_only matcher). Caddy listens on
+# every interface, so before this anyone on the same Wi-Fi could reach any
+# site by sending its hostname: the login form, the lost-password flow, and
+# everything else. `cove lan`, `cove tailscale`, and `cove share` open a site
+# up deliberately through their own blocks. A guard rather than a loopback
+# bind because macOS lets a normal user bind ports below 1024 only on the
+# wildcard address.
+emit_site_local_guard() {
+    local matcher="$1"
+    cat >> "$CADDYFILE_PATH" <<EOM
+    @cove_remote not $matcher
+    handle @cove_remote {
+        respond "This site answers only on the machine running Cove. To open it to other devices, use cove lan, cove tailscale, or cove share." 403
+    }
+EOM
+}
+
 # Read a site's multisite marker: "subdirectory", "subdomain", or "" when the
 # site is not a network. Written by `cove add --multisite`.
 site_multisite_mode() {
@@ -2451,7 +2500,7 @@ ${port_directives}    frankenphp {
         # RAM so a 16 GB box does not get 32 ZTS workers compiling into
         # one OPcache arena.
         num_threads $(cove_ini_get num_threads "$(cove_num_threads)")
-        php_ini sendmail_path "$mailpit_path sendmail -t"
+        php_ini sendmail_path "$mailpit_path sendmail -t -S 127.0.0.1:1025"
         php_ini log_errors On
         php_ini display_errors Off
         php_ini error_log "$LOGS_DIR/errors.log"
@@ -2598,6 +2647,8 @@ EOM
                 echo "$site_domains {" >> "$CADDYFILE_PATH"
                 
                 echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
+                emit_site_deny_rules
+                emit_site_local_guard "$local_only"
                 echo "    tls internal" >> "$CADDYFILE_PATH"
                 
                 echo "    log {" >> "$CADDYFILE_PATH"
@@ -2637,6 +2688,7 @@ EOM
                         echo "https://${lan_ip}:${lan_port} {" >> "$CADDYFILE_PATH"
                         echo "    bind 0.0.0.0" >> "$CADDYFILE_PATH"
                         echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
+                        emit_site_deny_rules
                         echo "    tls internal" >> "$CADDYFILE_PATH"
                         
                         echo "    log {" >> "$CADDYFILE_PATH"
@@ -2739,14 +2791,23 @@ EOM
                     
                     echo "# Tailscale: ${site_base_name} -> port ${ts_port}" >> "$CADDYFILE_PATH"
                     echo "https://${tailscale_hostname}:${ts_port} {" >> "$CADDYFILE_PATH"
+                    # Only tailnet peers get an answer; before this guard the
+                    # port answered the whole LAN too. (Not a bind to the
+                    # Tailscale IP: that would stop the whole server from
+                    # starting on a boot where tailscaled isn't up yet.)
+                    echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
+                    echo "    handle @outside {" >> "$CADDYFILE_PATH"
+                    echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
+                    echo "    }" >> "$CADDYFILE_PATH"
                     echo "    tls internal" >> "$CADDYFILE_PATH"
-                    
+
                     if [ -n "$direct_proxy_target" ]; then
                         # Proxy directly to the backend target
                         echo "    reverse_proxy ${direct_proxy_target}" >> "$CADDYFILE_PATH"
                     else
                         # Serve site directly (not via proxy) for better compatibility
                         echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
+                        emit_site_deny_rules
 
                         echo "    log {" >> "$CADDYFILE_PATH"
                         echo "        output file \"$site_path/logs/caddy-tailscale.log\"" >> "$CADDYFILE_PATH"
