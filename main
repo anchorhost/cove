@@ -2273,6 +2273,15 @@ deploy_adminer_theme() {
     local adminer_dir="${1:-$ADMINER_DIR}"
     mkdir -p "$adminer_dir"
 
+    # Adminer's permanent-login key, one per install (see permanentLogin in
+    # the entry point below). Made once and kept.
+    if [ -n "$CONFIG_FILE" ] && ! grep -q '^ADMINER_KEY=' "$CONFIG_FILE" 2>/dev/null; then
+        local adminer_key
+        adminer_key=$(openssl rand -hex 32 2>/dev/null)
+        [ -n "$adminer_key" ] || adminer_key=$(head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+        [ -n "$adminer_key" ] && config_set ADMINER_KEY "$adminer_key"
+    fi
+
     echo "⚙️ Writing Adminer entry point..."
     cat > "$adminer_dir/index.php" << 'ADMINER_INDEX_EOF'
 <?php
@@ -2281,7 +2290,15 @@ function adminer_object() {
     // Adminer 5.x uses the Adminer namespace
     class AdminerCoveLogin extends Adminer\Adminer {
         function name() { return 'Cove DB Manager'; }
-        function permanentLogin($i = false) { return "cove-local-development-key"; }
+        // This install's own key (ADMINER_KEY in ~/Cove/config). It encrypts
+        // the password Adminer keeps in its permanent-login cookie, and it used
+        // to be one fixed string shared by every Cove install. With none,
+        // Adminer simply skips the permanent cookie.
+        function permanentLogin($i = false) {
+            $configFile = getenv('HOME') . '/Cove/config';
+            $config = file_exists($configFile) ? @parse_ini_file($configFile) : [];
+            return (string) ($config['ADMINER_KEY'] ?? '');
+        }
         function credentials() {
             $configFile = getenv('HOME') . '/Cove/config';
             if (file_exists($configFile)) {
@@ -14613,6 +14630,10 @@ main() {
             deploy_whoops
             create_whoops_bootstrap
             refresh_all_mu_plugins
+            # The Adminer entry point and theme. The upgrade itself also calls
+            # this, but from the old script still in memory, which writes the
+            # old entry point (and, in earlier versions, fetched the theme from GitHub).
+            deploy_adminer_theme
             install_watchdog_service
             # Pin portable collation defaults (MariaDB 11.5+ uca1400 trap).
             # Only restarts MariaDB the first time the drop-in lands.
