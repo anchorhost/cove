@@ -1939,13 +1939,24 @@ mailpit_ui_auth_header() {
 }
 
 # Mailpit's --ui-auth-file, an htpasswd file. Prints its path, or returns 1
-# when it can't be made (no openssl to hash with), in which case Mailpit runs
-# without it, as before.
+# when it can't be made, in which case Mailpit runs without it, as before.
+# Hashed with openssl where there is one, else with FrankenPHP's own PHP
+# (bcrypt): minimal Fedora images ship no openssl. The password travels in
+# stdin or the environment, never on a command line.
 write_mailpit_ui_auth_file() {
-    local file="$COVE_DIR/mailpit-ui.htpasswd" pw hash
+    local file="$COVE_DIR/mailpit-ui.htpasswd" pw hash=""
     pw=$(mailpit_ui_password) || return 1
-    hash=$(printf '%s' "$pw" | openssl passwd -apr1 -stdin 2>/dev/null) || return 1
-    case "$hash" in '$apr1$'*) ;; *) return 1 ;; esac
+    if command -v openssl >/dev/null 2>&1; then
+        hash=$(printf '%s' "$pw" | openssl passwd -apr1 -stdin 2>/dev/null)
+    fi
+    if [ -z "$hash" ] && command -v frankenphp >/dev/null 2>&1; then
+        local php_file
+        php_file=$(mktemp "${TMPDIR:-/tmp}/cove-hash-XXXXXX") || return 1
+        printf '%s' '<?php echo password_hash((string) getenv("COVE_MAILPIT_PW"), PASSWORD_BCRYPT);' > "$php_file"
+        hash=$(COVE_MAILPIT_PW="$pw" frankenphp php-cli "$php_file" 2>/dev/null)
+        rm -f "$php_file"
+    fi
+    case "$hash" in '$apr1$'*|'$2y$'*|'$2a$'*|'$2b$'*) ;; *) return 1 ;; esac
     mkdir -p "$COVE_DIR"
     ( umask 077; printf 'cove:%s\n' "$hash" > "$file.tmp" ) && mv -f "$file.tmp" "$file" || return 1
     echo "$file"
@@ -1962,7 +1973,7 @@ write_mailpit_run_script() {
     if ui_auth_file=$(write_mailpit_ui_auth_file); then
         ui_auth_args=" --ui-auth-file \"$ui_auth_file\""
     else
-        echo "   - ⚠️  Could not create Mailpit's password file (openssl is missing); its web UI stays open to this machine's browser." >&2
+        echo "   - ⚠️  Could not create Mailpit's password file (no openssl, and FrankenPHP's PHP failed); its web UI stays open to this machine's browser." >&2
     fi
     cat > "$script_path" << EOM
 #!/bin/bash
