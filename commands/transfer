@@ -370,8 +370,11 @@ cmd_backup() {
     local dump="$site_dir/db_export-$dump_rand.sql"
     # shellcheck disable=SC2064
     trap "rm -f '$dump'" EXIT
+    # PIPE too: run over `ssh … bash -s` there is no terminal, so a dropped
+    # connection or a Ctrl-C at the other end arrives as SIGPIPE on the next
+    # write to the closed stderr, not as HUP.
     # shellcheck disable=SC2064
-    trap "rm -f '$dump'; exit 1" HUP INT TERM
+    trap "rm -f '$dump'; exit 1" HUP INT TERM PIPE
     if [ "$DB_DUMP" = native ]; then
         ( umask 077; $WP db export "$dump" --path="$site_dir" --add-drop-table \
             --default-character-set=utf8mb4 --skip-plugins --skip-themes >&2 ) \
@@ -382,7 +385,9 @@ cmd_backup() {
     fi
 
     log "Creating archive (${ARCHIVER})..."
-    ( cd "$parent" || exit 1
+    # Owner-only, like the dump inside it: for a WordPress in a subfolder,
+    # $parent is itself the web root.
+    ( umask 077; cd "$parent" || exit 1
       case "$ARCHIVER" in
         zip)
             local -a zargs=(-rq "$archive" "$base")
@@ -648,7 +653,7 @@ transfer_wp_cli_phar() {
     local phar="$cache_dir/wp-cli.phar"
     mkdir -p "$cache_dir"
     if [ ! -s "$phar" ]; then
-        curl -sL "$COVE_WP_CLI_PHAR_URL" -o "$phar" || return 1
+        curl -fsSL "$COVE_WP_CLI_PHAR_URL" -o "$phar" || { rm -f "$phar"; return 1; }
         [ -s "$phar" ] || { rm -f "$phar"; return 1; }
     fi
     echo "$phar"
