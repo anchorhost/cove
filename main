@@ -2889,8 +2889,8 @@ EOM
                     # port answered the whole LAN too. (Not a bind to the
                     # Tailscale IP: that would stop the whole server from
                     # starting on a boot where tailscaled isn't up yet.)
-                    echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
-                    echo "    handle @outside {" >> "$CADDYFILE_PATH"
+                    echo "    @cove_ts_outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
+                    echo "    handle @cove_ts_outside {" >> "$CADDYFILE_PATH"
                     echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
                     echo "    }" >> "$CADDYFILE_PATH"
                     echo "    tls internal" >> "$CADDYFILE_PATH"
