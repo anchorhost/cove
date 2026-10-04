@@ -92,6 +92,7 @@ upgrade_frankenphp() {
                 return 1
             fi
         else
+            rm -f "$temp_binary"
             gum style --foreground red "❌ Failed to download FrankenPHP binary."
             return 1
         fi
