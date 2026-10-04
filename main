@@ -2490,6 +2490,9 @@ regenerate_caddyfile() {
     # (mirrored networking arrives as loopback, which is always allowed).
     local local_only='remote_ip 127.0.0.1 ::1'
     [ "$IS_WSL" = true ] && local_only='remote_ip private_ranges'
+
+    # The dashboard's own origin, for the Mail route below.
+    local dashboard_origin="https://cove.localhost$(https_port_suffix)"
     cat > "$CADDYFILE_PATH" <<- EOM
 {
 ${port_directives}    frankenphp {
@@ -2587,7 +2590,15 @@ cove.localhost {
     # /mail-api/events rides the same route). Mailpit answers 403 to any
     # request whose Origin header is not its own host — even a GET or the
     # websocket upgrade — so the browser's Origin is dropped on the way in.
+    # Dropping it also drops Mailpit's guard against cross-site websockets
+    # (CORS doesn't cover them), so do that check here first: no Origin
+    # (curl, the CLI) or the dashboard's own, nothing else.
     handle_path /mail-api/* {
+        @foreign_origin {
+            header Origin *
+            not header Origin $dashboard_origin
+        }
+        respond @foreign_origin 403
         rewrite * /api{uri}
         reverse_proxy 127.0.0.1:8025 {
             header_up -Origin
