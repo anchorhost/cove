@@ -42,6 +42,16 @@ for menubar_file in Sources/main.m Resources/Info.plist Resources/Assets/cove-lo
     fi
 done
 
+# The Adminer theme is REQUIRED too, for the same reason: it is embedded and
+# written out by deploy_adminer_theme, which no longer downloads it.
+ADMINER_THEME_DIR="adminer-theme"
+for theme_file in adminer.css adminer.js; do
+    if [ ! -f "$ADMINER_THEME_DIR/$theme_file" ]; then
+        echo "Error: ${ADMINER_THEME_DIR}/${theme_file} not found — cannot embed the Adminer theme." >&2
+        exit 1
+    fi
+done
+
 echo "🚀 Starting compilation of ${FINAL_FILE}..."
 
 # 1. Start with the main script content, but EXCLUDE the final line that calls the main function.
@@ -104,6 +114,29 @@ if [ -d "$MENUBAR_DIR" ]; then
         echo ""
     } >> "$OUTPUT_FILE"
 fi
+
+# 4b. Embed the Adminer theme (adminer-theme/) the same way. It used to be
+#     downloaded at install time from the repo's main branch: unpinned code
+#     running inside an auto-signed-in database manager, a network dependency
+#     for an otherwise offline install, and local edits that reached nobody
+#     until pushed. Now the theme ships with the cove.sh it was built with.
+echo "   - Embedding Adminer theme from ${ADMINER_THEME_DIR}/"
+{
+    echo "# --- Embedded Adminer Theme (generated from ${ADMINER_THEME_DIR}/ by compile.sh) ---"
+    echo ""
+    echo "emit_adminer_theme_css() {"
+    echo "cat <<'COVE_ADMINER_CSS_EOF'"
+    cat "$ADMINER_THEME_DIR/adminer.css"
+    echo "COVE_ADMINER_CSS_EOF"
+    echo "}"
+    echo ""
+    echo "emit_adminer_theme_js() {"
+    echo "cat <<'COVE_ADMINER_JS_EOF'"
+    cat "$ADMINER_THEME_DIR/adminer.js"
+    echo "COVE_ADMINER_JS_EOF"
+    echo "}"
+    echo ""
+} >> "$OUTPUT_FILE"
 
 # 5. NOW, add the main function call at the very end of the script.
 echo "   - Adding final execution call"

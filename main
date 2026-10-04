@@ -2275,9 +2275,10 @@ function adminer_object() {
 include "./adminer-core.php";
 ADMINER_INDEX_EOF
 
-    echo "🎨 Downloading Cove Adminer theme..."
-    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.css" -o "$adminer_dir/adminer.css"
-    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.js"  -o "$adminer_dir/adminer.js"
+    # Embedded by compile.sh from adminer-theme/ (see emit_adminer_theme_css).
+    echo "🎨 Writing Cove Adminer theme..."
+    emit_adminer_theme_css > "$adminer_dir/adminer.css"
+    emit_adminer_theme_js > "$adminer_dir/adminer.js"
 }
 
 # Repair ownership of ~/Cove state that a pre-1.10 root-run FrankenPHP may
