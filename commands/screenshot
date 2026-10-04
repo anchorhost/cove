@@ -71,11 +71,16 @@ cove_screenshot_stop() {
 # and any capture lock file that outlived its capture.
 cove_screenshot_reap() {
     local d
+    # Only folders this user made, named exactly the way mktemp names them.
+    # On Linux $SHOT_TMP is the shared /tmp, and each name here becomes a
+    # pkill -f pattern: another account's 'cove-shot-profile.x|.' would
+    # otherwise have matched, and killed, every process this user runs.
     while IFS= read -r d; do
         [ -n "$d" ] || continue
+        [[ "$(basename "$d")" =~ ^cove-shot-profile\.[A-Za-z0-9]+$ ]] || continue
         cove_screenshot_stop "$d"
         rm -rf "$d"
-    done < <(find "$SHOT_TMP" -maxdepth 1 -name 'cove-shot-profile.*' -mmin +3 2>/dev/null)
+    done < <(find "$SHOT_TMP" -maxdepth 1 -type d -user "$(id -u)" -name 'cove-shot-profile.*' -mmin +3 2>/dev/null)
     [ -d "$SCREENSHOTS_DIR" ] && find "$SCREENSHOTS_DIR" -maxdepth 1 -name '*.png.tmp.png' -mmin +2 -delete 2>/dev/null
     # Previews of sites that no longer exist.
     local sp sn
