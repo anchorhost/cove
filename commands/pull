@@ -62,7 +62,7 @@ cove_pull() {
     # path so parallel `cove pull` invocations don't collide.
     local ssh_ctl
     ssh_ctl=$(mktemp -u "${TMPDIR:-/tmp}/cove-ssh-XXXXXXXX")
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
+    local ssh_opts="-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
     # Remove the socket on any exit path (success, failure, Ctrl-C). Any
     # orphaned master process times out on its own via ControlPersist.
     # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
@@ -73,7 +73,7 @@ cove_pull() {
     # ~16KB/s against a real gateway and then stalled outright, while the same
     # file moved in 15s on its own connection. Key auth makes the extra
     # connection free; with a password you are asked once more.
-    local ssh_bulk_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
+    local ssh_bulk_opts="-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pulling a remote WordPress site into Cove."
     # --- 1. Gather Remote Info ---
@@ -106,6 +106,16 @@ cove_pull() {
     # One probe round-trip answers both questions at once: is there a usable
     # WordPress here, and which tools does this host actually have? The answer
     # decides whether we need to sideload WP-CLI before doing any real work.
+    # Connect once in the open before the quiet probe below. Host keys are
+    # checked now: a host seen for the first time is remembered in
+    # ~/.ssh/known_hosts, and one whose key changed since is refused, with
+    # OpenSSH's own warning on screen instead of a vague probe failure. This
+    # used to skip the check entirely, which let anyone in the network path
+    # hand pull a hostile archive or receive a push's files and database.
+    if ! ssh $ssh_opts $remote_ssh true; then
+        log_error "Could not connect to ${remote_ssh} over SSH (see the message above). If the host was rebuilt and its key changed on purpose, clear the old one with ssh-keygen -R and try again."
+    fi
+
     log_step "Validating remote WordPress site..."
     local wp_cli_flag=""
     wp_cli_flag=$(transfer_ensure_remote_wp_cli "$ssh_opts" "$remote_ssh" "$remote_path")
