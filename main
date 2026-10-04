@@ -2462,14 +2462,19 @@ emit_site_php_handler() {
 }
 
 # Files no site should hand to a browser: WordPress's debug.log (WP_DEBUG_LOG
-# writes it inside the web root), plugin logs in uploads, database dumps, and
-# version-control or env files. Apache keeps most of these private through
-# .htaccess; Caddy ignores .htaccess, so without this they download to anyone
-# who can reach the site — a `cove share` visitor included. A `handle` block,
-# not a bare `respond`: php_server is ordered ahead of respond.
+# writes it inside the web root) and other logs (cPanel's error_log), database
+# dumps and backup-plugin archives, editor leftovers (wp-config.php.bak,
+# .swp, ~), and every dotfile or dot-folder (.git, .env, .htpasswd) except
+# /.well-known/. Apache keeps most of these private through .htaccess; Caddy
+# ignores .htaccess, so without this they download to anyone who can reach
+# the site — a `cove share` visitor included. A `handle` block, not a bare
+# `respond`: php_server is ordered ahead of respond.
 emit_site_deny_rules() {
     cat >> "$CADDYFILE_PATH" <<'EOM'
-    @cove_private path *.log *.sql *.sql.gz */.git/* */.env */.env.*
+    @cove_private {
+        path *.log */error_log *.sql *.sql.* *-db.gz *.wpress *.bak *.orig *.swp *~ */.*
+        not path /.well-known/*
+    }
     handle @cove_private {
         respond 404
     }
