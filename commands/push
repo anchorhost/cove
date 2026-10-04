@@ -154,8 +154,12 @@ cove_push() {
 
     # --- 5. Perform Local Backup ---
     log_step "Generating local backup for ${site_name}..."
+    # Cove's one-time-login mu-plugin is local-only and stays home: it is left
+    # out of the archive, and the restore keeps whatever the remote had at
+    # that path (a host's own helper of the same name, or nothing at all).
+    local cove_helper="wp-content/mu-plugins/captaincore-helper.php"
     local backup_path
-    backup_path=$(transfer_local backup "$local_path")
+    backup_path=$(transfer_local backup "$local_path" --exclude="$cove_helper")
     if [ -z "$backup_path" ] || [ ! -f "$backup_path" ]; then
         log_error "Failed to generate the local backup."
     fi
@@ -183,7 +187,7 @@ cove_push() {
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
     if ! transfer_remote "$ssh_opts" "$remote_ssh" restore "$remote_path" "$remote_tmp" \
-            --url-to="$remote_url" $wp_cli_flag; then
+            --url-to="$remote_url" --keep="$cove_helper" $wp_cli_flag; then
         rm -f "$backup_path"
         ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
         log_error "The remote restore failed."

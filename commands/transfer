@@ -30,7 +30,7 @@ cat << 'COVE_TRANSFER_HELPER'
 # Subcommands:
 #   probe   <site_dir>                     report tool capabilities as key=value
 #   backup  <site_dir> [--exclude=GLOB]... create an archive, print its path
-#   restore <site_dir> <archive> [--url-to=URL]
+#   restore <site_dir> <archive> [--url-to=URL] [--keep=PATH]...
 #
 # Design note: every capability degrades rather than failing. Archiving prefers
 # zip, falls back to tar, and finally to PHP itself; the database is dumped and
@@ -396,9 +396,18 @@ cmd_backup() {
 cmd_restore() {
     local site_dir="$1" archive="$2"; shift 2
     local url_to=""
+    local -a keeps=()
     local a
     for a in "$@"; do
-        case "$a" in --url-to=*) url_to="${a#--url-to=}" ;; esac
+        case "$a" in
+            --url-to=*) url_to="${a#--url-to=}" ;;
+            --keep=*)
+                a="${a#--keep=}"
+                case "/$a/" in
+                    *"/../"*|//*) die "--keep takes a path inside the site: $a" ;;
+                esac
+                keeps+=("$a") ;;
+        esac
     done
 
     [ -d "$site_dir" ] || die "Site directory not found: $site_dir"
@@ -426,10 +435,15 @@ cmd_restore() {
         die "Refusing to restore over $site_dir: it does not look like a WordPress install."
     fi
 
-    local work
+    local work held
     work=$(mktemp -d "${TMPDIR:-/tmp}/cove-restore-XXXXXX") || die "mktemp failed"
+    # What the destination keeps (its wp-config.php, --keep paths) waits in a
+    # folder of its own: when the archive has no WordPress markers the whole
+    # of $work is copied into the site, and anything parked there would land
+    # in the web root — wp-config.php.keep included, served as plain text.
+    held=$(mktemp -d "${TMPDIR:-/tmp}/cove-keep-XXXXXX") || { rm -rf "$work"; die "mktemp failed"; }
     # shellcheck disable=SC2064
-    trap "rm -rf '$work'" EXIT
+    trap "rm -rf '$work' '$held'" EXIT
 
     log "Extracting archive (${EXTRACTOR})..."
     case "$EXTRACTOR" in
@@ -482,15 +496,32 @@ cmd_restore() {
     # at a database that does not exist on this machine.
     local keep_config=""
     if [ -f "$site_dir/wp-config.php" ]; then
-        keep_config="$work/wp-config.php.keep"
+        keep_config="$held/wp-config.php.keep"
         cp "$site_dir/wp-config.php" "$keep_config"
     fi
+
+    # --keep paths: the destination's own copy survives the swap, the same
+    # way wp-config.php does. `cove push` keeps the remote's mu-plugin of the
+    # same name as Cove's local-only helper, which never leaves the machine.
+    local k
+    for k in ${keeps[@]+"${keeps[@]}"}; do
+        if [ -f "$site_dir/$k" ]; then
+            mkdir -p "$held/keep/$(dirname "$k")"
+            cp -p "$site_dir/$k" "$held/keep/$k"
+        fi
+    done
 
     log "Replacing files..."
     # Clear the destination except wp-config.php, then move the new tree in.
     find "$site_dir" -mindepth 1 -maxdepth 1 ! -name 'wp-config.php' -exec rm -rf {} + 2>/dev/null
     ( cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name 'wp-config.php' \
         -exec cp -R {} "$site_dir/" \; ) || die "Copying files failed."
+    for k in ${keeps[@]+"${keeps[@]}"}; do
+        if [ -f "$held/keep/$k" ]; then
+            mkdir -p "$site_dir/$(dirname "$k")"
+            cp -p "$held/keep/$k" "$site_dir/$k"
+        fi
+    done
     if [ -n "$keep_config" ]; then
         cp "$keep_config" "$site_dir/wp-config.php"
 
@@ -563,7 +594,7 @@ set -- ${ARGS+"${ARGS[@]}"}
 case "$SUB" in
     probe)   cmd_probe   "${1:-}" ;;
     backup)  [ $# -ge 1 ] || die "usage: backup <site_dir> [--exclude=GLOB]..."; cmd_backup  "$@" ;;
-    restore) [ $# -ge 2 ] || die "usage: restore <site_dir> <archive> [--url-to=URL]"; cmd_restore "$@" ;;
+    restore) [ $# -ge 2 ] || die "usage: restore <site_dir> <archive> [--url-to=URL] [--keep=PATH]..."; cmd_restore "$@" ;;
     *)       die "unknown subcommand: ${SUB:-<none>}" ;;
 esac
 COVE_TRANSFER_HELPER
