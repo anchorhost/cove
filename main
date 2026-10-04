@@ -265,6 +265,26 @@ cove_random_password() {
     fi
 }
 
+# Run an upstream install script (FrankenPHP's, Mailpit's) as root, from a
+# working directory. Downloaded whole first, then run: `curl -sL … | sudo
+# bash` executes as it streams, so a dropped connection ran half a script as
+# root, and without --fail an HTTP error page was handed to bash as well.
+run_installer_script() {
+    local url="$1" workdir="${2:-.}"
+    local script
+    script=$(mktemp "${TMPDIR:-/tmp}/cove-installer-XXXXXX") || return 1
+    if ! curl -fsSL "$url" -o "$script" || [ ! -s "$script" ] \
+        || ! head -n 1 "$script" | grep -q '^#!'; then
+        echo "   - ❌ Could not download a complete install script from $url" >&2
+        rm -f "$script"
+        return 1
+    fi
+    ( cd "$workdir" && $SUDO_CMD bash "$script" )
+    local rc=$?
+    rm -f "$script"
+    return $rc
+}
+
 # Reads a directive from ~/Cove/php.ini (last-wins, ini-style), trims
 # surrounding whitespace/quotes, and returns the fallback if the key is
 # missing or the ini file doesn't exist yet. Used by regenerate_caddyfile

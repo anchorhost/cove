@@ -390,7 +390,7 @@ cove_install() {
         echo "   - Using the official FrankenPHP installer..."
         local fp_tmpdir
         fp_tmpdir=$(mktemp -d)
-        if (cd "$fp_tmpdir" && curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash); then
+        if run_installer_script https://frankenphp.dev/install.sh "$fp_tmpdir"; then
             hash -r
             if ! command -v frankenphp &> /dev/null && [ -x "$fp_tmpdir/frankenphp" ]; then
                 $SUDO_CMD mv "$fp_tmpdir/frankenphp" "$BIN_DIR/frankenphp"
@@ -481,7 +481,7 @@ cove_install() {
     elif ! command -v mailpit &> /dev/null; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: mailpit"
         echo "   - Using the official Mailpit installer..."
-        if curl -sL https://raw.githubusercontent.com/axllent/mailpit/develop/install.sh | $SUDO_CMD bash; then
+        if run_installer_script https://raw.githubusercontent.com/axllent/mailpit/develop/install.sh; then
             echo "✅ Mailpit installed successfully."
         else
             gum style --foreground red "❌ The Mailpit download script failed."
