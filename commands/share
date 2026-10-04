@@ -250,7 +250,8 @@ import sys
 import ssl
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, HTTPRedirectHandler, HTTPSHandler, build_opener
 
 TARGET_HOST = sys.argv[1]  # e.g., anchordev.localhost
 LISTEN_PORT = int(sys.argv[2])
@@ -265,6 +266,23 @@ ssl_ctx.verify_mode = ssl.CERT_NONE
 
 # Content types that should have URL rewriting
 REWRITABLE_TYPES = ('text/html', 'text/css', 'application/javascript', 'application/json', 'text/javascript')
+
+# Redirects go back to the visitor's browser; the proxy never follows one
+# itself. Following them let a redirect on the shared site point this proxy at
+# anything this machine can reach (Mailpit on 127.0.0.1:8025, another site)
+# and hand the answer to a visitor. It also dropped the cookies a login sets
+# on its redirect.
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+opener = build_opener(NoRedirect, HTTPSHandler(context=ssl_ctx))
+
+def rewrite_urls(text):
+    # https://site.localhost[:port] -> https://public-url, plain and JSON-escaped
+    text = text.replace(f'https://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
+    text = text.replace(f'http://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
+    return text.replace(f'https:\\/\\/{TARGET_AUTHORITY}', f'https:\\/\\/{PUBLIC_HOST}')
 
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -318,32 +336,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if key.lower() not in ('host', 'connection', 'accept-encoding'):
                 req.add_header(key, value)
         req.add_header('Host', TARGET_AUTHORITY)
+        # Marks the request as a share visitor's, set after the visitor's own
+        # headers so they can't remove it. It arrives from loopback, so this
+        # is how Cove's PHP bootstrap knows not to show it Whoops pages.
+        req.add_header('X-Cove-Share', '1')
 
         try:
-            with urlopen(req, context=ssl_ctx, timeout=60) as response:
-                response_body = response.read()
-                content_type = response.headers.get('Content-Type', '')
-
-                # Rewrite URLs in text responses
-                if any(ct in content_type for ct in REWRITABLE_TYPES):
-                    try:
-                        text = response_body.decode('utf-8')
-                        # Replace https://site.localhost[:port] with https://public-url
-                        text = text.replace(f'https://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
-                        text = text.replace(f'http://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
-                        # Escaped versions (for JSON)
-                        text = text.replace(f'https:\\/\\/{TARGET_AUTHORITY}', f'https:\\/\\/{PUBLIC_HOST}')
-                        response_body = text.encode('utf-8')
-                    except:
-                        pass  # If decode fails, send original
-                
-                self.send_response(response.status)
-                for key, value in response.headers.items():
-                    if key.lower() not in ('transfer-encoding', 'connection', 'content-length', 'content-encoding'):
-                        self.send_header(key, value)
-                self.send_header('Content-Length', len(response_body))
-                self.end_headers()
-                self.wfile.write(response_body)
+            response = opener.open(req, timeout=60)
+        except HTTPError as e:
+            # Redirects (never followed, see NoRedirect) and 4xx/5xx answers
+            # are the site's own responses: pass them on, status and all.
+            # They used to surface as "502 Proxy Error".
+            response = e
         except Exception as e:
             error_msg = f"Proxy Error: {e}".encode()
             self.send_response(502)
@@ -351,6 +355,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Length', len(error_msg))
             self.end_headers()
             self.wfile.write(error_msg)
+            return
+
+        try:
+            response_body = response.read()
+        except Exception:
+            response_body = b''
+        finally:
+            response.close()
+        status = getattr(response, 'status', None) or response.code
+        content_type = response.headers.get('Content-Type', '')
+
+        # Rewrite URLs in text responses
+        if any(ct in content_type for ct in REWRITABLE_TYPES):
+            try:
+                response_body = rewrite_urls(response_body.decode('utf-8')).encode('utf-8')
+            except Exception:
+                pass  # If decode fails, send original
+
+        self.send_response(status)
+        for key, value in response.headers.items():
+            if key.lower() not in ('transfer-encoding', 'connection', 'content-length', 'content-encoding'):
+                # A redirect's target is a site URL too.
+                if key.lower() in ('location', 'refresh'):
+                    value = rewrite_urls(value)
+                self.send_header(key, value)
+        self.send_header('Content-Length', len(response_body))
+        self.end_headers()
+        self.wfile.write(response_body)
     
     def do_GET(self): self.do_request()
     def do_POST(self): self.do_request()
