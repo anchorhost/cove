@@ -55,6 +55,8 @@ snapshot_create() {
     while [ -e "$dest" ]; do dest="$SNAPSHOTS_DIR/$site_name/$id-$n"; n=$((n + 1)); done
     id=$(basename "$dest")
     mkdir -p "$dest"
+    # Snapshots hold whole sites and their databases: this user only.
+    chmod 700 "$SNAPSHOTS_DIR" 2>/dev/null
 
     local wp_version=""
     if [ -f "$public_dir/wp-config.php" ]; then

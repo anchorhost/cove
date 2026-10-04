@@ -38,7 +38,7 @@ cove_backup() {
     fi
 
     local backups_dir="$COVE_DIR/Backups"
-    [ -z "$out" ] && { mkdir -p "$backups_dir"; out="$backups_dir/$site_name-$(date +%Y%m%d-%H%M%S).zip"; }
+    [ -z "$out" ] && { mkdir -p "$backups_dir"; chmod 700 "$backups_dir" 2>/dev/null; out="$backups_dir/$site_name-$(date +%Y%m%d-%H%M%S).zip"; }
     case "$out" in
         *.zip) ;;
         *) out="$out.zip" ;;

@@ -14560,6 +14560,9 @@ main() {
             # Orphan-clearing mailpit runner + throttled KeepAlive. Safe to
             # re-run: rewrites the unit and restarts mailpit once.
             install_mailpit_service
+            # Backups and snapshots from earlier versions were readable by every
+            # account on the machine; closing the folders covers them all.
+            chmod 700 "$COVE_DIR/Backups" "$COVE_DIR/Snapshots" 2>/dev/null || true
             # The FrankenPHP plist is otherwise only written when the service
             # starts, and launchd keeps the copy it loaded. Rewrite it, and if
             # it changed (PATH for Ghostscript) restart once, waiting for the
