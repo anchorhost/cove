@@ -44,7 +44,11 @@ cove_delete() {
     local hosts_to_remove=("$site_name.localhost")
     if [ -f "$site_dir/mappings" ]; then
         while IFS= read -r mapping || [ -n "$mapping" ]; do
-            if [ -n "$mapping" ]; then
+            # Re-validated here, not just when `cove mappings add` wrote it:
+            # each name is spliced into a `sudo sed` expression below, and the
+            # file sits where any of the site's own PHP can rewrite it. GNU
+            # sed's `e` command runs a shell. Wildcards never get a hosts line.
+            if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]] && validate_hostname "$mapping"; then
                 hosts_to_remove+=("$mapping")
             fi
         done < "$site_dir/mappings"

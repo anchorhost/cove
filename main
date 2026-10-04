@@ -1269,6 +1269,12 @@ update_etc_hosts() {
                 if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$host_site_name" ]; then
                     continue
                 fi
+                # A folder name is a hostname only if it looks like one; any
+                # process running as this user can create folders here.
+                if ! validate_hostname "$host_site_name"; then
+                    echo "   - ⚠️  Skipping a folder in $SITES_DIR whose name isn't a hostname: $host_site_name"
+                    continue
+                fi
                 required_hosts+=("$host_site_name")
 
                 # Check for additional mappings
@@ -1279,7 +1285,15 @@ update_etc_hosts() {
                         # loopback natively, so a "*.name" line would be inert
                         # — and would prompt for sudo on every reload.
                         if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]]; then
-                            required_hosts+=("$mapping")
+                            # Checked again on the way to a root-written
+                            # file: the mappings file sits where a site's
+                            # own PHP can rewrite it, and a line holding
+                            # spaces would alias any domain to this machine.
+                            if validate_hostname "$mapping"; then
+                                required_hosts+=("$mapping")
+                            else
+                                echo "   - ⚠️  Skipping invalid mapping in $site_path/mappings: $mapping"
+                            fi
                         fi
                     done < "$site_path/mappings"
                 fi
