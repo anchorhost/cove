@@ -642,6 +642,11 @@ foreach (['HTTP_X_COVE_SHARE', 'HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 
 unset($__cove_ra, $__cove_h);
 if (!$__cove_local) {
     unset($__cove_local);
+    // Keep what Whoops did for these levels below: swallow them. Otherwise a
+    // site that displays errors would print warnings, file paths and all, to
+    // exactly the visitors the pretty page is kept from.
+    set_error_handler(function () { return true; },
+        E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE | E_WARNING | E_USER_WARNING);
     return;
 }
 unset($__cove_local);
@@ -680,7 +685,13 @@ try {
     foreach (array_keys($_COOKIE) as $__cove_k) {
         $handler->hideSuperglobalKey('_COOKIE', $__cove_k);
     }
-    foreach (['HTTP_COOKIE', 'HTTP_AUTHORIZATION', 'PHP_AUTH_PW'] as $__cove_k) {
+    // Passwords posted with the request (wp-login's pwd, a profile's pass1).
+    foreach (array_keys($_POST) as $__cove_k) {
+        if (preg_match('/pass|pwd|secret|token/i', (string) $__cove_k)) {
+            $handler->hideSuperglobalKey('_POST', $__cove_k);
+        }
+    }
+    foreach (['HTTP_COOKIE', 'HTTP_AUTHORIZATION', 'REDIRECT_HTTP_AUTHORIZATION', 'PHP_AUTH_PW', 'PHP_AUTH_DIGEST'] as $__cove_k) {
         $handler->hideSuperglobalKey('_SERVER', $__cove_k);
     }
     unset($__cove_k);
