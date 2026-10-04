@@ -410,6 +410,72 @@ port_is_free() {
     return 0
 }
 
+# Succeeds when <host>:<port> accepts a TCP connection within 2 seconds. A
+# firewall that drops packets would otherwise leave the connect hanging.
+cove_port_answers() {
+    local host="$1" port="$2" pid killer rc
+    ( exec 3<>"/dev/tcp/$host/$port" ) 2>/dev/null &
+    pid=$!
+    ( sleep 2; kill "$pid" 2>/dev/null ) &
+    killer=$!
+    wait "$pid" 2>/dev/null; rc=$?
+    kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null
+    return $rc
+}
+
+# This machine's own IPv4 addresses, loopback left out, one per line.
+cove_local_addresses() {
+    if [ "$OS" = "macos" ]; then
+        ifconfig 2>/dev/null | awk '$1 == "inet" && $2 !~ /^127\./ {print $2}'
+    elif command -v ip >/dev/null 2>&1; then
+        ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); if (a[1] !~ /^127\./) print a[1]}'
+    else
+        hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -v '^127\.'
+    fi
+}
+
+# Succeeds for an IPv4 address the internet at large can route to: not
+# loopback, private (RFC 1918), CGNAT (Tailscale), or link-local.
+cove_is_public_ipv4() {
+    case "$1" in
+        ""|10.*|127.*|192.168.*|169.254.*) return 1 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 1 ;;
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 1 ;;
+    esac
+    return 0
+}
+
+# The first public address this machine has, if any.
+cove_public_address() {
+    local a
+    for a in $(cove_local_addresses); do
+        cove_is_public_ipv4 "$a" && { echo "$a"; return 0; }
+    done
+    return 1
+}
+
+# Said by install and enable on a machine with a public address: Cove is
+# easy to put on a VPS, and nothing about that is safe to host live sites on
+# yet. A warning, not a refusal: a dev box reached over SSH is fine.
+cove_warn_if_server() {
+    local pub
+    pub=$(cove_public_address) || return 0
+    local lines=(
+        "⚠️  This machine has a public address ($pub)."
+        "Cove is built for local development. Sites, the dashboard, the database,"
+        "and mail answer only this machine, but cove lan, cove share, and"
+        "cove tailscale open them up on purpose: don't use those here."
+        "Don't host live sites with Cove yet; a production mode is planned."
+    )
+    echo ""
+    if command -v gum >/dev/null 2>&1; then
+        gum style --border normal --border-foreground 214 --padding "0 1" "${lines[@]}"
+    else
+        printf '%s\n' "${lines[@]}"
+    fi
+    echo ""
+}
+
 # True if the process listening on $1 is one of our own services (Caddy /
 # FrankenPHP). Used so reinstalls don't flag their own services as conflicts.
 port_is_own() {

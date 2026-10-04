@@ -172,6 +172,9 @@ cove_install() {
         esac
     done
 
+    # A VPS is an easy place to put Cove by mistake: say so up front.
+    cove_warn_if_server
+
     # Explicit ports bypass both interactive port menus below entirely.
     if [ -n "$explicit_http" ] || [ -n "$explicit_https" ]; then
         local want_http="${explicit_http:-$HTTP_PORT}"

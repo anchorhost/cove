@@ -1,8 +1,9 @@
 cove_health() {
     # Read-only diagnostic. Aggregates the signals you'd otherwise gather by
     # hand after a crash: service liveness, FrankenPHP process health + last
-    # exit code, recent hard segfaults (classified), live OPcache pressure, and
-    # on-disk hygiene. Never mutates anything — it only recommends fixes.
+    # exit code, recent hard segfaults (classified), live OPcache pressure,
+    # on-disk hygiene, and what the network can reach. Never mutates anything —
+    # it only recommends fixes.
     local warn=0 crit=0
     echo ""
     gum style --bold "🩺 Cove health check"
@@ -294,6 +295,81 @@ cove_health() {
     local strays; strays=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cove-shot-profile.*' -mmin +3 2>/dev/null | wc -l | tr -d ' ')
     if [ "$strays" -gt 0 ]; then
         echo "  ⚠️  $strays stale capture profile(s) in the temp folder (cleared by the next cove screenshot)"
+        warn=$((warn+1))
+    fi
+
+    # --- Network exposure ---------------------------------------------------
+    # What another machine on the network reaches, tried from this machine's
+    # own addresses: Caddy listens on every interface, and the site,
+    # dashboard, and proxy blocks must answer 403 there; Mailpit and MariaDB
+    # listen on loopback and must not answer at all. Then what has been
+    # opened on purpose (LAN sites, Tailscale, share tunnels).
+    echo ""
+    echo "Network exposure"
+    local addrs
+    addrs=$(cove_local_addresses)
+    if [ -z "$addrs" ]; then
+        echo "  ℹ️  No network address right now; nothing else can reach this machine"
+    elif [ "$IS_WSL" = true ]; then
+        echo "  ℹ️  WSL: sites answer the Windows host's private network by design (not probed)"
+    else
+        local sample_site="" s a code port open_http="" open_ports=""
+        for s in "$SITES_DIR"/*.localhost; do
+            [ -d "$s/public" ] && { sample_site=$(basename "$s"); break; }
+        done
+        for a in $addrs; do
+            code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' --resolve "cove.localhost:${HTTPS_PORT}:$a" "https://cove.localhost:${HTTPS_PORT}/api.php" 2>/dev/null)
+            case "$code" in 403|000) ;; *) open_http="$open_http cove.localhost via $a ($code)," ;; esac
+            if [ -n "$sample_site" ]; then
+                code=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' --resolve "${sample_site}:${HTTPS_PORT}:$a" "https://${sample_site}:${HTTPS_PORT}/" 2>/dev/null)
+                case "$code" in 403|000) ;; *) open_http="$open_http $sample_site via $a ($code)," ;; esac
+            fi
+            for port in 8025 1025 3306; do
+                cove_port_answers "$a" "$port" && open_ports="$open_ports $a:$port"
+            done
+        done
+        local tried; tried=$(echo $addrs | tr ' ' ',' | sed 's/,/, /g')
+        if [ -z "$open_http" ]; then
+            echo "  ✅ Sites and the dashboard refuse other machines (tried from $tried)"
+        else
+            echo "  ❌ Answering other machines:${open_http%,}"
+            echo "     Fix: cove reload   (regenerates the Caddyfile with the guards)"
+            crit=$((crit+1))
+        fi
+        if [ -z "$open_ports" ]; then
+            echo "  ✅ Mailpit and MariaDB listen on this machine only"
+        else
+            echo "  ❌ Reachable from the network:$open_ports (8025/1025 Mailpit, 3306 MariaDB)"
+            echo "     Fix: cove upgrade, or cove enable   (rewrites their loopback-only settings)"
+            crit=$((crit+1))
+        fi
+    fi
+    if [ -f "$APP_DIR/tailscale" ]; then
+        if [ -f "$APP_DIR/tailscale-dashboard" ]; then
+            echo "  ℹ️  Tailscale: sites, mail, the dashboard, and Adminer are shared with your tailnet"
+        else
+            echo "  ℹ️  Tailscale: sites and mail are shared with your tailnet"
+        fi
+    fi
+    local lan_sites=""
+    for s in "$SITES_DIR"/*.localhost; do
+        [ -f "$s/lan_config" ] && lan_sites="$lan_sites $(basename "$s" .localhost),"
+    done
+    [ -n "$lan_sites" ] && echo "  ℹ️  Open to the local network with cove lan:${lan_sites%,}"
+    if [ -d "$APP_DIR/share" ]; then
+        local st tpid url
+        for st in "$APP_DIR/share"/*; do
+            [ -f "$st" ] || continue
+            tpid=$(sed -n 's/^tunnel_pid=//p' "$st"); url=$(sed -n 's/^url=//p' "$st")
+            if [ -n "$tpid" ] && kill -0 "$tpid" 2>/dev/null; then
+                echo "  ℹ️  Shared publicly right now: $(basename "$st") at $url   (stop: cove share $(basename "$st") stop)"
+            fi
+        done
+    fi
+    local pub
+    if pub=$(cove_public_address); then
+        echo "  ⚠️  This machine has a public address ($pub). Cove is for local development;"
+        echo "     don't host live sites with it, and don't use cove lan, share, or tailscale here."
         warn=$((warn+1))
     fi
 
