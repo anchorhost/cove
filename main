@@ -2217,7 +2217,7 @@ validate_proxy_target() {
 
 # Write the Cove-themed Adminer entry point (index.php with the head() hook
 # that injects the theme toggle, plus autologin) and refresh the theme
-# assets (adminer.css, adminer.js) from GitHub. Shared by cove_install
+# assets (adminer.css, adminer.js, embedded by compile.sh). Shared by cove_install
 # (initial deploy) and cove_upgrade (so upgraders pick up theme changes
 # without a reinstall). Idempotent — overwrites existing files.
 deploy_adminer_theme() {
