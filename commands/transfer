@@ -359,16 +359,26 @@ cmd_backup() {
     archive="$parent/${stamp}_${rand}.${ext}"
 
     # The dump lands inside the site dir so it travels in the archive, exactly
-    # where restore expects to find it.
+    # where restore expects to find it. That is the web root, for as long as
+    # the archive takes to build — on a live host when `cove pull` runs this.
+    # So: a name nobody can guess (it used to be a fixed db_export.sql),
+    # readable by this user only, and removed however this exits.
     log "Exporting database..."
-    local dump="$site_dir/db_export.sql"
+    local dump_rand
+    dump_rand=$( (head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n') 2>/dev/null )
+    [ -n "$dump_rand" ] || dump_rand="$$$(date +%s)"
+    local dump="$site_dir/db_export-$dump_rand.sql"
+    # shellcheck disable=SC2064
+    trap "rm -f '$dump'" EXIT
+    # shellcheck disable=SC2064
+    trap "rm -f '$dump'; exit 1" HUP INT TERM
     if [ "$DB_DUMP" = native ]; then
-        $WP db export "$dump" --path="$site_dir" --add-drop-table \
-            --default-character-set=utf8mb4 --skip-plugins --skip-themes >&2 \
+        ( umask 077; $WP db export "$dump" --path="$site_dir" --add-drop-table \
+            --default-character-set=utf8mb4 --skip-plugins --skip-themes >&2 ) \
             || die "Database export failed."
     else
         log "  (no mysqldump — exporting through WordPress)"
-        wp_eval "$site_dir" php_dump_script "$dump" || die "Database export failed."
+        ( umask 077; wp_eval "$site_dir" php_dump_script "$dump" ) || die "Database export failed."
     fi
 
     log "Creating archive (${ARCHIVER})..."
@@ -483,8 +493,8 @@ cmd_restore() {
     case "$sql" in
         *.gz)
             log "Unpacking $(basename "$sql")..."
-            gunzip -c "$sql" > "$work/.cove-import.sql" || die "Could not unpack the SQL dump."
-            sql="$work/.cove-import.sql"
+            gunzip -c "$sql" > "$held/import.sql" || die "Could not unpack the SQL dump."
+            sql="$held/import.sql"
             ;;
     esac
     if [ -f "$src/wp-config.php" ] && grep -Eq "define\(\s*['\"]MULTISITE['\"]\s*,\s*true" "$src/wp-config.php"; then
@@ -513,8 +523,12 @@ cmd_restore() {
 
     log "Replacing files..."
     # Clear the destination except wp-config.php, then move the new tree in.
+    # Dumps at the top of the tree (the db_export-*.sql that backup packs
+    # there) are imported from where they sit, never copied into the web
+    # root, where a failed step below would have left them downloadable.
     find "$site_dir" -mindepth 1 -maxdepth 1 ! -name 'wp-config.php' -exec rm -rf {} + 2>/dev/null
     ( cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name 'wp-config.php' \
+        ! -name '*.sql' ! -name '*.sql.gz' \
         -exec cp -R {} "$site_dir/" \; ) || die "Copying files failed."
     for k in ${keeps[@]+"${keeps[@]}"}; do
         if [ -f "$held/keep/$k" ]; then
