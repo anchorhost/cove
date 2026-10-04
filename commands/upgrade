@@ -64,15 +64,23 @@ upgrade_frankenphp() {
             return 1
         fi
         
-        local temp_binary="/tmp/frankenphp_new"
-        if curl -L --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${binary_name}" -o "$temp_binary"; then
-            chmod +x "$temp_binary"
+        # mktemp, not a fixed /tmp name another account could create first,
+        # and --fail so an HTTP error page is never installed as the binary.
+        local temp_binary
+        temp_binary=$(mktemp "${TMPDIR:-/tmp}/frankenphp_new.XXXXXX") || return 1
+        if curl -L --fail --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${binary_name}" -o "$temp_binary"; then
+            chmod 755 "$temp_binary"
             if [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
                 rm -f "$temp_binary"
                 gum style --foreground red "❌ Replacing $target_bin_dir/frankenphp needs sudo, and there is no terminal to ask on." "Run: sudo cove upgrade"
                 return 1
             fi
             if sudo mv "$temp_binary" "$target_bin_dir/frankenphp"; then
+                # Root-owned, like the rest of $target_bin_dir. The moved file
+                # kept this user as its owner, and Cove runs this binary under
+                # sudo (trust, enable): anything running as this user, a
+                # site's PHP included, could have swapped it out first.
+                sudo chown 0:0 "$target_bin_dir/frankenphp" 2>/dev/null || true
                 # Set capability to bind to low ports without root
                 if command -v setcap &>/dev/null; then
                     $SUDO_CMD setcap 'cap_net_bind_service=+ep' "$target_bin_dir/frankenphp" 2>/dev/null || true
@@ -115,7 +123,8 @@ cove_upgrade() {
     echo "🔎 Checking for the latest version of Cove..."
 
     local download_url="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
-    local temp_script="/tmp/cove.sh.latest"
+    local temp_script
+    temp_script=$(mktemp "${TMPDIR:-/tmp}/cove.sh.latest.XXXXXX") || return 1
     local install_path
 
     # Find the real path of the currently running script. $0 is authoritative:
@@ -142,7 +151,7 @@ cove_upgrade() {
     fi
 
     # 2. Make it executable
-    chmod +x "$temp_script"
+    chmod 755 "$temp_script"
 
     # 3. Get the new version from the downloaded script
     local new_version
