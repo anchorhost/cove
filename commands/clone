@@ -125,17 +125,17 @@ cove_clone() {
         trap 'rm -f "$temp_sql"' EXIT
 
         echo "   - Dumping database '$source_db'..."
-        if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$source_db" > "$temp_sql" 2>/dev/null; then
+        if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$source_db" > "$temp_sql" 2>/dev/null; then
             gum style --foreground red "❌ Error: Failed to dump the source database '$source_db'."
             rm -rf "$new_dir"
             exit 1
         fi
 
         echo "   - Creating database '$new_db'..."
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db\`;"
-        if ! mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db" < "$temp_sql" 2>/dev/null; then
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$new_db\`;"
+        if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" "$new_db" < "$temp_sql" 2>/dev/null; then
             gum style --foreground red "❌ Error: Failed to import into '$new_db'."
-            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
             rm -rf "$new_dir"
             exit 1
         fi
@@ -143,7 +143,7 @@ cove_clone() {
         echo "   - Pointing wp-config.php at '$new_db'..."
         if ! (cd "$new_dir/public" && $wp_cmd config set DB_NAME "$new_db" --quiet </dev/null); then
             gum style --foreground red "❌ Error: Failed to update wp-config.php."
-            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
             rm -rf "$new_dir"
             exit 1
         fi

@@ -598,7 +598,7 @@ INI
                 root_pass=$(gum input --password --placeholder "Password for '$root_user'")
             fi
 
-            if echo "$sql_command" | mysql -u "$root_user" -p"$root_pass"; then
+            if echo "$sql_command" | MYSQL_PWD="$root_pass" mysql -u "$root_user"; then
                 echo "   - ✅ Manual database user creation successful."
                 user_created_successfully=true
             fi

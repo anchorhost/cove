@@ -77,7 +77,7 @@ snapshot_create() {
             return 1
         fi
         echo "   Dumping database '$db_name'…" >&2
-        if ! "$dump_cmd" -u"$db_user" -p"$db_pass" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "$db_name" > "$dest/db.sql" 2>"$dest/.dump-err"; then
+        if ! MYSQL_PWD="$db_pass" "$dump_cmd" -u"$db_user" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "$db_name" > "$dest/db.sql" 2>"$dest/.dump-err"; then
             local err; err=$(tail -n 2 "$dest/.dump-err")
             rm -rf "$dest"
             gum style --foreground red "❌ Error: The database dump failed." "$err" >&2
@@ -137,11 +137,11 @@ snapshot_restore() {
         # The dump carries DROP TABLE for what it holds; tables born after
         # the snapshot would otherwise linger, so the database is recreated.
         echo "   Restoring database '$db_name'…" >&2
-        if ! "$client" -u"$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null; then
+        if ! MYSQL_PWD="$DB_PASSWORD" "$client" -u"$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null; then
             gum style --foreground red "❌ Error: Could not recreate the database." >&2
             return 1
         fi
-        if ! "$client" -u"$DB_USER" -p"$DB_PASSWORD" --max_allowed_packet=512M "$db_name" < "$src/db.sql"; then
+        if ! MYSQL_PWD="$DB_PASSWORD" "$client" -u"$DB_USER" --max_allowed_packet=512M "$db_name" < "$src/db.sql"; then
             gum style --foreground red "❌ Error: The database import failed. The files were not touched; snapshot $safety holds the state from before." >&2
             return 1
         fi

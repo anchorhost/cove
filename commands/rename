@@ -70,20 +70,20 @@ cove_rename() {
         trap 'rm -f "$temp_sql_dump"' EXIT
 
         echo "   - Backing up old database '$old_db_name'..."
-        if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$old_db_name" > "$temp_sql_dump"; then
+        if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$old_db_name" > "$temp_sql_dump"; then
             gum style --foreground red "❌ Error: Failed to dump the old database. Aborting."
             mv "$new_site_dir" "$old_site_dir" # Revert directory rename
             exit 1
         fi
 
         echo "   - Creating and importing to new database '$new_db_name'..."
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
         # Gate the destructive DROP below on a verified import + config update.
         # Previously the import was unchecked, so a failed import (disk full,
         # packet size) still fell through to dropping the old database — losing
         # the site's only good copy. On failure here, abort with the old
         # database and wp-config left intact.
-        if ! mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db_name" < "$temp_sql_dump"; then
+        if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" "$new_db_name" < "$temp_sql_dump"; then
             gum style --foreground red "❌ Error: Failed to import into '$new_db_name'. Aborting; old database left intact."
             mv "$new_site_dir" "$old_site_dir" # Revert directory rename
             exit 1
@@ -116,7 +116,7 @@ cove_rename() {
         fi
 
         echo "   - Dropping old database '$old_db_name'..."
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
     fi
 
     # --- Snapshots and the dashboard preview follow the name ---

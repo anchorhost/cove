@@ -181,7 +181,7 @@ cove_add() {
             fi
         fi
         echo "🗄️ Creating database: $db_name"
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
         echo "Installing WordPress..."
         admin_pass=$(cove_random_password 12)
         
@@ -223,12 +223,31 @@ cove_add() {
             # is a local site: core's automatic updates back off, WooCommerce
             # and other plugins that gate live-only behaviour (payment
             # gateways, tracking, license pings) treat it as a sandbox.
-            $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
+            #
+            # The database password goes in afterwards, through the
+            # environment: on a command line `ps` shows it to every account on
+            # the machine, and it opens every Cove database. (WP-CLI's
+            # --prompt is no help: it echoes the command back, password and all.)
+            # --skip-check because a placeholder can't pass the connection test;
+            # the database was just created with these credentials, and core
+            # install below fails loudly if they don't work.
+            $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="__COVE_DB_PASSWORD__" --skip-check --extra-php <<PHP
 define( 'WP_ENVIRONMENT_TYPE', 'local' );
 define( 'WP_DEBUG', true );
 define( 'WP_DEBUG_LOG', true );
 define( 'WP_DEBUG_DISPLAY', false );
 PHP
+            COVE_DB_PASSWORD="$DB_PASSWORD" $wp_cmd eval --skip-wordpress '
+                $f = getcwd() . "/wp-config.php";
+                $c = file_get_contents( $f );
+                $n = 0;
+                $c = str_replace( "\x27__COVE_DB_PASSWORD__\x27", var_export( (string) getenv( "COVE_DB_PASSWORD" ), true ), $c, $n );
+                if ( 1 !== $n || false === file_put_contents( $f, $c ) ) { exit( 1 ); }
+            '
+            if [ $? -ne 0 ] || grep -q '__COVE_DB_PASSWORD__' wp-config.php 2>/dev/null; then
+                echo "❌ Error: Could not write the database password into wp-config.php."
+                exit 1
+            fi
 
             # 3. Install WordPress — a network when --multisite was given.
             # multisite-install also writes the MULTISITE / SUBDOMAIN_INSTALL /
@@ -258,7 +277,7 @@ PHP
             gum style --foreground red "❌ WordPress installation failed. Please review the errors above."
             # Clean up the failed site directory and database
             echo "   - Cleaning up failed installation..."
-            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
             rm -rf "$site_dir"
             exit 1
         fi

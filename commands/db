@@ -60,7 +60,7 @@ cove_db_backup() {
                 echo "   Saving backup to: $(basename "$site_path")/private/$(basename "$backup_file")"
 
                 # Execute the dump command
-                if ! "${dump_command}" -u"${db_user}" -p"${db_pass}" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "${db_name}" > "${backup_file}"; then
+                if ! MYSQL_PWD="${db_pass}" "${dump_command}" -u"${db_user}" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "${db_name}" > "${backup_file}"; then
                     echo "   ❌ Error: Database dump failed for '${db_name}'."
                     rm -f "${backup_file}" # Clean up failed backup file
                     return 1
@@ -303,7 +303,7 @@ cove_db_fix_collation() {
         # collation_character_set_applicability under a charset-free name,
         # so a join on collation_name finds nothing.
         local rows
-        rows=$(mysql -u"$db_user" -p"$db_pass" -N -B -e "
+        rows=$(MYSQL_PWD="$db_pass" mysql -u"$db_user" -N -B -e "
             SELECT table_name, SUBSTRING_INDEX(table_collation, '_', 1)
               FROM information_schema.tables
              WHERE table_schema = '${db_name//\'/\'\'}'
@@ -341,7 +341,7 @@ cove_db_fix_collation() {
         fi
 
         echo "   Converting $count table(s) to *_unicode_ci..."
-        if ! printf '%s' "$sql" | mysql -u"$db_user" -p"$db_pass" "$db_name"; then
+        if ! printf '%s' "$sql" | MYSQL_PWD="$db_pass" mysql -u"$db_user" "$db_name"; then
             echo "   ❌ One or more ALTER TABLE statements failed for '$db_name'."
             overall_success=false
             continue
@@ -351,7 +351,7 @@ cove_db_fix_collation() {
         # explicitly-collated column in a table whose default was already
         # something else. Rare, but worth pointing at rather than hiding.
         local leftovers
-        leftovers=$(mysql -u"$db_user" -p"$db_pass" -N -B -e "
+        leftovers=$(MYSQL_PWD="$db_pass" mysql -u"$db_user" -N -B -e "
             SELECT CONCAT(table_name, '.', column_name, ' (', collation_name, ')')
               FROM information_schema.columns
              WHERE table_schema = '${db_name//\'/\'\'}'

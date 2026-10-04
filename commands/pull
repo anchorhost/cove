@@ -1,8 +1,9 @@
 cove_pull() {
     # Sourced up front, not just before the post-migration step. Anything below
-    # that touches DB_USER / DB_PASSWORD needs it, and an unset DB_USER turns
-    # `mysql -u "$DB_USER" -p"$DB_PASSWORD"` into a bare `-p` that stops and
-    # prompts "Enter password:" — which hangs a headless pull outright.
+    # that touches DB_USER / DB_PASSWORD needs it. Unset, the mysql client logs
+    # in as the OS user with no password and fails. (When the password was
+    # still passed as -p"…", an empty one became a bare -p that stopped at
+    # "Enter password:" and hung a headless pull outright.)
     source_config
 
     # --- UI/Logging Functions ---

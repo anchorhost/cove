@@ -68,7 +68,7 @@ cove_delete() {
             db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
         fi
         echo "🗄️ Deleting database: $db_name"
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
     fi
 
     # Don't trust the bare rm — a pre-1.10 dashboard-created site would be
