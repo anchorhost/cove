@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### ✨ New Features
+
+* **`cove pull` and `cove push` work with WP Freighter tenant sites:** WP Freighter runs many WordPress sites out of one install, each with its own `stacked_<id>_` tables and, depending on its files mode, its own `content/<id>/` folder. Pass `--tenant` with the tenant's id, domain, or name (`--tenant cove.run`), or pick one from the list both commands now show when the remote is a Freighter host.
+    * A pull brings down that tenant only: its tables, its own files as `wp-content`, and the WordPress core it runs on. The host's `wp-config.php`, the other tenants, and the main site's files stay behind. The archive is assembled outside the web root, and links to `/content/<id>/` move to `/wp-content/` locally. `--proxy-uploads` fetches missing media from the tenant's own uploads folder.
+    * A push replaces that tenant only. That means its tables, and the folder that is its own: `content/<id>/` in dedicated mode, just its uploads in hybrid mode (plugins and themes there are shared by every tenant), and nothing in shared mode. Tables are renamed to the tenant's prefix on the way in, along with the roles option and user meta keyed by prefix, so a `wp_` site pushes into a tenant as-is. Every search-replace is held to the tenant's own tables. A dump that would touch any table outside the tenant is refused before anything changes.
+    * `cove transfer probe` now prints the site's prefix, folders, and URLs, and on a Freighter host its tenants; `--tenant=<id>` shows one.
+
+### 🔒 Security & Bug Fixes
+
+* **`cove push` no longer overwrites a whole WP Freighter host:** a push replaces the remote's files and resets its database, and on a Freighter host that database and those files belong to every tenant at once. A push to such a host without `--tenant` wiped all of them. A push there now goes to one tenant: the prompt lists tenants only, a headless push without `--tenant` is refused, and so is `--tenant=main`.
+
 ## [2.2] - 2026-10-05
 
 A security release. Cove listened on every network interface, so anyone on the same Wi-Fi could reach your sites and caught mail, and, chaining the two, sign in and run code on your machine. Sites, the dashboard, Mailpit, and MariaDB now answer only this machine, `cove health` shows what the network can reach, and the dashboard goes on your tailnet only with `--dashboard`.
