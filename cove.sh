@@ -186,7 +186,7 @@ RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="2.1"
+COVE_VERSION="2.2"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -195,7 +195,7 @@ WHOOPS_VERSION="2.18.0"
 # MUST match the `Version:` header in build_mu_plugin's heredoc — refresh_all_mu_plugins
 # compares the two to decide which sites need the plugin re-pushed on upgrade.
 # Bump whenever the mu-plugin code changes so existing sites pick it up.
-MU_PLUGIN_VERSION="0.7.0"
+MU_PLUGIN_VERSION="0.8.0"
 # Version of the menu bar companion apps (menubar/, embedded at compile
 # time): the macOS app under Sources/ and the Linux tray under Linux/ share
 # this one number. Bump whenever anything under menubar/ changes — post-upgrade
@@ -263,6 +263,26 @@ cove_random_password() {
     else
         head -c "$bytes" /dev/urandom | base64 | tr -d '\n'
     fi
+}
+
+# Run an upstream install script (FrankenPHP's, Mailpit's) as root, from a
+# working directory. Downloaded whole first, then run: `curl -sL … | sudo
+# bash` executes as it streams, so a dropped connection ran half a script as
+# root, and without --fail an HTTP error page was handed to bash as well.
+run_installer_script() {
+    local url="$1" workdir="${2:-.}"
+    local script
+    script=$(mktemp "${TMPDIR:-/tmp}/cove-installer-XXXXXX") || return 1
+    if ! curl -fsSL "$url" -o "$script" || [ ! -s "$script" ] \
+        || ! head -n 1 "$script" | grep -q '^#!'; then
+        echo "   - ❌ Could not download a complete install script from $url" >&2
+        rm -f "$script"
+        return 1
+    fi
+    ( cd "$workdir" && $SUDO_CMD bash "$script" )
+    local rc=$?
+    rm -f "$script"
+    return $rc
 }
 
 # Reads a directive from ~/Cove/php.ini (last-wins, ini-style), trims
@@ -388,6 +408,72 @@ port_is_free() {
         return 1
     fi
     return 0
+}
+
+# Succeeds when <host>:<port> accepts a TCP connection within 2 seconds. A
+# firewall that drops packets would otherwise leave the connect hanging.
+cove_port_answers() {
+    local host="$1" port="$2" pid killer rc
+    ( exec 3<>"/dev/tcp/$host/$port" ) 2>/dev/null &
+    pid=$!
+    ( sleep 2; kill "$pid" 2>/dev/null ) &
+    killer=$!
+    wait "$pid" 2>/dev/null; rc=$?
+    kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null
+    return $rc
+}
+
+# This machine's own IPv4 addresses, loopback left out, one per line.
+cove_local_addresses() {
+    if [ "$OS" = "macos" ]; then
+        ifconfig 2>/dev/null | awk '$1 == "inet" && $2 !~ /^127\./ {print $2}'
+    elif command -v ip >/dev/null 2>&1; then
+        ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); if (a[1] !~ /^127\./) print a[1]}'
+    else
+        hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -v '^127\.'
+    fi
+}
+
+# Succeeds for an IPv4 address the internet at large can route to: not
+# loopback, private (RFC 1918), CGNAT (Tailscale), or link-local.
+cove_is_public_ipv4() {
+    case "$1" in
+        ""|10.*|127.*|192.168.*|169.254.*) return 1 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 1 ;;
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 1 ;;
+    esac
+    return 0
+}
+
+# The first public address this machine has, if any.
+cove_public_address() {
+    local a
+    for a in $(cove_local_addresses); do
+        cove_is_public_ipv4 "$a" && { echo "$a"; return 0; }
+    done
+    return 1
+}
+
+# Said by install and enable on a machine with a public address: Cove is
+# easy to put on a VPS, and nothing about that is safe to host live sites on
+# yet. A warning, not a refusal: a dev box reached over SSH is fine.
+cove_warn_if_server() {
+    local pub
+    pub=$(cove_public_address) || return 0
+    local lines=(
+        "⚠️  This machine has a public address ($pub)."
+        "Cove is built for local development. Sites, the dashboard, the database,"
+        "and mail answer only this machine, but cove lan, cove share, and"
+        "cove tailscale open them up on purpose: don't use those here."
+        "Don't host live sites with Cove yet; a production mode is planned."
+    )
+    echo ""
+    if command -v gum >/dev/null 2>&1; then
+        gum style --border normal --border-foreground 214 --padding "0 1" "${lines[@]}"
+    else
+        printf '%s\n' "${lines[@]}"
+    fi
+    echo ""
 }
 
 # True if the process listening on $1 is one of our own services (Caddy /
@@ -573,10 +659,18 @@ deploy_whoops() {
 # --- Whoops Bootstrap Generation ---
 create_whoops_bootstrap() {
     echo "📜 Creating Whoops bootstrap file..."
-    cat > "$APP_DIR/whoops_bootstrap.php" << 'EOM'
+    cat > "$APP_DIR/whoops_bootstrap.php.tmp" << 'EOM'
 <?php
 // This script is automatically included before any other PHP script.
 // It registers a simple PSR-4 autoloader for the Whoops library.
+
+// Tells Cove's mu-plugin that this request runs under Cove's own PHP. The
+// mu-plugin's local-only behavior (taking home/siteurl from the LAN or
+// Tailscale address a request arrived on) stays off anywhere this file isn't
+// prepended — a site exported to a real host, for one.
+if (!defined('COVE_RUNTIME')) {
+    define('COVE_RUNTIME', true);
+}
 
 spl_autoload_register(function ($class) {
     $prefix = 'Whoops\\';
@@ -594,6 +688,34 @@ spl_autoload_register(function ($class) {
         require $file;
     }
 });
+
+// The pretty page shows the request's superglobals and the source around
+// every stack frame, so only the person at this machine gets it. A visitor
+// from the LAN or the tailnet arrives from their own address; a `cove share`
+// visitor arrives from loopback but through the share proxy, which marks the
+// request (and Cloudflare adds its own headers). Anyone else gets WordPress's
+// plain error page. Under WSL the Windows browser arrives from the virtual
+// adapter's private address, so private ranges count as this machine there.
+$__cove_ra = $_SERVER['REMOTE_ADDR'] ?? '';
+$__cove_local = in_array($__cove_ra, ['127.0.0.1', '::1', '::ffff:127.0.0.1'], true)
+    || ('IS_WSL_PLACEHOLDER' === 'true'
+        && preg_match('/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|fe80:|fd|fc|::ffff:(10\.|192\.168\.))/i', $__cove_ra));
+foreach (['HTTP_X_COVE_SHARE', 'HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_FORWARDED'] as $__cove_h) {
+    if (isset($_SERVER[$__cove_h])) {
+        $__cove_local = false;
+    }
+}
+unset($__cove_ra, $__cove_h);
+if (!$__cove_local) {
+    unset($__cove_local);
+    // Keep what Whoops did for these levels below: swallow them. Otherwise a
+    // site that displays errors would print warnings, file paths and all, to
+    // exactly the visitors the pretty page is kept from.
+    set_error_handler(function () { return true; },
+        E_DEPRECATED | E_USER_DEPRECATED | E_NOTICE | E_USER_NOTICE | E_WARNING | E_USER_WARNING);
+    return;
+}
+unset($__cove_local);
 
 // Whoops is a dev-time convenience (pretty error pages), not essential to
 // serving a request — so it must never be able to take a site down. A bundled
@@ -623,12 +745,33 @@ try {
     );
 
     // The PrettyPageHandler will now only be triggered for fatal errors.
-    $whoops->pushHandler(new \Whoops\Handler\PrettyPageHandler);
+    // Session cookies and credentials stay off the page: it ends up in
+    // screenshots and screen shares, and a WordPress auth cookie is a login.
+    $handler = new \Whoops\Handler\PrettyPageHandler;
+    foreach (array_keys($_COOKIE) as $__cove_k) {
+        $handler->hideSuperglobalKey('_COOKIE', $__cove_k);
+    }
+    // Passwords posted with the request (wp-login's pwd, a profile's pass1).
+    foreach (array_keys($_POST) as $__cove_k) {
+        if (preg_match('/pass|pwd|secret|token/i', (string) $__cove_k)) {
+            $handler->hideSuperglobalKey('_POST', $__cove_k);
+        }
+    }
+    foreach (['HTTP_COOKIE', 'HTTP_AUTHORIZATION', 'REDIRECT_HTTP_AUTHORIZATION', 'PHP_AUTH_PW', 'PHP_AUTH_DIGEST'] as $__cove_k) {
+        $handler->hideSuperglobalKey('_SERVER', $__cove_k);
+    }
+    unset($__cove_k);
+    $whoops->pushHandler($handler);
     $whoops->register();
 } catch (\Throwable $e) {
     error_log('Cove: Whoops failed to initialize, continuing without it: ' . $e->getMessage());
 }
 EOM
+    # Bake the WSL flag in (see the remote-address gate above), then swap the
+    # file into place whole so no request ever prepends a half-written copy.
+    sed -e "s/IS_WSL_PLACEHOLDER/${IS_WSL}/g" "$APP_DIR/whoops_bootstrap.php.tmp" > "$APP_DIR/whoops_bootstrap.php.new" \
+        && mv "$APP_DIR/whoops_bootstrap.php.new" "$APP_DIR/whoops_bootstrap.php"
+    rm -f "$APP_DIR/whoops_bootstrap.php.tmp"
 }
 
 # --- Helper Functions ---
@@ -647,51 +790,21 @@ read -r -d '' build_mu_plugin << 'heredoc'
  * Plugin Name: CaptainCore Helper
  * Plugin URI: https://captaincore.io
  * Description: Collection of helper functions for CaptainCore
- * Version: 0.7.0
+ * Version: 0.8.0
  * Author: CaptainCore
  * Author URI: https://captaincore.io
  * Text Domain: captaincore-helper
  */
 
 /**
- * Registers AJAX callback for quick logins
+ * Forget a user's one-time login token, its mint time, and its miss count.
  */
-function captaincore_quick_login_action_callback() {
-
-	$post = json_decode( file_get_contents( 'php://input' ) );
-	// Error if token not valid. Use hash_equals with a string cast: a loose
-	// `!=` let a JSON `{"token":true}` coerce to `true != <hash>` → false and
-	// bypass the check entirely, minting an admin login link unauthenticated.
-	if ( ! isset( $post->token ) || ! is_string( $post->token ) || ! hash_equals( md5( AUTH_KEY ), $post->token ) ) {
-		wp_die( '', '', [ 'response' => 404 ] );
-	}
-
-	$post->user_login = str_replace( "%20", " ", $post->user_login );
-	$user     = get_user_by( 'login', $post->user_login );
-	$password = wp_generate_password();
-	// Short token: sha1 is 40 hex chars; 7 is still 16^7 ≈ 268M combinations,
-	// plenty for a one-time-use local-dev login link, and short enough to fit
-	// a narrow terminal without wrapping.
-	$token    = substr( sha1( $password ), 0, 7 );
-
-	update_user_meta( $user->ID, 'cove_login_token', $token );
-	// Stamp the mint time so the token can expire — see the TTL check in
-	// captaincore_login_handle_token(). Without it an unused link stayed a
-	// valid standing credential forever.
-	update_user_meta( $user->ID, 'cove_login_token_time', time() );
-	$query_args = [
-			'user_id'          => $user->ID,
-			'cove_login_token' => $token,
-		];
-	$login_url    = wp_login_url();
-		$one_time_url = add_query_arg( $query_args, $login_url );
-
-	echo $one_time_url;
-	wp_die();
-
+function cove_login_token_clear( $user_id ) {
+	delete_user_meta( $user_id, 'cove_login_token' );
+	delete_user_meta( $user_id, 'cove_login_token_time' );
+	delete_user_meta( $user_id, 'cove_login_token_misses' );
 }
 
-add_action( 'wp_ajax_nopriv_captaincore_quick_login', 'captaincore_quick_login_action_callback' );
 /**
  * Login a request in as a user if the token is valid.
  */
@@ -720,17 +833,24 @@ function captaincore_login_handle_token() {
 	// Expire stale/unused tokens (15 min) so a cove login link that was never
 	// clicked can't be replayed later as a standing credential.
 	if ( '' === $token || ( time() - $token_time ) > 15 * MINUTE_IN_SECONDS ) {
-		delete_user_meta( $user->ID, 'cove_login_token' );
-		delete_user_meta( $user->ID, 'cove_login_token_time' );
+		cove_login_token_clear( $user->ID );
 		wp_die( $error );
 	}
 
+	// Five wrong guesses burn the token. It is only 7 hex characters, short
+	// enough to paste; the cap is what keeps it from being guessable by anyone
+	// who can reach the site (a LAN, Tailscale, or share visitor).
 	if ( ! hash_equals( $token, (string) $_GET['cove_login_token'] ) ) {
+		$misses = (int) get_user_meta( $user->ID, 'cove_login_token_misses', true ) + 1;
+		if ( $misses >= 5 ) {
+			cove_login_token_clear( $user->ID );
+		} else {
+			update_user_meta( $user->ID, 'cove_login_token_misses', $misses );
+		}
 		wp_die( $error );
 	}
 
-	delete_user_meta( $user->ID, 'cove_login_token' );
-	delete_user_meta( $user->ID, 'cove_login_token_time' );
+	cove_login_token_clear( $user->ID );
 	wp_set_auth_cookie( $user->ID, 1 );
 	wp_safe_redirect( admin_url() );
 	exit;
@@ -786,6 +906,8 @@ if (defined('WP_CLI') && WP_CLI) {
         // `wp user login` / `cove add` link read as already expired.
         update_user_meta( $user->ID, 'cove_login_token', $token );
         update_user_meta( $user->ID, 'cove_login_token_time', time() );
+        // A fresh link starts with a clean slate of wrong guesses.
+        delete_user_meta( $user->ID, 'cove_login_token_misses' );
         // Construct the one-time login URL
         $query_args = [
             'user_id'          => $user->ID,
@@ -820,7 +942,16 @@ function cove_maybe_override_site_url( $value ) {
     if ( defined( 'WP_CLI' ) && WP_CLI ) {
         return $value;
     }
-    
+
+    // Only under Cove's own PHP, whose prepended bootstrap defines this. A
+    // site moved to a real host by a migration plugin brings its mu-plugins
+    // along, and there this filter would take home and siteurl from whatever
+    // Host header a request sends: password-reset links and cached pages
+    // pointing wherever an attacker likes.
+    if ( ! defined( 'COVE_RUNTIME' ) ) {
+        return $value;
+    }
+
     $host = isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : '';
     
     // Skip if no host or if it ends with .localhost (normal local access)
@@ -1235,6 +1366,12 @@ update_etc_hosts() {
                 if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$host_site_name" ]; then
                     continue
                 fi
+                # A folder name is a hostname only if it looks like one; any
+                # process running as this user can create folders here.
+                if ! validate_hostname "$host_site_name"; then
+                    echo "   - ⚠️  Skipping a folder in $SITES_DIR whose name isn't a hostname: $host_site_name"
+                    continue
+                fi
                 required_hosts+=("$host_site_name")
 
                 # Check for additional mappings
@@ -1245,7 +1382,15 @@ update_etc_hosts() {
                         # loopback natively, so a "*.name" line would be inert
                         # — and would prompt for sudo on every reload.
                         if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]]; then
-                            required_hosts+=("$mapping")
+                            # Checked again on the way to a root-written
+                            # file: the mappings file sits where a site's
+                            # own PHP can rewrite it, and a line holding
+                            # spaces would alias any domain to this machine.
+                            if validate_hostname "$mapping"; then
+                                required_hosts+=("$mapping")
+                            else
+                                echo "   - ⚠️  Skipping invalid mapping in $site_path/mappings: $mapping"
+                            fi
                         fi
                     done < "$site_path/mappings"
                 fi
@@ -1332,6 +1477,16 @@ write_mariadb_config() {
 loose-character_set_collations = utf8mb3=utf8mb3_unicode_ci,utf8mb4=utf8mb4_unicode_ci
 CNF
 )
+    # Loopback only. Homebrew's MariaDB (and Fedora/RHEL's) listens on every
+    # interface, which puts any account with a '%' host — a WP-CLI test user,
+    # a hand-made app user — on the local network. Sites connect over the
+    # socket ('localhost'), so nothing of Cove's needs TCP from elsewhere.
+    # WSL is left alone: Windows-side database tools reach the VM from its
+    # virtual adapter, and under NAT the VM isn't on the LAN anyway.
+    if [ "$IS_WSL" != true ]; then
+        content+=$'\n'"# Only this machine. A later drop-in can set bind-address to open it up."
+        content+=$'\n'"bind-address = 127.0.0.1"
+    fi
 
     if [ -f "$conf_file" ] && [ "$(cat "$conf_file" 2>/dev/null)" = "$content" ]; then
         return 1
@@ -1756,11 +1911,70 @@ EOM
 # service-managed instance fails with "address already in use" and exits;
 # KeepAlive/Restart=always respawns forever (observed: 51k restarts over ~10
 # days and a 28MB log of nothing but bind errors).
+# Mailpit's web UI and API answer only with a password. Listening on loopback
+# isn't enough on its own: a page whose domain re-resolves to 127.0.0.1 (DNS
+# rebinding) reaches loopback from the browser, and Mailpit's one check,
+# Origin against Host, passes for a page on its own rebound name. Caddy adds
+# the password on every route that proxies to Mailpit, so the dashboard and
+# mail.cove.localhost never ask for it. SMTP (sendmail) is unaffected.
+mailpit_ui_password() {
+    local pw="${MAILPIT_UI_PASSWORD:-}"
+    if [ -z "$pw" ] && [ -f "$CONFIG_FILE" ]; then
+        pw=$(sed -n "s/^MAILPIT_UI_PASSWORD='\([0-9a-f]*\)'\$/\1/p" "$CONFIG_FILE" | tail -1)
+    fi
+    if [ -z "$pw" ]; then
+        pw=$(openssl rand -hex 24 2>/dev/null)
+        [ -n "$pw" ] || pw=$(head -c 24 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+        [ -n "$pw" ] || return 1
+        config_set MAILPIT_UI_PASSWORD "$pw"
+    fi
+    echo "$pw"
+}
+
+# The Authorization header Caddy sends to Mailpit (user "cove").
+mailpit_ui_auth_header() {
+    local pw
+    pw=$(mailpit_ui_password) || return 1
+    printf 'Basic %s' "$(printf 'cove:%s' "$pw" | base64 | tr -d '\n')"
+}
+
+# Mailpit's --ui-auth-file, an htpasswd file. Prints its path, or returns 1
+# when it can't be made, in which case Mailpit runs without it, as before.
+# Hashed with openssl where there is one, else with FrankenPHP's own PHP
+# (bcrypt): minimal Fedora images ship no openssl. The password travels in
+# stdin or the environment, never on a command line.
+write_mailpit_ui_auth_file() {
+    local file="$COVE_DIR/mailpit-ui.htpasswd" pw hash=""
+    pw=$(mailpit_ui_password) || return 1
+    if command -v openssl >/dev/null 2>&1; then
+        hash=$(printf '%s' "$pw" | openssl passwd -apr1 -stdin 2>/dev/null)
+    fi
+    if [ -z "$hash" ] && command -v frankenphp >/dev/null 2>&1; then
+        local php_file
+        php_file=$(mktemp "${TMPDIR:-/tmp}/cove-hash-XXXXXX") || return 1
+        printf '%s' '<?php echo password_hash((string) getenv("COVE_MAILPIT_PW"), PASSWORD_BCRYPT);' > "$php_file"
+        hash=$(COVE_MAILPIT_PW="$pw" frankenphp php-cli "$php_file" 2>/dev/null)
+        rm -f "$php_file"
+    fi
+    case "$hash" in '$apr1$'*|'$2y$'*|'$2a$'*|'$2b$'*) ;; *) return 1 ;; esac
+    mkdir -p "$COVE_DIR"
+    ( umask 077; printf 'cove:%s\n' "$hash" > "$file.tmp" ) && mv -f "$file.tmp" "$file" || return 1
+    echo "$file"
+}
+
 write_mailpit_run_script() {
     local script_path="$COVE_DIR/mailpit-run.sh"
     local mailpit_bin
     mailpit_bin=$(command -v mailpit)
     mkdir -p "$COVE_DIR" "$LOGS_DIR"
+    # The web UI's password file (see mailpit_ui_password). stdout is the
+    # script path for the caller, so the warning goes to stderr.
+    local ui_auth_args="" ui_auth_file
+    if ui_auth_file=$(write_mailpit_ui_auth_file); then
+        ui_auth_args=" --ui-auth-file \"$ui_auth_file\""
+    else
+        echo "   - ⚠️  Could not create Mailpit's password file (no openssl, and FrankenPHP's PHP failed); its web UI stays open to this machine's browser." >&2
+    fi
     cat > "$script_path" << EOM
 #!/bin/bash
 # Auto-generated by install_mailpit_service. See write_mailpit_run_script() in main.
@@ -1804,9 +2018,21 @@ if [ ! -x "\$mailpit_bin" ]; then
     exit 127
 fi
 
+# The database holds every caught message, password resets included: this
+# user only, for new files and the ones already there.
+umask 077
+chmod 600 "\$db_path" "\$db_path-wal" "\$db_path-shm" 2>/dev/null
+
 # --max 0 lifts Mailpit's default cap of 500 stored messages; local mail is
 # small and the point of catching it is to still have it later.
-exec "\$mailpit_bin" --database "\$db_path" --label Cove --max 0
+# Loopback only. Mailpit's defaults are [::]:8025 and [::]:1025, which put
+# every caught message (password resets included) one request away from
+# anyone on the same Wi-Fi. Everything Cove routes to Mailpit (the mail and
+# dashboard vhosts, the Tailscale mail port, sendmail_path) arrives over
+# 127.0.0.1 already. --ui-auth-file puts a password on the web UI and API,
+# which Caddy supplies on those routes (see mailpit_ui_password in main).
+exec "\$mailpit_bin" --database "\$db_path" --label Cove --max 0 \\
+    --listen 127.0.0.1:8025 --smtp 127.0.0.1:1025${ui_auth_args}
 EOM
     chmod +x "$script_path"
     echo "$script_path"
@@ -1949,7 +2175,7 @@ catch_workers_output = yes
 ; Mirror of the frankenphp{} php_ini block. The ZTS OPcache sizing there is
 ; deliberately NOT replicated: this is NTS php-fpm with a per-pool cache, so
 ; PHP's stock OPcache defaults are correct here.
-php_admin_value[sendmail_path] = $mailpit_path sendmail -t
+php_admin_value[sendmail_path] = $mailpit_path sendmail -t -S 127.0.0.1:1025
 php_admin_flag[log_errors] = on
 php_admin_flag[display_errors] = off
 php_admin_value[error_log] = $LOGS_DIR/errors.log
@@ -2117,12 +2343,21 @@ validate_proxy_target() {
 
 # Write the Cove-themed Adminer entry point (index.php with the head() hook
 # that injects the theme toggle, plus autologin) and refresh the theme
-# assets (adminer.css, adminer.js) from GitHub. Shared by cove_install
+# assets (adminer.css, adminer.js, embedded by compile.sh). Shared by cove_install
 # (initial deploy) and cove_upgrade (so upgraders pick up theme changes
 # without a reinstall). Idempotent — overwrites existing files.
 deploy_adminer_theme() {
     local adminer_dir="${1:-$ADMINER_DIR}"
     mkdir -p "$adminer_dir"
+
+    # Adminer's permanent-login key, one per install (see permanentLogin in
+    # the entry point below). Made once and kept.
+    if [ -n "$CONFIG_FILE" ] && ! grep -q '^ADMINER_KEY=' "$CONFIG_FILE" 2>/dev/null; then
+        local adminer_key
+        adminer_key=$(openssl rand -hex 32 2>/dev/null)
+        [ -n "$adminer_key" ] || adminer_key=$(head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+        [ -n "$adminer_key" ] && config_set ADMINER_KEY "$adminer_key"
+    fi
 
     echo "⚙️ Writing Adminer entry point..."
     cat > "$adminer_dir/index.php" << 'ADMINER_INDEX_EOF'
@@ -2132,7 +2367,15 @@ function adminer_object() {
     // Adminer 5.x uses the Adminer namespace
     class AdminerCoveLogin extends Adminer\Adminer {
         function name() { return 'Cove DB Manager'; }
-        function permanentLogin($i = false) { return "cove-local-development-key"; }
+        // This install's own key (ADMINER_KEY in ~/Cove/config). It encrypts
+        // the password Adminer keeps in its permanent-login cookie, and it used
+        // to be one fixed string shared by every Cove install. With none,
+        // Adminer simply skips the permanent cookie.
+        function permanentLogin($i = false) {
+            $configFile = getenv('HOME') . '/Cove/config';
+            $config = file_exists($configFile) ? @parse_ini_file($configFile) : [];
+            return (string) ($config['ADMINER_KEY'] ?? '');
+        }
         function credentials() {
             $configFile = getenv('HOME') . '/Cove/config';
             if (file_exists($configFile)) {
@@ -2186,9 +2429,10 @@ function adminer_object() {
 include "./adminer-core.php";
 ADMINER_INDEX_EOF
 
-    echo "🎨 Downloading Cove Adminer theme..."
-    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.css" -o "$adminer_dir/adminer.css"
-    curl -sL "https://raw.githubusercontent.com/anchorhost/cove/main/adminer-theme/adminer.js"  -o "$adminer_dir/adminer.js"
+    # Embedded by compile.sh from adminer-theme/ (see emit_adminer_theme_css).
+    echo "🎨 Writing Cove Adminer theme..."
+    emit_adminer_theme_css > "$adminer_dir/adminer.css"
+    emit_adminer_theme_js > "$adminer_dir/adminer.js"
 }
 
 # Repair ownership of ~/Cove state that a pre-1.10 root-run FrankenPHP may
@@ -2371,6 +2615,44 @@ emit_site_php_handler() {
     fi
 }
 
+# Files no site should hand to a browser: WordPress's debug.log (WP_DEBUG_LOG
+# writes it inside the web root) and other logs (cPanel's error_log), database
+# dumps and backup-plugin archives, editor leftovers (wp-config.php.bak,
+# .swp, ~), and every dotfile or dot-folder (.git, .env, .htpasswd) except
+# /.well-known/. Apache keeps most of these private through .htaccess; Caddy
+# ignores .htaccess, so without this they download to anyone who can reach
+# the site — a `cove share` visitor included. A `handle` block, not a bare
+# `respond`: php_server is ordered ahead of respond.
+emit_site_deny_rules() {
+    cat >> "$CADDYFILE_PATH" <<'EOM'
+    @cove_private {
+        path *.log */error_log *.sql *.sql.* *-db.gz *.wpress *.bak *.orig *.swp *~ */.*
+        not path /.well-known/*
+    }
+    handle @cove_private {
+        respond 404
+    }
+EOM
+}
+
+# A site's own hostname block answers this machine only — the same rule the
+# dashboard has (pass the generator's $local_only matcher). Caddy listens on
+# every interface, so before this anyone on the same Wi-Fi could reach any
+# site by sending its hostname: the login form, the lost-password flow, and
+# everything else. `cove lan`, `cove tailscale`, and `cove share` open a site
+# up deliberately through their own blocks. A guard rather than a loopback
+# bind because macOS lets a normal user bind ports below 1024 only on the
+# wildcard address.
+emit_site_local_guard() {
+    local matcher="$1"
+    cat >> "$CADDYFILE_PATH" <<EOM
+    @cove_remote not $matcher
+    handle @cove_remote {
+        respond "This site answers only on the machine running Cove. To open it to other devices, use cove lan, cove tailscale, or cove share." 403
+    }
+EOM
+}
+
 # Read a site's multisite marker: "subdirectory", "subdomain", or "" when the
 # site is not a network. Written by `cove add --multisite`.
 site_multisite_mode() {
@@ -2441,6 +2723,16 @@ regenerate_caddyfile() {
     # (mirrored networking arrives as loopback, which is always allowed).
     local local_only='remote_ip 127.0.0.1 ::1'
     [ "$IS_WSL" = true ] && local_only='remote_ip private_ranges'
+
+    # The dashboard's own origin, for the Mail route below.
+    local dashboard_origin="https://cove.localhost$(https_port_suffix)"
+
+    # Mailpit's web UI password, sent by every route below that proxies to
+    # it (see mailpit_ui_password). Empty only if no password could be made.
+    local mailpit_auth mailpit_auth_up=""
+    if mailpit_auth=$(mailpit_ui_auth_header); then
+        mailpit_auth_up="header_up Authorization \"$mailpit_auth\""
+    fi
     cat > "$CADDYFILE_PATH" <<- EOM
 {
 ${port_directives}    frankenphp {
@@ -2451,7 +2743,7 @@ ${port_directives}    frankenphp {
         # RAM so a 16 GB box does not get 32 ZTS workers compiling into
         # one OPcache arena.
         num_threads $(cove_ini_get num_threads "$(cove_num_threads)")
-        php_ini sendmail_path "$mailpit_path sendmail -t"
+        php_ini sendmail_path "$mailpit_path sendmail -t -S 127.0.0.1:1025"
         php_ini log_errors On
         php_ini display_errors Off
         php_ini error_log "$LOGS_DIR/errors.log"
@@ -2510,7 +2802,9 @@ mail.cove.localhost {
     handle @outside {
         respond "This answers only on the machine running Cove." 403
     }
-    reverse_proxy 127.0.0.1:8025
+    reverse_proxy 127.0.0.1:8025 {
+        $mailpit_auth_up
+    }
     tls internal
 }
 
@@ -2538,11 +2832,20 @@ cove.localhost {
     # /mail-api/events rides the same route). Mailpit answers 403 to any
     # request whose Origin header is not its own host — even a GET or the
     # websocket upgrade — so the browser's Origin is dropped on the way in.
+    # Dropping it also drops Mailpit's guard against cross-site websockets
+    # (CORS doesn't cover them), so do that check here first: no Origin
+    # (curl, the CLI) or the dashboard's own, nothing else.
     handle_path /mail-api/* {
+        @foreign_origin {
+            header Origin *
+            not header Origin $dashboard_origin
+        }
+        respond @foreign_origin 403
         rewrite * /api{uri}
         reverse_proxy 127.0.0.1:8025 {
             header_up -Origin
             header_up Host {upstream_hostport}
+            $mailpit_auth_up
         }
     }
     php_server
@@ -2551,6 +2854,8 @@ cove.localhost {
 
 # --- Cove Managed Sites ---
 EOM
+    # It carries Mailpit's password now: this user only.
+    chmod 600 "$CADDYFILE_PATH" 2>/dev/null
 
     # Check if Tailscale is enabled
     local tailscale_hostname=""
@@ -2598,6 +2903,8 @@ EOM
                 echo "$site_domains {" >> "$CADDYFILE_PATH"
                 
                 echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
+                emit_site_deny_rules
+                emit_site_local_guard "$local_only"
                 echo "    tls internal" >> "$CADDYFILE_PATH"
                 
                 echo "    log {" >> "$CADDYFILE_PATH"
@@ -2637,6 +2944,7 @@ EOM
                         echo "https://${lan_ip}:${lan_port} {" >> "$CADDYFILE_PATH"
                         echo "    bind 0.0.0.0" >> "$CADDYFILE_PATH"
                         echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
+                        emit_site_deny_rules
                         echo "    tls internal" >> "$CADDYFILE_PATH"
                         
                         echo "    log {" >> "$CADDYFILE_PATH"
@@ -2697,6 +3005,10 @@ EOM
                 if [ -n "$proxy_domain" ] && [ -n "$proxy_target" ]; then
                     echo "# Proxy: $proxy_name" >> "$CADDYFILE_PATH"
                     echo "$proxy_domain {" >> "$CADDYFILE_PATH"
+                    # Same rule as a site: this machine only. A dev server
+                    # behind `cove proxy` was reachable by anyone on the
+                    # network who sent its hostname.
+                    emit_site_local_guard "$local_only"
                     echo "    reverse_proxy $proxy_target" >> "$CADDYFILE_PATH"
                     if [ "$proxy_tls" = "internal" ]; then
                         echo "    tls internal" >> "$CADDYFILE_PATH"
@@ -2739,14 +3051,23 @@ EOM
                     
                     echo "# Tailscale: ${site_base_name} -> port ${ts_port}" >> "$CADDYFILE_PATH"
                     echo "https://${tailscale_hostname}:${ts_port} {" >> "$CADDYFILE_PATH"
+                    # Only tailnet peers get an answer; before this guard the
+                    # port answered the whole LAN too. (Not a bind to the
+                    # Tailscale IP: that would stop the whole server from
+                    # starting on a boot where tailscaled isn't up yet.)
+                    echo "    @cove_ts_outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
+                    echo "    handle @cove_ts_outside {" >> "$CADDYFILE_PATH"
+                    echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
+                    echo "    }" >> "$CADDYFILE_PATH"
                     echo "    tls internal" >> "$CADDYFILE_PATH"
-                    
+
                     if [ -n "$direct_proxy_target" ]; then
                         # Proxy directly to the backend target
                         echo "    reverse_proxy ${direct_proxy_target}" >> "$CADDYFILE_PATH"
                     else
                         # Serve site directly (not via proxy) for better compatibility
                         echo "    root * \"$site_path/public\"" >> "$CADDYFILE_PATH"
+                        emit_site_deny_rules
 
                         echo "    log {" >> "$CADDYFILE_PATH"
                         echo "        output file \"$site_path/logs/caddy-tailscale.log\"" >> "$CADDYFILE_PATH"
@@ -2785,35 +3106,44 @@ EOM
         echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
         echo "    }" >> "$CADDYFILE_PATH"
         echo "    tls internal" >> "$CADDYFILE_PATH"
-        echo "    reverse_proxy 127.0.0.1:8025" >> "$CADDYFILE_PATH"
+        echo "    reverse_proxy 127.0.0.1:8025 {" >> "$CADDYFILE_PATH"
+        echo "        $mailpit_auth_up" >> "$CADDYFILE_PATH"
+        echo "    }" >> "$CADDYFILE_PATH"
         echo "}" >> "$CADDYFILE_PATH"
         echo "" >> "$CADDYFILE_PATH"
         
-        # DB on port 9902 - serve directly
-        echo "# Tailscale: db -> port 9902" >> "$CADDYFILE_PATH"
-        echo "https://${tailscale_hostname}:9902 {" >> "$CADDYFILE_PATH"
-        echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
-        echo "    handle @outside {" >> "$CADDYFILE_PATH"
-        echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
-        echo "    }" >> "$CADDYFILE_PATH"
-        echo "    tls internal" >> "$CADDYFILE_PATH"
-        echo "    root * \"$ADMINER_DIR\"" >> "$CADDYFILE_PATH"
-        echo "    php_server" >> "$CADDYFILE_PATH"
-        echo "}" >> "$CADDYFILE_PATH"
-        echo "" >> "$CADDYFILE_PATH"
+        # Adminer (9902) and the dashboard (9900) only when asked for with
+        # `cove tailscale enable --dashboard`. Both are this machine's
+        # control panel: the dashboard runs shell commands and WP-CLI, and
+        # Adminer signs itself in with full database privileges. The tailnet
+        # can include devices shared in from other accounts.
+        if [ -f "$APP_DIR/tailscale-dashboard" ]; then
+            # DB on port 9902 - serve directly
+            echo "# Tailscale: db -> port 9902" >> "$CADDYFILE_PATH"
+            echo "https://${tailscale_hostname}:9902 {" >> "$CADDYFILE_PATH"
+            echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
+            echo "    handle @outside {" >> "$CADDYFILE_PATH"
+            echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
+            echo "    }" >> "$CADDYFILE_PATH"
+            echo "    tls internal" >> "$CADDYFILE_PATH"
+            echo "    root * \"$ADMINER_DIR\"" >> "$CADDYFILE_PATH"
+            echo "    php_server" >> "$CADDYFILE_PATH"
+            echo "}" >> "$CADDYFILE_PATH"
+            echo "" >> "$CADDYFILE_PATH"
         
-        # Dashboard on port 9900 - serve directly
-        echo "# Tailscale: cove dashboard -> port 9900" >> "$CADDYFILE_PATH"
-        echo "https://${tailscale_hostname}:9900 {" >> "$CADDYFILE_PATH"
-        echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
-        echo "    handle @outside {" >> "$CADDYFILE_PATH"
-        echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
-        echo "    }" >> "$CADDYFILE_PATH"
-        echo "    tls internal" >> "$CADDYFILE_PATH"
-        echo "    root * \"$GUI_DIR\"" >> "$CADDYFILE_PATH"
-        echo "    php_server" >> "$CADDYFILE_PATH"
-        echo "}" >> "$CADDYFILE_PATH"
-        echo "" >> "$CADDYFILE_PATH"
+            # Dashboard on port 9900 - serve directly
+            echo "# Tailscale: cove dashboard -> port 9900" >> "$CADDYFILE_PATH"
+            echo "https://${tailscale_hostname}:9900 {" >> "$CADDYFILE_PATH"
+            echo "    @outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.1 ::1" >> "$CADDYFILE_PATH"
+            echo "    handle @outside {" >> "$CADDYFILE_PATH"
+            echo "        respond \"This answers only on the tailnet.\" 403" >> "$CADDYFILE_PATH"
+            echo "    }" >> "$CADDYFILE_PATH"
+            echo "    tls internal" >> "$CADDYFILE_PATH"
+            echo "    root * \"$GUI_DIR\"" >> "$CADDYFILE_PATH"
+            echo "    php_server" >> "$CADDYFILE_PATH"
+            echo "}" >> "$CADDYFILE_PATH"
+            echo "" >> "$CADDYFILE_PATH"
+        fi
     fi
 
     # If Caddy is already running, reload against the new config. If it isn't,
@@ -2851,6 +3181,10 @@ EOM
             echo "⚠️  Caddy reload rejected by the running process — restarting with the on-disk binary..."
             echo "   (see $LOGS_DIR/caddy-reload.log)"
             start_caddy_service
+            # Give it the same 15 s post-upgrade does: the service manager
+            # needs a moment to bring it up, and checking straight away
+            # reported a restart that worked as a failure.
+            for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
             if ! is_caddy_running; then
                 gum style --foreground red "❌ Caddy failed to restart. See $LOGS_DIR/caddy-process.log for details."
                 return 1
@@ -7927,6 +8261,24 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
             },
 
+            // A URL that came from data (a request's Referer, a site's own
+            // options) may only become a link if it is http(s). escapeHtml
+            // keeps it inside the attribute but does nothing about the scheme,
+            // and a javascript: link clicked here runs as the dashboard, which
+            // can run shell commands. Returns '' for anything else.
+            safeUrl(u) {
+                const s = String(u == null ? '' : u).trim();
+                return /^https?:\/\//i.test(s) ? s : '';
+            },
+
+            // window.open for a URL that came from data (a login link built
+            // from a site's own siteurl, a subsite address): http(s) only.
+            openUrl(u, features) {
+                const safe = this.safeUrl(u);
+                if (!safe) { this.showSnack('Not opening that link: it is not a web address.', true); return null; }
+                return features ? window.open(safe, '_blank', features) : window.open(safe, '_blank');
+            },
+
             // Wrap every case-insensitive occurrence of `query` in <mark> while
             // escaping every other substring. Safe for innerHTML use because the
             // inner text comes from the trusted domain, not from query (query
@@ -9176,8 +9528,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (wp) {
                     const stat = (k, v, title) => '<div class="db-ov-stat"' + (title ? ' title="' + esc(title) + '"' : '') + '><span class="k">' + k + '</span><span class="v">' + v + '</span></div>';
                     html += '<div class="db-ov-grid">'
-                        + stat('site url', wp.siteurl ? '<a href="' + esc(wp.siteurl) + '" target="_blank" rel="noopener">' + esc(wp.siteurl.replace(/^https?:\/\//, '')) + '</a>' : '—', wp.siteurl)
-                        + stat('home', wp.home ? '<a href="' + esc(wp.home) + '" target="_blank" rel="noopener">' + esc(wp.home.replace(/^https?:\/\//, '')) + '</a>' : '—', wp.home)
+                        + stat('site url', this.safeUrl(wp.siteurl) ? '<a href="' + esc(wp.siteurl) + '" target="_blank" rel="noopener">' + esc(wp.siteurl.replace(/^https?:\/\//, '')) + '</a>' : (wp.siteurl ? esc(wp.siteurl) : '—'), wp.siteurl)
+                        + stat('home', this.safeUrl(wp.home) ? '<a href="' + esc(wp.home) + '" target="_blank" rel="noopener">' + esc(wp.home.replace(/^https?:\/\//, '')) + '</a>' : (wp.home ? esc(wp.home) : '—'), wp.home)
                         + stat('prefix', esc(wp.prefix))
                         + stat('theme', esc(wp.stylesheet || wp.template || '—'))
                         + stat('posts · users · comments', esc(this.formatCount(wp.posts)) + ' · ' + esc(this.formatCount(wp.users)) + ' · ' + esc(this.formatCount(wp.comments)))
@@ -10137,7 +10489,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         + '<dt>response</dt><dd>' + esc(this.formatSize(r.bytes || 0)) + (r.proto ? ' · ' + esc(r.proto) : '') + '</dd>'
                         + '<dt>client</dt><dd>' + esc(r.ip || '—') + '</dd>'
                         + '<dt>user agent</dt><dd>' + esc(r.ua || '—') + '</dd>'
-                        + '<dt>referer</dt><dd>' + (r.ref ? '<a href="' + esc(r.ref) + '" target="_blank" rel="noopener">' + esc(r.ref) + '</a>' : '—') + '</dd>'
+                        + '<dt>referer</dt><dd>' + (this.safeUrl(r.ref) ? '<a href="' + esc(r.ref) + '" target="_blank" rel="noopener">' + esc(r.ref) + '</a>' : (r.ref ? esc(r.ref) : '—')) + '</dd>'
                         + '</dl>';
                     note.innerHTML = '<button type="button" class="tr-back" data-act="path" data-path="' + esc(r.uri.split('?')[0]) + '">recent hits of this path ›</button>';
                     return;
@@ -10451,12 +10803,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (s.status !== 'public') { const c = document.createElement('span'); c.className = 'net-main-chip net-status'; c.textContent = s.status; name.appendChild(c); }
                     const url = row.querySelector('.net-url');
                     url.textContent = s.url.replace(/^https?:\/\//, '');
-                    url.href = s.url;
+                    // A subsite's URL comes from its own options: link it only if http(s).
+                    const safe = this.safeUrl(s.url);
+                    if (safe) url.href = safe; else url.removeAttribute('href');
                     const upd = row.querySelector('.net-updated');
                     const ts = s.updated ? Date.parse(s.updated.replace(' ', 'T') + 'Z') / 1000 : 0;
                     upd.textContent = ts ? this.formatRelative(ts) : '';
                     upd.title = ts ? 'Last updated ' + new Date(ts * 1000).toLocaleString() : 'Never updated';
-                    row.querySelector('.net-open').href = s.url;
+                    if (safe) row.querySelector('.net-open').href = safe; else row.querySelector('.net-open').removeAttribute('href');
                     const btn = row.querySelector('.net-login');
                     btn.disabled = !!p.busy;
                     btn.textContent = p.busy === s.url ? 'opening…' : 'log in';
@@ -10492,7 +10846,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderSiteNetwork();
                 const res = await this.apiPost('get_login_link', { site_name: name, url });
                 if (res.success && res.url) {
-                    window.open(res.url, '_blank');
+                    this.openUrl(res.url);
                     this.showSnack('Login link opened in a new tab.');
                 }
                 p.busy = null;
@@ -10530,7 +10884,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     if (e.target.closest('a')) return;
                     // The row itself opens the subsite, like the ↗ on a sites row.
                     if (window.getSelection && window.getSelection().toString()) return;
-                    window.open(row.dataset.url, '_blank', 'noopener');
+                    this.openUrl(row.dataset.url, 'noopener');
                 });
                 const withSite = (fn) => () => { const s = this.pageSite; if (s) fn(s); };
                 $id('spDomains').addEventListener('click', withSite(s => this.openDomainsModal(s)));
@@ -11073,7 +11427,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderSiteTab();
                 const res = await this.apiPost('get_login_link', url ? { site_name: site.name, user: login, url } : { site_name: site.name, user: login });
                 delete t.busy[login];
-                if (res.success && res.url) { window.open(res.url, '_blank'); this.showSnack('Login link for ' + login + ' opened in a new tab.'); }
+                if (res.success && res.url) { this.openUrl(res.url); this.showSnack('Login link for ' + login + ' opened in a new tab.'); }
                 if (this.sitePage.name === site.name) this.renderSiteTab();
             },
 
@@ -13326,7 +13680,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderAlerts();
                 const res = await this.apiPost('get_login_link', { site_name: alert.name });
                 if (res.success && res.url) {
-                    window.open(res.url, '_blank');
+                    this.openUrl(res.url);
                     // Acted on — banner's job is done. The new tab has the
                     // one-time URL; dashboard can drop the prompt.
                     this.dismissAlert(alert.id);
@@ -13490,7 +13844,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderSitePage();
                 const res = await this.apiPost('get_login_link', { site_name: name });
                 if (res.success && res.url) {
-                    window.open(res.url, '_blank');
+                    this.openUrl(res.url);
                     this.showSnack('Login link opened in a new tab.');
                 }
                 site.isLoggingIn = false;
@@ -13865,16 +14219,20 @@ display_command_help() {
             echo "your local development sites via their Tailscale hostname."
             echo ""
             echo "Subcommands:"
-            echo "  enable [hostname]    Enable Tailscale access (auto-detects if omitted)"
+            echo "  enable [hostname] [--dashboard]"
+            echo "                       Enable Tailscale access (auto-detects the hostname if omitted)."
+            echo "                       --dashboard also shares the Cove dashboard (9900) and Adminer"
+            echo "                       (9902), which can run commands on this machine."
             echo "  disable              Disable Tailscale access"
-            echo "  status               Show current Tailscale configuration"
+            echo "  status               Show current Tailscale configuration and URLs"
             echo ""
-            echo "After enabling, your sites will be accessible at:"
-            echo "  https://<site>.<your-tailscale-hostname>"
+            echo "After enabling, each site answers on its own port (from 9001), and mail on 9901:"
+            echo "  https://<your-tailscale-hostname>:<port>"
             echo ""
             echo "Examples:"
             echo "  cove tailscale enable"
             echo "  cove tailscale enable mycomputer.tail1234.ts.net"
+            echo "  cove tailscale enable --dashboard"
             echo "  cove tailscale status"
             ;;
         menubar)
@@ -14349,6 +14707,10 @@ main() {
             deploy_whoops
             create_whoops_bootstrap
             refresh_all_mu_plugins
+            # The Adminer entry point and theme. The upgrade itself also calls
+            # this, but from the old script still in memory, which writes the
+            # old entry point (and, in earlier versions, fetched the theme from GitHub).
+            deploy_adminer_theme
             install_watchdog_service
             # Pin portable collation defaults (MariaDB 11.5+ uca1400 trap).
             # Only restarts MariaDB the first time the drop-in lands.
@@ -14359,6 +14721,11 @@ main() {
             # Orphan-clearing mailpit runner + throttled KeepAlive. Safe to
             # re-run: rewrites the unit and restarts mailpit once.
             install_mailpit_service
+            # Earlier versions left ~/Cove, its backups, and its snapshots
+            # readable by every account on the machine: wp-config.php files
+            # (with the password to every database), dumps, caught mail.
+            # Closing the folders covers everything already in them.
+            chmod 700 "$COVE_DIR" "$COVE_DIR/Backups" "$COVE_DIR/Snapshots" 2>/dev/null || true
             # The FrankenPHP plist is otherwise only written when the service
             # starts, and launchd keeps the copy it loaded. Rewrite it, and if
             # it changed (PATH for Ghostscript) restart once, waiting for the
@@ -14689,7 +15056,7 @@ cove_add() {
             fi
         fi
         echo "🗄️ Creating database: $db_name"
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\`;"
         echo "Installing WordPress..."
         admin_pass=$(cove_random_password 12)
         
@@ -14731,12 +15098,31 @@ cove_add() {
             # is a local site: core's automatic updates back off, WooCommerce
             # and other plugins that gate live-only behaviour (payment
             # gateways, tracking, license pings) treat it as a sandbox.
-            $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --extra-php <<PHP
+            #
+            # The database password goes in afterwards, through the
+            # environment: on a command line `ps` shows it to every account on
+            # the machine, and it opens every Cove database. (WP-CLI's
+            # --prompt is no help: it echoes the command back, password and all.)
+            # --skip-check because a placeholder can't pass the connection test;
+            # the database was just created with these credentials, and core
+            # install below fails loudly if they don't work.
+            $wp_cmd config create --dbname="$db_name" --dbuser="$DB_USER" --dbpass="__COVE_DB_PASSWORD__" --skip-check --extra-php <<PHP
 define( 'WP_ENVIRONMENT_TYPE', 'local' );
 define( 'WP_DEBUG', true );
 define( 'WP_DEBUG_LOG', true );
 define( 'WP_DEBUG_DISPLAY', false );
 PHP
+            COVE_DB_PASSWORD="$DB_PASSWORD" $wp_cmd eval --skip-wordpress '
+                $f = getcwd() . "/wp-config.php";
+                $c = file_get_contents( $f );
+                $n = 0;
+                $c = str_replace( "\x27__COVE_DB_PASSWORD__\x27", var_export( (string) getenv( "COVE_DB_PASSWORD" ), true ), $c, $n );
+                if ( 1 !== $n || false === file_put_contents( $f, $c ) ) { exit( 1 ); }
+            '
+            if [ $? -ne 0 ] || grep -q '__COVE_DB_PASSWORD__' wp-config.php 2>/dev/null; then
+                echo "❌ Error: Could not write the database password into wp-config.php."
+                exit 1
+            fi
 
             # 3. Install WordPress — a network when --multisite was given.
             # multisite-install also writes the MULTISITE / SUBDOMAIN_INSTALL /
@@ -14766,7 +15152,7 @@ PHP
             gum style --foreground red "❌ WordPress installation failed. Please review the errors above."
             # Clean up the failed site directory and database
             echo "   - Cleaning up failed installation..."
-            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
             rm -rf "$site_dir"
             exit 1
         fi
@@ -14855,7 +15241,7 @@ cove_backup() {
     fi
 
     local backups_dir="$COVE_DIR/Backups"
-    [ -z "$out" ] && { mkdir -p "$backups_dir"; out="$backups_dir/$site_name-$(date +%Y%m%d-%H%M%S).zip"; }
+    [ -z "$out" ] && { mkdir -p "$backups_dir"; chmod 700 "$backups_dir" 2>/dev/null; out="$backups_dir/$site_name-$(date +%Y%m%d-%H%M%S).zip"; }
     case "$out" in
         *.zip) ;;
         *) out="$out.zip" ;;
@@ -14869,7 +15255,7 @@ cove_backup() {
     local tmp="$out.tmp"
     rm -f "$tmp"
     if command -v zip >/dev/null 2>&1; then
-        ( cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; [ "$keep" = true ] || rm -rf "$src"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
+        ( umask 077; cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; [ "$keep" = true ] || rm -rf "$src"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
     else
         gum style --foreground red "❌ Error: 'zip' is not installed." "Use cove snapshot $site_name export $id for a tar.gz instead."
         [ "$keep" = true ] || rm -rf "$src"
@@ -15013,17 +15399,17 @@ cove_clone() {
         trap 'rm -f "$temp_sql"' EXIT
 
         echo "   - Dumping database '$source_db'..."
-        if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$source_db" > "$temp_sql" 2>/dev/null; then
+        if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$source_db" > "$temp_sql" 2>/dev/null; then
             gum style --foreground red "❌ Error: Failed to dump the source database '$source_db'."
             rm -rf "$new_dir"
             exit 1
         fi
 
         echo "   - Creating database '$new_db'..."
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db\`;"
-        if ! mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db" < "$temp_sql" 2>/dev/null; then
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$new_db\`;"
+        if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" "$new_db" < "$temp_sql" 2>/dev/null; then
             gum style --foreground red "❌ Error: Failed to import into '$new_db'."
-            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
             rm -rf "$new_dir"
             exit 1
         fi
@@ -15031,7 +15417,7 @@ cove_clone() {
         echo "   - Pointing wp-config.php at '$new_db'..."
         if ! (cd "$new_dir/public" && $wp_cmd config set DB_NAME "$new_db" --quiet </dev/null); then
             gum style --foreground red "❌ Error: Failed to update wp-config.php."
-            mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$new_db\`;"
             rm -rf "$new_dir"
             exit 1
         fi
@@ -15457,7 +15843,7 @@ cove_db_backup() {
                 echo "   Saving backup to: $(basename "$site_path")/private/$(basename "$backup_file")"
 
                 # Execute the dump command
-                if ! "${dump_command}" -u"${db_user}" -p"${db_pass}" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "${db_name}" > "${backup_file}"; then
+                if ! MYSQL_PWD="${db_pass}" "${dump_command}" -u"${db_user}" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "${db_name}" > "${backup_file}"; then
                     echo "   ❌ Error: Database dump failed for '${db_name}'."
                     rm -f "${backup_file}" # Clean up failed backup file
                     return 1
@@ -15700,7 +16086,7 @@ cove_db_fix_collation() {
         # collation_character_set_applicability under a charset-free name,
         # so a join on collation_name finds nothing.
         local rows
-        rows=$(mysql -u"$db_user" -p"$db_pass" -N -B -e "
+        rows=$(MYSQL_PWD="$db_pass" mysql -u"$db_user" -N -B -e "
             SELECT table_name, SUBSTRING_INDEX(table_collation, '_', 1)
               FROM information_schema.tables
              WHERE table_schema = '${db_name//\'/\'\'}'
@@ -15738,7 +16124,7 @@ cove_db_fix_collation() {
         fi
 
         echo "   Converting $count table(s) to *_unicode_ci..."
-        if ! printf '%s' "$sql" | mysql -u"$db_user" -p"$db_pass" "$db_name"; then
+        if ! printf '%s' "$sql" | MYSQL_PWD="$db_pass" mysql -u"$db_user" "$db_name"; then
             echo "   ❌ One or more ALTER TABLE statements failed for '$db_name'."
             overall_success=false
             continue
@@ -15748,7 +16134,7 @@ cove_db_fix_collation() {
         # explicitly-collated column in a table whose default was already
         # something else. Rare, but worth pointing at rather than hiding.
         local leftovers
-        leftovers=$(mysql -u"$db_user" -p"$db_pass" -N -B -e "
+        leftovers=$(MYSQL_PWD="$db_pass" mysql -u"$db_user" -N -B -e "
             SELECT CONCAT(table_name, '.', column_name, ' (', collation_name, ')')
               FROM information_schema.columns
              WHERE table_schema = '${db_name//\'/\'\'}'
@@ -15820,7 +16206,11 @@ cove_delete() {
     local hosts_to_remove=("$site_name.localhost")
     if [ -f "$site_dir/mappings" ]; then
         while IFS= read -r mapping || [ -n "$mapping" ]; do
-            if [ -n "$mapping" ]; then
+            # Re-validated here, not just when `cove mappings add` wrote it:
+            # each name is spliced into a `sudo sed` expression below, and the
+            # file sits where any of the site's own PHP can rewrite it. GNU
+            # sed's `e` command runs a shell. Wildcards never get a hosts line.
+            if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]] && validate_hostname "$mapping"; then
                 hosts_to_remove+=("$mapping")
             fi
         done < "$site_dir/mappings"
@@ -15840,7 +16230,7 @@ cove_delete() {
             db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
         fi
         echo "🗄️ Deleting database: $db_name"
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
     fi
 
     # Don't trust the bare rm — a pre-1.10 dashboard-created site would be
@@ -16154,6 +16544,9 @@ cove_enable() {
 
     # Ensure log directory exists
     mkdir -p "$LOGS_DIR"
+    # Closed to other accounts (see cove_install).
+    chmod 700 "$COVE_DIR" 2>/dev/null
+    cove_warn_if_server
 
     if [ "$OS" == "macos" ]; then
         echo "   - Starting MariaDB..."
@@ -16284,8 +16677,9 @@ EOM
 cove_health() {
     # Read-only diagnostic. Aggregates the signals you'd otherwise gather by
     # hand after a crash: service liveness, FrankenPHP process health + last
-    # exit code, recent hard segfaults (classified), live OPcache pressure, and
-    # on-disk hygiene. Never mutates anything — it only recommends fixes.
+    # exit code, recent hard segfaults (classified), live OPcache pressure,
+    # on-disk hygiene, and what the network can reach. Never mutates anything —
+    # it only recommends fixes.
     local warn=0 crit=0
     echo ""
     gum style --bold "🩺 Cove health check"
@@ -16577,6 +16971,81 @@ cove_health() {
     local strays; strays=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cove-shot-profile.*' -mmin +3 2>/dev/null | wc -l | tr -d ' ')
     if [ "$strays" -gt 0 ]; then
         echo "  ⚠️  $strays stale capture profile(s) in the temp folder (cleared by the next cove screenshot)"
+        warn=$((warn+1))
+    fi
+
+    # --- Network exposure ---------------------------------------------------
+    # What another machine on the network reaches, tried from this machine's
+    # own addresses: Caddy listens on every interface, and the site,
+    # dashboard, and proxy blocks must answer 403 there; Mailpit and MariaDB
+    # listen on loopback and must not answer at all. Then what has been
+    # opened on purpose (LAN sites, Tailscale, share tunnels).
+    echo ""
+    echo "Network exposure"
+    local addrs
+    addrs=$(cove_local_addresses)
+    if [ -z "$addrs" ]; then
+        echo "  ℹ️  No network address right now; nothing else can reach this machine"
+    elif [ "$IS_WSL" = true ]; then
+        echo "  ℹ️  WSL: sites answer the Windows host's private network by design (not probed)"
+    else
+        local sample_site="" s a code port open_http="" open_ports=""
+        for s in "$SITES_DIR"/*.localhost; do
+            [ -d "$s/public" ] && { sample_site=$(basename "$s"); break; }
+        done
+        for a in $addrs; do
+            code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' --resolve "cove.localhost:${HTTPS_PORT}:$a" "https://cove.localhost:${HTTPS_PORT}/api.php" 2>/dev/null)
+            case "$code" in 403|000) ;; *) open_http="$open_http cove.localhost via $a ($code)," ;; esac
+            if [ -n "$sample_site" ]; then
+                code=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' --resolve "${sample_site}:${HTTPS_PORT}:$a" "https://${sample_site}:${HTTPS_PORT}/" 2>/dev/null)
+                case "$code" in 403|000) ;; *) open_http="$open_http $sample_site via $a ($code)," ;; esac
+            fi
+            for port in 8025 1025 3306; do
+                cove_port_answers "$a" "$port" && open_ports="$open_ports $a:$port"
+            done
+        done
+        local tried; tried=$(echo $addrs | tr ' ' ',' | sed 's/,/, /g')
+        if [ -z "$open_http" ]; then
+            echo "  ✅ Sites and the dashboard refuse other machines (tried from $tried)"
+        else
+            echo "  ❌ Answering other machines:${open_http%,}"
+            echo "     Fix: cove reload   (regenerates the Caddyfile with the guards)"
+            crit=$((crit+1))
+        fi
+        if [ -z "$open_ports" ]; then
+            echo "  ✅ Mailpit and MariaDB listen on this machine only"
+        else
+            echo "  ❌ Reachable from the network:$open_ports (8025/1025 Mailpit, 3306 MariaDB)"
+            echo "     Fix: cove upgrade, or cove enable   (rewrites their loopback-only settings)"
+            crit=$((crit+1))
+        fi
+    fi
+    if [ -f "$APP_DIR/tailscale" ]; then
+        if [ -f "$APP_DIR/tailscale-dashboard" ]; then
+            echo "  ℹ️  Tailscale: sites, mail, the dashboard, and Adminer are shared with your tailnet"
+        else
+            echo "  ℹ️  Tailscale: sites and mail are shared with your tailnet"
+        fi
+    fi
+    local lan_sites=""
+    for s in "$SITES_DIR"/*.localhost; do
+        [ -f "$s/lan_config" ] && lan_sites="$lan_sites $(basename "$s" .localhost),"
+    done
+    [ -n "$lan_sites" ] && echo "  ℹ️  Open to the local network with cove lan:${lan_sites%,}"
+    if [ -d "$APP_DIR/share" ]; then
+        local st tpid url
+        for st in "$APP_DIR/share"/*; do
+            [ -f "$st" ] || continue
+            tpid=$(sed -n 's/^tunnel_pid=//p' "$st"); url=$(sed -n 's/^url=//p' "$st")
+            if [ -n "$tpid" ] && kill -0 "$tpid" 2>/dev/null; then
+                echo "  ℹ️  Shared publicly right now: $(basename "$st") at $url   (stop: cove share $(basename "$st") stop)"
+            fi
+        done
+    fi
+    local pub
+    if pub=$(cove_public_address); then
+        echo "  ⚠️  This machine has a public address ($pub). Cove is for local development;"
+        echo "     don't host live sites with it, and don't use cove lan, share, or tailscale here."
         warn=$((warn+1))
     fi
 
@@ -17845,6 +18314,9 @@ cove_install() {
         esac
     done
 
+    # A VPS is an easy place to put Cove by mistake: say so up front.
+    cove_warn_if_server
+
     # Explicit ports bypass both interactive port menus below entirely.
     if [ -n "$explicit_http" ] || [ -n "$explicit_https" ]; then
         local want_http="${explicit_http:-$HTTP_PORT}"
@@ -18063,7 +18535,7 @@ cove_install() {
         echo "   - Using the official FrankenPHP installer..."
         local fp_tmpdir
         fp_tmpdir=$(mktemp -d)
-        if (cd "$fp_tmpdir" && curl -sL https://frankenphp.dev/install.sh | $SUDO_CMD bash); then
+        if run_installer_script https://frankenphp.dev/install.sh "$fp_tmpdir"; then
             hash -r
             if ! command -v frankenphp &> /dev/null && [ -x "$fp_tmpdir/frankenphp" ]; then
                 $SUDO_CMD mv "$fp_tmpdir/frankenphp" "$BIN_DIR/frankenphp"
@@ -18154,7 +18626,7 @@ cove_install() {
     elif ! command -v mailpit &> /dev/null; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: mailpit"
         echo "   - Using the official Mailpit installer..."
-        if curl -sL https://raw.githubusercontent.com/axllent/mailpit/develop/install.sh | $SUDO_CMD bash; then
+        if run_installer_script https://raw.githubusercontent.com/axllent/mailpit/develop/install.sh; then
             echo "✅ Mailpit installed successfully."
         else
             gum style --foreground red "❌ The Mailpit download script failed."
@@ -18171,6 +18643,10 @@ cove_install() {
     # --- Directory and Service Setup (Copied from original file) ---
     echo "📁 Creating Cove directory structure..."
     mkdir -p "$SITES_DIR" "$LOGS_DIR" "$GUI_DIR" "$ADMINER_DIR" "$CUSTOM_CADDY_DIR"
+    # ~/Cove holds every site's wp-config.php (with the database password
+    # that opens them all), backups, caught mail, and logs. Only this user's
+    # processes (FrankenPHP, php-fpm, Mailpit, the menu bar app) need it.
+    chmod 700 "$COVE_DIR" 2>/dev/null
 
     # Write the PHP ini that wp-cli (via `frankenphp php-cli`) will load.
     # See the comment on $PHPRC export in main for the rationale.
@@ -18271,7 +18747,7 @@ INI
                 root_pass=$(gum input --password --placeholder "Password for '$root_user'")
             fi
 
-            if echo "$sql_command" | mysql -u "$root_user" -p"$root_pass"; then
+            if echo "$sql_command" | MYSQL_PWD="$root_pass" mysql -u "$root_user"; then
                 echo "   - ✅ Manual database user creation successful."
                 user_created_successfully=true
             fi
@@ -20766,9 +21242,10 @@ cove_proxy() {
 
 cove_pull() {
     # Sourced up front, not just before the post-migration step. Anything below
-    # that touches DB_USER / DB_PASSWORD needs it, and an unset DB_USER turns
-    # `mysql -u "$DB_USER" -p"$DB_PASSWORD"` into a bare `-p` that stops and
-    # prompts "Enter password:" — which hangs a headless pull outright.
+    # that touches DB_USER / DB_PASSWORD needs it. Unset, the mysql client logs
+    # in as the OS user with no password and fails. (When the password was
+    # still passed as -p"…", an empty one became a bare -p that stopped at
+    # "Enter password:" and hung a headless pull outright.)
     source_config
 
     # --- UI/Logging Functions ---
@@ -20828,7 +21305,7 @@ cove_pull() {
     # path so parallel `cove pull` invocations don't collide.
     local ssh_ctl
     ssh_ctl=$(mktemp -u "${TMPDIR:-/tmp}/cove-ssh-XXXXXXXX")
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
+    local ssh_opts="-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
     # Remove the socket on any exit path (success, failure, Ctrl-C). Any
     # orphaned master process times out on its own via ControlPersist.
     # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
@@ -20839,7 +21316,7 @@ cove_pull() {
     # ~16KB/s against a real gateway and then stalled outright, while the same
     # file moved in 15s on its own connection. Key auth makes the extra
     # connection free; with a password you are asked once more.
-    local ssh_bulk_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
+    local ssh_bulk_opts="-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pulling a remote WordPress site into Cove."
     # --- 1. Gather Remote Info ---
@@ -20872,6 +21349,16 @@ cove_pull() {
     # One probe round-trip answers both questions at once: is there a usable
     # WordPress here, and which tools does this host actually have? The answer
     # decides whether we need to sideload WP-CLI before doing any real work.
+    # Connect once in the open before the quiet probe below. Host keys are
+    # checked now: a host seen for the first time is remembered in
+    # ~/.ssh/known_hosts, and one whose key changed since is refused, with
+    # OpenSSH's own warning on screen instead of a vague probe failure. This
+    # used to skip the check entirely, which let anyone in the network path
+    # hand pull a hostile archive or receive a push's files and database.
+    if ! ssh $ssh_opts $remote_ssh true; then
+        log_error "Could not connect to ${remote_ssh} over SSH (see the message above). If the host was rebuilt and its key changed on purpose, clear the old one with ssh-keygen -R and try again."
+    fi
+
     log_step "Validating remote WordPress site..."
     local wp_cli_flag=""
     wp_cli_flag=$(transfer_ensure_remote_wp_cli "$ssh_opts" "$remote_ssh" "$remote_path")
@@ -21104,7 +21591,7 @@ cove_push() {
     # password or unlocks their key once instead of four times.
     local ssh_ctl
     ssh_ctl=$(mktemp -u "${TMPDIR:-/tmp}/cove-ssh-XXXXXXXX")
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
+    local ssh_opts="-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=$ssh_ctl -o ControlPersist=5m"
     # shellcheck disable=SC2064 # we want $ssh_ctl expanded at trap-set time
     trap "rm -f '$ssh_ctl'" EXIT
 
@@ -21113,7 +21600,7 @@ cove_push() {
     # ~16KB/s against a real gateway and then stalled outright, while the same
     # file moved in 15s on its own connection. Key auth makes the extra
     # connection free; with a password you are asked once more.
-    local ssh_bulk_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
+    local ssh_bulk_opts="-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "This tool will guide you through pushing a local Cove site to a remote server."
 
@@ -21177,6 +21664,16 @@ cove_push() {
     # A single probe confirms there's a usable WordPress there and reports the
     # host's tooling, so a remote without WP-CLI gets the phar sideloaded before
     # we spend time building a backup that couldn't be restored anyway.
+    # Connect once in the open before the quiet probe below. Host keys are
+    # checked now: a host seen for the first time is remembered in
+    # ~/.ssh/known_hosts, and one whose key changed since is refused, with
+    # OpenSSH's own warning on screen instead of a vague probe failure. This
+    # used to skip the check entirely, which let anyone in the network path
+    # hand pull a hostile archive or receive a push's files and database.
+    if ! ssh $ssh_opts $remote_ssh true; then
+        log_error "Could not connect to ${remote_ssh} over SSH (see the message above). If the host was rebuilt and its key changed on purpose, clear the old one with ssh-keygen -R and try again."
+    fi
+
     log_step "Validating remote WordPress site..."
     local wp_cli_flag=""
     wp_cli_flag=$(transfer_ensure_remote_wp_cli "$ssh_opts" "$remote_ssh" "$remote_path")
@@ -21214,8 +21711,12 @@ cove_push() {
 
     # --- 5. Perform Local Backup ---
     log_step "Generating local backup for ${site_name}..."
+    # Cove's one-time-login mu-plugin is local-only and stays home: it is left
+    # out of the archive, and the restore keeps whatever the remote had at
+    # that path (a host's own helper of the same name, or nothing at all).
+    local cove_helper="wp-content/mu-plugins/captaincore-helper.php"
     local backup_path
-    backup_path=$(transfer_local backup "$local_path")
+    backup_path=$(transfer_local backup "$local_path" --exclude="$cove_helper")
     if [ -z "$backup_path" ] || [ ! -f "$backup_path" ]; then
         log_error "Failed to generate the local backup."
     fi
@@ -21243,7 +21744,7 @@ cove_push() {
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
     if ! transfer_remote "$ssh_opts" "$remote_ssh" restore "$remote_path" "$remote_tmp" \
-            --url-to="$remote_url" $wp_cli_flag; then
+            --url-to="$remote_url" --keep="$cove_helper" $wp_cli_flag; then
         rm -f "$backup_path"
         ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
         log_error "The remote restore failed."
@@ -21407,20 +21908,20 @@ cove_rename() {
         trap 'rm -f "$temp_sql_dump"' EXIT
 
         echo "   - Backing up old database '$old_db_name'..."
-        if ! mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$old_db_name" > "$temp_sql_dump"; then
+        if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$old_db_name" > "$temp_sql_dump"; then
             gum style --foreground red "❌ Error: Failed to dump the old database. Aborting."
             mv "$new_site_dir" "$old_site_dir" # Revert directory rename
             exit 1
         fi
 
         echo "   - Creating and importing to new database '$new_db_name'..."
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
         # Gate the destructive DROP below on a verified import + config update.
         # Previously the import was unchecked, so a failed import (disk full,
         # packet size) still fell through to dropping the old database — losing
         # the site's only good copy. On failure here, abort with the old
         # database and wp-config left intact.
-        if ! mysql -u "$DB_USER" -p"$DB_PASSWORD" "$new_db_name" < "$temp_sql_dump"; then
+        if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" "$new_db_name" < "$temp_sql_dump"; then
             gum style --foreground red "❌ Error: Failed to import into '$new_db_name'. Aborting; old database left intact."
             mv "$new_site_dir" "$old_site_dir" # Revert directory rename
             exit 1
@@ -21453,7 +21954,7 @@ cove_rename() {
         fi
 
         echo "   - Dropping old database '$old_db_name'..."
-        mysql -u "$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
     fi
 
     # --- Snapshots and the dashboard preview follow the name ---
@@ -21550,11 +22051,16 @@ cove_screenshot_stop() {
 # and any capture lock file that outlived its capture.
 cove_screenshot_reap() {
     local d
+    # Only folders this user made, named exactly the way mktemp names them.
+    # On Linux $SHOT_TMP is the shared /tmp, and each name here becomes a
+    # pkill -f pattern: another account's 'cove-shot-profile.x|.' would
+    # otherwise have matched, and killed, every process this user runs.
     while IFS= read -r d; do
         [ -n "$d" ] || continue
+        [[ "$(basename "$d")" =~ ^cove-shot-profile\.[A-Za-z0-9]+$ ]] || continue
         cove_screenshot_stop "$d"
         rm -rf "$d"
-    done < <(find "$SHOT_TMP" -maxdepth 1 -name 'cove-shot-profile.*' -mmin +3 2>/dev/null)
+    done < <(find "$SHOT_TMP" -maxdepth 1 -type d -user "$(id -u)" -name 'cove-shot-profile.*' -mmin +3 2>/dev/null)
     [ -d "$SCREENSHOTS_DIR" ] && find "$SCREENSHOTS_DIR" -maxdepth 1 -name '*.png.tmp.png' -mmin +2 -delete 2>/dev/null
     # Previews of sites that no longer exist.
     local sp sn
@@ -22033,7 +22539,8 @@ import sys
 import ssl
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, HTTPRedirectHandler, HTTPSHandler, build_opener
 
 TARGET_HOST = sys.argv[1]  # e.g., anchordev.localhost
 LISTEN_PORT = int(sys.argv[2])
@@ -22048,6 +22555,23 @@ ssl_ctx.verify_mode = ssl.CERT_NONE
 
 # Content types that should have URL rewriting
 REWRITABLE_TYPES = ('text/html', 'text/css', 'application/javascript', 'application/json', 'text/javascript')
+
+# Redirects go back to the visitor's browser; the proxy never follows one
+# itself. Following them let a redirect on the shared site point this proxy at
+# anything this machine can reach (Mailpit on 127.0.0.1:8025, another site)
+# and hand the answer to a visitor. It also dropped the cookies a login sets
+# on its redirect.
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+opener = build_opener(NoRedirect, HTTPSHandler(context=ssl_ctx))
+
+def rewrite_urls(text):
+    # https://site.localhost[:port] -> https://public-url, plain and JSON-escaped
+    text = text.replace(f'https://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
+    text = text.replace(f'http://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
+    return text.replace(f'https:\\/\\/{TARGET_AUTHORITY}', f'https:\\/\\/{PUBLIC_HOST}')
 
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -22101,32 +22625,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if key.lower() not in ('host', 'connection', 'accept-encoding'):
                 req.add_header(key, value)
         req.add_header('Host', TARGET_AUTHORITY)
+        # Marks the request as a share visitor's, set after the visitor's own
+        # headers so they can't remove it. It arrives from loopback, so this
+        # is how Cove's PHP bootstrap knows not to show it Whoops pages.
+        req.add_header('X-Cove-Share', '1')
 
         try:
-            with urlopen(req, context=ssl_ctx, timeout=60) as response:
-                response_body = response.read()
-                content_type = response.headers.get('Content-Type', '')
-
-                # Rewrite URLs in text responses
-                if any(ct in content_type for ct in REWRITABLE_TYPES):
-                    try:
-                        text = response_body.decode('utf-8')
-                        # Replace https://site.localhost[:port] with https://public-url
-                        text = text.replace(f'https://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
-                        text = text.replace(f'http://{TARGET_AUTHORITY}', f'https://{PUBLIC_HOST}')
-                        # Escaped versions (for JSON)
-                        text = text.replace(f'https:\\/\\/{TARGET_AUTHORITY}', f'https:\\/\\/{PUBLIC_HOST}')
-                        response_body = text.encode('utf-8')
-                    except:
-                        pass  # If decode fails, send original
-                
-                self.send_response(response.status)
-                for key, value in response.headers.items():
-                    if key.lower() not in ('transfer-encoding', 'connection', 'content-length', 'content-encoding'):
-                        self.send_header(key, value)
-                self.send_header('Content-Length', len(response_body))
-                self.end_headers()
-                self.wfile.write(response_body)
+            response = opener.open(req, timeout=60)
+        except HTTPError as e:
+            # Redirects (never followed, see NoRedirect) and 4xx/5xx answers
+            # are the site's own responses: pass them on, status and all.
+            # They used to surface as "502 Proxy Error".
+            response = e
         except Exception as e:
             error_msg = f"Proxy Error: {e}".encode()
             self.send_response(502)
@@ -22134,6 +22644,42 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Length', len(error_msg))
             self.end_headers()
             self.wfile.write(error_msg)
+            return
+
+        try:
+            response_body = response.read()
+        except Exception as e:
+            # A body that can't be read is the proxy's failure, not the
+            # site's answer: say so rather than relay its status with nothing.
+            response.close()
+            error_msg = f"Proxy Error: {e}".encode()
+            self.send_response(502)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', len(error_msg))
+            self.end_headers()
+            self.wfile.write(error_msg)
+            return
+        response.close()
+        status = getattr(response, 'status', None) or response.code
+        content_type = response.headers.get('Content-Type', '')
+
+        # Rewrite URLs in text responses
+        if any(ct in content_type for ct in REWRITABLE_TYPES):
+            try:
+                response_body = rewrite_urls(response_body.decode('utf-8')).encode('utf-8')
+            except Exception:
+                pass  # If decode fails, send original
+
+        self.send_response(status)
+        for key, value in response.headers.items():
+            if key.lower() not in ('transfer-encoding', 'connection', 'content-length', 'content-encoding'):
+                # A redirect's target is a site URL too.
+                if key.lower() in ('location', 'refresh'):
+                    value = rewrite_urls(value)
+                self.send_header(key, value)
+        self.send_header('Content-Length', len(response_body))
+        self.end_headers()
+        self.wfile.write(response_body)
     
     def do_GET(self): self.do_request()
     def do_POST(self): self.do_request()
@@ -22426,6 +22972,8 @@ snapshot_create() {
     while [ -e "$dest" ]; do dest="$SNAPSHOTS_DIR/$site_name/$id-$n"; n=$((n + 1)); done
     id=$(basename "$dest")
     mkdir -p "$dest"
+    # Snapshots hold whole sites and their databases: this user only.
+    chmod 700 "$SNAPSHOTS_DIR" 2>/dev/null
 
     local wp_version=""
     if [ -f "$public_dir/wp-config.php" ]; then
@@ -22446,7 +22994,7 @@ snapshot_create() {
             return 1
         fi
         echo "   Dumping database '$db_name'…" >&2
-        if ! "$dump_cmd" -u"$db_user" -p"$db_pass" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "$db_name" > "$dest/db.sql" 2>"$dest/.dump-err"; then
+        if ! MYSQL_PWD="$db_pass" "$dump_cmd" -u"$db_user" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "$db_name" > "$dest/db.sql" 2>"$dest/.dump-err"; then
             local err; err=$(tail -n 2 "$dest/.dump-err")
             rm -rf "$dest"
             gum style --foreground red "❌ Error: The database dump failed." "$err" >&2
@@ -22506,11 +23054,11 @@ snapshot_restore() {
         # The dump carries DROP TABLE for what it holds; tables born after
         # the snapshot would otherwise linger, so the database is recreated.
         echo "   Restoring database '$db_name'…" >&2
-        if ! "$client" -u"$DB_USER" -p"$DB_PASSWORD" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null; then
+        if ! MYSQL_PWD="$DB_PASSWORD" "$client" -u"$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`; CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null; then
             gum style --foreground red "❌ Error: Could not recreate the database." >&2
             return 1
         fi
-        if ! "$client" -u"$DB_USER" -p"$DB_PASSWORD" --max_allowed_packet=512M "$db_name" < "$src/db.sql"; then
+        if ! MYSQL_PWD="$DB_PASSWORD" "$client" -u"$DB_USER" --max_allowed_packet=512M "$db_name" < "$src/db.sql"; then
             gum style --foreground red "❌ Error: The database import failed. The files were not touched; snapshot $safety holds the state from before." >&2
             return 1
         fi
@@ -22663,9 +23211,9 @@ cove_snapshot() {
             rm -f "$tmp"
             if [ "$format" != "json" ]; then echo "📦 Packing snapshot $id…"; fi
             if [[ "$archive" == *.zip ]]; then
-                ( cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
+                ( umask 077; cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
             else
-                ( cd "$src" && tar -czf "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: tar failed."; exit 1; }
+                ( umask 077; cd "$src" && tar -czf "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: tar failed."; exit 1; }
             fi
             mv -f "$tmp" "$archive"
             local bytes
@@ -22811,9 +23359,20 @@ cove_status() {
 }
 # --- Tailscale Configuration ---
 TAILSCALE_CONFIG="$APP_DIR/tailscale"
+# Present only when the dashboard (9900) and Adminer (9902) should answer the
+# tailnet too; see regenerate_caddyfile.
+TAILSCALE_DASHBOARD_FLAG="$APP_DIR/tailscale-dashboard"
 
 cove_tailscale_enable() {
-    local hostname="$1"
+    local hostname="" with_dashboard=false
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --dashboard) with_dashboard=true ;;
+            -*) gum style --foreground red "❌ Error: Unknown option '$arg'."; exit 1 ;;
+            *) [ -z "$hostname" ] && hostname="$arg" ;;
+        esac
+    done
 
     # Try to auto-detect hostname if not provided
     if [ -z "$hostname" ]; then
@@ -22849,12 +23408,24 @@ cove_tailscale_enable() {
         exit 1
     fi
 
-    # Save the configuration
+    # Save the configuration. `enable` states the whole setup each time:
+    # without --dashboard, the dashboard and Adminer stay off the tailnet.
     mkdir -p "$APP_DIR"
     echo "$hostname" > "$TAILSCALE_CONFIG"
+    if $with_dashboard; then
+        : > "$TAILSCALE_DASHBOARD_FLAG"
+    else
+        rm -f "$TAILSCALE_DASHBOARD_FLAG"
+    fi
 
     echo "✅ Tailscale access enabled!"
     echo "   Hostname: $hostname"
+    if $with_dashboard; then
+        echo "   Dashboard and Adminer: on the tailnet too (ports 9900 and 9902)."
+        echo "   Anyone on your tailnet can use them to run commands on this machine."
+    else
+        echo "   Dashboard and Adminer: this machine only (add --dashboard to share them)."
+    fi
     echo ""
     echo "   Regenerating Caddyfile with port-based routing..."
     echo ""
@@ -22867,6 +23438,7 @@ cove_tailscale_enable() {
 cove_tailscale_disable() {
     if [ -f "$TAILSCALE_CONFIG" ]; then
         rm "$TAILSCALE_CONFIG"
+        rm -f "$TAILSCALE_DASHBOARD_FLAG"
         
         # Clean up port files
         if [ -d "$SITES_DIR" ]; then
@@ -22914,9 +23486,13 @@ cove_tailscale_status() {
         
         echo ""
         echo "   Global services:"
-        echo "   - https://${hostname}:9900  (Dashboard)"
         echo "   - https://${hostname}:9901  (Mailpit)"
-        echo "   - https://${hostname}:9902  (Adminer)"
+        if [ -f "$TAILSCALE_DASHBOARD_FLAG" ]; then
+            echo "   - https://${hostname}:9900  (Dashboard)"
+            echo "   - https://${hostname}:9902  (Adminer)"
+        else
+            echo "   Dashboard and Adminer are not shared (cove tailscale enable --dashboard)."
+        fi
     else
         gum style --foreground yellow "❌ Disabled"
         echo ""
@@ -22950,12 +23526,15 @@ cove_tailscale() {
             echo "  https://<your-tailscale-hostname>:<port>"
             echo ""
             echo "Subcommands:"
-            echo "  enable     Enable Tailscale access (auto-detects hostname)"
+            echo "  enable     Enable Tailscale access (auto-detects hostname)."
+            echo "             --dashboard also shares the Cove dashboard and Adminer,"
+            echo "             which can run commands on this machine."
             echo "  disable    Disable Tailscale access"
             echo "  status     Show current Tailscale configuration and URLs"
             echo ""
             echo "Examples:"
             echo "  cove tailscale enable"
+            echo "  cove tailscale enable --dashboard"
             echo "  cove tailscale status"
             echo "  cove tailscale disable"
             exit 0
@@ -22995,7 +23574,7 @@ cat << 'COVE_TRANSFER_HELPER'
 # Subcommands:
 #   probe   <site_dir>                     report tool capabilities as key=value
 #   backup  <site_dir> [--exclude=GLOB]... create an archive, print its path
-#   restore <site_dir> <archive> [--url-to=URL]
+#   restore <site_dir> <archive> [--url-to=URL] [--keep=PATH]...
 #
 # Design note: every capability degrades rather than failing. Archiving prefers
 # zip, falls back to tar, and finally to PHP itself; the database is dumped and
@@ -23324,20 +23903,35 @@ cmd_backup() {
     archive="$parent/${stamp}_${rand}.${ext}"
 
     # The dump lands inside the site dir so it travels in the archive, exactly
-    # where restore expects to find it.
+    # where restore expects to find it. That is the web root, for as long as
+    # the archive takes to build — on a live host when `cove pull` runs this.
+    # So: a name nobody can guess (it used to be a fixed db_export.sql),
+    # readable by this user only, and removed however this exits.
     log "Exporting database..."
-    local dump="$site_dir/db_export.sql"
+    local dump_rand
+    dump_rand=$( (head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n') 2>/dev/null )
+    [ -n "$dump_rand" ] || dump_rand="$$$(date +%s)"
+    local dump="$site_dir/db_export-$dump_rand.sql"
+    # shellcheck disable=SC2064
+    trap "rm -f '$dump'" EXIT
+    # PIPE too: run over `ssh … bash -s` there is no terminal, so a dropped
+    # connection or a Ctrl-C at the other end arrives as SIGPIPE on the next
+    # write to the closed stderr, not as HUP.
+    # shellcheck disable=SC2064
+    trap "rm -f '$dump'; exit 1" HUP INT TERM PIPE
     if [ "$DB_DUMP" = native ]; then
-        $WP db export "$dump" --path="$site_dir" --add-drop-table \
-            --default-character-set=utf8mb4 --skip-plugins --skip-themes >&2 \
+        ( umask 077; $WP db export "$dump" --path="$site_dir" --add-drop-table \
+            --default-character-set=utf8mb4 --skip-plugins --skip-themes >&2 ) \
             || die "Database export failed."
     else
         log "  (no mysqldump — exporting through WordPress)"
-        wp_eval "$site_dir" php_dump_script "$dump" || die "Database export failed."
+        ( umask 077; wp_eval "$site_dir" php_dump_script "$dump" ) || die "Database export failed."
     fi
 
     log "Creating archive (${ARCHIVER})..."
-    ( cd "$parent" || exit 1
+    # Owner-only, like the dump inside it: for a WordPress in a subfolder,
+    # $parent is itself the web root.
+    ( umask 077; cd "$parent" || exit 1
       case "$ARCHIVER" in
         zip)
             local -a zargs=(-rq "$archive" "$base")
@@ -23361,9 +23955,18 @@ cmd_backup() {
 cmd_restore() {
     local site_dir="$1" archive="$2"; shift 2
     local url_to=""
+    local -a keeps=()
     local a
     for a in "$@"; do
-        case "$a" in --url-to=*) url_to="${a#--url-to=}" ;; esac
+        case "$a" in
+            --url-to=*) url_to="${a#--url-to=}" ;;
+            --keep=*)
+                a="${a#--keep=}"
+                case "/$a/" in
+                    *"/../"*|//*) die "--keep takes a path inside the site: $a" ;;
+                esac
+                keeps+=("$a") ;;
+        esac
     done
 
     [ -d "$site_dir" ] || die "Site directory not found: $site_dir"
@@ -23391,10 +23994,15 @@ cmd_restore() {
         die "Refusing to restore over $site_dir: it does not look like a WordPress install."
     fi
 
-    local work
+    local work held
     work=$(mktemp -d "${TMPDIR:-/tmp}/cove-restore-XXXXXX") || die "mktemp failed"
+    # What the destination keeps (its wp-config.php, --keep paths) waits in a
+    # folder of its own: when the archive has no WordPress markers the whole
+    # of $work is copied into the site, and anything parked there would land
+    # in the web root — wp-config.php.keep included, served as plain text.
+    held=$(mktemp -d "${TMPDIR:-/tmp}/cove-keep-XXXXXX") || { rm -rf "$work"; die "mktemp failed"; }
     # shellcheck disable=SC2064
-    trap "rm -rf '$work'" EXIT
+    trap "rm -rf '$work' '$held'" EXIT
 
     log "Extracting archive (${EXTRACTOR})..."
     case "$EXTRACTOR" in
@@ -23434,8 +24042,8 @@ cmd_restore() {
     case "$sql" in
         *.gz)
             log "Unpacking $(basename "$sql")..."
-            gunzip -c "$sql" > "$work/.cove-import.sql" || die "Could not unpack the SQL dump."
-            sql="$work/.cove-import.sql"
+            gunzip -c "$sql" > "$held/import.sql" || die "Could not unpack the SQL dump."
+            sql="$held/import.sql"
             ;;
     esac
     if [ -f "$src/wp-config.php" ] && grep -Eq "define\(\s*['\"]MULTISITE['\"]\s*,\s*true" "$src/wp-config.php"; then
@@ -23447,15 +24055,36 @@ cmd_restore() {
     # at a database that does not exist on this machine.
     local keep_config=""
     if [ -f "$site_dir/wp-config.php" ]; then
-        keep_config="$work/wp-config.php.keep"
+        keep_config="$held/wp-config.php.keep"
         cp "$site_dir/wp-config.php" "$keep_config"
     fi
 
+    # --keep paths: the destination's own copy survives the swap, the same
+    # way wp-config.php does. `cove push` keeps the remote's mu-plugin of the
+    # same name as Cove's local-only helper, which never leaves the machine.
+    local k
+    for k in ${keeps[@]+"${keeps[@]}"}; do
+        if [ -f "$site_dir/$k" ]; then
+            mkdir -p "$held/keep/$(dirname "$k")"
+            cp -p "$site_dir/$k" "$held/keep/$k"
+        fi
+    done
+
     log "Replacing files..."
     # Clear the destination except wp-config.php, then move the new tree in.
+    # Dumps at the top of the tree (the db_export-*.sql that backup packs
+    # there) are imported from where they sit, never copied into the web
+    # root, where a failed step below would have left them downloadable.
     find "$site_dir" -mindepth 1 -maxdepth 1 ! -name 'wp-config.php' -exec rm -rf {} + 2>/dev/null
     ( cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name 'wp-config.php' \
+        ! -name '*.sql' ! -name '*.sql.gz' \
         -exec cp -R {} "$site_dir/" \; ) || die "Copying files failed."
+    for k in ${keeps[@]+"${keeps[@]}"}; do
+        if [ -f "$held/keep/$k" ]; then
+            mkdir -p "$site_dir/$(dirname "$k")"
+            cp -p "$held/keep/$k" "$site_dir/$k"
+        fi
+    done
     if [ -n "$keep_config" ]; then
         cp "$keep_config" "$site_dir/wp-config.php"
 
@@ -23528,7 +24157,7 @@ set -- ${ARGS+"${ARGS[@]}"}
 case "$SUB" in
     probe)   cmd_probe   "${1:-}" ;;
     backup)  [ $# -ge 1 ] || die "usage: backup <site_dir> [--exclude=GLOB]..."; cmd_backup  "$@" ;;
-    restore) [ $# -ge 2 ] || die "usage: restore <site_dir> <archive> [--url-to=URL]"; cmd_restore "$@" ;;
+    restore) [ $# -ge 2 ] || die "usage: restore <site_dir> <archive> [--url-to=URL] [--keep=PATH]..."; cmd_restore "$@" ;;
     *)       die "unknown subcommand: ${SUB:-<none>}" ;;
 esac
 COVE_TRANSFER_HELPER
@@ -23568,7 +24197,7 @@ transfer_wp_cli_phar() {
     local phar="$cache_dir/wp-cli.phar"
     mkdir -p "$cache_dir"
     if [ ! -s "$phar" ]; then
-        curl -sL "$COVE_WP_CLI_PHAR_URL" -o "$phar" || return 1
+        curl -fsSL "$COVE_WP_CLI_PHAR_URL" -o "$phar" || { rm -f "$phar"; return 1; }
         [ -s "$phar" ] || { rm -f "$phar"; return 1; }
     fi
     echo "$phar"
@@ -23817,15 +24446,23 @@ upgrade_frankenphp() {
             return 1
         fi
         
-        local temp_binary="/tmp/frankenphp_new"
-        if curl -L --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${binary_name}" -o "$temp_binary"; then
-            chmod +x "$temp_binary"
+        # mktemp, not a fixed /tmp name another account could create first,
+        # and --fail so an HTTP error page is never installed as the binary.
+        local temp_binary
+        temp_binary=$(mktemp "${TMPDIR:-/tmp}/frankenphp_new.XXXXXX") || return 1
+        if curl -L --fail --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${binary_name}" -o "$temp_binary"; then
+            chmod 755 "$temp_binary"
             if [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
                 rm -f "$temp_binary"
                 gum style --foreground red "❌ Replacing $target_bin_dir/frankenphp needs sudo, and there is no terminal to ask on." "Run: sudo cove upgrade"
                 return 1
             fi
             if sudo mv "$temp_binary" "$target_bin_dir/frankenphp"; then
+                # Root-owned, like the rest of $target_bin_dir. The moved file
+                # kept this user as its owner, and Cove runs this binary under
+                # sudo (trust, enable): anything running as this user, a
+                # site's PHP included, could have swapped it out first.
+                sudo chown 0:0 "$target_bin_dir/frankenphp" 2>/dev/null || true
                 # Set capability to bind to low ports without root
                 if command -v setcap &>/dev/null; then
                     $SUDO_CMD setcap 'cap_net_bind_service=+ep' "$target_bin_dir/frankenphp" 2>/dev/null || true
@@ -23837,6 +24474,7 @@ upgrade_frankenphp() {
                 return 1
             fi
         else
+            rm -f "$temp_binary"
             gum style --foreground red "❌ Failed to download FrankenPHP binary."
             return 1
         fi
@@ -23868,7 +24506,8 @@ cove_upgrade() {
     echo "🔎 Checking for the latest version of Cove..."
 
     local download_url="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
-    local temp_script="/tmp/cove.sh.latest"
+    local temp_script
+    temp_script=$(mktemp "${TMPDIR:-/tmp}/cove.sh.latest.XXXXXX") || return 1
     local install_path
 
     # Find the real path of the currently running script. $0 is authoritative:
@@ -23895,7 +24534,7 @@ cove_upgrade() {
     fi
 
     # 2. Make it executable
-    chmod +x "$temp_script"
+    chmod 755 "$temp_script"
 
     # 3. Get the new version from the downloaded script
     local new_version
@@ -26366,6 +27005,1532 @@ def main():
 if __name__ == "__main__":
     main()
 COVE_MENUBAR_TRAY_EOF
+}
+
+# --- Embedded Adminer Theme (generated from adminer-theme/ by compile.sh) ---
+
+emit_adminer_theme_css() {
+cat <<'COVE_ADMINER_CSS_EOF'
+/**
+ * Cove — Adminer skin.
+ * Matches the Cove landing page + dashboard (https://cove.run).
+ *
+ * Light/dark via prefers-color-scheme. Design tokens mirror
+ * the Cove WordPress theme so the two UIs feel native together.
+ */
+
+/* ============================================
+   Design tokens — Cove (light)
+   ============================================ */
+html {
+  --bg:            #fbfaf7;
+  --bg-elev:       #ffffff;
+  --bg-sunk:       #f4f2ec;
+  --bg-card:       #ffffff;
+  --border:        #c9c4b6;
+  --border-soft:   #dcd7ca;
+  --border-strong: #9a948a;
+  --brand:         oklch(48% 0.14 190);
+  --text:          #1a1c1b;
+  --text-soft:     #3a3d3a;
+  --muted:         #6b6f6a;
+  --dim:           #9a9d97;
+
+  --accent:        oklch(62% 0.11 190);
+  --accent-soft:   oklch(62% 0.11 190 / 0.10);
+  --accent-ink:    oklch(35% 0.08 190);
+  --accent-bright: oklch(72% 0.13 190);
+
+  --ok:            oklch(60% 0.12 155);
+  --ok-soft:       oklch(60% 0.12 155 / 0.12);
+  --warn:          oklch(70% 0.14 70);
+  --warn-soft:     oklch(70% 0.14 70 / 0.14);
+  --err:           oklch(62% 0.18 25);
+  --err-soft:      oklch(62% 0.18 25 / 0.14);
+
+  /* Inked: hairlines do the work, corners near-square, nothing floats. */
+  --radius-sm: 3px;
+  --radius:    4px;
+  --radius-lg: 6px;
+
+  --font-sans:  'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --font-mono:  'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-serif: 'Fraunces', 'Times New Roman', serif;
+
+  /* Sidebar width (resizable via adminer.js drag handle, persisted in localStorage). */
+  --menu-width: 240px;
+
+  --shadow-sm: none;
+  --shadow: none;
+  --shadow-lg: none;
+
+  /* Syntax colors */
+  --syn-keyword: oklch(52% 0.14 290);
+  --syn-string:  oklch(52% 0.13 155);
+  --syn-number:  oklch(62% 0.14 60);
+  --syn-comment: var(--dim);
+  --syn-func:    var(--accent-ink);
+  --syn-var:     oklch(55% 0.12 25);
+  --syn-op:      var(--accent);
+  --syn-type:    oklch(58% 0.13 70);
+}
+
+/* Design tokens — Cove (dark)
+   Applies when: system prefers dark AND user hasn't explicitly chosen light,
+   OR user has explicitly toggled to dark. adminer.js persists the choice. */
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) {
+    --bg:            #0f1210;
+    --bg-elev:       #161a17;
+    --bg-sunk:       #0b0e0c;
+    --bg-card:       #181c19;
+    --border:        #3a3f3a;
+    --border-soft:   #2a2f2a;
+    --border-strong: #565c56;
+    --brand:         oklch(72% 0.12 190);
+    --text:          #edeee9;
+    --text-soft:     #c6c9c1;
+    --muted:         #8a8e85;
+    --dim:           #5d615a;
+
+    --accent:        oklch(72% 0.12 190);
+    --accent-soft:   oklch(72% 0.12 190 / 0.15);
+    --accent-ink:    oklch(82% 0.10 190);
+    --accent-bright: oklch(82% 0.13 190);
+
+    --ok:            oklch(70% 0.13 155);
+    --ok-soft:       oklch(70% 0.13 155 / 0.16);
+    --warn:          oklch(78% 0.14 70);
+    --warn-soft:     oklch(78% 0.14 70 / 0.18);
+    --err:           oklch(72% 0.16 25);
+    --err-soft:      oklch(72% 0.16 25 / 0.18);
+
+    --shadow-sm: none;
+    --shadow: none;
+    --shadow-lg: none;
+
+    --syn-keyword: oklch(76% 0.11 290);
+    --syn-string:  oklch(78% 0.13 155);
+    --syn-number:  oklch(80% 0.13 60);
+    --syn-func:    var(--accent-ink);
+    --syn-var:     oklch(78% 0.10 25);
+    --syn-op:      var(--accent);
+    --syn-type:    oklch(80% 0.13 70);
+  }
+}
+html[data-theme="dark"] {
+  --bg:            #0f1210;
+  --bg-elev:       #161a17;
+  --bg-sunk:       #0b0e0c;
+  --bg-card:       #181c19;
+  --border:        #3a3f3a;
+  --border-soft:   #2a2f2a;
+  --border-strong: #565c56;
+  --brand:         oklch(72% 0.12 190);
+  --text:          #edeee9;
+  --text-soft:     #c6c9c1;
+  --muted:         #8a8e85;
+  --dim:           #5d615a;
+
+  --accent:        oklch(72% 0.12 190);
+  --accent-soft:   oklch(72% 0.12 190 / 0.15);
+  --accent-ink:    oklch(82% 0.10 190);
+  --accent-bright: oklch(82% 0.13 190);
+
+  --ok:            oklch(70% 0.13 155);
+  --ok-soft:       oklch(70% 0.13 155 / 0.16);
+  --warn:          oklch(78% 0.14 70);
+  --warn-soft:     oklch(78% 0.14 70 / 0.18);
+  --err:           oklch(72% 0.16 25);
+  --err-soft:      oklch(72% 0.16 25 / 0.18);
+
+  --shadow-sm: none;
+  --shadow: none;
+  --shadow-lg: none;
+
+  --syn-keyword: oklch(76% 0.11 290);
+  --syn-string:  oklch(78% 0.13 155);
+  --syn-number:  oklch(80% 0.13 60);
+  --syn-func:    var(--accent-ink);
+  --syn-var:     oklch(78% 0.10 25);
+  --syn-op:      var(--accent);
+  --syn-type:    oklch(80% 0.13 70);
+}
+
+/* ============================================
+   Base & typography
+   ============================================ */
+body {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--bg);
+  margin: 0;
+  min-width: fit-content;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "ss01", "cv11";
+}
+
+a {
+  color: var(--accent-ink);
+  text-decoration: none;
+  transition: color 120ms ease;
+}
+a:visited { color: var(--accent-ink); }
+a:link:hover,
+a:visited:hover {
+  color: var(--accent);
+  text-decoration: none;
+}
+a.text:hover { text-decoration: none; }
+a.jush-help:hover { color: inherit; }
+
+/* ============================================
+   Headers
+   ============================================ */
+h1 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text);
+  background: var(--bg-sunk);
+  letter-spacing: -0.01em;
+}
+
+h2 {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-weight: 500;
+  font-size: 1.65rem;
+  letter-spacing: -0.02em;
+  margin: 0 0 1.25rem 0;
+  padding: 0;
+  color: var(--text);
+  background: transparent;
+}
+
+h3 {
+  font-weight: 600;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+  margin: 1.5rem 0 0.5rem;
+  color: var(--text);
+}
+
+/* ============================================
+   Layout — Sidebar menu
+   ============================================ */
+#menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: var(--menu-width);
+  height: 100vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--bg-elev);
+  border-right: 1px solid var(--border-soft);
+  margin: 0;
+  padding: 0;
+  z-index: 100;
+}
+
+/* App brand */
+#menu h1 {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: 1.08rem;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  padding: 1rem 1.125rem 0.85rem;
+  margin: 0;
+  color: var(--text);
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border-soft);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  white-space: nowrap;
+}
+
+/* Brand anchor (wraps the app name so it links back to the server home).
+   Opt out of the #menu a sizing/hover rules — inherit h1 typography. */
+#menu h1 a,
+#menu h1 a#h1 {
+  display: inline;
+  padding: 0;
+  margin: 0;
+  font-family: inherit;
+  font-size: inherit;
+  font-style: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  background: transparent;
+  border-radius: 0;
+}
+#menu h1 a:hover {
+  background: transparent;
+  color: var(--accent-ink);
+}
+/* The Cove mark beside the app name (one drawing, one colour, per scheme). */
+#menu h1 a#h1::before {
+  content: '';
+  display: inline-block;
+  width: 22px; height: 22px;
+  margin-right: 9px;
+  vertical-align: -5px;
+  background: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none' stroke='%2300746f' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'><circle cx='32' cy='32' r='26'/><path d='M 17 27 Q 24.5 20 32 27 T 47 27'/><path d='M 17 40 Q 24.5 33 32 40 T 47 40'/></svg>") no-repeat center / contain;
+}
+html[data-theme="dark"] #menu h1 a#h1::before { background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none' stroke='%231dbcb5' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'><circle cx='32' cy='32' r='26'/><path d='M 17 27 Q 24.5 20 32 27 T 47 27'/><path d='M 17 40 Q 24.5 33 32 40 T 47 40'/></svg>"); }
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) #menu h1 a#h1::before { background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none' stroke='%231dbcb5' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'><circle cx='32' cy='32' r='26'/><path d='M 17 27 Q 24.5 20 32 27 T 47 27'/><path d='M 17 40 Q 24.5 33 32 40 T 47 40'/></svg>"); }
+}
+
+/* Version chip under brand */
+#menu h1 .version {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-style: normal;
+  font-size: 0.68rem;
+  font-weight: 500;
+  color: var(--muted);
+  background: var(--bg-sunk);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+  letter-spacing: 0.02em;
+}
+
+/* Section labels (DB:, etc) */
+#menu p {
+  padding: 0.75rem 1.125rem 0.35rem;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  color: var(--dim);
+  border-bottom: none;
+}
+
+/* Language selector */
+#lang {
+  position: relative;
+  padding: 0.5rem 1.125rem 0.75rem;
+  margin: 0;
+  border-bottom: 1px solid var(--border-soft);
+  top: auto; left: auto; right: auto;
+}
+#lang select { width: 100%; font-size: 0.82rem; }
+
+/* Database dropdown */
+#dbs {
+  overflow: hidden;
+  padding: 0.5rem 1.125rem 0.9rem;
+  border-bottom: 1px solid var(--border-soft);
+}
+#dbs select { width: 100%; }
+
+/* Menu links — general */
+#menu a {
+  display: inline;
+  padding: 0.125rem 0.3rem;
+  color: var(--text-soft);
+  border-radius: var(--radius-sm);
+  transition: background 120ms ease, color 120ms ease;
+  font-size: 0.88rem;
+}
+#menu a:hover {
+  background: var(--bg-sunk);
+  color: var(--accent-ink);
+}
+
+/* Active state */
+#menu a.active,
+#menu .active > a,
+#tables a.active {
+  background: var(--accent-soft) !important;
+  color: var(--accent-ink) !important;
+  font-weight: 500;
+}
+
+#menu a.view { font-style: italic; opacity: 0.85; }
+
+/* Logins + tables lists */
+#logins,
+#tables {
+  padding: 0.5rem 1.125rem;
+  margin: 0;
+  border-bottom: 1px solid var(--border-soft);
+  white-space: nowrap;
+  overflow: hidden;
+}
+#logins li,
+#tables li { list-style: none; margin: 0; padding: 0; }
+#logins a,
+#tables a,
+#tables span { background: transparent; }
+
+#tables a {
+  display: inline;
+  margin-right: 0.2rem;
+}
+#tables a[href*="table="],
+#tables a[href*="view="] {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: 0.82rem;
+  color: var(--text);
+  padding: 0.15rem 0.4rem;
+  border-radius: var(--radius-sm);
+}
+#tables a[href*="table="]:hover,
+#tables a[href*="view="]:hover {
+  background: var(--bg-sunk);
+  color: var(--accent-ink);
+}
+#tables a[href*="table="].active,
+#tables a[href*="view="].active,
+#tables a[href*="table="]:target,
+#tables a[href*="view="]:target,
+#tables .active a[href*="table="],
+#tables .active a[href*="view="] {
+  background: var(--accent-soft) !important;
+  color: var(--accent-ink) !important;
+}
+
+/* "select" action pill */
+#tables a[href*="select="] {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  padding: 0.05rem 0.4rem;
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  margin-left: 0.25rem;
+}
+#tables a[href*="select="]:hover {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border-color: transparent;
+}
+
+/* Structure span pills */
+#tables span { font-size: 0.72rem; color: var(--dim); }
+#tables span a {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  padding: 0.1rem 0.5rem;
+  background: var(--bg-sunk);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+}
+#tables span a:hover {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border-color: transparent;
+}
+
+/* Top-level nav links (SQL COMMAND, IMPORT, EXPORT, …) */
+#menu > a {
+  display: block;
+  padding: 0.55rem 1.125rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  border-left: 2px solid transparent;
+  border-radius: 0;
+}
+#menu > a:hover {
+  background: var(--bg-sunk);
+  border-left-color: var(--accent);
+  color: var(--text);
+}
+#menu > a.active {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border-left-color: var(--accent);
+}
+
+/* ============================================
+   Layout — Main content & breadcrumb
+   ============================================ */
+#content {
+  margin: 0 0 0 var(--menu-width);
+  padding: 3.25rem 1.75rem 2.5rem 1.75rem;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+#breadcrumb {
+  white-space: nowrap;
+  position: fixed;
+  top: 0;
+  left: var(--menu-width);
+  right: 0;
+  background: color-mix(in oklab, var(--bg) 82%, transparent);
+  backdrop-filter: saturate(140%) blur(12px);
+  -webkit-backdrop-filter: saturate(140%) blur(12px);
+  height: auto;
+  line-height: 1.5;
+  padding: 0.7rem 1.75rem;
+  margin: 0;
+  border-bottom: 1px solid var(--border-soft);
+  z-index: 99;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+#breadcrumb a { color: var(--muted); }
+#breadcrumb a:hover { color: var(--accent-ink); }
+
+/* Logout — hidden: Cove uses passwordless autologin, so the button is a no-op. */
+.logout { display: none !important; }
+
+/* Theme toggle (injected by adminer.js, sits left of the logout button) */
+.cove-theme-toggle {
+  position: fixed;
+  top: 0.4rem;
+  right: 1rem;
+  z-index: 101;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  color: var(--text-soft);
+  cursor: pointer;
+  box-shadow: none;
+  transition: border-color 120ms, background 120ms, color 120ms;
+}
+.cove-theme-toggle:hover {
+  background: var(--bg-sunk);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.cove-theme-toggle svg {
+  width: 15px;
+  height: 15px;
+  position: absolute;
+  transition: opacity 200ms ease, transform 300ms ease;
+}
+.cove-theme-toggle svg { opacity: 0; transform: rotate(-40deg) scale(0.7); }
+/* Icon shows the PREFERENCE (System = half disc), not just the paint. */
+html[data-theme-pref="system"] .cove-theme-toggle .icon-system,
+html[data-theme-pref="light"]  .cove-theme-toggle .icon-sun,
+html[data-theme-pref="dark"]   .cove-theme-toggle .icon-moon { opacity: 1; transform: rotate(0) scale(1); }
+
+/* Right-click menu on the toggle: System / Light / Dark */
+.cove-theme-menu {
+  position: fixed; top: 2.9rem; right: 1rem; z-index: 102;
+  display: flex; flex-direction: column; min-width: 150px; padding: 4px;
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.cove-theme-menu[hidden] { display: none; }
+.cove-theme-menu button {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 7px 10px; border: 0; background: transparent; border-radius: var(--radius-sm);
+  font: inherit; font-size: 0.88rem; color: var(--text-soft); text-align: left; cursor: pointer;
+}
+.cove-theme-menu button:hover { background: var(--bg-sunk); color: var(--text); }
+.cove-theme-menu button[aria-checked="true"] { color: var(--text); }
+.cove-theme-menu button[aria-checked="true"]::after { content: "\2713"; color: var(--accent); font-size: 0.85em; }
+
+/* Auto sign-in interstitial (index.php's loginForm override) */
+.cove-autologin { max-width: 520px; }
+.cove-autologin-msg { font-size: 0.95rem; color: var(--text-soft); margin: 0 0 1rem; }
+.cove-autologin-msg code { font-family: var(--font-mono); font-size: 0.85em; color: var(--text); }
+.cove-autologin:not(.is-failed) input[type="submit"] { opacity: 0.6; }
+
+.cove-menu-resize {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--menu-width) - 3px);
+  width: 6px;
+  z-index: 102;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 150ms ease;
+  touch-action: none;
+}
+.cove-menu-resize:hover,
+.cove-menu-resize.dragging {
+  background: var(--accent-soft);
+}
+body.cove-menu-resizing {
+  cursor: col-resize;
+  user-select: none;
+  -webkit-user-select: none;
+}
+body.cove-menu-resizing * {
+  cursor: col-resize !important;
+}
+
+/* ============================================
+   Tables
+   ============================================ */
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: inherit;
+  margin: 0.75rem 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  /* clip, not hidden: `hidden` makes the table a scroll container, which
+     pins the sticky <thead> 2.6rem below the table's own top edge and
+     leaves an empty band above every header row. */
+  overflow: clip;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-sm);
+}
+
+td table {
+  width: 100%;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+td,
+th {
+  padding: 0.55rem 0.85rem;
+  text-align: left;
+  vertical-align: top;
+  border: none;
+  border-bottom: 1px solid var(--border-soft);
+  background: inherit;
+  margin: 0;
+}
+tr:last-child td,
+tr:last-child th { border-bottom: none; }
+
+th {
+  background: var(--bg-sunk);
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+/* Row-header cells (the name column in database and table lists) follow
+   their row; only the real column headers in <thead> get the sunk band. */
+tbody th { background: inherit; font-weight: 500; }
+/* Adminer's own stylesheet paints the checkbox cell with the page colour; let it follow its row. */
+#content td.hover,
+#content tr:hover td.hover,
+#content .checkable .checked td.hover { background: inherit; }
+#content thead td.hover { background: var(--bg-sunk); }
+
+thead {
+  position: sticky;
+  top: 2.6rem;
+  z-index: 10;
+}
+thead th,
+thead td {
+  background: var(--bg-sunk);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  padding: 0.6rem 0.85rem;
+  text-align: left;
+  white-space: nowrap;
+}
+thead th a,
+thead td a { color: var(--muted); }
+thead th a:hover,
+thead td a:hover { color: var(--accent-ink); }
+thead tr:hover td,
+thead tr:hover th,
+.js thead .checked th,
+.js thead .checked td { background: var(--bg-sunk); }
+
+.odds tbody tr:nth-child(2n) {
+  background: color-mix(in oklab, var(--bg-sunk), transparent 50%);
+}
+tbody tr:hover td,
+tbody tr:hover th { background: var(--accent-soft); }
+#content td.check,
+#content th.check { background: inherit; width: 1%; white-space: nowrap; padding-right: 0.5rem; }
+#content td.check a { font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); margin-right: 0.35rem; }
+#content td.check a:hover { color: var(--accent-ink); }
+
+.js .checkable .checked td,
+.js .checkable .checked th,
+.js .checked td,
+.js .checked th {
+  background: var(--accent-soft) !important;
+}
+
+/* Column types */
+.number,
+.datetime,
+.function { text-align: right; }
+td[align="right"] { text-align: right; }
+
+td.number {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-soft);
+}
+.char { color: var(--syn-string); }
+.date { color: var(--syn-keyword); }
+.enum { color: var(--syn-type); }
+.binary {
+  color: var(--err);
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+td.null { color: var(--dim); font-style: italic; }
+
+.view { font-style: italic; }
+.active { font-weight: 600; }
+
+.nowrap td,
+.nowrap th,
+td.nowrap,
+p.nowrap { white-space: pre; }
+.wrap td { white-space: normal; }
+
+table code { font-size: 0.88rem; line-height: 1.45; }
+
+/* Database-name cells (first column of a database list) feel like Cove site rows */
+tbody tr td:first-child a {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  color: var(--text);
+}
+tbody tr td:first-child a:hover { color: var(--accent-ink); }
+
+/* ============================================
+   Forms & fieldsets
+   ============================================ */
+form { margin: 0; }
+
+fieldset {
+  display: inline-block;
+  vertical-align: top;
+  padding: 0.6rem 0.9rem 0.75rem;
+  margin: 0.5rem 0.4rem 0 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  box-shadow: none;
+  min-height: auto;
+}
+/* Select / Search / Sort start collapsed: show them as a toggle chip, not an empty box. */
+fieldset:has(> legend > a.toggle):has(> .hidden) {
+  padding: 0.15rem 0.6rem 0.35rem;
+  background: var(--bg-sunk);
+}
+legend a.toggle { text-decoration: none; color: var(--muted); }
+legend a.toggle:hover { color: var(--accent-ink); }
+legend a.toggle::after { content: ' +'; color: var(--dim); }
+fieldset:has(> legend > a.toggle):not(:has(> .hidden)) legend a.toggle::after { content: ' \2212'; }
+legend {
+  padding: 0 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+}
+fieldset div { margin-top: 0.4rem; }
+fieldset select { margin-right: 0.25rem; }
+
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: 0.875rem;
+  padding: 0.42rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  color: var(--text);
+  transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
+  box-sizing: border-box;
+  vertical-align: middle;
+}
+input[type="checkbox"],
+input[type="radio"] {
+  width: 15px; height: 15px;
+  padding: 0; margin: 0 0.15rem 0 0;
+  border: 0; background: transparent; box-shadow: none;
+  accent-color: var(--accent);
+  vertical-align: -2px;
+}
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+input:hover,
+select:hover,
+textarea:hover { border-color: var(--border-strong); }
+
+select {
+  padding: 0.38rem 0.55rem;
+  cursor: pointer;
+}
+option { padding: 0 5px; }
+optgroup { font-size: 0.8rem; }
+
+textarea,
+.sqlarea {
+  font-family: var(--font-mono);
+  font-size: 0.88rem;
+  line-height: 1.55;
+  min-height: 150px;
+}
+.sqlarea {
+  width: 98%;
+  padding: 0.85rem;
+  background: var(--bg-sunk);
+  border-radius: var(--radius);
+}
+
+input.default { box-shadow: 0 0 0 3px var(--accent-soft); }
+input.required,
+input.maxlength { box-shadow: 0 0 0 3px var(--err-soft); }
+
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
+  width: 0.95rem;
+  height: 0.95rem;
+  cursor: pointer;
+  border: none;
+  padding: 0;
+  vertical-align: middle;
+}
+input[type="radio"] { vertical-align: text-bottom; }
+
+input[type="image"] {
+  border: none;
+  padding: 0;
+  vertical-align: middle;
+  opacity: 0.7;
+  transition: opacity 120ms;
+}
+input[type="image"]:hover { opacity: 1; }
+
+label input[type="checkbox"],
+td input[type="radio"],
+td span select { margin-right: 0.25rem; }
+
+input.wayoff { left: -1000px; position: absolute; }
+
+/* ============================================
+   Buttons
+   ============================================ */
+input[type="submit"],
+input[type="button"],
+input[type="reset"],
+button {
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 500;
+  padding: 0.45rem 0.95rem;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--bg);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 80ms ease, box-shadow 120ms ease;
+  box-shadow: var(--shadow-sm);
+  letter-spacing: -0.005em;
+}
+input[type="submit"]:hover,
+input[type="button"]:hover,
+button:hover {
+  background: var(--accent-bright);
+  border-color: var(--accent-bright);
+}
+input[type="submit"]:active,
+input[type="button"]:active,
+button:active { transform: translateY(1px); }
+
+input[type="reset"],
+input[type="submit"][value="Cancel"] {
+  background: var(--bg-elev);
+  color: var(--text-soft);
+  border-color: var(--border);
+}
+input[type="reset"]:hover,
+input[type="submit"][value="Cancel"]:hover {
+  background: var(--bg-sunk);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+/* Destructive submit buttons */
+div input[name="delete"],
+div input[name="drop"],
+div input[name="truncate"],
+input[value="Kill"] {
+  background: var(--err);
+  border-color: var(--err);
+  color: var(--bg);
+}
+div input[name="delete"]:hover,
+div input[name="drop"]:hover,
+div input[name="truncate"]:hover,
+input[value="Kill"]:hover {
+  background: color-mix(in oklab, var(--err), white 10%);
+  border-color: color-mix(in oklab, var(--err), white 10%);
+}
+
+/* ============================================
+   Messages
+   ============================================ */
+.message {
+  color: color-mix(in oklab, var(--ok), var(--text) 30%);
+  background: var(--ok-soft);
+  padding: 0.7rem 0.95rem;
+  margin: 0.85rem 0;
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--ok);
+}
+.message table {
+  color: var(--text);
+  background: var(--bg-elev);
+  box-shadow: none;
+}
+
+.error {
+  color: color-mix(in oklab, var(--err), var(--text) 30%);
+  background: var(--err-soft);
+  padding: 0.7rem 0.95rem;
+  margin: 0.85rem 0;
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--err);
+}
+.error b { background: transparent; font-weight: 600; }
+
+/* ============================================
+   Code & syntax
+   ============================================ */
+code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  padding: 0.15rem 0.4rem;
+  background: var(--bg-sunk);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  color: var(--text-soft);
+}
+code a:hover { background-color: transparent !important; }
+
+pre {
+  font-family: var(--font-mono);
+  font-size: 0.88rem;
+  line-height: 1.55;
+  margin: 0.75rem 0 0;
+}
+pre, textarea {
+  font: 0.88rem/1.55 var(--font-mono);
+}
+pre.jush {
+  background: var(--bg-sunk);
+  padding: 0.9rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+pre code {
+  display: block;
+  font-size: 100%;
+  padding: 0;
+  background: transparent;
+  border: none;
+}
+td pre { margin: 0; }
+
+/* JUSH syntax highlighting */
+.jush-sql,
+.jush-sql_code { color: var(--syn-keyword); font-weight: 600; }
+.jush-apo,
+.jush-quo,
+.jush-sql_apo,
+.jush-sql_quo { color: var(--syn-string); }
+.jush-num { color: var(--syn-number); }
+.jush-com,
+.jush-sql_com { color: var(--syn-comment); font-style: italic; }
+.jush-sql_function { color: var(--syn-func); }
+.jush-op { color: var(--syn-op); }
+.jush-var,
+.jush-sql_var { color: var(--syn-var); }
+.jush-bac,
+.jush-sql_bac { color: var(--syn-type); }
+/* Adminer 6 wraps keywords in doc-link anchors colored by jush's own
+   --keyword-color (navy) — unreadable on the dark theme. Inherit the
+   token color from the wrapping span instead. */
+.jush a { color: inherit; }
+
+/* ============================================
+   Paragraphs, link groups, pagination
+   ============================================ */
+p { margin: 0.7rem 0; }
+
+.links {
+  margin: 0.85rem 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.links a {
+  display: inline-block;
+  white-space: nowrap;
+  padding: 0.42rem 0.85rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-soft);
+  font-weight: 500;
+  font-size: 0.84rem;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.links a:hover {
+  background: var(--bg-sunk);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.links a.active {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-ink);
+}
+
+.pages { margin: 0.85rem 0; }
+.pages a,
+.pages b {
+  display: inline-block;
+  padding: 0.3rem 0.65rem;
+  margin: 0.1rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  color: var(--text-soft);
+  text-decoration: none;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+.pages a:hover {
+  background: var(--bg-sunk);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.pages b {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+/* ============================================
+   Schema viz
+   ============================================ */
+#schema {
+  margin-left: 60px;
+  position: relative;
+  user-select: none;
+  -webkit-user-select: none;
+}
+#schema .table {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 2px;
+  cursor: move;
+  position: absolute;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow);
+}
+#schema .table b {
+  display: block;
+  padding: 0.4rem 0.65rem;
+  background: var(--accent);
+  color: var(--bg);
+  border-radius: 5px 5px 0 0;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+}
+#schema .table a {
+  display: block;
+  padding: 0.2rem 0.65rem;
+  font-size: 0.85rem;
+  font-family: var(--font-mono);
+}
+#schema .table a:hover { background: var(--bg-sunk); }
+#schema .references { position: absolute; }
+#schema .arrow {
+  height: 1.25em;
+  background: url(data:image/gif;base64,R0lGODlhCAAKAIAAAICAgP///yH5BAEAAAEALAAAAAAIAAoAAAIPBIJplrGLnpQRqtOy3rsAADs=) no-repeat right center;
+}
+
+/* ============================================
+   Help tooltip
+   ============================================ */
+#help {
+  position: absolute;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  padding: 0.5rem 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--text-soft);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  z-index: 1000;
+  max-width: 360px;
+}
+/* Neutralize syntax highlighting inside the tooltip — it's documentation
+   for a single keyword, not an editable SQL snippet. */
+#help * {
+  color: inherit;
+  font-weight: 500;
+  font-style: normal;
+}
+#help a,
+#help a:visited {
+  color: var(--accent-ink);
+}
+#help a:hover {
+  color: var(--accent);
+}
+
+/* ============================================
+   Footer
+   ============================================ */
+.footer {
+  position: sticky;
+  bottom: 0;
+  margin: 1.25rem -20px 0.5rem 0;
+  box-shadow: 0 -5px 10px 10px var(--bg);
+}
+.footer > div {
+  background: var(--bg);
+  padding: 0 0 0.5rem;
+}
+.footer fieldset { margin-top: 0; }
+.sql-footer { margin-bottom: 2rem; }
+
+/* ============================================
+   Misc
+   ============================================ */
+.time, .version {
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+#version { color: var(--err); }
+#h1 {
+  color: var(--muted);
+  text-decoration: none;
+  font-style: italic;
+}
+#logo { vertical-align: baseline; margin-bottom: -3px; }
+
+.block { display: block; }
+.hidden { display: none; }
+.js .hidden,
+.nojs .jsonly { display: none; }
+.help { cursor: help; }
+
+.type { width: 15ex; }
+.size { width: 7ex; }
+.options select,
+.options input { width: 20ex; }
+.loadmore { margin-left: 1ex; }
+.explain table { white-space: pre; }
+
+/* Column sort indicator */
+.js .column {
+  position: absolute;
+  background: var(--bg-elev);
+  padding: 0.2rem 0.6rem 0.25rem 0;
+  margin-top: -0.3rem;
+  border: 1px solid var(--border);
+  border-left: none;
+  border-radius: 0 6px 6px 0;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+}
+
+:target { background: var(--accent-soft); }
+
+/* Icons */
+.icon {
+  width: 18px;
+  height: 18px;
+  background: var(--accent) center no-repeat;
+  border: 0;
+  padding: 0;
+  vertical-align: middle;
+  border-radius: 4px;
+}
+.icon span { display: none; }
+.icon:hover { background-color: var(--accent-bright); }
+.icon-up    { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIghI+py+0PTQhRTgrvfRP0nmEVOIoReZphxbauAMfyHBcAOw==); }
+.icon-down  { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIghI+py+0PTQjxzCopvltX/lyix0wm2ZwdxraVAMfyHBcAOw==); }
+.icon-plus  { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIhhI+py+0PTQjxzCopvm/6rykgCHGVGaFliLXuI8TyTMsFADs=); }
+.icon-cross { background-image: url(data:image/gif;base64,R0lGODlhEgASAIEAMe7u7gAAgJmZmQAAACH5BAEAAAEALAAAAAASABIAAQIjhI+py+0PIwph1kZvfnnDLoFfd2GU4THnsUruC0fCTNc2XQAAOw==); }
+.icon-move  { background-image: url(data:image/gif;base64,R0lGODlhEgASAJEAAO7u7gAAAJmZmQAAACH5BAEAAAEALAAAAAASABIAAAIfhI+py+3vgpyU0Rug3gnX5U3cqIWSZZLqigjuC8dvAQA7); }
+
+#menuopen { display: none; }
+
+/* ============================================
+   Responsive — Mobile
+   ============================================ */
+@media all and (max-width: 800px) {
+  .cove-menu-resize { display: none; }
+  .pages { left: auto; }
+  .js .logout {
+    top: 1.25rem;
+    background-color: var(--bg);
+    box-shadow: 0 0 5px 5px var(--bg);
+  }
+  #menu {
+    position: static;
+    width: 100%;
+    height: auto;
+    min-width: 23em;
+    border-right: none;
+    border-bottom: 1px solid var(--border-soft);
+    background: var(--bg-elev);
+    margin-top: 9px;
+    box-shadow: var(--shadow);
+  }
+  #content {
+    margin-left: 10px !important;
+    padding-top: 1rem;
+  }
+  #lang { position: static; }
+  #breadcrumb { position: static; left: auto !important; }
+  .js #foot { position: absolute; top: 2em; left: 0; }
+  .js .foot { display: none; }
+  .js #menuopen {
+    display: block;
+    position: absolute;
+    top: 3px;
+    left: 6px;
+  }
+  .nojs #menu { position: static; }
+  table { display: block; overflow-x: auto; }
+  thead { position: static; }
+}
+
+/* ============================================
+   Print
+   ============================================ */
+@media print {
+  #lang, #menu, .logout { display: none; }
+  #content { margin-left: 1em; padding-top: 0; }
+  #breadcrumb { position: static; left: 1em; }
+  body { background: white; color: black; }
+  table { box-shadow: none; border: 1px solid #ccc; }
+  .nowrap td, .nowrap th, td.nowrap { white-space: normal; }
+}
+
+/* ============================================
+   RTL
+   ============================================ */
+.rtl h2 { margin: 0 -18px 1rem 0; }
+.rtl p, .rtl table, .rtl .error, .rtl .message { margin: 0.75rem 0 0 20px; }
+.rtl .logout { left: 1rem; right: auto; }
+.rtl #content {
+  margin: 0 var(--menu-width) 0 0;
+  padding: 3.25rem 0 2.5rem 1.75rem;
+}
+.rtl #breadcrumb { left: auto; right: var(--menu-width); margin: 0; }
+.rtl .pages { left: auto; right: var(--menu-width); }
+.rtl input.wayoff { left: auto; right: -1000px; }
+.rtl #lang, .rtl #menu { left: auto; right: 0; }
+.rtl pre, .rtl code { direction: ltr; }
+@media all and (max-width: 800px) {
+  .rtl.js #foot { left: auto; right: 0; }
+  .rtl .pages { right: auto; }
+  .rtl.js #menuopen { left: auto; right: 6px; }
+  .rtl #content { margin-left: 0 !important; margin-right: 10px; }
+  .rtl #breadcrumb { left: auto !important; right: 48px; }
+}
+@media print {
+  .rtl #content { margin-left: auto; margin-right: 1em; }
+  .rtl #breadcrumb { left: auto; right: 1em; }
+}
+
+/* ============================================
+   Scrollbars
+   ============================================ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) var(--bg-sunk);
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: var(--bg-sunk); }
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* ============================================
+   Image constraints
+   ============================================ */
+img { vertical-align: middle; border: 0; }
+td img { max-width: 200px; max-height: 200px; }
+COVE_ADMINER_CSS_EOF
+}
+
+emit_adminer_theme_js() {
+cat <<'COVE_ADMINER_JS_EOF'
+/**
+ * Cove — Adminer UI enhancements.
+ * Pairs with adminer.css. Adds:
+ *   - Explicit light/dark theme toggle (persisted in localStorage).
+ *   - Drag-to-resize sidebar (persisted in localStorage).
+ *
+ * index.php emits a tiny inline <script> earlier in <head> that sets
+ * data-theme synchronously (before CSS applies) to avoid a theme flash.
+ */
+(function () {
+  var KEY_THEME = 'cove-adminer-theme';
+  var KEY_WIDTH = 'cove-adminer-menu-width';
+  var MIN_W = 180, MAX_W = 480;
+  var html = document.documentElement;
+
+  /* ---------- Theme ----------
+     Preference: 'light' | 'dark' | 'system' (default). data-theme carries the
+     effective mode the tokens read; data-theme-pref drives the toggle icon.
+     Click flips light and dark; right-click picks from a small menu. */
+  function readPref() {
+    try {
+      var s = localStorage.getItem(KEY_THEME);
+      if (s === 'dark' || s === 'light') return s;
+    } catch (e) {}
+    return 'system';
+  }
+  function osTheme() {
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  function effective(pref) { return pref === 'system' ? osTheme() : pref; }
+
+  function applyPref(pref) {
+    pref = (pref === 'dark' || pref === 'light') ? pref : 'system';
+    html.setAttribute('data-theme', effective(pref));
+    html.setAttribute('data-theme-pref', pref);
+    try { localStorage.setItem(KEY_THEME, pref); } catch (e) {}
+    var btn = document.querySelector('.cove-theme-toggle');
+    if (btn) {
+      var label = { system: 'System', light: 'Light', dark: 'Dark' }[pref];
+      btn.setAttribute('aria-label', 'Theme: ' + label + ' (click to switch light and dark, right-click for options)');
+      btn.title = btn.getAttribute('aria-label');
+    }
+    var menu = document.querySelector('.cove-theme-menu');
+    if (menu) {
+      var items = menu.querySelectorAll('button');
+      for (var i = 0; i < items.length; i++) items[i].setAttribute('aria-checked', String(items[i].getAttribute('data-pref') === pref));
+    }
+  }
+
+  if (!html.hasAttribute('data-theme')) applyPref(readPref());
+  try {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+      if (readPref() === 'system') applyPref('system');
+    });
+  } catch (e) {}
+
+  /* ---------- Menu width ---------- */
+  function clampWidth(w) {
+    w = Math.round(w);
+    if (w < MIN_W) return MIN_W;
+    if (w > MAX_W) return MAX_W;
+    return w;
+  }
+
+  function applyWidth(w) {
+    w = clampWidth(w);
+    html.style.setProperty('--menu-width', w + 'px');
+    return w;
+  }
+
+  // Restore saved width synchronously (before first paint).
+  try {
+    var savedWidth = parseInt(localStorage.getItem(KEY_WIDTH), 10);
+    if (savedWidth >= MIN_W && savedWidth <= MAX_W) applyWidth(savedWidth);
+  } catch (e) {}
+
+  /* ---------- Toggle button ---------- */
+  var SUN  = '<svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41"/></svg>';
+  var MOON = '<svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+  var SYSTEM = '<svg class="icon-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>';
+
+  function makeToggle() {
+    if (document.querySelector('.cove-theme-toggle')) return;
+
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cove-theme-toggle';
+    btn.setAttribute('aria-haspopup', 'menu');
+    btn.innerHTML = SYSTEM + SUN + MOON;
+
+    var menu = document.createElement('div');
+    menu.className = 'cove-theme-menu';
+    menu.setAttribute('role', 'menu');
+    menu.hidden = true;
+    var prefs = [['system', 'System'], ['light', 'Light'], ['dark', 'Dark']];
+    for (var i = 0; i < prefs.length; i++) {
+      var item = document.createElement('button');
+      item.type = 'button';
+      item.setAttribute('role', 'menuitemradio');
+      item.setAttribute('data-pref', prefs[i][0]);
+      item.textContent = prefs[i][1];
+      menu.appendChild(item);
+    }
+    document.body.appendChild(menu);
+
+    btn.addEventListener('click', function () {
+      menu.hidden = true;
+      applyPref(effective(readPref()) === 'dark' ? 'light' : 'dark');
+    });
+    btn.addEventListener('contextmenu', function (e) {
+      e.preventDefault();
+      menu.hidden = !menu.hidden;
+    });
+    menu.addEventListener('click', function (e) {
+      var b = e.target.closest('[data-pref]');
+      if (!b) return;
+      applyPref(b.getAttribute('data-pref'));
+      menu.hidden = true;
+    });
+    document.addEventListener('click', function (e) {
+      if (!menu.hidden && !e.target.closest('.cove-theme-menu, .cove-theme-toggle')) menu.hidden = true;
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && !menu.hidden) menu.hidden = true;
+    });
+    applyPref(readPref());
+
+    var logout = document.querySelector('.logout');
+    if (logout && logout.parentNode) {
+      logout.parentNode.insertBefore(btn, logout);
+    } else {
+      document.body.appendChild(btn);
+    }
+  }
+
+  /* ---------- Resize handle ---------- */
+  function makeResizer() {
+    if (document.querySelector('.cove-menu-resize')) return;
+
+    var handle = document.createElement('div');
+    handle.className = 'cove-menu-resize';
+    handle.setAttribute('aria-hidden', 'true');
+    handle.title = 'Drag to resize · double-click to reset';
+    document.body.appendChild(handle);
+
+    var active = false;
+
+    handle.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+      active = true;
+      handle.classList.add('dragging');
+      document.body.classList.add('cove-menu-resizing');
+    });
+    handle.addEventListener('pointermove', function (e) {
+      if (!active) return;
+      applyWidth(e.clientX);
+    });
+    function end(e) {
+      if (!active) return;
+      active = false;
+      try { handle.releasePointerCapture(e.pointerId); } catch (err) {}
+      handle.classList.remove('dragging');
+      document.body.classList.remove('cove-menu-resizing');
+      var w = parseInt(html.style.getPropertyValue('--menu-width'), 10);
+      if (w) {
+        try { localStorage.setItem(KEY_WIDTH, String(w)); } catch (err) {}
+      }
+    }
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
+    handle.addEventListener('dblclick', function () {
+      html.style.removeProperty('--menu-width');
+      try { localStorage.removeItem(KEY_WIDTH); } catch (e) {}
+    });
+  }
+
+  /* ---------- Brand link ----------
+     On the login page Adminer wraps the name in <a id="h1"> pointing at
+     adminer.org. On authenticated pages the name is a bare text node.
+     Handle both: retarget if the anchor exists, otherwise wrap the text. */
+  function retargetBrand() {
+    var existing = document.getElementById('h1');
+    if (existing && existing.tagName === 'A') {
+      existing.setAttribute('href', '?server=&username=');
+      existing.removeAttribute('target');
+      existing.removeAttribute('rel');
+      return;
+    }
+
+    var h1 = document.querySelector('#menu h1');
+    if (!h1) return;
+    for (var node = h1.firstChild; node; node = node.nextSibling) {
+      if (node.nodeType === 3 && node.nodeValue.trim()) {
+        var a = document.createElement('a');
+        a.id = 'h1';
+        a.href = '?server=&username=';
+        a.textContent = node.nodeValue.trim();
+        h1.replaceChild(a, node);
+        return;
+      }
+    }
+  }
+
+  function init() {
+    makeToggle();
+    makeResizer();
+    retargetBrand();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+COVE_ADMINER_JS_EOF
 }
 
 #  Pass all script arguments to the main function.
