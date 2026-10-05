@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [2.2] - 2026-10-05
+
+A security release. Cove listened on every network interface, so anyone on the same Wi-Fi could reach your sites and caught mail, and, chaining the two, sign in and run code on your machine. Sites, the dashboard, Mailpit, and MariaDB now answer only this machine, `cove health` shows what the network can reach, and the dashboard goes on your tailnet only with `--dashboard`.
 
 ### ✨ New Features
 
