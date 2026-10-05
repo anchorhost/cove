@@ -27,10 +27,13 @@ cove_pull() {
     local arg_ssh=""
     local arg_path=""
     local arg_site=""
+    local arg_tenant=""
     local force=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --proxy-uploads) proxy_uploads=true; shift ;;
+            --tenant) arg_tenant="$2"; shift 2 ;;
+            --tenant=*) arg_tenant="${1#*=}"; shift ;;
             --force|--yes|-y) force=true; shift ;;
             --ssh)  arg_ssh="$2";  shift 2 ;;
             --ssh=*)  arg_ssh="${1#*=}";  shift ;;
@@ -41,7 +44,7 @@ cove_pull() {
             -h|--help) display_command_help pull; exit 0 ;;
             *)
                 gum style --foreground red "❌ Unknown option: $1" >&2
-                echo "Usage: cove pull [--ssh \"user@host -p 22\"] [--path public/] [--site <name>] [--proxy-uploads] [--yes]" >&2
+                echo "Usage: cove pull [--ssh \"user@host -p 22\"] [--path public/] [--tenant <id|domain>] [--site <name>] [--proxy-uploads] [--yes]" >&2
                 exit 1
                 ;;
         esac
@@ -133,6 +136,44 @@ cove_pull() {
         log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
     fi
     log_success "Found WordPress site: $remote_url"
+
+    # A WP Freighter host runs many sites out of this one install. Pulling the
+    # install pulls all of them; --tenant (or the picker) pulls one: its own
+    # tables and files, plus the WordPress core it runs on.
+    local tenant="" tenant_rows
+    tenant_rows=$(transfer_probe_tenants "$remote_probe")
+    if [ -n "$arg_tenant" ] && [ "$arg_tenant" != main ]; then
+        if [ -z "$tenant_rows" ]; then
+            log_error "--tenant: ${remote_url} is not a WP Freighter host (it lists no tenant sites)."
+        fi
+        tenant=$(transfer_match_tenant "$tenant_rows" "$arg_tenant")
+        if [ -z "$tenant" ]; then
+            log_error "No tenant '${arg_tenant}' on this host. Its tenants: $(transfer_list_tenants "$tenant_rows")."
+        fi
+    elif [ -z "$arg_tenant" ] && [ -n "$tenant_rows" ]; then
+        if is_noninteractive; then
+            log_success "This is a WP Freighter host; pulling the whole install. Pass --tenant=<id|domain> for one of its $(printf '%s\n' "$tenant_rows" | grep -c .) tenant sites."
+        else
+            tenant=$(transfer_choose_tenant "$tenant_rows" "Main site · ${remote_url} (the whole install, every tenant included)")
+            if [ -z "$tenant" ]; then log_error "No site selected."; fi
+            [ "$tenant" = main ] && tenant=""
+        fi
+    fi
+
+    local tenant_flag=""
+    if [ -n "$tenant" ]; then
+        tenant_flag="--tenant=$tenant"
+        remote_probe=$(transfer_remote "$ssh_opts" "$remote_ssh" probe "$remote_path" "$tenant_flag" $wp_cli_flag 2>/dev/null)
+        local tenant_error
+        tenant_error=$(echo "$remote_probe" | sed -n 's/^tenant_error=//p')
+        if [ -n "$tenant_error" ]; then log_error "$tenant_error"; fi
+        remote_url=$(echo "$remote_probe" | sed -n 's/^home=//p')
+        if [[ ! "$remote_url" == http* ]]; then
+            log_error "Tenant ${tenant} has no home URL."
+        fi
+        domain=$(echo "$remote_url" | sed -E 's/https?:\/\/(www\.)?//; s/\/.*//')
+        log_success "Tenant ${tenant}: ${remote_url} (tables $(echo "$remote_probe" | sed -n 's/^prefix=//p')*)"
+    fi
     # Worth surfacing: a host on the PHP tier works, just more slowly.
     local remote_arch remote_db
     remote_arch=$(echo "$remote_probe" | sed -n 's/^archiver=//p')
@@ -222,7 +263,7 @@ cove_pull() {
 
     local remote_archive
     remote_archive=$(transfer_remote "$ssh_opts" "$remote_ssh" backup "$remote_path" \
-        ${backup_args[@]+"${backup_args[@]}"} $wp_cli_flag)
+        ${backup_args[@]+"${backup_args[@]}"} $tenant_flag $wp_cli_flag)
     if [ -z "$remote_archive" ]; then
         log_error "Failed to generate a backup on the remote."
     fi
@@ -268,6 +309,16 @@ cove_pull() {
     # --- 6. Add Proxy Directive if Flag is Set ---
     if [ "$proxy_uploads" = true ]; then
         log_step "Adding upload proxy directive..."
+        # A tenant serves its uploads from its own folder (/content/<id>/uploads
+        # in dedicated mode), while the local copy links them under wp-content.
+        local uploads_rewrite=""
+        if [ -n "$tenant" ]; then
+            local remote_uploads_path
+            remote_uploads_path=$(echo "$remote_probe" | sed -n 's/^uploads_url=//p' | sed -E 's#^[a-zA-Z]+://[^/]*##')
+            if [ -n "$remote_uploads_path" ] && [ "$remote_uploads_path" != "/wp-content/uploads" ]; then
+                uploads_rewrite="uri replace /wp-content/uploads/ ${remote_uploads_path}/ 1"
+            fi
+        fi
         local new_directive
         # Use a heredoc to create the multi-line directive string
         read -r -d '' new_directive << EOM
@@ -281,6 +332,7 @@ handle @local_upload {
 }
 
 handle /wp-content/uploads/* {
+    ${uploads_rewrite}
     # Proxy the request to the live site.
     reverse_proxy ${remote_url} {
         header_up Host ${domain}

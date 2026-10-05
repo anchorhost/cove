@@ -14044,7 +14044,7 @@ display_command_help() {
             echo "logs). Recommends fixes but changes nothing."
             ;;
         transfer)
-            echo "Usage: cove transfer probe [site]"
+            echo "Usage: cove transfer probe [site] [--tenant=<id>]"
             echo ""
             echo "Reports which tools the backup/restore engine behind 'cove pull' and"
             echo "'cove push' will use here. Cove implements backup and restore itself"
@@ -14056,6 +14056,9 @@ display_command_help() {
             echo "still transfers, just more slowly. Missing tools are installed when the"
             echo "host allows it, and a remote with no WP-CLI gets wp-cli.phar sideloaded"
             echo "over SSH."
+            echo ""
+            echo "It also prints the site's table prefix, folders and URLs, and on a"
+            echo "WP Freighter host its tenant sites; --tenant=<id> shows one tenant's."
             ;;
         trust)
             echo "Usage: cove trust"
@@ -14484,8 +14487,8 @@ display_command_help() {
             echo "  <name>         The name of the site."
             ;;
         pull)
-            echo "Usage: cove pull [--ssh \"user@host -p 22\"] [--path public/] [--site <name>]"
-            echo "                 [--proxy-uploads] [--yes]"
+            echo "Usage: cove pull [--ssh \"user@host -p 22\"] [--path public/] [--tenant <id|domain>]"
+            echo "                 [--site <name>] [--proxy-uploads] [--yes]"
             echo ""
             echo "Pulls a remote WordPress site into Cove. Creates a backup on the remote,"
             echo "pulls it down, and configures it to run locally."
@@ -14496,6 +14499,10 @@ display_command_help() {
             echo "Flags:"
             echo "  --ssh <conn>     Remote SSH connection, e.g. \"user@host.com -p 2222\"."
             echo "  --path <path>    Remote WordPress root. Defaults to 'public/'."
+            echo "  --tenant <id>    On a WP Freighter host, pull one tenant site (by id, domain,"
+            echo "                   or name): its own tables and files, plus WordPress core."
+            echo "                   Without it you are asked, or headless the whole install"
+            echo "                   comes down. Its /content/<id>/ links move to wp-content."
             echo "  --site <name>    Destination site. An existing site is OVERWRITTEN;"
             echo "                   an unused name is created."
             echo "  --yes, -y        Skip the overwrite confirmation. Required (instead of the"
@@ -14504,8 +14511,9 @@ display_command_help() {
             echo "                   configures the local site to proxy media requests to the live URL."
             echo "                   This saves significant time and disk space for large sites."
             echo ""
-            echo "Example:"
+            echo "Examples:"
             echo "  cove pull --ssh \"dev@example.com -p 22\" --site myblog --yes"
+            echo "  cove pull --ssh \"dev@example.com -p 22\" --tenant example.org --site example --yes"
             ;;
         push)
             echo "Usage: cove push [--site <name>] [--ssh \"user@host -p 22\"] [--path public/] [--yes]"
@@ -14520,12 +14528,18 @@ display_command_help() {
             echo "  --site <name>    Local WordPress site to push."
             echo "  --ssh <conn>     Remote SSH connection, e.g. \"user@host.com -p 2222\"."
             echo "  --path <path>    Remote WordPress root. Defaults to 'public/'."
+            echo "  --tenant <id>    Push to one tenant site of a WP Freighter host (by id, domain,"
+            echo "                   or name). Only its tables and its own folder are replaced;"
+            echo "                   tables are renamed to its prefix. Required on a Freighter"
+            echo "                   host: pushing over the whole install is refused, since it"
+            echo "                   would overwrite every tenant."
             echo "  --yes, -y        Confirm the overwrite. Unlike other commands this is never"
             echo "                   assumed when headless — push destroys a live remote site,"
             echo "                   so it must always be stated explicitly."
             echo ""
-            echo "Example:"
+            echo "Examples:"
             echo "  cove push --site myblog --ssh \"dev@example.com -p 22\" --yes"
+            echo "  cove push --site example --ssh \"dev@example.com -p 22\" --tenant example.org --yes"
             ;;
         reload)
             echo "Usage: cove reload"

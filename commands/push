@@ -19,10 +19,13 @@ cove_push() {
     local arg_site=""
     local arg_ssh=""
     local arg_path=""
+    local arg_tenant=""
     local force=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force|--yes|-y) force=true; shift ;;
+            --tenant) arg_tenant="$2"; shift 2 ;;
+            --tenant=*) arg_tenant="${1#*=}"; shift ;;
             --site) arg_site="$2"; shift 2 ;;
             --site=*) arg_site="${1#*=}"; shift ;;
             --ssh)  arg_ssh="$2";  shift 2 ;;
@@ -32,7 +35,7 @@ cove_push() {
             -h|--help) display_command_help push; exit 0 ;;
             *)
                 gum style --foreground red "❌ Unknown option: $1" >&2
-                echo "Usage: cove push [--site <name>] [--ssh \"user@host -p 22\"] [--path public/] [--yes]" >&2
+                echo "Usage: cove push [--site <name>] [--ssh \"user@host -p 22\"] [--path public/] [--tenant <id|domain>] [--yes]" >&2
                 exit 1
                 ;;
         esac
@@ -141,7 +144,58 @@ cove_push() {
         fi
         log_error "Could not find a valid WordPress site at the specified path. Check your connection details and path."
     fi
-    log_success "Found remote site to overwrite: $remote_url"
+    # A WP Freighter host runs many sites out of this one install, and a push
+    # to the install replaces its files and empties its database: every
+    # tenant would go with it. So on such a host a push goes to one tenant,
+    # and only that tenant's tables and own folder are replaced.
+    local tenant="" tenant_rows
+    tenant_rows=$(transfer_probe_tenants "$remote_probe")
+    if [ -n "$tenant_rows" ]; then
+        local tenant_count
+        tenant_count=$(printf '%s\n' "$tenant_rows" | grep -c .)
+        if [ "$arg_tenant" = main ]; then
+            log_error "Refusing to push over the whole install at ${remote_url}: it is a WP Freighter host, and the push would replace the files and tables of all ${tenant_count} of its tenant sites too. Push to one tenant with --tenant=<id|domain>."
+        elif [ -n "$arg_tenant" ]; then
+            tenant=$(transfer_match_tenant "$tenant_rows" "$arg_tenant")
+            if [ -z "$tenant" ]; then
+                log_error "No tenant '${arg_tenant}' on this host. Its tenants: $(transfer_list_tenants "$tenant_rows")."
+            fi
+        elif is_noninteractive; then
+            log_error "${remote_url} is a WP Freighter host with ${tenant_count} tenant sites, and a push to the whole install would overwrite every one of them. Pass --tenant=<id|domain> to push to one tenant."
+        else
+            tenant=$(transfer_choose_tenant "$tenant_rows" "")
+            if [ -z "$tenant" ]; then log_error "No tenant selected."; fi
+        fi
+    elif [ -n "$arg_tenant" ]; then
+        log_error "--tenant: ${remote_url} is not a WP Freighter host (it lists no tenant sites)."
+    fi
+
+    local tenant_flag="" tenant_scope=""
+    if [ -n "$tenant" ]; then
+        tenant_flag="--tenant=$tenant"
+        remote_probe=$(transfer_remote "$ssh_opts" "$remote_ssh" probe "$remote_path" "$tenant_flag" $wp_cli_flag 2>/dev/null)
+        local tenant_error
+        tenant_error=$(echo "$remote_probe" | sed -n 's/^tenant_error=//p')
+        if [ -n "$tenant_error" ]; then log_error "$tenant_error"; fi
+        remote_url=$(echo "$remote_probe" | sed -n 's/^home=//p')
+        if [[ ! "$remote_url" == http* ]]; then
+            log_error "Tenant ${tenant} has no home URL."
+        fi
+        local t_prefix t_files t_dir t_root
+        t_prefix=$(echo "$remote_probe" | sed -n 's/^prefix=//p')
+        t_files=$(echo "$remote_probe" | sed -n 's/^tenant_files=//p')
+        t_dir=$(echo "$remote_probe" | sed -n 's/^tenant_dir=//p')
+        t_root=$(echo "$remote_probe" | sed -n 's/^abspath=//p')
+        t_dir="${t_dir#"$t_root"/}"
+        case "$t_files" in
+            content) tenant_scope="its tables (${t_prefix}*) and its folder ${t_dir}/" ;;
+            uploads) tenant_scope="its tables (${t_prefix}*) and its uploads folder ${t_dir}/. Plugins and themes are shared by every tenant on this host, so they are not pushed" ;;
+            *)       tenant_scope="its tables (${t_prefix}*). Files are shared by every tenant on this host, so none are pushed" ;;
+        esac
+        log_success "Found tenant ${tenant} to overwrite: $remote_url"
+    else
+        log_success "Found remote site to overwrite: $remote_url"
+    fi
     local remote_ext remote_db
     remote_ext=$(echo "$remote_probe" | sed -n 's/^extractor=//p')
     remote_db=$(echo "$remote_probe" | sed -n 's/^db_load=//p')
@@ -156,7 +210,11 @@ cove_push() {
     # caller has to say --yes out loud.
     if ! $force; then
         require_interactive "Overwriting the remote site at '${remote_url}'" "--yes to confirm the push"
-        if ! gum confirm "🚨 Are you sure you want to push '${site_name}' to '${remote_url}'? This will completely overwrite the remote site's files and database."; then
+        local confirm_text="🚨 Are you sure you want to push '${site_name}' to '${remote_url}'? This will completely overwrite the remote site's files and database."
+        if [ -n "$tenant" ]; then
+            confirm_text="🚨 Are you sure you want to push '${site_name}' to tenant ${tenant} (${remote_url})? This replaces ${tenant_scope}. The other tenants and the main site are not touched."
+        fi
+        if ! gum confirm "$confirm_text"; then
             echo "🚫 Push cancelled."
             exit 0
         fi
@@ -169,7 +227,11 @@ cove_push() {
     # that path (a host's own helper of the same name, or nothing at all).
     local cove_helper="wp-content/mu-plugins/captaincore-helper.php"
     local backup_path
-    backup_path=$(transfer_local backup "$local_path" --exclude="$cove_helper")
+    # A tenant gets only this site's own tables: anything else in the local
+    # database would land in the host's shared one.
+    local only_prefix=""
+    [ -n "$tenant" ] && only_prefix="--only-prefix"
+    backup_path=$(transfer_local backup "$local_path" --exclude="$cove_helper" $only_prefix)
     if [ -z "$backup_path" ] || [ ! -f "$backup_path" ]; then
         log_error "Failed to generate the local backup."
     fi
@@ -197,7 +259,7 @@ cove_push() {
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
     if ! transfer_remote "$ssh_opts" "$remote_ssh" restore "$remote_path" "$remote_tmp" \
-            --url-to="$remote_url" --keep="$cove_helper" $wp_cli_flag; then
+            --url-to="$remote_url" --keep="$cove_helper" $tenant_flag $wp_cli_flag; then
         rm -f "$backup_path"
         ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
         log_error "The remote restore failed."
