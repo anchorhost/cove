@@ -10,7 +10,8 @@
     * `cove transfer probe` now prints the site's prefix, folders, and URLs, and on a Freighter host its tenants; `--tenant=<id>` shows one.
 
 * **`cove twin` serves a second copy of a site at its own domain:** a twin is another folder of the same site, with the same database behind it, served at a domain of its own. It was built for sites that run Minn Engine, which parks WordPress in `wp-reference/` beside the engine: `cove twin minn add` serves that WordPress at `wp.minn.localhost` while `minn.localhost` keeps answering through Minn, so the same page can be opened on each. `--domain` and `--root` pick another domain or folder, `cove twin <site>` shows the twin and what each folder runs, and `cove twin <site> remove` takes it down.
-    * PHP behind the twin is handed the site's own hostname over HTTPS, so each request answers exactly as it would at the site's address: the same canonical redirects, links, and cookies. That is what makes the two comparable request for request, and it means the twin's links and redirects lead back to the site.
+    * The twin browses as a site of its own: WordPress there is configured for the twin's address from the first line of the request, so its links, redirects, sign-ins, and content URLs stay on the twin.
+    * To compare the two request for request, a twin can answer as the site instead: `--as-site=ref.minn.localhost` adds a domain that always does, and any request carrying `X-Cove-Twin: as-site` does too. WordPress then sees the site's own hostname over HTTPS and answers exactly as the site's address would, canonical redirects and stored URLs included.
     * The twin gets the site's guards (this machine only, no logs or dumps served) and its own log, `logs/caddy-twin.log`.
 
 ### 🔒 Security & Bug Fixes
