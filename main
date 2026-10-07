@@ -672,6 +672,19 @@ if (!defined('COVE_RUNTIME')) {
     define('COVE_RUNTIME', true);
 }
 
+// A twin (cove twin) is the same site served from another folder at a
+// domain of its own, and Caddy says whose twin it is (COVE_TWIN_OF). It
+// answers as itself: WordPress there is configured for the twin's address
+// from the start, so its links, redirects, and content URLs stay on the
+// twin. A request that asks to be answered as the site (X-Cove-Twin:
+// as-site) arrives with the site's own Host and keeps the stored addresses.
+if (!empty($_SERVER['COVE_TWIN_OF']) && isset($_SERVER['HTTP_HOST'])
+    && strcasecmp($_SERVER['HTTP_HOST'], $_SERVER['COVE_TWIN_OF']) !== 0
+    && preg_match('/^[A-Za-z0-9._-]+(:\d+)?$/', $_SERVER['HTTP_HOST'])) {
+    define('WP_HOME', 'https://' . $_SERVER['HTTP_HOST']);
+    define('WP_SITEURL', 'https://' . $_SERVER['HTTP_HOST']);
+}
+
 spl_autoload_register(function ($class) {
     $prefix = 'Whoops\\';
     $base_dir = __DIR__ . '/whoops/src/Whoops/';
@@ -953,7 +966,7 @@ function cove_maybe_override_site_url( $value ) {
     }
 
     $host = isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : '';
-    
+
     // Skip if no host or if it ends with .localhost (normal local access)
     if ( empty( $host ) || preg_match( '/\.localhost(:\d+)?$/', $host ) ) {
         return $value;
@@ -1395,10 +1408,12 @@ update_etc_hosts() {
                     done < "$site_path/mappings"
                 fi
 
-                # A twin's domain (site_twin checks it before it gets here).
-                local twin_entry
+                # A twin's domains (site_twin checks them before they get here).
+                local twin_entry twin_domain twin_folder twin_as_site
                 if twin_entry=$(site_twin "$site_path"); then
-                    required_hosts+=("${twin_entry%%$'\t'*}")
+                    IFS=$'\t' read -r twin_domain twin_folder twin_as_site <<< "$twin_entry"
+                    required_hosts+=("$twin_domain")
+                    [ -n "$twin_as_site" ] && required_hosts+=("$twin_as_site")
                 fi
             fi
         done
@@ -2606,18 +2621,28 @@ prune_delete_tombstones() {
 # default directive order already precedes file_server, so the plain-site
 # file_server conditional below needs no change.
 emit_site_php_handler() {
-    local site_path="$1"
-    local ver
+    local site_path="$1" env_name="$2" env_value="$3"
+    local ver handler open=""
     ver=$(site_php_version "$site_path")
+    # An optional server variable for PHP (a twin's COVE_TWIN_OF) goes in the
+    # handler's block, which both php_server and php_fastcgi take.
+    [ -n "$env_name" ] && open=" {"
     if [ -n "$ver" ] && [ -n "$(php_fpm_prefix_for "$ver")" ]; then
         # php_server is shorthand for php_fastcgi + file_server. When swapping
         # in a pinned socket, file_server must come along explicitly or every
         # static asset (JS/CSS/images) falls through to no handler and Caddy
         # answers with an empty 200 — which presents as a broken wp-admin.
-        echo "    php_fastcgi unix/$(php_fpm_sock_for "$ver")" >> "$CADDYFILE_PATH"
-        echo "    file_server" >> "$CADDYFILE_PATH"
+        handler="php_fastcgi unix/$(php_fpm_sock_for "$ver")"
     else
-        echo "    php_server" >> "$CADDYFILE_PATH"
+        handler="php_server"
+    fi
+    echo "    $handler$open" >> "$CADDYFILE_PATH"
+    if [ -n "$env_name" ]; then
+        echo "        env $env_name $env_value" >> "$CADDYFILE_PATH"
+        echo "    }" >> "$CADDYFILE_PATH"
+    fi
+    if [ "$handler" != "php_server" ]; then
+        echo "    file_server" >> "$CADDYFILE_PATH"
     fi
 }
 
@@ -2666,34 +2691,32 @@ site_multisite_mode() {
     [ -f "$site_path/multisite" ] && cat "$site_path/multisite"
 }
 
-# WordPress subdirectory-multisite rewrites, the Caddy translation of the
-# canonical nginx rules. A subsite request like /store/wp-admin/... or
-# /store/wp-login.php has no matching file on disk — the real files live at
-# the root — so rewrite the subsite prefix away. The `not file` guard is
-# load-bearing: it scopes the rewrite to paths that DON'T exist, so real
-# root files (/wp-admin/index.php itself) are never mangled. Caddy runs
-# redir/rewrite before php_server AND php_fastcgi in its standard directive
-# order, so this works for FrankenPHP and pinned-FPM sites alike.
 # A site's twin (commands/twin): a second domain serving another folder of
-# the same site, the same database behind both. Prints "<domain>\t<folder>"
-# when the site has a valid one. The values are checked again on the way
-# out, not just when `cove twin` wrote them: the file sits where the site's
-# own PHP can rewrite it, and both reach the Caddyfile (and the domain
-# /etc/hosts).
+# the same site, the same database behind both, and optionally one more
+# domain that always answers as the site. Prints
+# "<domain>\t<folder>\t<as-site domain or empty>" when the site has a valid
+# twin. The values are checked again on the way out, not just when `cove
+# twin` wrote them: the file sits where the site's own PHP can rewrite it,
+# and they reach the Caddyfile and /etc/hosts.
 site_twin() {
-    local site_path="$1" key value domain="" folder=""
+    local site_path="$1" key value domain="" folder="" as_site=""
     [ -f "$site_path/twin" ] || return 1
     while IFS='=' read -r key value || [ -n "$key" ]; do
         case "$key" in
             domain) domain="$value" ;;
             root) folder="$value" ;;
+            as_site) as_site="$value" ;;
         esac
     done < "$site_path/twin"
     validate_hostname "$domain" || return 1
     [[ "$domain" == \*.* ]] && return 1
     validate_twin_folder "$folder" || return 1
     [ -d "$site_path/$folder" ] || return 1
-    printf '%s\t%s\n' "$domain" "$folder"
+    if [ -n "$as_site" ]; then
+        validate_hostname "$as_site" || return 1
+        [[ "$as_site" == \*.* ]] && return 1
+    fi
+    printf '%s\t%s\t%s\n' "$domain" "$folder" "$as_site"
 }
 
 # A twin's folder: relative to the site's directory, plain path segments
@@ -2706,20 +2729,23 @@ validate_twin_folder() {
     return 0
 }
 
-# The twin's server block: its folder as the docroot, the site's own guards,
-# and the site's own hostname handed to PHP. That last part is the point:
-# the code behind the twin answers exactly as it would at the site's address
-# (canonical redirects, links, cookies, HTTPS), so the two can be compared
-# request for request. Its links and redirects therefore lead to the site.
+# The twin's server block: its folder as the docroot and the site's own
+# guards. PHP is told whose twin it is (COVE_TWIN_OF), and the prepended
+# bootstrap (create_whoops_bootstrap) configures WordPress for the twin's
+# own address, so the twin browses as a site of its own. A request on the
+# as-site domain, or carrying X-Cove-Twin: as-site, is handed the site's
+# hostname instead and answers exactly as the site would (canonical
+# redirects, links, cookies, what a write stores): that is how the two are
+# compared request for request.
 emit_site_twin_block() {
     local site_path="$1" site_name="$2" local_only="$3" ms_mode="$4"
-    local twin domain folder
+    local twin domain folder as_site site_host
     twin=$(site_twin "$site_path") || return 0
-    domain="${twin%%$'\t'*}"
-    folder="${twin#*$'\t'}"
+    IFS=$'\t' read -r domain folder as_site <<< "$twin"
+    site_host="$site_name$(https_port_suffix)"
     {
-        echo "# Twin of $site_name: $folder/ answers as $site_name"
-        echo "$domain {"
+        echo "# Twin of $site_name: $folder/${as_site:+ (as the site at $as_site)}"
+        echo "$domain${as_site:+, $as_site} {"
         echo "    root * \"$site_path/$folder\""
     } >> "$CADDYFILE_PATH"
     emit_site_deny_rules
@@ -2729,16 +2755,29 @@ emit_site_twin_block() {
         echo "    log {"
         echo "        output file \"$site_path/logs/caddy-twin.log\""
         echo "    }"
-        echo "    request_header Host $site_name$(https_port_suffix)"
+        echo "    @cove_as_site header X-Cove-Twin as-site"
+        echo "    request_header @cove_as_site Host $site_host"
+        if [ -n "$as_site" ]; then
+            echo "    @cove_as_site_domain host $as_site"
+            echo "    request_header @cove_as_site_domain Host $site_host"
+        fi
     } >> "$CADDYFILE_PATH"
     if [ "$ms_mode" == "subdirectory" ]; then
         emit_multisite_subdir_rewrites
     fi
-    emit_site_php_handler "$site_path"
+    emit_site_php_handler "$site_path" COVE_TWIN_OF "$site_host"
     echo "}" >> "$CADDYFILE_PATH"
     echo "" >> "$CADDYFILE_PATH"
 }
 
+# WordPress subdirectory-multisite rewrites, the Caddy translation of the
+# canonical nginx rules. A subsite request like /store/wp-admin/... or
+# /store/wp-login.php has no matching file on disk — the real files live at
+# the root — so rewrite the subsite prefix away. The `not file` guard is
+# load-bearing: it scopes the rewrite to paths that DON'T exist, so real
+# root files (/wp-admin/index.php itself) are never mangled. Caddy runs
+# redir/rewrite before php_server AND php_fastcgi in its standard directive
+# order, so this works for FrankenPHP and pinned-FPM sites alike.
 emit_multisite_subdir_rewrites() {
     cat >> "$CADDYFILE_PATH" <<'EOM'
     @cove_ms_admin path_regexp ^(/[_0-9a-zA-Z-]+)?/wp-admin$
@@ -14389,18 +14428,21 @@ display_command_help() {
             echo "Mappings allow a single site to be served from multiple domains."
             ;;
         twin)
-            echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>] [--format=json]"
+            echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>] [--as-site=<domain>] [--format=json]"
             echo ""
             echo "A twin is a second domain that serves another folder of the same site, with the"
             echo "same database behind both. Minn Engine parks WordPress in wp-reference/ beside the"
             echo "engine in public/, so 'cove twin minn add' serves it at wp.minn.localhost while"
             echo "minn.localhost keeps answering through Minn."
             echo ""
-            echo "PHP behind the twin sees the site's own hostname over HTTPS, so every request"
-            echo "answers exactly as it would at the site's address (canonical redirects, links,"
-            echo "cookies). Its links and redirects lead to the site."
+            echo "The twin answers as itself: WordPress there gets the twin's own URLs, so it"
+            echo "browses as a site of its own. A request carrying 'X-Cove-Twin: as-site' is"
+            echo "answered as the site instead, over HTTPS, exactly as the site's address would"
+            echo "answer it (canonical redirects, links, cookies, what a write stores): that is"
+            echo "how the two are compared request for request."
             echo ""
-            echo "  add      --domain defaults to wp.<site>.localhost, --root to wp-reference"
+            echo "  add      --domain defaults to wp.<site>.localhost, --root to wp-reference;"
+            echo "           --as-site names one more domain that always answers as the site"
             echo "  remove   stop serving the twin"
             ;;
         lan)

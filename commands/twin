@@ -2,9 +2,12 @@
 # same database behind both. Built for sites that run Minn Engine, which
 # parks WordPress in wp-reference/ beside the engine in public/:
 # minn.localhost answers through Minn and wp.minn.localhost through
-# WordPress, on the same data. PHP behind the twin is handed the site's own
-# hostname (see emit_site_twin_block), so each request answers exactly as it
-# would at the site's address, which is what lets the two be compared.
+# WordPress, on the same data. The twin answers as itself (the prepended
+# bootstrap configures WordPress for its address), so it browses as a site
+# of its own. A
+# request carrying X-Cove-Twin: as-site is answered as the site instead,
+# exactly as the site's address would answer it, which is how the two are
+# compared request for request (see emit_site_twin_block).
 
 # Which software a folder runs: Minn Engine, WordPress (with its version), or
 # nothing Cove recognises.
@@ -33,19 +36,24 @@ twin_domain_taken() {
             return 0
         fi
         [ "$(basename "$path")" = "$own_site" ] && continue
-        if entry=$(site_twin "$path") && [ "${entry%%$'\t'*}" = "$domain" ]; then
-            return 0
+        if entry=$(site_twin "$path"); then
+            local other_domain other_folder other_as_site
+            IFS=$'\t' read -r other_domain other_folder other_as_site <<< "$entry"
+            if [ "$other_domain" = "$domain" ] || [ "$other_as_site" = "$domain" ]; then
+                return 0
+            fi
         fi
     done
     return 1
 }
 
 cove_twin() {
-    local site_name="" action="" domain="" folder="wp-reference" format=""
+    local site_name="" action="" domain="" folder="wp-reference" as_site="" format=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --domain=*) domain="${1#*=}" ;;
             --root=*) folder="${1#*=}" ;;
+            --as-site=*) as_site="${1#*=}" ;;
             --format=*) format="${1#*=}" ;;
             -*)
                 gum style --foreground red "❌ Error: Unknown option '$1'."
@@ -64,7 +72,7 @@ cove_twin() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>]"
+        echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>] [--as-site=<domain>]"
         exit 1
     fi
     site_name="${site_name%.localhost}"
@@ -95,20 +103,22 @@ cove_twin() {
                 fi
                 return 0
             fi
-            domain="${entry%%$'\t'*}"
-            folder="${entry#*$'\t'}"
+            IFS=$'\t' read -r domain folder as_site <<< "$entry"
             local site_engine twin_engine
             site_engine=$(twin_engine_of "$site_dir/public")
             twin_engine=$(twin_engine_of "$site_dir/$folder")
             if [ "$format" = "json" ]; then
-                printf '{"twin":{"domain":"%s","root":"%s","url":"%s","answers_as":"%s","site_runs":"%s","twin_runs":"%s"}}\n' \
-                    "$domain" "$folder" "$(url_for "$domain")" "$site_host" "$site_engine" "$twin_engine"
+                printf '{"twin":{"domain":"%s","root":"%s","url":"%s","as_site":"%s","as_site_header":"X-Cove-Twin: as-site","site_runs":"%s","twin_runs":"%s"}}\n' \
+                    "$domain" "$folder" "$(url_for "$domain")" "$as_site" "$site_engine" "$twin_engine"
                 return 0
             fi
             echo "🪞 $site_host has a twin"
             echo "   $(url_for "$site_host")  →  public/  ($site_engine)"
             echo "   $(url_for "$domain")  →  $folder/  ($twin_engine)"
-            echo "   PHP behind the twin sees $site_host, so its links and redirects lead there."
+            if [ -n "$as_site" ]; then
+                echo "   $(url_for "$as_site")  →  $folder/, answering as $site_host"
+            fi
+            echo "   The twin answers as itself. Send 'X-Cove-Twin: as-site' to have it answer as $site_host."
             ;;
         add)
             [ -n "$domain" ] || domain="wp.$site_host"
@@ -124,6 +134,16 @@ cove_twin() {
                 gum style --foreground red "❌ Error: Another site already answers on '$domain'."
                 exit 1
             fi
+            if [ -n "$as_site" ]; then
+                if ! validate_hostname "$as_site" || [[ "$as_site" == \*.* ]] || [ "$as_site" = "$site_host" ] || [ "$as_site" = "$domain" ]; then
+                    gum style --foreground red "❌ Error: Invalid --as-site domain '$as_site'." "It needs a hostname of its own, apart from the site's and the twin's."
+                    exit 1
+                fi
+                if twin_domain_taken "$as_site" "$site_host"; then
+                    gum style --foreground red "❌ Error: Another site already answers on '$as_site'."
+                    exit 1
+                fi
+            fi
             if ! validate_twin_folder "$folder"; then
                 gum style --foreground red "❌ Error: Invalid folder '$folder'." "Name a folder inside the site's directory (not public/), e.g. --root=wp-reference."
                 exit 1
@@ -137,8 +157,14 @@ cove_twin() {
             if [ "$twin_engine" = "nothing servable" ]; then
                 gum style --foreground yellow "⚠️  $folder/ has no index.php or index.html yet; the twin answers once it does."
             fi
-            printf 'domain=%s\nroot=%s\n' "$domain" "$folder" > "$site_dir/twin.tmp" && mv "$site_dir/twin.tmp" "$site_dir/twin"
-            echo "✅ $(url_for "$domain") now serves $folder/ ($twin_engine) as $site_host."
+            {
+                printf 'domain=%s\nroot=%s\n' "$domain" "$folder"
+                [ -n "$as_site" ] && printf 'as_site=%s\n' "$as_site"
+            } > "$site_dir/twin.tmp" && mv "$site_dir/twin.tmp" "$site_dir/twin"
+            echo "✅ $(url_for "$domain") now serves $folder/ ($twin_engine), the same site at its own domain."
+            if [ -n "$as_site" ]; then
+                echo "   $(url_for "$as_site") serves it too, answering as $site_host."
+            fi
             regenerate_caddyfile
             update_etc_hosts
             ;;
@@ -153,7 +179,7 @@ cove_twin() {
             ;;
         *)
             gum style --foreground red "❌ Error: Unknown action '$action'."
-            echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>]"
+            echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>] [--as-site=<domain>]"
             exit 1
             ;;
     esac

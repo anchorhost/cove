@@ -53,9 +53,11 @@ cove_delete() {
             fi
         done < "$site_dir/mappings"
     fi
-    local twin_entry
+    local twin_entry twin_domain twin_folder twin_as_site
     if twin_entry=$(site_twin "$site_dir"); then
-        hosts_to_remove+=("${twin_entry%%$'\t'*}")
+        IFS=$'\t' read -r twin_domain twin_folder twin_as_site <<< "$twin_entry"
+        hosts_to_remove+=("$twin_domain")
+        [ -n "$twin_as_site" ] && hosts_to_remove+=("$twin_as_site")
     fi
 
     echo "🔥 Deleting site: $site_name.localhost"
