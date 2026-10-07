@@ -1,0 +1,160 @@
+# A twin: a second domain that serves another folder of the same site, the
+# same database behind both. Built for sites that run Minn Engine, which
+# parks WordPress in wp-reference/ beside the engine in public/:
+# minn.localhost answers through Minn and wp.minn.localhost through
+# WordPress, on the same data. PHP behind the twin is handed the site's own
+# hostname (see emit_site_twin_block), so each request answers exactly as it
+# would at the site's address, which is what lets the two be compared.
+
+# Which software a folder runs: Minn Engine, WordPress (with its version), or
+# nothing Cove recognises.
+twin_engine_of() {
+    local dir="$1" version
+    if [ -f "$dir/minn/bootstrap.php" ] && grep -q "minn/bootstrap.php" "$dir/wp-settings.php" 2>/dev/null; then
+        echo "Minn Engine"
+    elif [ -f "$dir/wp-includes/version.php" ]; then
+        version=$(sed -n "s/^\$wp_version = '\([^']*\)';.*/\1/p" "$dir/wp-includes/version.php" | head -1)
+        echo "WordPress${version:+ $version}"
+    elif [ -f "$dir/index.php" ] || [ -f "$dir/index.html" ]; then
+        echo "a plain site"
+    else
+        echo "nothing servable"
+    fi
+}
+
+# The domain is someone else's when a site, a mapping, or another twin
+# already answers on it.
+twin_domain_taken() {
+    local domain="$1" own_site="$2" path entry
+    [ -d "$SITES_DIR/$domain" ] && return 0
+    for path in "$SITES_DIR"/*; do
+        [ -d "$path" ] || continue
+        if [ -f "$path/mappings" ] && grep -Fxq "$domain" "$path/mappings"; then
+            return 0
+        fi
+        [ "$(basename "$path")" = "$own_site" ] && continue
+        if entry=$(site_twin "$path") && [ "${entry%%$'\t'*}" = "$domain" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+cove_twin() {
+    local site_name="" action="" domain="" folder="wp-reference" format=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain=*) domain="${1#*=}" ;;
+            --root=*) folder="${1#*=}" ;;
+            --format=*) format="${1#*=}" ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$1'."
+                exit 1
+                ;;
+            *)
+                if [ -z "$site_name" ]; then
+                    site_name="$1"
+                elif [ -z "$action" ]; then
+                    action="$1"
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>]"
+        exit 1
+    fi
+    site_name="${site_name%.localhost}"
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
+    local site_host="$site_name.localhost"
+    local site_dir="$SITES_DIR/$site_host"
+    if [ ! -d "$site_dir/public" ]; then
+        gum style --foreground red "❌ Error: Site '$site_host' not found."
+        exit 1
+    fi
+
+    case "${action:-show}" in
+        show)
+            local entry
+            if ! entry=$(site_twin "$site_dir"); then
+                if [ "$format" = "json" ]; then
+                    echo '{"twin":null}'
+                    return 0
+                fi
+                if [ -f "$site_dir/twin" ]; then
+                    gum style --foreground yellow "⚠️  $site_dir/twin is not a valid twin, so Cove ignores it. 'cove twin $site_name remove' clears it."
+                else
+                    echo "ℹ️  $site_host has no twin. Add one with: cove twin $site_name add"
+                fi
+                return 0
+            fi
+            domain="${entry%%$'\t'*}"
+            folder="${entry#*$'\t'}"
+            local site_engine twin_engine
+            site_engine=$(twin_engine_of "$site_dir/public")
+            twin_engine=$(twin_engine_of "$site_dir/$folder")
+            if [ "$format" = "json" ]; then
+                printf '{"twin":{"domain":"%s","root":"%s","url":"%s","answers_as":"%s","site_runs":"%s","twin_runs":"%s"}}\n' \
+                    "$domain" "$folder" "$(url_for "$domain")" "$site_host" "$site_engine" "$twin_engine"
+                return 0
+            fi
+            echo "🪞 $site_host has a twin"
+            echo "   $(url_for "$site_host")  →  public/  ($site_engine)"
+            echo "   $(url_for "$domain")  →  $folder/  ($twin_engine)"
+            echo "   PHP behind the twin sees $site_host, so its links and redirects lead there."
+            ;;
+        add)
+            [ -n "$domain" ] || domain="wp.$site_host"
+            if ! validate_hostname "$domain" || [[ "$domain" == \*.* ]]; then
+                gum style --foreground red "❌ Error: Invalid domain '$domain'." "A twin takes one hostname: letters, numbers, dots, hyphens, and underscores."
+                exit 1
+            fi
+            if [ "$domain" = "$site_host" ]; then
+                gum style --foreground red "❌ Error: A twin needs a domain of its own, not the site's."
+                exit 1
+            fi
+            if twin_domain_taken "$domain" "$site_host"; then
+                gum style --foreground red "❌ Error: Another site already answers on '$domain'."
+                exit 1
+            fi
+            if ! validate_twin_folder "$folder"; then
+                gum style --foreground red "❌ Error: Invalid folder '$folder'." "Name a folder inside the site's directory (not public/), e.g. --root=wp-reference."
+                exit 1
+            fi
+            if [ ! -d "$site_dir/$folder" ]; then
+                gum style --foreground red "❌ Error: $site_dir/$folder does not exist."
+                exit 1
+            fi
+            local twin_engine
+            twin_engine=$(twin_engine_of "$site_dir/$folder")
+            if [ "$twin_engine" = "nothing servable" ]; then
+                gum style --foreground yellow "⚠️  $folder/ has no index.php or index.html yet; the twin answers once it does."
+            fi
+            printf 'domain=%s\nroot=%s\n' "$domain" "$folder" > "$site_dir/twin.tmp" && mv "$site_dir/twin.tmp" "$site_dir/twin"
+            echo "✅ $(url_for "$domain") now serves $folder/ ($twin_engine) as $site_host."
+            regenerate_caddyfile
+            update_etc_hosts
+            ;;
+        remove)
+            if [ ! -f "$site_dir/twin" ]; then
+                echo "ℹ️  $site_host has no twin."
+                return 0
+            fi
+            rm -f "$site_dir/twin"
+            echo "✅ Removed the twin of $site_host."
+            regenerate_caddyfile
+            ;;
+        *)
+            gum style --foreground red "❌ Error: Unknown action '$action'."
+            echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>]"
+            exit 1
+            ;;
+    esac
+}

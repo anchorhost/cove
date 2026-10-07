@@ -1394,6 +1394,12 @@ update_etc_hosts() {
                         fi
                     done < "$site_path/mappings"
                 fi
+
+                # A twin's domain (site_twin checks it before it gets here).
+                local twin_entry
+                if twin_entry=$(site_twin "$site_path"); then
+                    required_hosts+=("${twin_entry%%$'\t'*}")
+                fi
             fi
         done
     fi
@@ -2668,6 +2674,71 @@ site_multisite_mode() {
 # root files (/wp-admin/index.php itself) are never mangled. Caddy runs
 # redir/rewrite before php_server AND php_fastcgi in its standard directive
 # order, so this works for FrankenPHP and pinned-FPM sites alike.
+# A site's twin (commands/twin): a second domain serving another folder of
+# the same site, the same database behind both. Prints "<domain>\t<folder>"
+# when the site has a valid one. The values are checked again on the way
+# out, not just when `cove twin` wrote them: the file sits where the site's
+# own PHP can rewrite it, and both reach the Caddyfile (and the domain
+# /etc/hosts).
+site_twin() {
+    local site_path="$1" key value domain="" folder=""
+    [ -f "$site_path/twin" ] || return 1
+    while IFS='=' read -r key value || [ -n "$key" ]; do
+        case "$key" in
+            domain) domain="$value" ;;
+            root) folder="$value" ;;
+        esac
+    done < "$site_path/twin"
+    validate_hostname "$domain" || return 1
+    [[ "$domain" == \*.* ]] && return 1
+    validate_twin_folder "$folder" || return 1
+    [ -d "$site_path/$folder" ] || return 1
+    printf '%s\t%s\n' "$domain" "$folder"
+}
+
+# A twin's folder: relative to the site's directory, plain path segments
+# only (none starting with a dot, so no "..", and nothing Caddy would read
+# as syntax), and never public/, which is the site itself.
+validate_twin_folder() {
+    local folder="$1"
+    [[ "$folder" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] || return 1
+    [ "$folder" != "public" ] || return 1
+    return 0
+}
+
+# The twin's server block: its folder as the docroot, the site's own guards,
+# and the site's own hostname handed to PHP. That last part is the point:
+# the code behind the twin answers exactly as it would at the site's address
+# (canonical redirects, links, cookies, HTTPS), so the two can be compared
+# request for request. Its links and redirects therefore lead to the site.
+emit_site_twin_block() {
+    local site_path="$1" site_name="$2" local_only="$3" ms_mode="$4"
+    local twin domain folder
+    twin=$(site_twin "$site_path") || return 0
+    domain="${twin%%$'\t'*}"
+    folder="${twin#*$'\t'}"
+    {
+        echo "# Twin of $site_name: $folder/ answers as $site_name"
+        echo "$domain {"
+        echo "    root * \"$site_path/$folder\""
+    } >> "$CADDYFILE_PATH"
+    emit_site_deny_rules
+    emit_site_local_guard "$local_only"
+    {
+        echo "    tls internal"
+        echo "    log {"
+        echo "        output file \"$site_path/logs/caddy-twin.log\""
+        echo "    }"
+        echo "    request_header Host $site_name$(https_port_suffix)"
+    } >> "$CADDYFILE_PATH"
+    if [ "$ms_mode" == "subdirectory" ]; then
+        emit_multisite_subdir_rewrites
+    fi
+    emit_site_php_handler "$site_path"
+    echo "}" >> "$CADDYFILE_PATH"
+    echo "" >> "$CADDYFILE_PATH"
+}
+
 emit_multisite_subdir_rewrites() {
     cat >> "$CADDYFILE_PATH" <<'EOM'
     @cove_ms_admin path_regexp ^(/[_0-9a-zA-Z-]+)?/wp-admin$
@@ -2930,6 +3001,8 @@ EOM
 
                 echo "}" >> "$CADDYFILE_PATH"
                 echo "" >> "$CADDYFILE_PATH"
+
+                emit_site_twin_block "$site_path" "$site_name" "$local_only" "$ms_mode"
 
                 # Check if LAN access is enabled for this site
                 local lan_config="$site_path/lan_config"
@@ -13968,6 +14041,7 @@ show_general_help() {
     help_cmd lan "Enable LAN access to sites for mobile app sync."
     help_cmd tailscale "Expose all sites to your Tailscale network."
     help_cmd mappings "Extra domains a site answers on; a '*.' entry covers every subdomain."
+    help_cmd twin "A second domain serving another folder of a site (WordPress beside Minn Engine)."
     help_cmd directive "Add or remove custom Caddyfile rules for a site."
     help_cmd proxy "Manage standalone reverse proxy entries."
     help_cmd ports "Reconfigure HTTP/HTTPS ports + update site URLs."
@@ -14313,6 +14387,21 @@ display_command_help() {
             echo ""
             echo "Manage additional domain mappings for a site."
             echo "Mappings allow a single site to be served from multiple domains."
+            ;;
+        twin)
+            echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>] [--format=json]"
+            echo ""
+            echo "A twin is a second domain that serves another folder of the same site, with the"
+            echo "same database behind both. Minn Engine parks WordPress in wp-reference/ beside the"
+            echo "engine in public/, so 'cove twin minn add' serves it at wp.minn.localhost while"
+            echo "minn.localhost keeps answering through Minn."
+            echo ""
+            echo "PHP behind the twin sees the site's own hostname over HTTPS, so every request"
+            echo "answers exactly as it would at the site's address (canonical redirects, links,"
+            echo "cookies). Its links and redirects lead to the site."
+            echo ""
+            echo "  add      --domain defaults to wp.<site>.localhost, --root to wp-reference"
+            echo "  remove   stop serving the twin"
             ;;
         lan)
             echo "Usage: cove lan <subcommand>"
@@ -14832,6 +14921,10 @@ main() {
         mappings)
             check_dependencies
             cove_mappings "$@"
+            ;;
+        twin)
+            check_dependencies
+            cove_twin "$@"
             ;;
         lan)
             check_dependencies

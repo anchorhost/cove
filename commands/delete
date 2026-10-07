@@ -53,6 +53,10 @@ cove_delete() {
             fi
         done < "$site_dir/mappings"
     fi
+    local twin_entry
+    if twin_entry=$(site_twin "$site_dir"); then
+        hosts_to_remove+=("${twin_entry%%$'\t'*}")
+    fi
 
     echo "🔥 Deleting site: $site_name.localhost"
     if [ -f "$site_dir/public/wp-config.php" ]; then
