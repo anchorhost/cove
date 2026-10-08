@@ -126,6 +126,8 @@ cove_rename() {
     if [ -f "$COVE_DIR/cache/screenshots/$old_name.png" ]; then
         mv "$COVE_DIR/cache/screenshots/$old_name.png" "$COVE_DIR/cache/screenshots/$new_name.png" 2>/dev/null || true
     fi
+    # The dashboard remakes the gallery thumbnail from the moved preview.
+    rm -f "$COVE_DIR/cache/screenshots/thumbs/$old_name.webp" 2>/dev/null
 
     # --- Rename Custom Caddy Directives File ---
     local old_custom_conf_file="$CUSTOM_CADDY_DIR/$old_name.localhost"

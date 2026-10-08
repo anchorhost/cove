@@ -95,6 +95,16 @@ cove_screenshot_reap() {
         sn=$(basename "$sp" .failed); sn="${sn#.}"
         [ -d "$SITES_DIR/$sn.localhost" ] || rm -f "$sp"
     done
+    # Gallery thumbnails (made by the dashboard) whose preview is gone, and
+    # half-written ones.
+    if [ -d "$SCREENSHOTS_DIR/thumbs" ]; then
+        find "$SCREENSHOTS_DIR/thumbs" -maxdepth 1 -name '*.webp.tmp.*' -mmin +2 -delete 2>/dev/null
+        for sp in "$SCREENSHOTS_DIR"/thumbs/*.webp; do
+            [ -f "$sp" ] || continue
+            sn=$(basename "$sp" .webp)
+            [ -f "$SCREENSHOTS_DIR/$sn.png" ] || rm -f "$sp"
+        done
+    fi
     return 0
 }
 
