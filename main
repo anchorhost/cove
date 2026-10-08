@@ -7493,10 +7493,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (this.typeFilter) {
                     base = base.filter(s => s.type === this.typeFilter);
                 }
-                const q = this.filter.trim().toLowerCase();
+                const q = this.siteQuery(this.filter);
                 if (q) {
                     base = base.filter(s =>
-                        s.name.toLowerCase().includes(q) ||
+                        this.siteMatches(s, q) ||
                         (s.type || '').toLowerCase().includes(q));
                 }
                 const dir = this.sortDir === 'asc' ? 1 : -1;
@@ -8065,7 +8065,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     row.classList.toggle('has-menu', this.ctxMenu.open && this.ctxMenu.site && this.ctxMenu.site.name === site.name);
                     row.classList.toggle('is-pinned', this.isPinned(site.name));
 
-                    row.querySelector('.site-domain').innerHTML = this.highlightedDomain(site.domain, this.filter);
+                    row.querySelector('.site-domain').innerHTML = this.highlightedDomain(site.domain, this.siteQuery(this.filter));
                     const openLink = row.querySelector('.site-open-link');
                     openLink.href = site.domain;
                     openLink.title = 'Open ' + site.domain.replace('https://', '');
@@ -8391,23 +8391,40 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 return features ? window.open(safe, '_blank', features) : window.open(safe, '_blank');
             },
 
+            // Site filters match the whole host, so "anchor.localhost" finds
+            // anchor as well as "anchor" does. A pasted address is reduced to
+            // its host first (scheme, port and path dropped).
+            siteQuery(raw) {
+                return String(raw || '').trim().toLowerCase()
+                    .replace(/^https?:\/\//, '').replace(/[/?#].*$/, '').replace(/:\d+$/, '');
+            },
+            siteMatches(site, q) {
+                return !q || (site.name + '.localhost').toLowerCase().includes(q);
+            },
+
             // Wrap every case-insensitive occurrence of `query` in <mark> while
             // escaping every other substring. Safe for innerHTML use because the
             // inner text comes from the trusted domain, not from query (query
-            // only controls WHERE to split).
-            highlightMatch(text, query) {
-                const q = (query || '').trim();
-                if (!q) return this.escapeHtml(text);
+            // only controls WHERE to split). `from`/`to` render one window of
+            // `text` with matches found across the whole of it, so a match that
+            // runs past the window's edge is still marked up to that edge.
+            highlightMatch(text, query, from = 0, to = text.length) {
+                const q = (query || '').trim().toLowerCase();
+                const part = (a, b) => this.escapeHtml(text.slice(a, b));
+                if (!q) return part(from, to);
                 const lower = text.toLowerCase();
-                const lowerQ = q.toLowerCase();
                 let out = '';
+                let pos = from;
                 let i = 0;
-                while (i < text.length) {
-                    const idx = lower.indexOf(lowerQ, i);
-                    if (idx === -1) { out += this.escapeHtml(text.slice(i)); break; }
-                    out += this.escapeHtml(text.slice(i, idx));
-                    out += '<mark>' + this.escapeHtml(text.slice(idx, idx + q.length)) + '</mark>';
-                    i = idx + q.length;
+                while (pos < to) {
+                    const idx = lower.indexOf(q, i);
+                    if (idx === -1 || idx >= to) { out += part(pos, to); break; }
+                    const end = idx + q.length;
+                    i = end;
+                    if (end <= pos) continue;
+                    const a = Math.max(idx, pos), b = Math.min(end, to);
+                    out += part(pos, a) + '<mark>' + part(a, b) + '</mark>';
+                    pos = b;
                 }
                 return out;
             },
@@ -8415,14 +8432,14 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // Wrap the site name in <span class="host-accent"> so it reads
             // teal while the .localhost suffix stays dim — matches the
             // landing-page dashboard mock. Split at the first dot; if
-            // there's none, the whole string is treated as the name.
+            // there's none, the whole string is treated as the name. Matches
+            // are found on the whole host, so "anchor.loc" marks both halves.
             highlightedDomain(domain, query) {
                 const stripped = String(domain).replace(/^https?:\/\//, '');
                 const dotIdx = stripped.indexOf('.');
-                if (dotIdx === -1) return '<span class="host-accent">' + this.highlightMatch(stripped, query) + '</span>';
-                const name = stripped.slice(0, dotIdx);
-                const suffix = stripped.slice(dotIdx);
-                return '<span class="host-accent">' + this.highlightMatch(name, query) + '</span>' + this.highlightMatch(suffix, query);
+                const cut = dotIdx === -1 ? stripped.length : dotIdx;
+                return '<span class="host-accent">' + this.highlightMatch(stripped, query, 0, cut) + '</span>'
+                    + this.highlightMatch(stripped, query, cut, stripped.length);
             },
 
             // --- Mail ------------------------------------------------------
@@ -10167,8 +10184,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const list = $id('logsSites');
                 list.querySelectorAll('.db-row').forEach(n => n.remove());
                 show($id('logsSitesLoading'), !l.sourcesLoaded);
-                const q = l.siteFilter.trim().toLowerCase();
-                const rows = l.sites.filter(s => !q || s.name.includes(q));
+                const q = this.siteQuery(l.siteFilter);
+                const rows = l.sites.filter(s => this.siteMatches(s, q));
                 show($id('logsSitesEmpty'), l.sourcesLoaded && rows.length === 0);
                 const anchor = $id('logsSitesLoading');
                 for (const s of rows) {
@@ -10298,8 +10315,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 siteFilter.addEventListener('keydown', (e) => {
                     if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.logs.siteFilter = ''; siteFilter.value = ''; siteFilter.blur(); this.renderLogsSide(); }
                     if (e.key === 'Enter') {
-                        const q = this.logs.siteFilter.trim().toLowerCase();
-                        const first = this.logs.sites.find(s => !q || s.name.includes(q));
+                        const q = this.siteQuery(this.logs.siteFilter);
+                        const first = this.logs.sites.find(s => this.siteMatches(s, q));
                         if (first) { e.preventDefault(); this.setLogsSite(first.name); }
                     }
                 });
@@ -12596,8 +12613,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 list.querySelectorAll('.db-row').forEach(n => n.remove());
                 const loaded = !this.isLoading || this.sites.length > 0;
                 show($id('filesSitesLoading'), !loaded);
-                const q = f.siteFilter.trim().toLowerCase();
-                const rows = [...this.sites].filter(s => !q || s.name.toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name));
+                const q = this.siteQuery(f.siteFilter);
+                const rows = [...this.sites].filter(s => this.siteMatches(s, q)).sort((a, b) => a.name.localeCompare(b.name));
                 show($id('filesSitesEmpty'), loaded && rows.length === 0);
                 const tpl = $id('tpl-log-source');
                 const anchor = $id('filesSitesLoading');
@@ -12930,8 +12947,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 siteFilter.addEventListener('keydown', (e) => {
                     if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); f.siteFilter = ''; siteFilter.value = ''; siteFilter.blur(); this.renderFilesSide(); }
                     if (e.key === 'Enter') {
-                        const q = f.siteFilter.trim().toLowerCase();
-                        const first = [...this.sites].sort((a, b) => a.name.localeCompare(b.name)).find(s => !q || s.name.toLowerCase().includes(q));
+                        const q = this.siteQuery(f.siteFilter);
+                        const first = [...this.sites].sort((a, b) => a.name.localeCompare(b.name)).find(s => this.siteMatches(s, q));
                         if (first) { e.preventDefault(); this.setFilesSite(first.name); }
                     }
                 });
