@@ -82,10 +82,16 @@ cove_list() {
                 $size = $show_totals && is_dir($public_path) ? formatSize(getDirectorySize($public_path)) : null;
                 $version = wpVersion($public_path);
                 $status = $version !== null ? ($status_map[$version] ?? null) : null;
+                // The rule Minn Engine uses itself: its install record, or the engine
+                // at the webroot with no WordPress loader beside it.
+                $is_minn = is_file($public_path . "/.minn-install.php") || (is_file($public_path . "/minn/bootstrap.php") && !is_file($public_path . "/wp-load.php"));
+                $minn_head = $is_minn ? @file_get_contents($public_path . "/minn/bootstrap.php", false, null, 0, 8192) : false;
+                if ($is_minn) $status = null; // none of that WordPress release runs on Minn
                 $sites[] = [
                     "name" => str_replace(".localhost", "", $item),
                     "domain" => "https://" . $item . $port_suffix,
-                    "type" => file_exists($site_path . "/multisite") ? "Multisite" : (file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain"),
+                    "type" => file_exists($site_path . "/multisite") ? "Multisite" : ($is_minn ? "Minn" : (file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain")),
+                    "minn_version" => ($minn_head !== false && preg_match("/MINN_ENGINE_VERSION\x27, \x27([^\x27]+)\x27/", $minn_head, $mm)) ? $mm[1] : null,
                     "size" => $size,
                     "size_bytes" => $show_totals && is_dir($public_path) ? getDirectorySize($public_path) : null,
                     "wp_version" => $version,
@@ -113,7 +119,7 @@ cove_list() {
         // Sort the array: first by type, then by name
         if (getenv("LIST_FORMAT") === "json") {
             usort($sites, fn($a, $b) => strcmp($a["name"], $b["name"]));
-            echo json_encode(array_map(fn($s) => ["name" => $s["name"], "domain" => $s["domain"], "type" => $s["type"], "multisite" => $s["multisite"], "wp_version" => $s["wp_version"], "wp_status" => $s["wp_status"], "php" => preg_replace("/ pin$/", "", $s["php"]), "php_pinned" => $s["php_pinned"], "path" => $s["path"], "size_bytes" => $s["size_bytes"]], $sites), JSON_UNESCAPED_SLASHES) . "\n";
+            echo json_encode(array_map(fn($s) => ["name" => $s["name"], "domain" => $s["domain"], "type" => $s["type"], "multisite" => $s["multisite"], "wp_version" => $s["wp_version"], "minn_version" => $s["minn_version"], "wp_status" => $s["wp_status"], "php" => preg_replace("/ pin$/", "", $s["php"]), "php_pinned" => $s["php_pinned"], "path" => $s["path"], "size_bytes" => $s["size_bytes"]], $sites), JSON_UNESCAPED_SLASHES) . "\n";
             exit;
         }
         array_multisort(

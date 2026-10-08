@@ -3401,6 +3401,52 @@ function cove_wp_versions($cache_path, $ttl = 86400) {
     return $out;
 }
 
+// Whether a Minn Engine release is out for `cove add --minn`, which downloads
+// minn.zip from the latest GitHub release. Cached for an hour (GitHub allows
+// 60 unauthenticated API calls an hour); a lookup that fails, offline or
+// rate-limited, is not cached and reports none.
+function cove_minn_release($cache_path, $ttl = 3600) {
+    if (is_file($cache_path)) {
+        $cached = @json_decode(@file_get_contents($cache_path), true);
+        // "None yet" is asked again sooner: that is the answer that changes.
+        if (is_array($cached) && (time() - filemtime($cache_path)) < (empty($cached['available']) ? 600 : $ttl)) return $cached;
+    }
+    $none = ['available' => false, 'version' => null];
+    if (!function_exists('curl_init')) return $none;
+    $c = curl_init('https://api.github.com/repos/austinginder/minn-engine/releases/latest');
+    curl_setopt_array($c, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 4, CURLOPT_USERAGENT => 'Cove', CURLOPT_HTTPHEADER => ['Accept: application/vnd.github+json']]);
+    $raw = curl_exec($c);
+    $code = (int) curl_getinfo($c, CURLINFO_RESPONSE_CODE);
+    $release = $code === 200 && is_string($raw) ? json_decode($raw, true) : null;
+    if ($code === 404) {
+        $out = $none; // no release yet
+    } elseif (is_array($release)) {
+        $zip = false;
+        foreach ($release['assets'] ?? [] as $a) { if (($a['name'] ?? '') === 'minn.zip') $zip = true; }
+        $out = ['available' => $zip, 'version' => $zip ? ltrim((string) ($release['tag_name'] ?? ''), 'v') : null];
+    } else {
+        return $none;
+    }
+    @mkdir(dirname($cache_path), 0755, true);
+    @file_put_contents($cache_path, json_encode($out));
+    return $out;
+}
+
+// Minn Engine's own rule (Minn\Cli\Installer::state): its install record at
+// the webroot, or the engine there with no WordPress loader beside it. A
+// Minn site keeps wp-config.php and a version.php naming the WordPress
+// release it speaks, so it also passes every "is WordPress" file test.
+function cove_site_is_minn($public) {
+    return is_file($public . '/.minn-install.php') || (is_file($public . '/minn/bootstrap.php') && !is_file($public . '/wp-load.php'));
+}
+
+// The engine's version, from the constant its bootstrap defines (the way
+// Minn\Ops\EngineUpdate::versionOf reads it), or null.
+function cove_minn_version($public) {
+    $head = @file_get_contents($public . '/minn/bootstrap.php', false, null, 0, 8192);
+    return ($head !== false && preg_match("/MINN_ENGINE_VERSION', '([^']+)'/", $head, $m)) ? $m[1] : null;
+}
+
 function cove_read_size_cache($path) {
     if (!file_exists($path)) return [];
     $data = @json_decode(@file_get_contents($path), true);
@@ -3484,17 +3530,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         }
                     }
                     $multisite_mode = is_file($site_path . '/multisite') ? trim((string) @file_get_contents($site_path . '/multisite')) : '';
+                    $is_minn = cove_site_is_minn($site_path . '/public');
 
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
                         'mappings' => $mappings_list,
                         'multisite' => $multisite_mode !== '' ? $multisite_mode : null,
                         'domain' => 'https://' . $item . $__cove_port_suffix,
-                        'type' => file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain',
+                        'type' => $is_minn ? 'Minn' : (file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain'),
+                        // On a Minn site, the WordPress release the engine speaks.
                         'wp_version' => $wp_version,
+                        'minn_version' => $is_minn ? cove_minn_version($site_path . '/public') : null,
                         // latest | outdated | insecure | null when wp.org's
-                        // stable-check data has not been fetched yet.
-                        'wp_status' => $wp_version !== null ? ($__cove_wpver_status[$wp_version] ?? null) : null,
+                        // stable-check data has not been fetched yet. Not for
+                        // Minn: none of that release's code runs there.
+                        'wp_status' => $wp_version !== null && !$is_minn ? ($__cove_wpver_status[$wp_version] ?? null) : null,
                         'display_path' => '~/Cove/Sites/' . $item,
                         'full_path' => $site_path,
                         'size_bytes' => isset($size_cache[$item]) ? (int) $size_cache[$item] : null,
@@ -3628,6 +3678,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         echo json_encode(cove_wp_versions($__cove_wpver_cache));
         exit;
     }
+    if ($action === 'minn_release') {
+        echo json_encode(cove_minn_release($user_home . '/Cove/cache/minn-release.json'));
+        exit;
+    }
     if ($action === 'php_info') {
         // Which PHP versions the dashboard can offer for per-site pins. The
         // dashboard itself runs under FrankenPHP, so PHP_VERSION here IS
@@ -3684,7 +3738,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'add_site':
             if (!empty($site_name) && preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
                 // One positional "flavor" slot, mirroring the CLI: 'plain', a
-                // WordPress version, 'nightly', or nothing at all for latest.
+                // WordPress version, 'nightly', 'minn', or nothing at all for latest.
                 // Validated here as well as in cove_add — escapeshellarg stops
                 // shell injection, but there's no reason to hand the CLI a
                 // value the UI already knows is malformed.
@@ -3693,7 +3747,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $flavor = 'plain';
                 } elseif (!empty($input['wp_version']) && $input['wp_version'] !== 'latest') {
                     $v = $input['wp_version'];
-                    if ($v === 'nightly' || preg_match('/^\d+(\.\d+){1,2}(-[A-Za-z0-9.]+)?$/', $v)) {
+                    if ($v === 'nightly' || $v === 'minn' || preg_match('/^\d+(\.\d+){1,2}(-[A-Za-z0-9.]+)?$/', $v)) {
                         $flavor = $v;
                     }
                 }
@@ -3853,6 +3907,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 return [$data, $ms];
             };
             $__slug_ok = function ($s) { return is_string($s) && $s !== '' && preg_match('/^[A-Za-z0-9._-]+$/', $s); };
+            // Minn Engine's WP-CLI has no --skip-update-check, no `file`
+            // field on plugin list, and only the full user_registered name.
+            $__minn = cove_site_is_minn($sitedir . '/' . $site_name . '.localhost/public');
             $__multisite = is_file($sitedir . '/' . $site_name . '.localhost/multisite') || strpos((string) @file_get_contents($sitedir . '/' . $site_name . '.localhost/public/wp-config.php'), "'MULTISITE'") !== false;
 
             if ($action === 'site_plugins' || $action === 'site_themes') {
@@ -3863,9 +3920,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // `file` names the main file: 'dir/main.php' for a folder plugin,
                 // 'name.php' for a single-file one (Hello Dolly) or a must-use
                 // plugin, which lives in mu-plugins/ — Browse files uses it.
-                $args = [$kind, 'list', '--fields=name,title,status,version,update,update_version,auto_update' . ($kind === 'plugin' ? ',file' : ''), '--format=json', '--skip-plugins', '--skip-themes'];
-                if (empty($input['check'])) $args[] = '--skip-update-check';
+                $args = [$kind, 'list', '--fields=name,title,status,version,update,update_version,auto_update' . ($kind === 'plugin' && !$__minn ? ',file' : ''), '--format=json', '--skip-plugins', '--skip-themes'];
+                if (empty($input['check']) && !$__minn) $args[] = '--skip-update-check';
                 [$items, $ms] = $__wp_json($args);
+                if ($kind === 'plugin' && $__minn) {
+                    // The main file, the way WP-CLI names it: Browse files
+                    // only needs to know a folder plugin from a single file.
+                    $content = $sitedir . '/' . $site_name . '.localhost/public/wp-content';
+                    foreach ($items as &$it) {
+                        $n = (string) ($it['name'] ?? '');
+                        $it['file'] = ($it['status'] ?? '') !== 'must-use' && is_dir($content . '/plugins/' . $n) ? $n . '/' . $n . '.php' : $n . '.php';
+                    }
+                    unset($it);
+                }
                 echo json_encode(['success' => true, 'items' => array_values($items), 'ms' => $ms, 'multisite' => $__multisite, 'checked' => !empty($input['check'])]);
                 exit;
             }
@@ -3875,8 +3942,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // no roles, so the main site's roles are merged in; users who
                 // belong only to subsites show without one. Super admins are
                 // marked either way.
-                $args = ['user', 'list', '--fields=ID,user_login,display_name,user_email,roles,registered', '--format=json', '--skip-plugins', '--skip-themes'];
+                $args = ['user', 'list', '--fields=ID,user_login,display_name,user_email,roles,' . ($__minn ? 'user_registered' : 'registered'), '--format=json', '--skip-plugins', '--skip-themes'];
                 [$items, $ms] = $__wp_json($args);
+                if ($__minn) {
+                    foreach ($items as &$u) { $u['registered'] = $u['user_registered'] ?? ''; unset($u['user_registered']); }
+                    unset($u);
+                }
                 if ($__multisite) {
                     // Every user on the network with the sites each belongs
                     // to and the role held there, so a user who lives only
@@ -5409,6 +5480,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --pill-wp-bg: color-mix(in oklch, var(--accent) 18%, transparent);
             --pill-wp-fg: #71c0ce;
             --pill-wp-fg: color-mix(in oklch, var(--accent) 80%, white);
+            /* Minn Engine: the coral that sits beside teal in Cove's palette. */
+            --pill-minn-bg: rgba(229, 132, 92, 0.18);
+            --pill-minn-bg: color-mix(in oklch, oklch(74% 0.15 45) 18%, transparent);
+            --pill-minn-fg: #f2a582;
+            --pill-minn-fg: oklch(82% 0.11 45);
             --pill-static-bg: #1e2320;
             --pill-static-fg: #9a9d94;
             --input-bg: #0b0e0c;
@@ -5439,6 +5515,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --pill-wp-bg: color-mix(in oklch, var(--accent) 14%, transparent);
             --pill-wp-fg: #20535d;
             --pill-wp-fg: color-mix(in oklch, var(--accent) 55%, black);
+            --pill-minn-bg: rgba(211, 112, 74, 0.14);
+            --pill-minn-bg: color-mix(in oklch, oklch(66% 0.15 45) 14%, transparent);
+            --pill-minn-fg: #8a3d1e;
+            --pill-minn-fg: oklch(44% 0.11 45);
             --pill-static-bg: #f1ede5;
             --pill-static-fg: #8a8781;
             --input-bg: #fbfaf7;
@@ -5607,6 +5687,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .site-wp-version.insecure { color: var(--text-dim); }
         .site-wp-version.insecure::after { content: "●"; margin-left: 0.25rem; color: var(--pill-warn-fg, #d08c30); font-size: 0.6em; vertical-align: middle; }
         .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
+        .site-type.minn { background: var(--pill-minn-bg); color: var(--pill-minn-fg); }
         .site-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); }
         /* Pinned-PHP chip: only rendered when a site is pinned off the default,
            so the common case stays visually quiet. While a version change is
@@ -6500,7 +6581,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         <input type="checkbox" id="newSitePlain">
                         plain (no WordPress)
                     </label>
-                    <select class="wp-version" id="wpVersionSelect" title="WordPress version to install" aria-label="WordPress version">
+                    <select class="wp-version" id="wpVersionSelect" title="What to install: a WordPress version, or Minn Engine once it has a release" aria-label="What to install">
                         <option value="latest">latest</option>
                         <option value="nightly">nightly</option>
                     </select>
@@ -7560,6 +7641,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // empty when offline, leaving 'latest' and 'nightly' available.
             wpVersions: [],
             wpVersionsLoaded: false,
+            minnReleaseLoaded: false,
             snackbar: { visible: false, message: '', isError: false, timer: null, action: null, actionLabel: '' },
             // Deletes are staged for a short undo window before anything is
             // sent to the backend. One batch at a time; staging more sites
@@ -7646,7 +7728,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     // Version segments compare numerically so 6.10 outranks 6.9.
                     // Plain sites have no wp_version and stay grouped together.
                     const vcmp = (a, b) => {
-                        const pa = (a.wp_version || '').split('.'), pb = (b.wp_version || '').split('.');
+                        const v = s => (s.type === 'Minn' ? s.minn_version : s.wp_version) || '';
+                        const pa = v(a).split('.'), pb = v(b).split('.');
                         for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
                             const d = (parseInt(pa[i], 10) || 0) - (parseInt(pb[i], 10) || 0);
                             if (d) return d;
@@ -7683,7 +7766,39 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             get typeFilterLabel() {
-                return this.typeFilter === 'WordPress' ? 'type: wp' : 'type: static';
+                return 'type: ' + this.siteTypeInfo(this.typeFilter).short;
+            },
+
+            // Pill text, class and names for a site type. Minn Engine sites
+            // speak WordPress's contracts (sign-in, the database, WP-CLI), so
+            // isWpLike treats them as WordPress everywhere but the label.
+            siteTypeInfo(type) {
+                if (type === 'WordPress') return { cls: 'wp', pill: 'WP', name: 'WordPress', short: 'wp' };
+                if (type === 'Minn') return { cls: 'minn', pill: 'MINN', name: 'Minn Engine', short: 'minn' };
+                return { cls: 'static', pill: 'STATIC', name: 'static', short: 'static' };
+            },
+            isWpLike(site) { return !!site && (site.type === 'WordPress' || site.type === 'Minn'); },
+
+            // The type pill and the version beside it, for a row or a tile.
+            // A Minn site shows the engine's version, with the WordPress
+            // release it speaks in the tooltip.
+            paintSiteType(type, ver, site) {
+                const t = this.siteTypeInfo(site.type);
+                type.classList.add(t.cls);
+                type.textContent = t.pill;
+                type.title = 'Filter to ' + t.name + ' sites';
+                if (site.type === 'Minn') {
+                    if (!site.minn_version) { ver.remove(); return; }
+                    ver.textContent = site.minn_version;
+                    ver.title = 'Minn Engine ' + site.minn_version + (site.wp_version ? ', speaking WordPress ' + site.wp_version : '');
+                    return;
+                }
+                if (!site.wp_version) { ver.remove(); return; }
+                ver.textContent = site.wp_version;
+                if (site.wp_status) ver.classList.add(site.wp_status);
+                ver.title = site.wp_status === 'insecure'
+                    ? 'WordPress ' + site.wp_version + ' — wp.org marks this release insecure. Update with: cove core update ' + site.name
+                    : 'WordPress ' + site.wp_version;
             },
 
             setTypeFilter(v) {
@@ -7782,7 +7897,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         }
                         if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !typing) {
                             const s = this.pageSite;
-                            if (s && s.type === 'WordPress') { e.preventDefault(); this.getLoginLink(s.name); }
+                            if (this.isWpLike(s)) { e.preventDefault(); this.getLoginLink(s.name); }
                         }
                         return;
                     }
@@ -7851,7 +7966,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         const site = this.selectedSite();
                         if (!site) return;
                         e.preventDefault();
-                        if ((e.metaKey || e.ctrlKey) && site.type === 'WordPress') {
+                        if ((e.metaKey || e.ctrlKey) && this.isWpLike(site)) {
                             this.getLoginLink(site.name);
                         } else {
                             this.openSitePage(site.name);
@@ -8258,22 +8373,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     openLink.href = site.domain;
                     openLink.title = 'Open ' + site.domain.replace('https://', '');
 
-                    const isWp = site.type === 'WordPress';
-                    const type = row.querySelector('.site-type');
-                    type.classList.add(isWp ? 'wp' : 'static');
-                    type.textContent = isWp ? 'WP' : 'STATIC';
-                    type.title = 'Filter to ' + (isWp ? 'WordPress' : 'static') + ' sites';
-
-                    const ver = row.querySelector('.site-wp-version');
-                    if (site.wp_version) {
-                        ver.textContent = site.wp_version;
-                        if (site.wp_status) ver.classList.add(site.wp_status);
-                        ver.title = site.wp_status === 'insecure'
-                            ? 'WordPress ' + site.wp_version + ' — wp.org marks this release insecure. Update with: cove core update ' + site.name
-                            : 'WordPress ' + site.wp_version;
-                    } else {
-                        ver.remove();
-                    }
+                    const isWp = this.isWpLike(site);
+                    this.paintSiteType(row.querySelector('.site-type'), row.querySelector('.site-wp-version'), site);
 
                     const php = row.querySelector('.site-php-version');
                     const applying = this.phpApplying[site.name];
@@ -8328,21 +8429,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 open.href = site.domain;
                 open.title = 'Open ' + host;
 
-                const isWp = site.type === 'WordPress';
-                const type = tile.querySelector('.site-type');
-                type.classList.add(isWp ? 'wp' : 'static');
-                type.textContent = isWp ? 'WP' : 'STATIC';
-                type.title = 'Filter to ' + (isWp ? 'WordPress' : 'static') + ' sites';
-                const ver = tile.querySelector('.site-wp-version');
-                if (site.wp_version) {
-                    ver.textContent = site.wp_version;
-                    if (site.wp_status) ver.classList.add(site.wp_status);
-                    ver.title = site.wp_status === 'insecure'
-                        ? 'WordPress ' + site.wp_version + ' — wp.org marks this release insecure. Update with: cove core update ' + site.name
-                        : 'WordPress ' + site.wp_version;
-                } else {
-                    ver.remove();
-                }
+                const isWp = this.isWpLike(site);
+                this.paintSiteType(tile.querySelector('.site-type'), tile.querySelector('.site-wp-version'), site);
                 const php = tile.querySelector('.site-php-version');
                 if (site.php_version) php.textContent = 'php ' + site.php_version; else php.remove();
                 const when = tile.querySelector('.tile-when');
@@ -8421,7 +8509,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 menu.style.left = this.ctxMenu.x + 'px';
                 menu.style.top = this.ctxMenu.y + 'px';
                 $id('ctxTitle').textContent = site.domain.replace('https://', '');
-                const isWp = site.type === 'WordPress';
+                const isWp = this.isWpLike(site);
                 show($id('ctxLogin'), isWp);
                 show($id('ctxDb'), isWp);
                 $id('ctxReveal').querySelector('span').textContent = this.revealLabel;
@@ -8606,6 +8694,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.render();
                 if (this.adding) {
                     this.loadWpVersions();
+                    this.loadMinnRelease();
                     $id('newSiteName').focus();
                 }
             },
@@ -8633,6 +8722,25 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         }
                     }
                 } catch (e) { /* offline — 'latest' still works */ }
+            },
+
+            // Minn Engine is offered only once a release is out: `cove add
+            // --minn` downloads the latest one and has nothing to fetch
+            // before that. Placed after 'nightly', ahead of the versions.
+            async loadMinnRelease() {
+                if (this.minnReleaseLoaded) return;
+                this.minnReleaseLoaded = true;
+                try {
+                    const res = await fetch('/api.php?action=minn_release');
+                    const data = await res.json();
+                    if (!data || !data.available) return;
+                    const sel = $id('wpVersionSelect');
+                    if (sel.querySelector('option[value="minn"]')) return;
+                    const opt = document.createElement('option');
+                    opt.value = 'minn';
+                    opt.textContent = 'minn engine' + (data.version ? ' ' + data.version : '');
+                    sel.querySelector('option[value="nightly"]').after(opt);
+                } catch (e) { /* offline — WordPress still works */ }
             },
 
             formatSize(bytes) {
@@ -10670,13 +10778,17 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     $id('siteFacts').textContent = '';
                     return;
                 }
-                const isWp = site.type === 'WordPress';
+                const isWp = this.isWpLike(site);
+                const isMinn = site.type === 'Minn';
                 const facts = $id('siteFacts');
                 facts.innerHTML = '';
                 const fact = (text, cls, title) => { const s = document.createElement('span'); s.className = 'fact' + (cls ? ' ' + cls : ''); s.textContent = text; if (title) s.title = title; facts.appendChild(s); return s; };
-                const type = fact(isWp ? 'wordpress' : 'static', 'fact-type site-type ' + (isWp ? 'wp' : 'static'));
+                const tinfo = this.siteTypeInfo(site.type);
+                const type = fact(tinfo.name.toLowerCase(), 'fact-type site-type ' + tinfo.cls, 'Filter the sites list to ' + tinfo.name + ' sites');
                 type.dataset.type = site.type;
-                if (isWp && site.wp_version) fact(site.wp_version, 'fact-ver' + (site.wp_status === 'insecure' ? ' insecure' : ''), site.wp_status === 'insecure' ? 'wp.org marks this version insecure' : (site.wp_status === 'outdated' ? 'A newer WordPress is available' : ''));
+                if (isMinn && site.minn_version) fact(site.minn_version, 'fact-ver', 'Minn Engine ' + site.minn_version);
+                if (isMinn && site.wp_version) fact('speaks wp ' + site.wp_version, '', 'The WordPress release whose contracts the engine speaks; none of its code runs here');
+                if (!isMinn && isWp && site.wp_version) fact(site.wp_version, 'fact-ver' + (site.wp_status === 'insecure' ? ' insecure' : ''), site.wp_status === 'insecure' ? 'wp.org marks this version insecure' : (site.wp_status === 'outdated' ? 'A newer WordPress is available' : ''));
                 if (site.multisite) fact('multisite · ' + site.multisite, 'fact-ms');
                 const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
                 if (isWp && effPhp) fact('php ' + effPhp, '', site.php_version ? 'Pinned with cove php' : 'Cove\'s default PHP');
@@ -10689,7 +10801,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const login = $id('btnSiteLogin');
                 show(login, isWp);
                 login.disabled = !!site.isLoggingIn;
-                login.querySelector('.btn-label').textContent = site.isLoggingIn ? 'opening…' : 'log in to admin';
+                login.querySelector('.btn-label').textContent = site.isLoggingIn ? 'opening…' : (isMinn ? 'log in to Minn Admin' : 'log in to admin');
                 show($id('tileDb'), isWp);
                 show($id('siteNetwork'), !!site.multisite);
                 if (site.multisite) {
@@ -11323,7 +11435,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const p = this.sitePage;
                 tab = this.siteTabs.includes(tab) ? tab : 'overview';
                 const site = this.pageSite;
-                if (site && site.type !== 'WordPress' && tab !== 'snapshots' && tab !== 'traffic' && tab !== 'history') tab = 'overview';
+                if (site && !this.isWpLike(site) && tab !== 'snapshots' && tab !== 'traffic' && tab !== 'history') tab = 'overview';
                 p.tab = tab;
                 this.syncUrl();
                 this.renderSitePage();
@@ -11344,7 +11456,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (tab === 'traffic') { this.loadTraffic(opts); return; }
                 if (tab === 'overview') { this.loadSiteHealth(); return; }
                 if (!site || !['plugins', 'themes', 'users', 'cron', 'snapshots', 'history'].includes(tab)) return;
-                if (site.type !== 'WordPress' && tab !== 'snapshots' && tab !== 'history') return;
+                if (!this.isWpLike(site) && tab !== 'snapshots' && tab !== 'history') return;
                 const t = this.siteTabState(tab);
                 if (t.loadedFor === site.name && !opts.force) return;
                 if (t.loadedFor !== site.name) { t.items = []; t.loadedFor = null; t.filter = t.filterFor === site.name ? t.filter : ''; t.status = 'all'; t.arm = null; t.open = null; t.diff = null; }
@@ -12467,7 +12579,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (!site) { this.showSnack('That site is not in the list — is it still being created?', true); return; }
                 this.siteDeleteConfirm = name;
                 $id('siteDeleteName').textContent = name + '.localhost';
-                $id('siteDeleteSub').textContent = (site.type === 'WordPress'
+                $id('siteDeleteSub').textContent = (this.isWpLike(site)
                     ? 'Deletes the whole site: every file under ' + name + '.localhost/ (public/, logs, uploads) and its database. '
                     : 'Deletes the whole site: every file under ' + name + '.localhost/. ')
                     + 'The Files view cannot delete just the site folder — this is the same as "Delete site" on the sites list, with the same few seconds to undo.';
@@ -12911,7 +13023,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     row.dataset.site = s.name;
                     row.classList.toggle('is-selected', f.site === s.name);
                     row.querySelector('.db-row-name').textContent = s.name;
-                    row.querySelector('.db-row-meta').textContent = s.type === 'WordPress' ? 'wp' : 'static';
+                    row.querySelector('.db-row-meta').textContent = this.siteTypeInfo(s.type).short;
                     row.querySelector('.db-row-meta').title = s.size_bytes ? this.formatSize(s.size_bytes) + ' on disk' : '';
                     list.insertBefore(row, anchor);
                 }
@@ -13386,7 +13498,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 for (const site of sites.slice(0, 40)) {
                     out.push({
                         key: 'site:' + site.name,
-                        kind: site.type === 'WordPress' ? 'wp' : 'static',
+                        kind: this.siteTypeInfo(site.type).short,
                         label: site.name + '.localhost',
                         meta: this.formatSize(site.size_bytes),
                         site,
@@ -13791,7 +13903,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (!item) return;
                 // A site: Enter opens its page, Shift+Enter the site itself in
                 // a new tab, Cmd/Ctrl+Enter a one-time admin login.
-                if (event && (event.metaKey || event.ctrlKey) && item.site && item.site.type === 'WordPress') {
+                if (event && (event.metaKey || event.ctrlKey) && this.isWpLike(item.site)) {
                     this.closePalette();
                     this.getLoginLink(item.site.name);
                     return;
@@ -14075,7 +14187,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.sites.push({
                         name,
                         domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
-                        type: isPlain ? 'Plain' : 'WordPress',
+                        type: isPlain ? 'Plain' : (wpVersion === 'minn' ? 'Minn' : 'WordPress'),
                         display_path: '~/Cove/Sites/' + name + '.localhost',
                         full_path: SITES_DIR + '/' + name + '.localhost',
                         // Server calculates size in add_site and returns it
