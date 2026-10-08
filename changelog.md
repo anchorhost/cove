@@ -24,6 +24,10 @@
     * `--minn` works as an alias, like `--plain`. `--minn=<url or path>` installs a release candidate or a local build instead of the latest release.
     * The engine is downloaded and checked before anything is created, so a missing release or a bad zip costs nothing. A plain site, a pinned or nightly WordPress, a multisite network, or PHP older than 8.2 is refused up front.
 
+* **The dashboard knows Minn Engine sites:** they get a MINN pill of their own, in the coral that sits beside Cove's teal, with the engine's version beside it (the WordPress release it speaks is in the tooltip), and a type filter of their own. The site page says Minn Engine and logs in to Minn Admin. Sign-in, the database, and the plugins, themes, users, cron, history, snapshots, traffic, and wp-cli tabs all work on them.
+    * A site counts as Minn by the engine's own rule: its install record (`.minn-install.php`) at the webroot, or the engine there without WordPress's loader. `cove list` shows those sites as `Minn`, and its JSON carries `minn_version`.
+    * The add-site form offers Minn Engine beside `latest` and `nightly` once a release is out: it asks GitHub for the latest release when the form opens and lists the option only when that release carries `minn.zip`.
+
 ### 🔒 Security & Bug Fixes
 
 * **`cove push` no longer overwrites a whole WP Freighter host:** a push replaces the remote's files and resets its database, and on a Freighter host that database and those files belong to every tenant at once. A push to such a host without `--tenant` wiped all of them. A push there now goes to one tenant: the prompt lists tenants only, a headless push without `--tenant` is refused, and so is `--tenant=main`.
