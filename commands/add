@@ -7,7 +7,7 @@ cove_add() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [flavor] [--plain] [--php=8.2] [--multisite[=subdomain]]"
+        echo "Usage: cove add <name> [flavor] [--plain] [--minn] [--php=8.2] [--multisite[=subdomain]]"
         exit 1
     fi
 
@@ -33,12 +33,16 @@ cove_add() {
     # forever so existing scripts and the dashboard never break.
     local flavor=""
     local plain_flag=false
+    local minn=false
+    local minn_zip=""
     local php_pin=""
     local multisite_mode=""
     shift
     for arg in "$@"; do
         case "$arg" in
             --plain)        plain_flag=true ;;
+            --minn)         minn=true ;;
+            --minn=*)       minn=true; minn_zip="${arg#*=}" ;;
             --no-reload)    no_reload_flag=true ;;
             --wp-version=*) flavor="${arg#*=}" ;;
             --php=*)        php_pin="${arg#*=}" ;;
@@ -88,6 +92,8 @@ cove_add() {
             ;;                                  # newest WordPress — the default
         plain)
             site_type="plain" ;;
+        minn)
+            minn=true ;;
         nightly|trunk)
             wp_version="nightly" ;;
         [0-9]*)
@@ -101,7 +107,7 @@ cove_add() {
             fi
             wp_version="$flavor" ;;
         *)
-            gum style --foreground red "❌ Error: Unknown option '$flavor'." "Expected a WordPress version (6.4.3), 'nightly', 'latest', or 'plain'."
+            gum style --foreground red "❌ Error: Unknown option '$flavor'." "Expected a WordPress version (6.4.3), 'nightly', 'latest', 'minn', or 'plain'."
             exit 1 ;;
     esac
 
@@ -118,6 +124,28 @@ cove_add() {
     if [ -n "$multisite_mode" ] && [ "$site_type" == "plain" ]; then
         gum style --foreground red "❌ Error: Cannot combine --multisite with a plain site." "A plain site has no WordPress to network."
         exit 1
+    fi
+
+    # Minn Engine goes in over a fresh install of the latest WordPress: the
+    # database schema and wp-config.php are WordPress's, then the engine
+    # parks WordPress's own files and answers in their place. So a plain
+    # site, a pinned or nightly WordPress, or a network can't go with it,
+    # and the engine needs PHP 8.2 or newer.
+    if [ "$minn" = true ]; then
+        local minn_conflict=""
+        if [ "$site_type" == "plain" ]; then
+            minn_conflict="A plain site has no WordPress for Minn to take over."
+        elif [ -n "$wp_version" ]; then
+            minn_conflict="Minn installs over the latest WordPress; it can't be pinned to $wp_version."
+        elif [ -n "$multisite_mode" ]; then
+            minn_conflict="Minn Engine runs single sites, not multisite networks."
+        elif [ -n "$php_pin" ] && [ "$(printf '%s\n' 8.2 "$php_pin" | sort -V | head -1)" != "8.2" ]; then
+            minn_conflict="Minn Engine needs PHP 8.2 or newer."
+        fi
+        if [ -n "$minn_conflict" ]; then
+            gum style --foreground red "❌ Error: Cannot create a Minn Engine site with those options." "$minn_conflict"
+            exit 1
+        fi
     fi
 
     for protected_name in $PROTECTED_NAMES; do
@@ -142,7 +170,19 @@ cove_add() {
         exit 1
     fi
 
-    echo "➕ Creating $site_type site: $full_hostname"
+    # The engine is fetched and checked before anything is created, so a
+    # missing release or a bad zip costs nothing.
+    local minn_work=""
+    if [ "$minn" = true ]; then
+        minn_work=$(cove_minn_fetch "$minn_zip") || exit 1
+        trap "rm -rf '$minn_work'" EXIT
+    fi
+
+    if [ "$minn" = true ]; then
+        echo "➕ Creating Minn Engine site: $full_hostname"
+    else
+        echo "➕ Creating $site_type site: $full_hostname"
+    fi
     mkdir -p "$site_dir/public" "$site_dir/logs"
     if [ -n "$php_pin" ]; then
         # Written before the WordPress install so get_wp_cmd runs wp-cli under
@@ -285,6 +325,14 @@ PHP
         # Generate must-use plugin
         inject_mu_plugin "$site_dir/public"
 
+        if [ "$minn" = true ] && ! cove_add_minn "$site_dir" "$minn_work/x/minn"; then
+            gum style --foreground red "❌ Minn Engine installation failed. Please review the errors above."
+            echo "   - Cleaning up failed installation..."
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+            rm -rf "$site_dir"
+            exit 1
+        fi
+
         # The multisite marker drives Caddyfile generation (wildcard alias for
         # subdomain networks, subdirectory rewrites otherwise), so it must be
         # on disk before the regenerate below.
@@ -321,8 +369,62 @@ PHP
             local subsite_example="$(url_for "$full_hostname")/store/"
             [ "$multisite_mode" == "subdomain" ] && subsite_example="$(url_for "store.$full_hostname")/"
             gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Multisite Installed ($multisite_mode)" "Network admin: $(url_for "$full_hostname")/wp-admin/network/" "User: $admin_user" "Pass: $admin_pass" "New subsites (e.g. $subsite_example) work with no extra setup." "One-time login URL: $one_time_login_url"
+        elif [ "$minn" = true ]; then
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Minn Engine Installed" "URL: $(url_for "$full_hostname")/minn-admin/" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url" "WordPress's own files are parked in $site_dir/wp-parked"
         else
             gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: $(url_for "$full_hostname")/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
         fi
     fi
+}
+
+# Downloads a Minn Engine release zip (the latest by default, or the URL or
+# file given by --minn=) into a temp dir, unpacks it to x/, and prints the
+# temp dir.
+# Progress and errors go to stderr.
+cove_minn_fetch() {
+    local source="$1" work rc
+    [ -n "$source" ] || source="https://github.com/austinginder/minn-engine/releases/latest/download/minn.zip"
+    work=$(mktemp -d "${TMPDIR:-/tmp}/cove-minn-XXXXXX") || return 1
+
+    if [ -f "$source" ]; then
+        cp "$source" "$work/minn.zip"
+    elif [[ "$source" != *://* ]]; then
+        echo "❌ Error: No such file: $source" >&2
+        rm -rf "$work"
+        return 1
+    else
+        echo "⬇️  Downloading Minn Engine: $source" >&2
+        if ! curl -fsSL "$source" -o "$work/minn.zip"; then
+            echo "❌ Error: Could not download $source" >&2
+            rm -rf "$work"
+            return 1
+        fi
+    fi
+
+    mkdir "$work/x"
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$work/minn.zip" -d "$work/x" >&2
+    else
+        $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open($argv[1]) === true && $z->extractTo($argv[2]) ? 0 : 1);' "$work/minn.zip" "$work/x" >&2
+    fi
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ ! -f "$work/x/minn/bootstrap.php" ] || [ ! -f "$work/x/minn/bin/minn" ]; then
+        echo "❌ Error: $source is not a Minn Engine release (expected minn/bootstrap.php and minn/bin/minn inside)." >&2
+        rm -rf "$work"
+        return 1
+    fi
+    echo "$work"
+}
+
+# Installs Minn Engine (an unpacked minn/ folder) over the WordPress `cove
+# add` just put in a site. The engine's own installer copies it to
+# public/minn and parks WordPress's own files in <site>/wp-parked, beside
+# public/ rather than inside it. wp-config.php, wp-content and the database
+# are left as they are, so `minn eject` puts WordPress back.
+cove_add_minn() {
+    local site_dir="$1" engine="$2" rc
+    echo "🌊 Installing Minn Engine..."
+    $(cove_php_cmd "$site_dir") "$engine/bin/minn" install "$site_dir/public" --park="$site_dir/wp-parked" | sed 's/^/   /'
+    rc=${PIPESTATUS[0]}
+    return "$rc"
 }

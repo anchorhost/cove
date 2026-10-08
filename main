@@ -1295,20 +1295,26 @@ get_wp_cmd() {
         echo "$wp_path$root_flag"
         return 0
     fi
+    echo "$(cove_php_cmd "$site_dir") $wp_path$root_flag"
+}
+
+# The PHP that runs a script for a site: its pinned native php when it has
+# one (and the binary is there), else FrankenPHP's php-cli. Optional $1: a
+# site dir.
+cove_php_cmd() {
+    local site_dir="$1"
     if [ -n "$site_dir" ]; then
         local pinned prefix
         pinned=$(site_php_version "$site_dir")
         if [ -n "$pinned" ]; then
             prefix=$(php_fpm_prefix_for "$pinned")
             if [ -n "$prefix" ] && [ -x "$prefix/bin/php" ]; then
-                echo "$prefix/bin/php $wp_path$root_flag"
+                echo "$prefix/bin/php"
                 return 0
             fi
         fi
     fi
-    local frank
-    frank=$(command -v frankenphp)
-    echo "$frank php-cli $wp_path$root_flag"
+    echo "$(command -v frankenphp) php-cli"
 }
 
 # Read a site's WordPress version straight out of wp-includes/version.php.
@@ -14362,7 +14368,7 @@ show_general_help() {
     echo "For help with a specific command, run: cove <command> --help"
     echo ""
     help_section "Sites"
-    help_cmd add "Creates a new WordPress or plain static site."
+    help_cmd add "Creates a new WordPress, Minn Engine, or plain static site."
     help_cmd import "Create a new site from a backup archive (zip or tar.gz)."
     help_cmd clone "Copies an existing site, database and all, under a new name."
     help_cmd list "Lists all sites currently managed by Cove."
@@ -14518,9 +14524,13 @@ display_command_help() {
             echo "                   nightly    WordPress trunk, rebuilt daily."
             echo "                   latest     The newest WordPress release (the default)."
             echo "                   plain      A static HTML site with no database."
+            echo "                   minn       WordPress with Minn Engine installed over it"
+            echo "                              (WordPress's own files parked in wp-parked/)."
             echo ""
             echo "Flags:"
             echo "  --plain        Alias for the 'plain' flavor."
+            echo "  --minn         Alias for the 'minn' flavor. --minn=<url or path> installs"
+            echo "                 that Minn Engine zip instead of the latest release."
             echo "  --php=<ver>    Pin the site to an older PHP (see 'cove php')."
             echo "  --multisite    Install a WordPress multisite network (subdirectory"
             echo "                 mode: <name>.localhost/store/). Use --multisite=subdomain"
@@ -14532,6 +14542,7 @@ display_command_help() {
             echo "  cove add mysite 6.4.3                  WordPress pinned to 6.4.3."
             echo "  cove add mysite nightly                WordPress trunk."
             echo "  cove add mysite plain                  Static site, no database."
+            echo "  cove add mysite minn                   Minn Engine, latest release."
             echo "  cove add mysite --multisite            Subdirectory multisite network."
             echo "  cove add mysite --multisite=subdomain  Subdomain multisite network."
             ;;
