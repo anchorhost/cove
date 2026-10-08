@@ -19,6 +19,11 @@
     * In the list, a shelf above the rows shows pinned sites as preview cards. With nothing pinned it shows the sites last opened from the dashboard, or else the ones changed most recently. It steps aside while a filter is on.
     * The gallery loads 640px WebP thumbnails, made from each preview the first time they are asked for and kept beside it. They are about a tenth the size of the full capture, and load only as cards scroll into view.
 
+* **`cove add <name> minn` creates a Minn Engine site:** it installs the latest WordPress as usual, then puts Minn Engine over it with the engine's own installer. The one-time login link at the end opens Minn Admin.
+    * WordPress's own files are parked in `wp-parked/` beside `public/`. `wp-config.php`, `wp-content`, and the database stay as WordPress left them, so `minn eject` turns the site back into WordPress.
+    * `--minn` works as an alias, like `--plain`. `--minn=<url or path>` installs a release candidate or a local build instead of the latest release.
+    * The engine is downloaded and checked before anything is created, so a missing release or a bad zip costs nothing. A plain site, a pinned or nightly WordPress, a multisite network, or PHP older than 8.2 is refused up front.
+
 ### 🔒 Security & Bug Fixes
 
 * **`cove push` no longer overwrites a whole WP Freighter host:** a push replaces the remote's files and resets its database, and on a Freighter host that database and those files belong to every tenant at once. A push to such a host without `--tenant` wiped all of them. A push there now goes to one tenant: the prompt lists tenants only, a headless push without `--tenant` is refused, and so is `--tenant=main`.
