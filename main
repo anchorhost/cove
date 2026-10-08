@@ -3398,6 +3398,9 @@ function cove_wp_versions($cache_path, $ttl = 86400) {
 
     @mkdir(dirname($cache_path), 0755, true);
     @file_put_contents($cache_path, json_encode($out));
+    // Every version's status, for the sites list: the dropdown slice above
+    // stops at the 40 newest, and a site still on 6.4 is the one to flag.
+    @file_put_contents(preg_replace('/\.json$/', '-status.json', $cache_path), json_encode($all));
     return $out;
 }
 
@@ -3447,6 +3450,183 @@ function cove_minn_version($public) {
     return ($head !== false && preg_match("/MINN_ENGINE_VERSION', '([^']+)'/", $head, $m)) ? $m[1] : null;
 }
 
+// --- What the sites list says about each site ---------------------------
+// Beyond the name: what runs it and the last plugin or theme change (from
+// the nightly history save), when someone last opened it in a browser, and
+// PHP errors in the last day. Each is cheap or cached, so list_sites stays
+// on the first paint's critical path.
+
+// The commit a git dir's HEAD points at, read from files (no git process).
+function cove_git_head($gitdir) {
+    $head = @file_get_contents($gitdir . '/HEAD');
+    if ($head === false) return null;
+    $head = trim($head);
+    if (preg_match('/^[0-9a-f]{40}$/', $head)) return $head;
+    if (!preg_match('#^ref: (refs/\S+)$#', $head, $m)) return null;
+    $ref = @file_get_contents($gitdir . '/' . $m[1]);
+    if ($ref !== false && preg_match('/^[0-9a-f]{40}/', $ref, $h)) return $h[0];
+    $packed = @file_get_contents($gitdir . '/packed-refs');
+    if ($packed !== false && preg_match('/^([0-9a-f]{40}) ' . preg_quote($m[1], '/') . '$/m', $packed, $h)) return $h[1];
+    return null;
+}
+
+// One component change from a save's summary, in words, plus a kind for
+// the glyph beside it: up, down, add, del, state or edit.
+function cove_card_change(array $c, $more) {
+    $t = (string) (($c['title'] ?? '') !== '' ? $c['title'] : ($c['slug'] ?? ''));
+    $n = (int) ($c['added'] ?? 0) + (int) ($c['modified'] ?? 0) + (int) ($c['deleted'] ?? 0);
+    switch ($c['change'] ?? '') {
+        case 'updated': case 'downgraded':
+            $k = ($c['change'] === 'updated') ? 'up' : 'down';
+            $text = $t . ' ' . ($c['version_from'] ?? '?') . ' → ' . ($c['version'] ?? '?');
+            break;
+        case 'new':
+            $k = 'add'; $text = 'Added ' . $t . (!empty($c['version']) ? ' ' . $c['version'] : '');
+            break;
+        case 'deleted':
+            $k = 'del'; $text = 'Removed ' . $t;
+            break;
+        case 'status':
+            $k = 'state'; $text = $t . ' ' . (($c['status'] ?? '') === 'inactive' ? 'deactivated' : 'activated');
+            break;
+        default:
+            $k = 'edit'; $text = $t . ' edited' . ($n ? ', ' . $n . ' file' . ($n === 1 ? '' : 's') : '');
+    }
+    return ['k' => $k, 't' => $text, 'more' => (int) $more, 'linked' => !empty($c['linked'])];
+}
+
+// The site's history card: active theme, active plugins, and the newest
+// save that changed a plugin or theme (Cove's own helper left out; a
+// symlinked plugin shared by many sites only when nothing else changed).
+// Cached in history/.git/cove/card.json against the HEAD it was read from;
+// rebuilding costs two git calls, charged to $budget (seconds) so one
+// listing after a nightly sweep can't stall. Out of budget = pending.
+function cove_history_card($site_path, &$budget) {
+    $gitdir = $site_path . '/history/.git';
+    if (!is_dir($gitdir . '/objects')) return null;
+    $head = cove_git_head($gitdir);
+    if (!$head) return null;
+    $cache_file = $gitdir . '/cove/card.json';
+    $cached = @json_decode((string) @file_get_contents($cache_file), true);
+    if (is_array($cached) && ($cached['head'] ?? '') === $head && ($cached['v'] ?? 0) === 1) return $cached;
+    if ($budget <= 0) return ['pending' => true];
+    $t0 = microtime(true);
+    $git = 'git --git-dir=' . escapeshellarg($gitdir);
+    $card = ['v' => 1, 'head' => $head, 'theme' => null, 'plugins' => 0, 'pl' => []];
+    $man = [];
+    exec($git . ' show ' . escapeshellarg($head . ':manifest.tsv') . ' 2>/dev/null', $man);
+    foreach ($man as $line) {
+        $f = explode("\t", $line);
+        if (count($f) < 4) continue;
+        if ($f[0] === 'theme' && $f[3] === 'active') $card['theme'] = ($f[4] ?? '') !== '' ? $f[4] : $f[1];
+        if ($f[0] === 'plugin' && ($f[3] === 'active' || $f[3] === 'active-network')) { $card['plugins']++; $card['pl'][] = $f[1]; }
+    }
+    $card['manifest'] = !empty($man);
+    $log = [];
+    exec($git . ' log -n 60 --format=%H%x20%ct ' . escapeshellarg($head) . ' 2>/dev/null', $log);
+    $oldest = null;
+    foreach ($log as $l) {
+        $parts = explode(' ', $l);
+        if (count($parts) < 2) continue;
+        $oldest = (int) $parts[1];
+        $sum = @json_decode((string) @file_get_contents($gitdir . '/cove/summary-' . $parts[0] . '.json'), true);
+        if (!is_array($sum)) continue;
+        if (!empty($sum['initial'])) break;
+        $pick = null; $more = 0;
+        foreach (($sum['components'] ?? []) as $comp) {
+            if (($comp['slug'] ?? '') === 'captaincore-helper' || ($comp['type'] ?? '') === 'file') continue;
+            $comp['linked'] = is_link($site_path . '/public/wp-content/' . ($comp['path'] ?? ''));
+            if ($pick === null) { $pick = $comp; continue; }
+            $more++;
+            if ($pick['linked'] && !$comp['linked']) $pick = $comp;
+        }
+        if ($pick !== null) { $card['ch'] = cove_card_change($pick, $more) + ['at' => (int) $parts[1]]; break; }
+    }
+    if (empty($card['ch']) && $oldest) $card['since'] = $oldest;
+    @file_put_contents($cache_file . '.tmp', json_encode($card, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    @rename($cache_file . '.tmp', $cache_file);
+    $budget -= microtime(true) - $t0;
+    return $card;
+}
+
+// When someone last opened the site in a browser: the newest request in
+// logs/caddy.log from a real browser — not Cove's preview captures
+// (HeadlessChrome), WP-Cron's loopbacks or scripts. $prev is the cached
+// {size, ts}; only bytes written since are read (the last 16 MB at most).
+function cove_last_visit($log, $prev) {
+    $size = @filesize($log);
+    if ($size === false) return ['size' => 0, 'ts' => null];
+    if (is_array($prev) && ($prev['size'] ?? -1) === $size) return $prev;
+    $from = (is_array($prev) && isset($prev['size']) && $prev['size'] <= $size) ? (int) $prev['size'] : 0;
+    $ts = null;
+    $fh = @fopen($log, 'rb');
+    if ($fh) {
+        $start = max($from, $size - 16 * 1048576);
+        $carry = '';
+        for ($pos = $size; $pos > $start && $ts === null; ) {
+            $len = min(1048576, $pos - $start);
+            $pos -= $len;
+            fseek($fh, $pos);
+            $lines = explode("\n", fread($fh, $len) . $carry);
+            $carry = $pos > $start ? array_shift($lines) : '';
+            for ($i = count($lines) - 1; $i >= 0; $i--) {
+                if (strpos($lines[$i], 'Mozilla') === false) continue;
+                $e = json_decode($lines[$i], true);
+                if (!is_array($e)) continue;
+                $ua = implode(' ', (array) ($e['request']['headers']['User-Agent'] ?? []));
+                if ($ua === '' || preg_match('/HeadlessChrome|bot\b|crawl|spider|curl|wget|python|Go-http|WordPress\//i', $ua)) continue;
+                $ts = isset($e['ts']) ? (int) $e['ts'] : null;
+                break;
+            }
+        }
+        fclose($fh);
+    }
+    if ($ts === null && $from > 0 && is_array($prev)) $ts = $prev['ts'] ?? null;
+    return ['size' => $size, 'ts' => $ts];
+}
+
+// PHP errors WordPress wrote to wp-content/debug.log in the last 24 hours:
+// fatals, parse errors and warnings (notices and deprecations left out).
+function cove_recent_php_errors($debug_log) {
+    $mt = @filemtime($debug_log);
+    if (!$mt || $mt < time() - 86400) return 0;
+    $size = (int) @filesize($debug_log);
+    $fh = @fopen($debug_log, 'rb');
+    if (!$fh) return 0;
+    fseek($fh, max(0, $size - 2097152));
+    $text = (string) fread($fh, 2097152);
+    fclose($fh);
+    if (!preg_match_all('/^\[(\d{2}-\w{3}-\d{4} \d{2}:\d{2}:\d{2}) ([A-Za-z_\/+-]+)\] PHP (?:Fatal error|Parse error|Warning)/m', $text, $m)) return 0;
+    $cut = time() - 86400;
+    $n = 0;
+    foreach ($m[1] as $i => $when) {
+        try { $tz = new DateTimeZone($m[2][$i]); } catch (Exception $e) { $tz = new DateTimeZone('UTC'); }
+        $t = DateTime::createFromFormat('d-M-Y H:i:s', $when, $tz);
+        if ($t && $t->getTimestamp() >= $cut) $n++;
+    }
+    return $n;
+}
+
+// A static site's page title and file count (capped), for its row.
+function cove_static_facts($public) {
+    $title = null;
+    foreach (['index.html', 'index.htm', 'index.php'] as $fn) {
+        $head = @file_get_contents($public . '/' . $fn, false, null, 0, 65536);
+        if ($head === false) continue;
+        if (preg_match('/<title[^>]*>(.*?)<\/title>/is', $head, $m)) {
+            $t = trim(html_entity_decode(preg_replace('/\s+/', ' ', $m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            if ($t !== '' && !preg_match('/<\?|\{\{|\$/', $t)) $title = function_exists('mb_substr') ? mb_substr($t, 0, 80) : substr($t, 0, 80);
+        }
+        break;
+    }
+    $files = 0;
+    try {
+        $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($public, FilesystemIterator::SKIP_DOTS));
+        foreach ($it as $f) { if ($f->isFile() && ++$files >= 5000) break; }
+    } catch (Exception $e) {}
+    return ['title' => $title, 'files' => $files];
+}
+
 function cove_read_size_cache($path) {
     if (!file_exists($path)) return [];
     $data = @json_decode(@file_get_contents($path), true);
@@ -3467,12 +3647,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     if ($action === 'list_sites') {
         $sites_info = [];
         $size_cache = cove_read_size_cache($__cove_sizes_cache);
+        // Last visits and static-site facts, cached between listings.
+        $__facts_file = $user_home . '/Cove/cache/site-facts.json';
+        $__facts = @json_decode((string) @file_get_contents($__facts_file), true);
+        if (!is_array($__facts)) $__facts = [];
+        $__facts_before = $__facts;
+        $__card_budget = 1.2;
 
         // Read whatever stable-check data is already cached. Deliberately does
         // not fetch: list_sites is on the critical path for the dashboard's
         // first paint, and version status is a nicety. The add-site form's
         // wp_versions call is what populates this.
         $__cove_wpver_status = [];
+        $__cove_wpver_all = @json_decode((string) @file_get_contents(preg_replace('/\.json$/', '-status.json', $__cove_wpver_cache)), true);
+        if (is_array($__cove_wpver_all)) $__cove_wpver_status = $__cove_wpver_all;
         if (is_file($__cove_wpver_cache)) {
             $__cove_wpver_cached = @json_decode(@file_get_contents($__cove_wpver_cache), true);
             if (is_array($__cove_wpver_cached)) {
@@ -3531,6 +3719,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                     }
                     $multisite_mode = is_file($site_path . '/multisite') ? trim((string) @file_get_contents($site_path . '/multisite')) : '';
                     $is_minn = cove_site_is_minn($site_path . '/public');
+                    $is_wp = $is_minn || file_exists($site_path . '/public/wp-config.php');
+
+                    $__f = $__facts[$item] ?? [];
+                    $__f['visit'] = cove_last_visit($site_path . '/logs/caddy.log', $__f['visit'] ?? null);
+                    $static_facts = null;
+                    if (!$is_wp) {
+                        $pm = @filemtime($site_path . '/public') ?: 0;
+                        if (($__f['static']['mtime'] ?? -1) !== $pm) $__f['static'] = cove_static_facts($site_path . '/public') + ['mtime' => $pm];
+                        $static_facts = ['title' => $__f['static']['title'], 'files' => $__f['static']['files']];
+                    }
+                    $__facts[$item] = $__f;
+                    $twin_domain = null;
+                    if (is_file($site_path . '/twin') && preg_match('/^domain=(.+)$/m', (string) @file_get_contents($site_path . '/twin'), $tm)) $twin_domain = trim($tm[1]);
 
                     $sites_info[] = [
                         'name' => str_replace('.localhost', '', $item),
@@ -3554,8 +3755,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'php_version' => is_file($site_path . '/php_version') ? trim((string) @file_get_contents($site_path . '/php_version')) : null,
                         // When the dashboard's preview of the front page was captured.
                         'shot_mtime' => is_file($user_home . '/Cove/cache/screenshots/' . str_replace('.localhost', '', $item) . '.png') ? filemtime($user_home . '/Cove/cache/screenshots/' . str_replace('.localhost', '', $item) . '.png') : null,
+                        // Theme, plugins and the last plugin or theme change
+                        // (null: no history yet; {pending}: ask again shortly).
+                        'card' => $is_wp ? cove_history_card($site_path, $__card_budget) : null,
+                        'static' => $static_facts,
+                        // Unix time of the last visit from a browser, or null.
+                        'seen_at' => $__f['visit']['ts'],
+                        'php_errors' => $is_wp ? cove_recent_php_errors($site_path . '/public/wp-content/debug.log') : 0,
+                        'twin' => $twin_domain,
                     ];
                 }
+            }
+            $__facts = array_intersect_key($__facts, array_flip(array_filter(scandir($sitedir), fn($i) => $i !== '.' && $i !== '..')));
+            if ($__facts !== $__facts_before) {
+                @mkdir(dirname($__facts_file), 0755, true);
+                @file_put_contents($__facts_file . '.tmp', json_encode($__facts, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                @rename($__facts_file . '.tmp', $__facts_file);
             }
             if (!empty($sites_info)) {
                 array_multisort(
@@ -3607,13 +3822,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         $site = (string) ($_GET['site'] ?? '');
         $png = preg_match('/^[a-zA-Z0-9-]+$/', $site) ? $user_home . '/Cove/cache/screenshots/' . $site . '.png' : '';
         if ($png === '' || !is_file($png)) { http_response_code(404); echo json_encode(['success' => false, 'message' => 'No preview yet.']); exit; }
-        if (($_GET['size'] ?? '') === 'thumb' && function_exists('imagewebp') && function_exists('imagecreatefrompng')) {
-            $thumb = dirname($png) . '/thumbs/' . $site . '.webp';
+        $__shot_size = (string) ($_GET['size'] ?? '');
+        if (($__shot_size === 'thumb' || $__shot_size === 'mini') && function_exists('imagewebp') && function_exists('imagecreatefrompng')) {
+            $thumb = dirname($png) . '/thumbs/' . ($__shot_size === 'mini' ? 'mini/' : '') . $site . '.webp';
             if (!is_file($thumb) || filemtime($thumb) < filemtime($png)) {
                 $src = @imagecreatefrompng($png);
                 if ($src) {
                     $sw = imagesx($src); $sh = imagesy($src);
-                    $tw = min(640, $sw); $th = max(1, (int) round($sh * $tw / max(1, $sw)));
+                    $tw = min($__shot_size === 'mini' ? 160 : 640, $sw); $th = max(1, (int) round($sh * $tw / max(1, $sw)));
                     $dst = imagecreatetruecolor($tw, $th);
                     imagecopyresampled($dst, $src, 0, 0, 0, 0, $tw, $th, $sw, $sh);
                     if (!is_dir(dirname($thumb))) @mkdir(dirname($thumb), 0755, true);
@@ -5303,12 +5519,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // Walk every site directory with `du -sk` (portable on macOS + Linux — -k
             // forces 1024-byte blocks) and cache the result as bytes. Runs sequentially
             // so 80+ sites take a few seconds; acceptable because this is user-triggered.
-            $sizes = [];
+            // `missing` measures only sites the cache has never seen, within a
+            // time budget, and says how many are left: the dashboard calls it
+            // on its own until none are, so no row waits on the ↻ button.
+            $only_missing = !empty($input['missing']);
+            $sizes = $only_missing ? cove_read_size_cache($__cove_sizes_cache) : [];
+            $remaining = 0;
+            $t_start = microtime(true);
             if (file_exists($sitedir) && is_dir($sitedir)) {
                 foreach (scandir($sitedir) as $item) {
                     if ($item === '.' || $item === '..') continue;
                     $p = $sitedir . '/' . $item;
                     if (!is_dir($p)) continue;
+                    if ($only_missing && isset($sizes[$item])) continue;
+                    if ($only_missing && microtime(true) - $t_start > 12) { $remaining++; continue; }
                     $out = []; $rc = 0;
                     exec('du -sk ' . escapeshellarg($p) . ' 2>/dev/null', $out, $rc);
                     if ($rc === 0 && !empty($out[0])) {
@@ -5319,8 +5543,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
             }
+            if ($only_missing) $sizes = array_intersect_key($sizes, array_flip(array_filter(scandir($sitedir), fn($i) => $i !== '.' && $i !== '..')));
             cove_write_size_cache($__cove_sizes_cache, $sizes);
-            echo json_encode(['success' => true, 'sites' => $sizes, 'updated_at' => time()]);
+            echo json_encode(['success' => true, 'sites' => $sizes, 'remaining' => $remaining, 'updated_at' => time()]);
             exit;
     }
 
@@ -5431,7 +5656,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='32' r='30' fill='%23009b95'/><g fill='none' stroke='%23ffffff' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'><path d='M 17 27 Q 24.5 20 32 27 T 47 27'/><path d='M 17 40 Q 24.5 33 32 40 T 47 40'/></g></svg>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..600;1,9..144,400..600&family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
         *, *::before, *::after { box-sizing: border-box; }
         html, body { margin: 0; padding: 0; }
@@ -5441,7 +5666,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         :root {
             --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
             --font-serif: 'Fraunces', Georgia, serif;
-            --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+            --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
             /* sRGB fallback first; browsers without oklch() support silently
                drop the override on the next line and keep the hex value.
                Without the fallback, the whole declaration would be invalid on
@@ -5489,6 +5714,15 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --pill-static-fg: #9a9d94;
             --input-bg: #0b0e0c;
             --danger: #d66a6a;
+            /* Sites view: softer hairlines than --panel-border, state colours,
+               the coral Minn dot, and the console's frosted backing. */
+            --hairline: #252925;
+            --ok: #2bb98a;
+            --warn: #e3a94f;
+            --minn: #e5845c;
+            --mark: rgba(77, 176, 194, 0.24);
+            --scrim: rgba(15, 18, 16, 0.86);
+            --shadow-pop: 0 1px 2px rgba(0, 0, 0, 0.4), 0 14px 40px rgba(0, 0, 0, 0.45);
             /* Syntax highlighting in the Files editor. */
             --hl-cmt: #6c716a; --hl-str: #b3c78c; --hl-kw: #7cc3cf; --hl-num: #e0b078; --hl-var: #c7b6e6; --hl-tag: #5fb6c4; --hl-attr: #d8c68e; --hl-fn: #e9e7dc;
             --shadow-lg: none;
@@ -5523,6 +5757,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             --pill-static-fg: #8a8781;
             --input-bg: #fbfaf7;
             --danger: #b44848;
+            --hairline: #e8e4da;
+            --ok: #089772;
+            --warn: #a8650f;
+            --minn: #d3704a;
+            --mark: rgba(58, 151, 169, 0.22);
+            --scrim: rgba(251, 250, 247, 0.86);
+            --shadow-pop: 0 1px 2px rgba(26, 28, 27, 0.06), 0 10px 30px rgba(26, 28, 27, 0.1);
             --hl-cmt: #8a8e85; --hl-str: #4f7d2a; --hl-kw: #1f7a8c; --hl-num: #b0641d; --hl-var: #7a4fa8; --hl-tag: #0f6d7a; --hl-attr: #8a6a10; --hl-fn: #2f3a3c;
             --shadow-lg: none;
             color-scheme: light;
@@ -5543,8 +5784,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         /* The page widens for mail and databases; ease the width so a view
            switch reads as the same page reshaping, not a new one landing. */
         .wrap { position: relative; max-width: 820px; margin: 0 auto; transition: max-width 280ms cubic-bezier(0.2, 0.7, 0.2, 1); }
-        /* The sites gallery needs the room for four tiles a row. */
-        body.sites-grid .wrap { max-width: 1120px; }
+        body.view-sites .wrap { max-width: 1200px; }
 
         /* Top nav */
         .nav { position: relative; }
@@ -5659,84 +5899,217 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .add-row select.wp-version { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.85rem; padding: 0.5rem 0.7rem; border-radius: var(--radius-md); flex: none; cursor: pointer; }
         .add-row select.wp-version:focus { outline: 0; border-color: var(--accent); }
 
-        /* Site list — one grid on the <ul>, rows inherit its columns via
-           subgrid so type/modified/size/actions align vertically across rows
-           instead of each row sizing independently. */
-        .site-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr auto auto auto auto; column-gap: 0.9rem; }
-        .site-row { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; padding: 0.8rem 1.5rem; border-bottom: 1px solid var(--panel-border); transition: background 100ms; cursor: pointer; }
-        .site-row:last-child { border-bottom: 0; }
-        .site-row:hover { background: var(--panel-hover); }
-        .site-domain-cell { display: inline-flex; align-items: center; gap: 0.35rem; min-width: 0; }
-        .site-domain { font-family: var(--font-mono); font-size: 0.88rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .site-domain .host-accent { color: var(--accent); }
-        /* The one spot on a row that opens the site — everywhere else on the
-           row opens the context menu. Always visible (not hover-gated) so a
-           site stays one tap away on touch. */
-        .site-open-link { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: var(--radius-sm); color: var(--text-faint); flex: none; }
-        .site-open-link:hover { color: var(--accent); background: var(--panel-border); }
-        .site-open-link svg { width: 13px; height: 13px; }
-        .site-domain mark { background: rgba(58, 151, 169, 0.28); background: color-mix(in oklch, var(--accent) 28%, transparent); color: inherit; padding: 0 1px; border-radius: var(--radius-sm); }
+        /* ---- Sites view ------------------------------------------------
+           A harbour band (the summary, over a contour chart), a sticky
+           console (filter, quick filters, layout, sort, add), pinned cards,
+           then every site grouped by when it last changed: rows or cards
+           for the recent groups, a compact index for the rest. */
+        .card.sites-view { background: none; border: 0; border-radius: 0; overflow: visible; box-shadow: none; }
+        .sl-harbor { position: relative; display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 1.75rem; padding: 2rem 2rem 1.8rem; border: 1px solid var(--hairline); border-radius: 12px; background: var(--panel); overflow: hidden; }
+        .sl-chart { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+        .sl-harbor > :not(.sl-chart) { position: relative; }
+        .sl-eyebrow { margin: 0 0 0.85rem; font-family: var(--font-mono); font-size: 0.72rem; color: var(--accent); letter-spacing: 0.04em; }
+        .sl-title { margin: 0; font-family: var(--font-sans); font-weight: 650; font-size: clamp(1.9rem, 3.6vw, 2.85rem); line-height: 1.06; letter-spacing: -0.032em; text-wrap: balance; }
+        .sl-title em { font-family: var(--font-serif); font-style: italic; font-weight: 500; color: var(--brand); letter-spacing: -0.01em; padding-inline: 0.04em; background: linear-gradient(transparent 80%, var(--mark) 80%); }
+        .sl-sub { margin: 0.85rem 0 0; color: var(--text-dim); font-size: 0.95rem; }
+        .sl-sub b { font-family: var(--font-mono); font-weight: 500; font-size: 0.88rem; color: var(--text); }
+        .sl-readouts { display: grid; gap: 0.6rem; align-content: start; }
+        .sl-readout { padding: 0.75rem 0.9rem; border: 1px solid var(--hairline); border-radius: 8px; background: var(--panel); }
+        .sl-readout h2 { margin: 0 0 0.5rem; font-family: var(--font-mono); font-weight: 500; font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--text-faint); }
+        .sl-stack { display: flex; height: 8px; border-radius: 999px; overflow: hidden; background: var(--bg-sunk); }
+        .sl-stack i { display: block; height: 100%; }
+        .sl-legend { list-style: none; margin: 0.5rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.25rem 0.9rem; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); }
+        .sl-legend li { display: inline-flex; align-items: center; gap: 0.4rem; }
+        .sl-legend i { width: 8px; height: 8px; border-radius: 2px; }
+        .sl-quiet { margin: 0; font-size: 0.82rem; color: var(--text-faint); }
+        .sl-attention { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; }
+        .sl-attention button { width: calc(100% + 0.8rem); display: grid; grid-template-columns: 10px auto minmax(0, 1fr); align-items: center; gap: 0.5rem; margin: 0 -0.4rem; padding: 0.25rem 0.4rem; border: 0; border-radius: var(--radius-sm); background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+        .sl-attention button:hover { background: var(--panel-hover); }
+        .sl-attention button[data-chip-go] { grid-template-columns: 10px minmax(0, 1fr); }
+        .sl-attention .sl-host { font-size: 0.8rem; }
+        .sl-why { font-size: 0.8rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sl-readout.is-tidy { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+        .sl-readout.is-tidy p { margin: 0; font-size: 0.82rem; color: var(--text-dim); }
+        .sl-readout.is-tidy b { font-family: var(--font-mono); font-weight: 500; color: var(--text); }
+        .sl-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
+        .sl-dot.warn { background: var(--warn); }
+        .sl-dot.danger { background: var(--danger); }
+        .sl-dot.pre { background: var(--accent); }
+
+        .sl-console { position: sticky; top: 0; z-index: 30; margin-top: 1.1rem; padding-block: 0.65rem; background: var(--scrim); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); border-bottom: 1px solid transparent; }
+        .sl-console.is-stuck { border-bottom-color: var(--hairline); }
+        .sl-console-row { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+        .sl-search { flex: 1 1 320px; min-width: 0; display: flex; align-items: center; gap: 0.6rem; height: 2.6rem; padding: 0 0.75rem; border: 1px solid var(--hairline); border-radius: 8px; background: var(--panel); cursor: text; }
+        .sl-search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--mark); }
+        .sl-search > svg { width: 16px; height: 16px; color: var(--text-faint); flex: none; }
+        .sl-search .filter-input { padding: 0; font-family: var(--font-mono); font-size: 0.88rem; }
+        .sl-seg { display: inline-flex; height: 2.6rem; border: 1px solid var(--hairline); border-radius: 8px; overflow: hidden; background: var(--panel); }
+        .sl-seg button { width: 2.6rem; border: 0; background: none; color: var(--text-faint); display: grid; place-items: center; cursor: pointer; }
+        .sl-seg button + button { border-left: 1px solid var(--hairline); }
+        .sl-seg button:hover { color: var(--text); }
+        .sl-seg button[aria-pressed="true"] { color: var(--accent); background: var(--bg-sunk); }
+        .sl-seg svg { width: 16px; height: 16px; }
+        .sl-sort { display: inline-flex; align-items: center; gap: 0.5rem; height: 2.6rem; padding: 0 0.6rem 0 0.75rem; border: 1px solid var(--hairline); border-radius: 8px; background: var(--panel); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.78rem; }
+        .sl-sort select { border: 0; background: transparent; color: var(--text); font: inherit; font-weight: 500; outline: 0; cursor: pointer; }
+        .pill.sl-new { height: 2.6rem; padding: 0 1rem; }
+        .sl-chips { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.6rem; }
+        .sl-chip { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.28rem 0.7rem; border: 1px solid var(--hairline); border-radius: 999px; background: var(--panel); color: var(--text-dim); font: 500 0.78rem/1.3 var(--font-sans); cursor: pointer; }
+        .sl-chip:hover { color: var(--text); border-color: var(--panel-border); }
+        .sl-chip span { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
+        .sl-chip[aria-pressed="true"] { background: var(--text); border-color: var(--text); color: var(--bg); }
+        .sl-chip[aria-pressed="true"] span { color: var(--bg); opacity: 0.7; }
+        .sl-chip .sl-dot { width: 6px; height: 6px; }
+        .add-echo { display: flex; gap: 0.5rem; align-items: baseline; margin-top: 0.75rem; font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-dim); overflow-wrap: anywhere; }
+        .add-echo b { color: var(--accent); font-weight: 500; }
+
+        .sl-group { margin-top: 1.6rem; }
+        .sl-group-head { display: flex; align-items: center; gap: 0.6rem; margin: 0 0 0.5rem; }
+        .sl-group-head h2 { margin: 0; font-family: var(--font-mono); font-weight: 500; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.14em; color: var(--accent); }
+        .sl-count { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-faint); }
+        .sl-rule { flex: 1; height: 1px; background: var(--hairline); }
+        .sl-hint { font-size: 0.74rem; color: var(--text-faint); }
+        .sl-link { border: 0; background: none; padding: 0.1rem 0.3rem; border-radius: var(--radius-sm); color: var(--accent); font: 500 0.78rem var(--font-sans); cursor: pointer; }
+        .sl-link:hover { background: var(--panel-hover); }
+
+        .sl-host { font-family: var(--font-mono); font-size: 0.88rem; line-height: 1.3; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+        .sl-host .host-accent { color: var(--accent); font-weight: 500; }
+        .sl-host mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1px; }
+        .sl-type { display: inline-flex; align-items: center; padding: 0.12rem 0.45rem; border: 0; border-radius: 999px; font-family: var(--font-mono); font-weight: 600; font-size: 0.62rem; line-height: 1.4; letter-spacing: 0.07em; flex: none; cursor: pointer; }
+        .sl-type:hover { filter: brightness(1.12); }
+        .sl-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
+        .sl-type.minn { background: var(--pill-minn-bg); color: var(--pill-minn-fg); }
+        .sl-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); box-shadow: inset 0 0 0 1px var(--hairline); }
+        .sl-ver { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); white-space: nowrap; }
+        .sl-php { font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-faint); border: 1px solid var(--hairline); border-radius: 999px; padding: 0 0.4rem; white-space: nowrap; }
+        /* The type pill on a site's page (and the keyframe its PHP chip and
+           the logs view's live dot pulse with). */
         .site-type { display: inline-flex; justify-content: center; min-width: 64px; padding: 0.2rem 0.55rem; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 0.68rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; user-select: none; transition: filter 120ms; }
         .site-type:hover { filter: brightness(1.15); }
-        /* One grid child holding the pill plus its version, so adding the
-           version does not shift the row's subgrid columns. */
-        .site-type-cell { display: inline-flex; align-items: baseline; gap: 0.45rem; min-width: 0; }
-        .site-wp-version { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; }
-        /* Local sites aren't exposed, so an insecure release is a nudge to
-           update rather than a warning — hence the dot, not a red badge. */
-        .site-wp-version.insecure { color: var(--text-dim); }
-        .site-wp-version.insecure::after { content: "●"; margin-left: 0.25rem; color: var(--pill-warn-fg, #d08c30); font-size: 0.6em; vertical-align: middle; }
         .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
         .site-type.minn { background: var(--pill-minn-bg); color: var(--pill-minn-fg); }
         .site-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); }
-        /* Pinned-PHP chip: only rendered when a site is pinned off the default,
-           so the common case stays visually quiet. While a version change is
-           applying (or installing), the chip pulses with the target version. */
-        .site-php-version { font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-faint); white-space: nowrap; border: 1px solid var(--panel-border); border-radius: var(--radius-pill); padding: 0.05rem 0.45rem; }
-        .site-php-version.applying { border-color: var(--accent); color: var(--text-dim); animation: php-pulse 1.2s ease-in-out infinite; }
         @keyframes php-pulse { 50% { opacity: 0.45; } }
-        .site-modified { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-faint); min-width: 44px; text-align: right; }
-        .site-size { font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-dim); min-width: 64px; text-align: right; }
-        .site-actions { display: flex; gap: 0.15rem; opacity: 0; transition: opacity 100ms; }
-        .site-row:hover .site-actions, .site-row:focus-within .site-actions { opacity: 1; }
-        /* Fixed button size + both children stacked in one grid cell. Since
-           grid-area "stack" collocates them at the same position and size is
-           locked by width/height, toggling opacity on .loading can't shift
-           any neighbour. */
-        .site-action-btn { display: inline-grid; grid-template-areas: "stack"; place-items: center; box-sizing: border-box; width: 3.5em; height: 1.75em; padding: 0; background: transparent; border: 0; color: var(--text-dim); cursor: pointer; border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: 0.78rem; line-height: 1; }
-        .site-action-btn > * { grid-area: stack; }
-        .site-action-btn:hover { background: var(--panel-border); color: var(--text); }
-        .site-action-btn.danger:hover { color: var(--danger); }
-        .site-action-btn:disabled { cursor: wait; }
-        .site-action-btn .btn-spinner { width: 10px; height: 10px; border: 1.5px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; opacity: 0; pointer-events: none; }
-        .site-action-btn.loading .btn-label { opacity: 0; }
-        .site-action-btn.loading .btn-spinner { opacity: 1; }
+        .sl-php.applying { border-color: var(--accent); color: var(--text-dim); animation: php-pulse 1.2s ease-in-out infinite; }
+        .sl-sig { display: inline-flex; align-items: center; gap: 0.25rem; padding: 0.05rem 0.45rem 0.05rem 0.32rem; border-radius: 999px; font-family: var(--font-mono); font-weight: 500; font-size: 0.68rem; line-height: 1.5; flex: none; white-space: nowrap; }
+        .sl-sig svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.6; }
+        .sl-sig.mail { color: var(--pill-wp-fg); background: var(--pill-wp-bg); }
+        .sl-sig.err { color: var(--danger); background: rgba(214, 106, 106, 0.14); }
+        .sl-pin { width: 11px; height: 11px; color: var(--accent); flex: none; }
+        .sl-open { display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: var(--radius-sm); color: var(--text-faint); flex: none; }
+        .sl-open:hover { color: var(--accent); background: var(--panel-hover); }
+        .sl-open svg { width: 12px; height: 12px; }
+        .sl-blank { display: grid; place-items: center; width: 100%; height: 100%; }
+        .sl-blank svg { width: 56%; max-width: 46px; fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linecap: round; opacity: 0.55; }
+        .sl-thumb img, .sl-shot img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top; transition: opacity 240ms; }
+        .sl-thumb img.is-loading, .sl-shot img.is-loading { opacity: 0; }
+        .sl-thumb img.is-broken, .sl-shot img.is-broken { display: none; }
 
-        /* Empty + loading states — scoped to direct children of .site-list so
-           the global .loading class doesn't leak into unrelated elements
-           (notably .site-action-btn.loading, which uses its own state class). */
-        .site-list > .empty, .site-list > .loading { grid-column: 1 / -1; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); }
+        .sl-rows { border: 1px solid var(--hairline); border-radius: 12px; background: var(--panel); overflow: hidden; }
+        .sl-row { position: relative; display: grid; grid-template-columns: 22px 64px minmax(0, 1fr) minmax(0, 1.15fr) 132px 64px 112px 104px; align-items: center; gap: 0.85rem; padding: 0.55rem 1rem 0.55rem 0.75rem; border-top: 1px solid var(--hairline); cursor: pointer; }
+        .sl-row:first-child { border-top: 0; }
+        .sl-row:hover, .sl-row.has-menu { background: var(--panel-hover); }
+        .sl-row.is-selected { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--panel-border-strong); }
+        .sl-row.is-checked { background: rgba(77, 176, 194, 0.08); }
+        .sl-check { width: 18px; height: 18px; padding: 0; border: 1.5px solid var(--panel-border); border-radius: 5px; background: var(--panel); display: grid; place-items: center; opacity: 0; transition: opacity 120ms; cursor: pointer; }
+        .sl-check svg { width: 12px; height: 12px; fill: none; stroke: var(--accent-fg); stroke-width: 2.4; opacity: 0; }
+        .sl-row:hover .sl-check, .sl-row.is-selected .sl-check, .has-checked .sl-check { opacity: 1; }
+        .sl-row.is-checked .sl-check { opacity: 1; background: var(--accent); border-color: var(--accent); }
+        .sl-row.is-checked .sl-check svg { opacity: 1; }
+        .sl-thumb { width: 64px; aspect-ratio: 16 / 10; max-width: 100%; border-radius: 5px; overflow: hidden; border: 1px solid var(--hairline); background: var(--bg-sunk); }
+        .sl-who { min-width: 0; display: grid; gap: 0.15rem; }
+        .sl-who-top { display: flex; align-items: center; gap: 0.45rem; min-width: 0; }
+        .sl-facts { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sl-inside { min-width: 0; display: grid; gap: 0.2rem; }
+        .sl-inside-top { font-size: 0.82rem; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sl-inside-top .n { font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-dim); }
+        .sl-change { display: flex; align-items: center; gap: 0.4rem; min-width: 0; font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-dim); }
+        .sl-change > span:last-child { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sl-change.is-quiet { color: var(--text-faint); }
+        .sl-g { flex: none; width: 15px; height: 15px; border-radius: 4px; display: grid; place-items: center; font-family: var(--font-mono); font-weight: 600; font-size: 0.62rem; line-height: 1; background: var(--bg-sunk); color: var(--text-dim); }
+        .sl-g.up { color: var(--ok); background: rgba(43, 185, 138, 0.14); }
+        .sl-g.down { color: var(--warn); background: rgba(227, 169, 79, 0.15); }
+        .sl-g.add { color: var(--pill-wp-fg); background: var(--pill-wp-bg); }
+        .sl-g.del { color: var(--danger); background: rgba(214, 106, 106, 0.14); }
+        .sl-g.edit, .sl-g.state { color: var(--pill-minn-fg); background: var(--pill-minn-bg); }
+        .sl-kind { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+        .sl-seen { display: grid; justify-items: end; gap: 1px; font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+        .sl-seen small { font-size: 0.56rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); }
+        .sl-size { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 0.5rem; }
+        .sl-bar { height: 4px; border-radius: 999px; background: var(--bg-sunk); overflow: hidden; }
+        .sl-bar i { display: block; height: 100%; background: var(--accent); opacity: 0.55; border-radius: 999px; }
+        .sl-num { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); text-align: right; min-width: 3.2rem; font-variant-numeric: tabular-nums; }
+        .sl-acts { display: flex; gap: 0.35rem; justify-content: flex-end; opacity: 0; transition: opacity 120ms; }
+        .sl-row:hover .sl-acts, .sl-row.is-selected .sl-acts, .sl-row.has-menu .sl-acts, .sl-row:focus-within .sl-acts { opacity: 1; }
+        .sl-btn { display: inline-flex; align-items: center; justify-content: center; gap: 0.35rem; height: 1.75rem; padding: 0 0.6rem; border: 1px solid var(--hairline); border-radius: var(--radius-md); background: var(--panel); color: var(--text); font: 500 0.76rem var(--font-sans); white-space: nowrap; cursor: pointer; }
+        .sl-btn:hover { border-color: var(--panel-border); }
+        .sl-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+        .sl-btn.primary:hover { filter: brightness(1.08); }
+        .sl-btn.icon { width: 1.75rem; padding: 0; color: var(--text-dim); }
+        .sl-btn.danger { color: var(--danger); }
+        .sl-btn.danger:hover { border-color: var(--danger); }
+        .sl-btn:disabled { cursor: wait; opacity: 0.7; }
+
+        .sl-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 1.1rem 1rem; }
+        .sl-card { min-width: 0; cursor: pointer; }
+        .sl-shot { position: relative; display: grid; place-items: center; aspect-ratio: 16 / 10; max-width: 100%; border: 1px solid var(--hairline); border-radius: 8px; overflow: hidden; background: var(--bg-sunk); transition: border-color 140ms, box-shadow 140ms; }
+        .sl-shot img { position: absolute; inset: 0; transition: transform 500ms cubic-bezier(0.2, 0.7, 0.2, 1), opacity 240ms; }
+        .sl-shot .sl-type { position: absolute; top: 8px; left: 8px; background: var(--panel); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15); }
+        .sl-card:hover .sl-shot, .sl-card.has-menu .sl-shot { border-color: var(--panel-border); box-shadow: var(--shadow-pop); }
+        .sl-card:hover .sl-shot img { transform: scale(1.03); }
+        .sl-card.is-selected .sl-shot { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+        .sl-card.is-checked .sl-shot { border-color: var(--brand); box-shadow: 0 0 0 2px var(--brand); }
+        .sl-card-acts { position: absolute; left: 0; right: 0; bottom: 0; display: flex; gap: 0.35rem; padding: 1.6rem 0.5rem 0.5rem; background: linear-gradient(to top, var(--scrim), transparent); opacity: 0; transform: translateY(4px); transition: opacity 140ms, transform 160ms; }
+        .sl-card:hover .sl-card-acts, .sl-card.is-selected .sl-card-acts, .sl-card.has-menu .sl-card-acts, .sl-card:focus-within .sl-card-acts { opacity: 1; transform: none; }
+        .sl-card-body { display: grid; gap: 0.2rem; padding: 0.55rem 0.1rem 0; min-width: 0; }
+        .sl-shelf .sl-shot { aspect-ratio: 16 / 9.4; }
+
+        .sl-index { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 2px 0.9rem; padding: 0.5rem; border: 1px solid var(--hairline); border-radius: 12px; background: var(--panel); }
+        .sl-idx { display: flex; align-items: center; gap: 0.55rem; min-width: 0; padding: 0.42rem 0.55rem; border-radius: var(--radius-md); cursor: pointer; }
+        .sl-idx:hover, .sl-idx.has-menu { background: var(--panel-hover); }
+        .sl-idx.is-selected { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--panel-border-strong); }
+        .sl-idx.is-checked { background: rgba(77, 176, 194, 0.12); }
+        .sl-idx .sl-host { flex: 1; font-size: 0.82rem; }
+        .sl-age { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); flex: none; }
+        .sl-tdot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+        .sl-tdot.wp { background: var(--accent); }
+        .sl-tdot.minn { background: var(--minn); }
+        .sl-tdot.static { background: var(--panel-border-strong); }
+
+        .sl-state { margin-top: 1.6rem; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); border: 1px dashed var(--panel-border); border-radius: 12px; }
+        .sl-foot { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; margin-top: 1.75rem; padding-top: 1rem; border-top: 1px solid var(--hairline); font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-faint); }
+        .sl-foot .totals { display: inline-flex; align-items: center; gap: 0.45rem; }
+        .sl-keys { display: flex; gap: 0.35rem 0.85rem; flex-wrap: wrap; align-items: center; }
+        .sl-keys span { display: inline-flex; gap: 0.25rem; align-items: center; }
+        .sl-keys kbd { font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-dim); border: 1px solid var(--hairline); border-bottom-width: 2px; border-radius: 4px; padding: 0.05rem 0.3rem; background: var(--panel); }
+        .sl-bulk { position: fixed; z-index: 250; left: 50%; bottom: 1.25rem; transform: translateX(-50%); display: flex; align-items: center; gap: 0.45rem; padding: 0.45rem 0.45rem 0.45rem 1rem; border: 1px solid var(--panel-border); border-radius: 999px; background: var(--panel); box-shadow: var(--shadow-pop); max-width: calc(100vw - 2rem); flex-wrap: wrap; }
+        .sl-bulk strong { font-family: var(--font-mono); font-weight: 600; font-size: 0.82rem; margin-right: 0.35rem; }
+        .sl-bulk .sl-btn { border-radius: 999px; }
+        @media (max-width: 980px) {
+            .sl-harbor { grid-template-columns: 1fr; }
+            .sl-row { grid-template-columns: 22px 64px minmax(0, 1fr) minmax(0, 1fr) 124px 96px; }
+            .sl-row .sl-seen, .sl-row .sl-size { display: none; }
+        }
+        @media (max-width: 640px) {
+            .sl-harbor { padding: 1.4rem 1.1rem; }
+            .sl-row { grid-template-columns: 52px minmax(0, 1fr) auto; gap: 0.6rem; padding: 0.55rem 0.75rem; }
+            .sl-row .sl-check, .sl-row .sl-inside, .sl-row .sl-acts { display: none; }
+            .sl-thumb { width: 52px; }
+            .sl-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem 0.6rem; }
+            .sl-card-acts, .sl-keys, .sl-sort span { display: none; }
+            /* The nav's tabs, service dots and theme button don't fit one
+               line on a phone: the tabs take their own scrolling line. */
+            .nav { flex-wrap: wrap; row-gap: 0.75rem; }
+            .nav .nav-views { order: 3; width: 100%; margin-left: 0; overflow-x: auto; flex-wrap: nowrap; }
+            .nav-services { display: none; }
+            .theme-btn { margin-left: auto; }
+        }
+
         .empty-hint { margin-top: 0.35rem; font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-faint); }
         .empty-hint code { background: var(--panel-hover); padding: 0.1rem 0.4rem; border-radius: var(--radius-sm); }
         .empty-art { display: block; width: 104px; height: 68px; margin: 0 auto 1rem; }
         .empty-art .art-line { stroke: var(--text-dim); stroke-width: 2; fill: none; }
         .empty-art .art-fill { fill: var(--accent); opacity: 0.14; stroke: none; }
         .empty-art .art-wave { stroke: var(--accent); stroke-width: 2; fill: none; opacity: 0.55; }
-
-        /* Column headers — subgrid row mirroring .site-row's columns. */
-        .site-head { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); }
-        .site-head-btn, .site-head-label { background: transparent; border: 0; padding: 0; font-family: var(--font-mono); font-size: 0.66rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); text-align: left; }
-        .site-head-btn { cursor: pointer; border-radius: var(--radius-sm); }
-        .site-head-btn:hover { color: var(--text); }
-        .site-head-btn.active { color: var(--text-dim); }
-        .site-head-label { justify-self: center; }
-        .site-head-right { justify-self: end; text-align: right; }
-        .sort-arrow { display: inline-block; min-width: 1em; text-align: right; }
-
-        /* Bulk delete — appears in the filter row when a filter narrows the list. */
-        .bulk-delete-btn { background: transparent; border: 1px solid var(--panel-border); color: var(--text-dim); cursor: pointer; font-family: var(--font-mono); font-size: 0.76rem; padding: 0.18rem 0.65rem; border-radius: var(--radius-pill); white-space: nowrap; transition: color 120ms, border-color 120ms, background 120ms; }
-        .bulk-delete-btn:hover { color: var(--danger); border-color: var(--danger); }
-        .bulk-delete-btn.armed { color: white; background: var(--danger); border-color: var(--danger); }
 
         /* Service dots in the top bar. They used to live only in the footer,
            which on an install with hundreds of sites sits ~14,000px down the
@@ -5757,65 +6130,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .sweep-row .st-chip.ch-running { color: var(--accent); border-color: var(--accent); }
         .dot.sweep-dot:hover { color: var(--text); }
 
-        /* Keyboard selection. Distinct from :hover so the two can coexist. */
-        /* Selected rows: fill plus a hairline, never an accent stripe. */
-        .site-row.is-selected { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--panel-border-strong); }
-        .site-row.is-selected .site-actions { opacity: 1; }
-        /* Transient: only while this row's context menu is open. Deliberately
-           separate from .is-selected — a mouse action shouldn't leave keyboard
-           selection behind, which read as a highlight stuck on the last row. */
-        .site-row.has-menu { background: var(--panel-hover); }
-        .site-row.has-menu .site-actions { opacity: 1; }
 
-        /* Pinned sites float to the top of the list. */
-        .site-row.is-pinned .site-domain::before { content: '●'; color: var(--accent); font-size: 0.62rem; margin-right: 0.4rem; vertical-align: middle; opacity: 0.9; }
-        .gallery-tile.is-pinned .site-domain::before { content: '●'; color: var(--accent); font-size: 0.62rem; margin-right: 0.4rem; vertical-align: middle; opacity: 0.9; }
-
-        /* List / gallery switch beside "+ add site". */
-        .layout-toggle { display: inline-flex; align-self: stretch; border: 1px solid var(--panel-border); border-radius: var(--radius-md); overflow: hidden; }
-        .layout-btn { display: inline-flex; align-items: center; justify-content: center; width: 2.1rem; background: transparent; border: 0; color: var(--text-faint); cursor: pointer; transition: color 120ms, background 120ms; }
-        .layout-btn + .layout-btn { border-left: 1px solid var(--panel-border); }
-        .layout-btn:hover { color: var(--text); }
-        .layout-btn.is-active { color: var(--accent); background: var(--panel-hover); }
-        .layout-btn svg { width: 14px; height: 14px; }
-
-        /* Site tiles: the gallery layout of the list, and the shelf above it.
-           The preview sits over a placeholder (initial + waves) that shows
-           through until the image loads, or for good when there is none. */
-        .site-list.is-grid { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); column-gap: 1.1rem; row-gap: 1.35rem; padding: 1.35rem 1.5rem 1.6rem; }
-        .gallery-tile { display: flex; flex-direction: column; min-width: 0; cursor: pointer; }
-        .tile-shot { position: relative; aspect-ratio: 16 / 10; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--bg-sunk); overflow: hidden; transition: border-color 140ms, box-shadow 140ms; }
-        .tile-shot img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: top; transition: transform 420ms cubic-bezier(0.2, 0.7, 0.2, 1), opacity 240ms; }
-        .tile-shot img.is-loading { opacity: 0; }
-        .tile-shot img.is-broken { display: none; }
-        .gallery-tile:hover .tile-shot { border-color: var(--panel-border-strong); }
-        .gallery-tile:hover .tile-shot img { transform: scale(1.03); }
-        .tile-blank { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.55rem; }
-        .tile-initial { font-family: var(--font-serif); font-style: italic; font-weight: 500; font-size: 2.4rem; line-height: 1; color: var(--text-faint); text-transform: lowercase; }
-        .tile-blank svg { width: 56px; height: 14px; fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linecap: round; opacity: 0.55; }
-        .tile-actions { position: absolute; left: 0; right: 0; bottom: 0; display: flex; gap: 0.3rem; padding: 1.4rem 0.5rem 0.5rem; background: linear-gradient(to top, color-mix(in oklch, var(--bg) 88%, transparent), transparent); opacity: 0; transform: translateY(4px); transition: opacity 140ms, transform 160ms; }
-        .gallery-tile:hover .tile-actions, .gallery-tile:focus-within .tile-actions, .gallery-tile.is-selected .tile-actions, .gallery-tile.has-menu .tile-actions { opacity: 1; transform: none; }
-        .tile-act { white-space: nowrap; font-family: var(--font-mono); font-size: 0.7rem; line-height: 1.3; padding: 0.22rem 0.6rem; border-radius: var(--radius-pill); border: 1px solid var(--panel-border); background: var(--panel); color: var(--text-dim); cursor: pointer; }
-        .tile-act:hover { color: var(--text); border-color: var(--text-faint); }
-        .tile-act.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-        .tile-act.primary:hover { filter: brightness(1.08); color: var(--accent-fg); }
-        .tile-act:disabled { cursor: wait; opacity: 0.8; }
-        .tile-body { display: flex; flex-direction: column; gap: 0.35rem; padding: 0.6rem 0.1rem 0; min-width: 0; }
-        .tile-body .site-domain-cell { display: flex; }
-        .tile-meta { display: flex; align-items: center; gap: 0.45rem; min-width: 0; font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); white-space: nowrap; }
-        .tile-meta .site-type { min-width: 0; padding: 0.08rem 0.45rem; font-size: 0.6rem; }
-        .tile-meta .site-wp-version { font-size: 0.68rem; }
-        .tile-when { margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
-        .gallery-tile.is-selected .tile-shot { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
-        .gallery-tile.has-menu .tile-shot { border-color: var(--panel-border-strong); }
-
-        /* Shelf: pinned sites (or the most recently changed) above the list,
-           in a sunk tray so it reads as a place rather than more rows. */
-        .site-shelf { padding: 1rem 1.5rem 1.35rem; background: var(--bg-sunk); border-bottom: 1px solid var(--panel-border); }
-        .shelf-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: 0.75rem; font-family: var(--font-mono); font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); }
-        .shelf-hint { letter-spacing: 0; text-transform: none; font-size: 0.68rem; }
-        .shelf-grid { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(var(--shelf-cols, 3), minmax(0, 1fr)); gap: 1rem; }
-        .site-shelf .tile-shot { background: var(--panel); }
+        /* The sites menu: an icon per item, the type beside the title, and
+           the cove command each item corresponds to along the bottom. */
+        #ctxMenu { width: 17rem; }
+        #ctxMenu .ctx-title { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; }
+        #ctxMenu .ctx-item { justify-content: flex-start; }
+        #ctxMenu .ctx-item > span:not(.ctx-key) { flex: 1; text-align: left; }
+        .ctx-ico { width: 15px; height: 15px; flex: none; margin-right: 0.55rem; fill: none; stroke: var(--text-faint); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+        .ctx-item:hover .ctx-ico { stroke: var(--accent); }
+        .ctx-item.danger .ctx-ico { stroke: var(--danger); }
+        .ctx-echo { display: flex; gap: 0.5rem; align-items: baseline; margin-top: 0.25rem; padding: 0.5rem 0.6rem 0.3rem; border-top: 1px solid var(--panel-border); font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-dim); }
+        .ctx-echo b { color: var(--accent); font-weight: 500; }
+        .ctx-echo code { min-width: 0; overflow-wrap: anywhere; }
+        .ctx-echo code.is-note { color: var(--text-faint); }
 
         /* Context menu — opened by clicking a row (right- or left-click). */
         .ctx-menu { position: fixed; z-index: 300; min-width: 190px; padding: 0.3rem; background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); box-shadow: 0 12px 34px rgba(0,0,0,0.28); font-size: 0.85rem; }
@@ -6462,15 +6790,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             body { padding: 1.25rem 0.75rem 3rem; }
             .card-head { padding: 0.9rem 1rem; flex-wrap: wrap; }
             .card-actions { width: 100%; justify-content: flex-end; }
-            .site-list { grid-template-columns: 1fr auto auto; column-gap: 0.6rem; }
-            .site-row { padding: 0.7rem 1rem; }
-            .site-size, .site-modified, .head-size, .head-modified { display: none; }
-            .site-actions { opacity: 1; }
             .add-row { padding: 0.8rem 1rem; }
-            .site-list.is-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); padding: 1rem; }
-            .site-shelf { padding: 0.9rem 1rem 1.1rem; }
-            .shelf-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-            .tile-actions, .shelf-hint { display: none; }
             .card-foot { padding: 0.75rem 1rem; }
         }
     </style>
@@ -6509,21 +6829,70 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             </div>
         </nav>
 
-        <section class="card" id="sitesCard">
-            <header class="card-head">
-                <h1 class="card-title">Sites</h1>
-                <div class="card-actions">
-                    <div class="layout-toggle" id="layoutToggle" role="group" aria-label="Layout">
-                        <button type="button" class="layout-btn" data-layout="list" title="List" aria-label="List">
+        <section class="card sites-view" id="sitesCard">
+            <header class="sl-harbor" id="slHarbor">
+                <canvas class="sl-chart" id="slChart" aria-hidden="true"></canvas>
+                <div>
+                    <p class="sl-eyebrow">~/Cove/Sites</p>
+                    <h1 class="sl-title" id="slTitle">Sites</h1>
+                    <p class="sl-sub" id="slSub"></p>
+                </div>
+                <div class="sl-readouts">
+                    <section class="sl-readout" aria-labelledby="slDiskH">
+                        <h2 id="slDiskH">disk by type</h2>
+                        <div class="sl-stack" id="slDiskStack"></div>
+                        <ul class="sl-legend" id="slDiskLegend"></ul>
+                    </section>
+                    <section class="sl-readout" aria-labelledby="slAttH">
+                        <h2 id="slAttH">needs a look</h2>
+                        <ul class="sl-attention" id="slAttList"></ul>
+                    </section>
+                    <section class="sl-readout is-tidy" id="slTidy" aria-labelledby="slTidyH">
+                        <div><h2 id="slTidyH">tidy up</h2><p id="slTidyText"></p></div>
+                        <button type="button" class="pill" id="btnTidy">review</button>
+                    </section>
+                </div>
+            </header>
+
+            <div class="sl-console" id="slConsole">
+                <div class="sl-console-row">
+                    <label class="sl-search" for="filterInput">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></svg>
+                        <input
+                            class="filter-input"
+                            id="filterInput"
+                            type="text"
+                            placeholder="filter · type:minn  plugin:woocommerce  has:mail"
+                            spellcheck="false"
+                            autocomplete="off"
+                            autocapitalize="off"
+                            autocorrect="off"
+                            aria-label="Filter sites"
+                            autofocus
+                        >
+                        <span class="filter-kbd" id="filterKbd" aria-hidden="true">/</span>
+                        <button type="button" class="filter-clear" id="btnFilterClear" aria-label="Clear filter" title="Clear all (Esc)" style="display: none;">×</button>
+                    </label>
+                    <div class="sl-seg" id="layoutToggle" role="group" aria-label="Layout">
+                        <button type="button" data-layout="list" title="Rows" aria-label="Rows">
                             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></svg>
                         </button>
-                        <button type="button" class="layout-btn" data-layout="grid" title="Gallery" aria-label="Gallery">
+                        <button type="button" data-layout="grid" title="Cards" aria-label="Cards">
                             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="0.8"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="0.8"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="0.8"/><rect x="9" y="9" width="4.5" height="4.5" rx="0.8"/></svg>
                         </button>
                     </div>
-                    <button class="pill primary" id="btnToggleAdd">+ add site</button>
+                    <label class="sl-sort" for="sortSelect"><span>sort</span>
+                        <select id="sortSelect">
+                            <option value="modified">recently changed</option>
+                            <option value="name">name</option>
+                            <option value="size">size</option>
+                            <option value="type">type</option>
+                        </select>
+                    </label>
+                    <button class="pill primary sl-new" id="btnToggleAdd">+ add site</button>
                 </div>
-            </header>
+                <div class="sl-chips" id="slChips" role="group" aria-label="Quick filters"></div>
+            </div>
 
             <div id="alerts"></div>
             <template id="tpl-alert">
@@ -6539,33 +6908,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     <button class="new-site-alert-close" aria-label="Dismiss" title="Dismiss">×</button>
                 </div>
             </template>
-
-            <div class="filter-row">
-                <span class="filter-chip" id="typeChip" aria-label="Active type filter" style="display: none;">
-                    <span id="typeChipLabel"></span>
-                    <button type="button" class="filter-chip-x" id="typeChipClear" aria-label="Remove type filter" title="Remove">×</button>
-                </span>
-                <input
-                    class="filter-input"
-                    id="filterInput"
-                    type="text"
-                    placeholder="filter sites by name or type…"
-                    spellcheck="false"
-                    autocomplete="off"
-                    autocapitalize="off"
-                    autocorrect="off"
-                    aria-label="Filter sites"
-                    autofocus
-                >
-                <button
-                    type="button"
-                    class="bulk-delete-btn"
-                    id="btnBulkDelete"
-                    title="Delete every site matching the current filter"
-                    style="display: none;"></button>
-                <span class="filter-kbd" id="filterKbd" aria-hidden="true">/</span>
-                <button class="filter-clear" id="btnFilterClear" aria-label="Clear filter" title="Clear all (Esc)" style="display: none;">×</button>
-            </div>
 
             <div class="add-row" id="addRow" style="display: none;">
                 <div class="add-drop" id="addDrop" title="Import a backup: a zip or tar.gz holding a WordPress tree and a .sql dump — a Cove snapshot export, a Local export, a host backup">
@@ -6590,75 +6932,17 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         <span id="createLabel">create</span>
                     </button>
                 </form>
+                <div class="add-echo" aria-label="The same from a terminal"><b>$</b><code id="addEcho"></code></div>
             </div>
 
-            <section class="site-shelf" id="siteShelf" style="display: none;">
-                <div class="shelf-head"><span id="shelfLabel">pinned</span><span class="shelf-hint" id="shelfHint">right-click a site → pin to top</span></div>
-                <ul class="shelf-grid" id="shelfGrid"></ul>
+            <section class="sl-group sl-shelf" id="siteShelf" style="display: none;">
+                <header class="sl-group-head"><h2 id="shelfLabel">pinned</h2><span class="sl-count" id="shelfCount"></span><span class="sl-rule"></span><span class="sl-hint" id="shelfHint"></span></header>
+                <div class="sl-cards" id="shelfGrid"></div>
             </section>
 
-            <ul class="site-list" id="siteList">
-                <li class="site-head" id="siteHead" style="display: none;">
-                    <button type="button" class="site-head-btn" data-sort="name" title="Sort by name">name<span class="sort-arrow"></span></button>
-                    <button type="button" class="site-head-btn" data-sort="type" title="Sort by type">type<span class="sort-arrow"></span></button>
-                    <button type="button" class="site-head-btn site-head-right head-modified" data-sort="modified" title="Sort by last modified">modified<span class="sort-arrow"></span></button>
-                    <button type="button" class="site-head-btn site-head-right head-size" data-sort="size" title="Sort by disk size">size<span class="sort-arrow"></span></button>
-                    <span aria-hidden="true"></span>
-                </li>
-                <template id="tpl-site-row">
-                    <li class="site-row">
-                        <span class="site-domain-cell">
-                            <span class="site-domain"></span>
-                            <a class="site-open-link" target="_blank" rel="noopener">
-                                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4.5h5v5"/><path d="M11.5 4.5 4.5 11.5"/></svg>
-                            </a>
-                        </span>
-                        <span class="site-type-cell">
-                            <span class="site-type"></span>
-                            <span class="site-wp-version"></span>
-                            <span class="site-php-version"></span>
-                        </span>
-                        <span class="site-modified"></span>
-                        <span class="site-size"></span>
-                        <div class="site-actions">
-                            <button class="site-action-btn site-login-btn">
-                                <span class="btn-label">login</span>
-                                <span class="btn-spinner" aria-hidden="true"></span>
-                            </button>
-                        </div>
-                    </li>
-                </template>
-                <template id="tpl-gallery-tile">
-                    <li class="gallery-tile">
-                        <div class="tile-shot">
-                            <span class="tile-blank" aria-hidden="true">
-                                <span class="tile-initial"></span>
-                                <svg viewBox="0 0 56 14"><path d="M2 5 Q 8 1, 14 5 T 26 5 T 38 5 T 50 5"/><path d="M8 11 Q 14 7, 20 11 T 32 11 T 44 11" opacity="0.5"/></svg>
-                            </span>
-                            <div class="tile-actions">
-                                <button type="button" class="tile-act primary" data-act="login">log in</button>
-                                <button type="button" class="tile-act" data-act="files">files</button>
-                                <button type="button" class="tile-act" data-act="logs">logs</button>
-                            </div>
-                        </div>
-                        <div class="tile-body">
-                            <span class="site-domain-cell">
-                                <span class="site-domain"></span>
-                                <a class="site-open-link" target="_blank" rel="noopener">
-                                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4.5h5v5"/><path d="M11.5 4.5 4.5 11.5"/></svg>
-                                </a>
-                            </span>
-                            <span class="tile-meta">
-                                <span class="site-type"></span>
-                                <span class="site-wp-version"></span>
-                                <span class="site-php-version"></span>
-                                <span class="tile-when"></span>
-                            </span>
-                        </div>
-                    </li>
-                </template>
-                <li class="loading" id="siteLoading">Loading sites…</li>
-                <li class="empty" id="emptyNone" style="display: none;">
+            <div id="siteGroups"></div>
+            <div class="sl-state" id="siteLoading">Loading sites…</div>
+            <div class="sl-state empty" id="emptyNone" style="display: none;">
                         <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path class="art-fill" d="M52 12 L68 38 H52 Z"/>
                             <path class="art-line" d="M52 10 v30"/>
@@ -6670,8 +6954,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         </svg>
                     <div>No sites in the cove yet.</div>
                     <div class="empty-hint">Click <em>+ add site</em>, or run <code>cove add myblog</code>.</div>
-                </li>
-                <li class="empty" id="emptyFilter" style="display: none;">
+                </div>
+            <div class="sl-state empty" id="emptyFilter" style="display: none;">
                         <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path class="art-line" d="M52 44 v-14 q0 -6 6 -6 h4"/>
                             <path class="art-line" d="M62 18 h8 q3 0 3 3 v3 h-11 q-3 0 -3 -3 v-3 Z"/>
@@ -6683,14 +6967,21 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         </svg>
                     <div>Nothing surfaced for <code id="emptyFilterQuery"></code>.</div>
                     <div class="empty-hint">Press Esc to clear.</div>
-                </li>
-            </ul>
+                </div>
 
-            <footer class="card-foot">
+            <footer class="sl-foot">
                 <div class="totals">
                     <span id="siteCount"></span>
                     <span id="totalSize" style="display: none;"></span>
                     <button type="button" class="refresh-btn" id="btnRefreshSizes" title="Refresh disk sizes">↻</button>
+                </div>
+                <div class="sl-keys" aria-hidden="true">
+                    <span><kbd>/</kbd> filter</span>
+                    <span><kbd>j</kbd><kbd>k</kbd> move</span>
+                    <span><kbd>↵</kbd> manage</span>
+                    <span><kbd>⌘↵</kbd> log in</span>
+                    <span><kbd>x</kbd> select</span>
+                    <span><kbd>⌘K</kbd> anywhere</span>
                 </div>
             </footer>
         </section>
@@ -7525,6 +7816,13 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         </div>
     </div>
 
+    <div class="sl-bulk" id="slBulk" role="toolbar" aria-label="Selected sites" style="display: none;">
+        <strong id="slBulkCount"></strong>
+        <button type="button" class="sl-btn" data-bulk="pin" id="slBulkPin">pin</button>
+        <button type="button" class="sl-btn danger" data-bulk="delete">delete…</button>
+        <button type="button" class="sl-btn icon" data-bulk="clear" aria-label="Clear the selection" title="Clear (Esc)">✕</button>
+    </div>
+
     <div class="ctx-menu" id="ctxMenu" style="display: none;">
         <div>
             <div class="ctx-title" id="ctxTitle"></div>
@@ -7545,6 +7843,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             <button class="ctx-item" id="ctxPin"><span>Pin to top</span></button>
             <div class="ctx-sep"></div>
             <button class="ctx-item danger" id="ctxDelete"><span>Delete site</span><span class="ctx-key">⌘⌫</span></button>
+            <div class="ctx-echo"><b>$</b><code id="ctxEcho"></code></div>
         </div>
     </div>
 
@@ -7600,12 +7899,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             showDbModal: false,
             isRefreshingSizes: false,
             filter: '',
-            typeFilter: null, // null | 'WordPress' | 'Plain' — set via the row type pills, cleared via the chip × or overall filter clear
+            // Quick filter under the filter box: all | wp | minn | static |
+            // pinned | attention | mail | idle. A row's type pill sets it too.
+            chip: 'all',
+            // Sites ticked for a bulk action (shift- or ⌘-click, x, a group's
+            // "select all"), apart from the keyboard selection.
+            checked: new Set(),
+            // Unread mail per site, from one Mailpit search after each load.
+            siteMail: {},
+            // Site names in the order they are drawn, for the arrow keys.
+            _order: [],
             // Default to most-recently-modified rather than alphabetical: on an
             // install with hundreds of sites, "what was I just working on" is a
             // far better landing state than "what starts with A".
             sort: ['name', 'type', 'size', 'modified'].includes(localStorage.getItem('sort')) ? localStorage.getItem('sort') : 'modified',
-            sortDir: ['asc', 'desc'].includes(localStorage.getItem('sortDir')) ? localStorage.getItem('sortDir') : 'desc',
             pinned: (() => { try { return JSON.parse(localStorage.getItem('pinned')) || []; } catch (e) { return []; } })(),
             // Sites most recently opened from the dashboard, newest first —
             // the shelf's second choice after pins.
@@ -7647,11 +7954,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // sent to the backend. One batch at a time; staging more sites
             // merges into it and restarts the window.
             pendingDelete: null, // { sites: [...], timer }
-            bulkArmed: false,
             bulkConfirm: null, // { names: [...] } while the bulk-delete dialog is open
             importFile: null,  // a File dropped on the add-site row, to import instead of installing
             importing: null,   // { pct, phase } while an import runs
-            bulkArmTimer: null,
             // Persistent dismissible banners for newly-created sites — the
             // snackbar only lives ~3.5s, not long enough to reach for the
             // admin login after spinning up a fresh install.
@@ -7703,71 +8008,100 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             get adminerUrl() { return 'https://db.cove.localhost' + PORT_SUFFIX; },
             get mailpitUrl() { return 'https://mail.cove.localhost' + PORT_SUFFIX; },
             get totalBytes() { return this.sites.reduce((t, s) => t + (s.size_bytes || 0), 0); },
+            // Every site the quick filter and the filter box let through, in
+            // the chosen order. The box takes words (part of the address, or
+            // the type) and tokens: type:wp|minn|static, is:pinned|idle|
+            // outdated|insecure|multisite, has:mail|errors|preview|twin,
+            // plugin:<slug>, theme:<name>, php:<version>.
             get filteredSites() {
-                // Two independent filters ANDed together: typeFilter (chip,
-                // exact match on site.type) and filter (free text, substring
-                // match on name OR type). Keeping them separate means the
-                // user can type anything in the input without worrying about
-                // stepping on the type constraint.
-                let base = [...this.sites];
-                if (this.typeFilter) {
-                    base = base.filter(s => s.type === this.typeFilter);
+                const chip = this.chips.find(c => c.id === this.chip) || this.chips[0];
+                let base = this.sites.filter(s => chip.test(s));
+                for (const tok of String(this.filter || '').trim().toLowerCase().split(/\s+/).filter(Boolean)) {
+                    const m = tok.match(/^(type|is|has|plugin|theme|php):(.*)$/);
+                    if (m && m[2]) { base = base.filter(s => this.siteHasToken(s, m[1], m[2])); continue; }
+                    if (m) continue;
+                    const q = this.siteQuery(tok);
+                    if (q) base = base.filter(s => this.siteMatches(s, q) || (s.type || '').toLowerCase().includes(q));
                 }
-                const q = this.siteQuery(this.filter);
-                if (q) {
-                    base = base.filter(s =>
-                        this.siteMatches(s, q) ||
-                        (s.type || '').toLowerCase().includes(q));
-                }
-                const dir = this.sortDir === 'asc' ? 1 : -1;
-                if (this.sort === 'size') {
-                    base.sort((a, b) => dir * ((a.size_bytes || 0) - (b.size_bytes || 0)));
-                } else if (this.sort === 'modified') {
-                    base.sort((a, b) => dir * ((a.modified_at || 0) - (b.modified_at || 0)));
-                } else if (this.sort === 'type') {
-                    // Version segments compare numerically so 6.10 outranks 6.9.
-                    // Plain sites have no wp_version and stay grouped together.
-                    const vcmp = (a, b) => {
-                        const v = s => (s.type === 'Minn' ? s.minn_version : s.wp_version) || '';
-                        const pa = v(a).split('.'), pb = v(b).split('.');
-                        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-                            const d = (parseInt(pa[i], 10) || 0) - (parseInt(pb[i], 10) || 0);
-                            if (d) return d;
-                        }
-                        return 0;
-                    };
-                    base.sort((a, b) => dir * (a.type.localeCompare(b.type) || vcmp(a, b)) || a.name.localeCompare(b.name));
-                } else {
-                    base.sort((a, b) => dir * a.name.localeCompare(b.name));
-                }
-                // Pinned sites float above the chosen sort rather than replacing
-                // it: out of hundreds of sites only a handful are ever active.
-                if (this.pinned.length) {
-                    base.sort((a, b) => (this.pinned.includes(b.name) ? 1 : 0) - (this.pinned.includes(a.name) ? 1 : 0));
-                }
-                return base;
+                return this.sortSites(base);
             },
 
-            // The "what am I working on" row above the list: pinned sites,
-            // else the ones last opened from here, else the last changed on
-            // disk. List layout only (the gallery already shows every
-            // preview) and never while a filter is on, where the results
-            // should be all there is.
-            get shelf() {
-                if (this.layout !== 'list' || this.isLoading || this.filter.trim() || this.typeFilter) return null;
-                const byName = (names) => names.map(n => this.sites.find(s => s.name === n)).filter(Boolean);
-                const pinned = byName(this.pinned);
-                if (pinned.length) return { label: 'pinned', sites: pinned.slice(0, 6) };
-                if (this.sites.length <= 6) return null;
-                const opened = byName(this.recent).slice(0, 3);
-                if (opened.length) return { label: 'recently opened', sites: opened };
-                const changed = this.sites.filter(s => s.modified_at).sort((a, b) => b.modified_at - a.modified_at).slice(0, 3);
-                return changed.length ? { label: 'recently changed', sites: changed } : null;
+            siteHasToken(s, key, v) {
+                const card = s.card && !s.card.pending ? s.card : null;
+                switch (key) {
+                    case 'type': return this.siteTypeInfo(s.type).short === v || (s.type || '').toLowerCase() === v || (v === 'plain' && s.type === 'Plain');
+                    case 'is':
+                        if (v === 'pinned') return this.isPinned(s.name);
+                        if (v === 'idle') return this.siteIdle(s);
+                        if (v === 'multisite') return !!s.multisite;
+                        if (v === 'outdated' || v === 'insecure') return s.wp_status === v;
+                        if (v === 'behind') return this.siteBehind(s);
+                        return false;
+                    case 'has':
+                        if (v === 'mail') return !!this.siteMail[s.name];
+                        if (v.startsWith('error')) return s.php_errors > 0;
+                        if (v === 'preview') return !!s.shot_mtime;
+                        if (v === 'twin') return !!s.twin;
+                        return false;
+                    case 'plugin': return !!card && (card.pl || []).some(p => p.includes(v));
+                    case 'theme': return !!card && !!card.theme && card.theme.toLowerCase().includes(v);
+                    case 'php': return (s.php_version || '') === v;
+                }
+                return true;
             },
 
-            get typeFilterLabel() {
-                return 'type: ' + this.siteTypeInfo(this.typeFilter).short;
+            sortSites(list) {
+                // Version segments compare numerically so 6.10 outranks 6.9.
+                const ver = s => (s.type === 'Minn' ? s.minn_version : s.wp_version) || '';
+                const vcmp = (a, b) => {
+                    const pa = ver(a).split('.'), pb = ver(b).split('.');
+                    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+                        const d = (parseInt(pb[i], 10) || 0) - (parseInt(pa[i], 10) || 0);
+                        if (d) return d;
+                    }
+                    return 0;
+                };
+                const rank = { WordPress: 0, Minn: 1, Plain: 2 };
+                const by = {
+                    name: (a, b) => a.name.localeCompare(b.name),
+                    size: (a, b) => (b.size_bytes || 0) - (a.size_bytes || 0) || a.name.localeCompare(b.name),
+                    type: (a, b) => (rank[a.type] ?? 3) - (rank[b.type] ?? 3) || vcmp(a, b) || a.name.localeCompare(b.name),
+                    modified: (a, b) => (b.modified_at || 0) - (a.modified_at || 0) || a.name.localeCompare(b.name),
+                }[this.sort] || ((a, b) => (b.modified_at || 0) - (a.modified_at || 0));
+                return [...list].sort(by);
             },
+
+            get chips() {
+                return [
+                    { id: 'all', label: 'all', test: () => true },
+                    { id: 'wp', label: 'wordpress', test: s => s.type === 'WordPress' },
+                    { id: 'minn', label: 'minn', test: s => s.type === 'Minn' },
+                    { id: 'static', label: 'static', test: s => s.type === 'Plain' },
+                    { id: 'pinned', label: 'pinned', test: s => this.isPinned(s.name) },
+                    { id: 'attention', label: 'needs a look', dot: 'danger', test: s => !!this.siteAttention(s) },
+                    { id: 'behind', label: 'older wordpress', dot: 'warn', test: s => this.siteBehind(s) },
+                    { id: 'mail', label: 'unread mail', test: s => !!this.siteMail[s.name] },
+                    { id: 'idle', label: 'idle 30+ days', test: s => this.siteIdle(s) },
+                ];
+            },
+
+            get chipLabel() {
+                const c = this.chips.find(x => x.id === this.chip);
+                return c ? c.label : '';
+            },
+
+            // What a site needs looked at: PHP errors in its debug.log today.
+            // An older WordPress is not on this list. Local sites aren't
+            // exposed, so wordpress.org's "insecure" is a nudge to update
+            // (the version's dot, and the "older wordpress" filter).
+            siteAttention(s) {
+                if (s.php_errors > 0) return { level: 'danger', why: s.php_errors + ' PHP error' + (s.php_errors === 1 ? '' : 's') + ' today' };
+                return null;
+            },
+
+            siteBehind(s) { return s.type === 'WordPress' && (s.wp_status === 'outdated' || s.wp_status === 'insecure'); },
+
+            siteIdle(s) { return !!s.modified_at && Date.now() / 1000 - s.modified_at > 30 * 86400; },
 
             // Pill text, class and names for a site type. Minn Engine sites
             // speak WordPress's contracts (sign-in, the database, WP-CLI), so
@@ -7779,41 +8113,20 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
             isWpLike(site) { return !!site && (site.type === 'WordPress' || site.type === 'Minn'); },
 
-            // The type pill and the version beside it, for a row or a tile.
-            // A Minn site shows the engine's version, with the WordPress
-            // release it speaks in the tooltip.
-            paintSiteType(type, ver, site) {
-                const t = this.siteTypeInfo(site.type);
-                type.classList.add(t.cls);
-                type.textContent = t.pill;
-                type.title = 'Filter to ' + t.name + ' sites';
-                if (site.type === 'Minn') {
-                    if (!site.minn_version) { ver.remove(); return; }
-                    ver.textContent = site.minn_version;
-                    ver.title = 'Minn Engine ' + site.minn_version + (site.wp_version ? ', speaking WordPress ' + site.wp_version : '');
-                    return;
-                }
-                if (!site.wp_version) { ver.remove(); return; }
-                ver.textContent = site.wp_version;
-                if (site.wp_status) ver.classList.add(site.wp_status);
-                ver.title = site.wp_status === 'insecure'
-                    ? 'WordPress ' + site.wp_version + ' — wp.org marks this release insecure. Update with: cove core update ' + site.name
-                    : 'WordPress ' + site.wp_version;
-            },
-
-            setTypeFilter(v) {
-                this.typeFilter = v;
-                // An armed bulk-delete is scoped to the current result set —
-                // disarm when the filter changes underneath it.
-                this.bulkArmed = false;
+            // The quick filter. A type pill on a row lands here with the
+            // site's type; choosing the active chip again goes back to all.
+            setChip(id) {
+                this.chip = (id === this.chip && id !== 'all') ? 'all' : (this.chips.some(c => c.id === id) ? id : 'all');
+                this.selectedName = null;
                 this.render();
             },
+
+            setTypeFilter(type) { this.setChip(this.siteTypeInfo(type).cls); },
 
             clearAllFilters() {
                 this.filter = '';
                 $id('filterInput').value = '';
-                this.typeFilter = null;
-                this.bulkArmed = false;
+                this.chip = 'all';
                 this.render();
             },
 
@@ -7825,6 +8138,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             init() {
+                document.body.classList.toggle('view-sites', this.view === 'sites');
                 this.applyTheme();
                 this.bindStaticEvents();
                 this.bindMailEvents();
@@ -7946,19 +8260,25 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
                     // Arrows work while filtering (type to narrow, arrow to pick).
                     // j/k only outside a text field, or they'd eat typed letters.
+                    // Cards and the compact index are grids: up and down move a
+                    // row of them, left and right one.
                     const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
                     const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
-                    if ((isDown || isUp) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                    const plainKey = !e.metaKey && !e.ctrlKey && !e.altKey;
+                    if ((isDown || isUp) && plainKey) {
                         e.preventDefault();
-                        const step = this.layout === 'grid' ? this.gridColumns() : 1;
+                        const step = this.selectionColumns();
                         this.moveSelection(isDown ? step : -step);
                         return;
                     }
-                    // In the gallery, left/right step one tile (outside the
-                    // filter field, where they move the caret).
-                    if (this.layout === 'grid' && !typing && (e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                    if (!typing && plainKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight') && this.selectionColumns() > 1) {
                         e.preventDefault();
                         this.moveSelection(e.key === 'ArrowRight' ? 1 : -1);
+                        return;
+                    }
+                    if (!typing && plainKey && e.key === 'x' && this.selectedName) {
+                        e.preventDefault();
+                        this.toggleChecked(this.selectedName);
                         return;
                     }
 
@@ -7974,7 +8294,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         return;
                     }
 
-                    if ((e.metaKey || e.ctrlKey) && (e.key === 'Backspace' || e.key === 'Delete') && this.selectedName) {
+                    if ((e.metaKey || e.ctrlKey) && (e.key === 'Backspace' || e.key === 'Delete') && this.selectedName && !typing) {
                         e.preventDefault();
                         this.deleteSite(this.selectedName);
                         return;
@@ -7988,7 +8308,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         if (this.rename.open) { this.closeRename(); return; }
                         if (this.logView.open) { this.closeLog(); return; }
                         if (this.showDbModal) { this.setDbModal(false); return; }
+                        if (this.checked.size && !typing) { this.checked.clear(); this.renderList(); return; }
                         if (this.selectedName && !typing) { this.selectedName = null; this.render(); return; }
+                        if (this.chip !== 'all' && !typing) { this.setChip('all'); return; }
                     }
 
                     if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -8052,11 +8374,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 $id('btnDbClose').addEventListener('click', () => this.setDbModal(false));
                 $id('dbModal').addEventListener('click', (e) => { if (e.target === $id('dbModal')) this.setDbModal(false); });
 
-                // Filter row
+                // Console: filter box, quick filters, sort, layout, tidy-up.
                 const filterInput = $id('filterInput');
                 filterInput.addEventListener('input', () => {
                     this.filter = filterInput.value;
-                    this.bulkArmed = false;
+                    this.selectedName = null;
                     this.render();
                 });
                 filterInput.addEventListener('keydown', (e) => {
@@ -8065,14 +8387,44 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         e.stopPropagation();
                         this.filter = '';
                         filterInput.value = '';
-                        this.bulkArmed = false;
                         filterInput.blur();
                         this.render();
                     }
                 });
-                $id('typeChipClear').addEventListener('click', () => { this.setTypeFilter(null); filterInput.focus(); });
-                $id('btnFilterClear').addEventListener('click', () => { this.clearAllFilters(); filterInput.focus(); });
-                $id('btnBulkDelete').addEventListener('click', () => this.bulkDelete());
+                $id('btnFilterClear').addEventListener('click', (e) => { e.preventDefault(); this.clearAllFilters(); filterInput.focus(); });
+                $id('sortSelect').addEventListener('change', (e) => this.setSort(e.target.value));
+                $id('slChips').addEventListener('click', (e) => { const b = e.target.closest('[data-chip]'); if (b) this.setChip(b.dataset.chip); });
+                $id('btnTidy').addEventListener('click', () => { this.chip = 'idle'; this.selectedName = null; this.render(); $id('slConsole').scrollIntoView({ block: 'start', behavior: 'smooth' }); });
+                $id('slAttList').addEventListener('click', (e) => {
+                    const go = e.target.closest('[data-chip-go]');
+                    if (go) { this.setChip(go.dataset.chipGo); $id('slConsole').scrollIntoView({ block: 'start', behavior: 'smooth' }); return; }
+                    const b = e.target.closest('[data-goto]');
+                    if (!b) return;
+                    this.chip = 'attention';
+                    this.selectedName = b.dataset.goto;
+                    this.render();
+                    this.scrollToSelection();
+                });
+                $id('slBulk').addEventListener('click', (e) => {
+                    const b = e.target.closest('[data-bulk]');
+                    if (!b) return;
+                    const names = [...this.checked];
+                    if (b.dataset.bulk === 'clear') { this.checked.clear(); this.renderList(); return; }
+                    if (b.dataset.bulk === 'delete') { this.bulkDelete(names); return; }
+                    if (b.dataset.bulk === 'pin') {
+                        const unpin = names.every(n => this.isPinned(n));
+                        this.pinned = unpin ? this.pinned.filter(n => !names.includes(n)) : [...this.pinned, ...names.filter(n => !this.isPinned(n))];
+                        localStorage.setItem('pinned', JSON.stringify(this.pinned));
+                        this.checked.clear();
+                        this.showSnack((unpin ? 'Unpinned ' : 'Pinned ') + names.length + ' site' + (names.length === 1 ? '' : 's') + '.');
+                        this.render();
+                    }
+                });
+                // The console's hairline shows once it has stuck under the top.
+                const consoleSentinel = document.createElement('div');
+                $id('slConsole').before(consoleSentinel);
+                if ('IntersectionObserver' in window) new IntersectionObserver(([en]) => $id('slConsole').classList.toggle('is-stuck', !en.isIntersecting)).observe(consoleSentinel);
+                if ('ResizeObserver' in window) new ResizeObserver(() => this.drawHarbor()).observe($id('slHarbor'));
                 $id('btnBulkDeleteCancel').addEventListener('click', () => this.closeBulkConfirm());
                 $id('btnBulkDeleteConfirm').addEventListener('click', () => this.confirmBulkDelete());
                 $id('bulkDeleteModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) this.closeBulkConfirm(); });
@@ -8105,52 +8457,55 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 row.addEventListener('dragleave', () => { if (!drop.classList.contains('is-over')) return; dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) drop.classList.remove('is-over'); });
                 row.addEventListener('drop', (e) => { if (!drop.classList.contains('is-over')) return; e.preventDefault(); dragDepth = 0; drop.classList.remove('is-over'); const f = e.dataTransfer.files && e.dataTransfer.files[0]; if (f) this.setImportFile(f); });
 
-                // Sort headers
-                document.querySelectorAll('.site-head-btn[data-sort]').forEach(btn => {
-                    btn.addEventListener('click', () => this.setSort(btn.dataset.sort));
-                });
-
-                // Site rows: one delegated listener instead of per-row handlers.
-                // The ↗ icon is the only thing that opens the site; the type
-                // pill filters and the login button logs in; a click anywhere
-                // else on the row opens the site's page (right-click: the menu).
-                // Tiles (the gallery and the shelf) work the same way, plus
-                // their hover buttons.
-                const onSiteClick = (e) => {
-                    const row = e.target.closest('.site-row, .gallery-tile');
-                    if (!row) return;
-                    const site = this.sites.find(s => s.name === row.dataset.name);
-                    if (!site) return;
-                    if (e.target.closest('.site-open-link')) { this.touchRecent(site.name); return; } // plain link — let it navigate
-                    if (e.target.closest('.site-type')) { this.setTypeFilter(site.type); return; }
-                    if (e.target.closest('.site-login-btn')) { this.getLoginLink(site.name); return; }
-                    const act = e.target.closest('.tile-act');
-                    if (act && act.dataset.act !== 'login') this.touchRecent(site.name);
-                    if (act) {
-                        if (act.dataset.act === 'login') this.getLoginLink(site.name);
-                        else if (act.dataset.act === 'files') this.openFilesForSite(site.name);
-                        else if (act.dataset.act === 'logs') this.openLogsForSite(site.name);
+                // Sites: one delegated listener for rows, cards, the compact
+                // index and the pinned shelf. The ↗ link opens the site; the
+                // type pill filters; buttons do what they say; shift- or
+                // ⌘-click ticks the site; any other click opens its page.
+                // Right-click opens the menu everywhere.
+                const sitesCard = $id('sitesCard');
+                sitesCard.addEventListener('click', (e) => {
+                    const all = e.target.closest('[data-selectall]');
+                    if (all) {
+                        const names = (this._groups.find(g => g.id === all.dataset.selectall) || { sites: [] }).sites.map(s => s.name);
+                        const every = names.length && names.every(n => this.checked.has(n));
+                        names.forEach(n => every ? this.checked.delete(n) : this.checked.add(n));
+                        this.renderList();
                         return;
                     }
+                    const item = e.target.closest('[data-name]');
+                    if (!item || !sitesCard.contains(item) || item.closest('#addRow')) return;
+                    const site = this.sites.find(s => s.name === item.dataset.name);
+                    if (!site) return;
+                    if (e.target.closest('.sl-open')) { this.touchRecent(site.name); return; } // a plain link — let it navigate
+                    const act = e.target.closest('[data-act]');
+                    if (act) {
+                        const a = act.dataset.act;
+                        if (a === 'type') { this.setTypeFilter(site.type); return; }
+                        if (a === 'check') { this.toggleChecked(site.name); return; }
+                        if (a === 'menu') { const r = act.getBoundingClientRect(); this.openRowMenu(site, { clientX: r.right - 8, clientY: r.bottom + 4, timeStamp: e.timeStamp }); return; }
+                        this.touchRecent(site.name);
+                        if (a === 'login') { this.getLoginLink(site.name); return; }
+                        if (a === 'open') { this.openSite(site); return; }
+                        if (a === 'files') { this.openFilesForSite(site.name); return; }
+                        if (a === 'logs') { this.openLogsForSite(site.name); return; }
+                        return;
+                    }
+                    if (e.shiftKey || e.metaKey || e.ctrlKey) { e.preventDefault(); this.toggleChecked(site.name); return; }
                     // Don't open the page when the click ends a drag-to-select —
                     // users still grab the domain/size text to copy it.
                     if (window.getSelection && window.getSelection().toString()) return;
                     this.openSitePage(site.name);
-                };
-                const onSiteMenu = (e) => {
-                    const row = e.target.closest('.site-row, .gallery-tile');
-                    if (!row) return;
-                    const site = this.sites.find(s => s.name === row.dataset.name);
+                });
+                sitesCard.addEventListener('contextmenu', (e) => {
+                    const item = e.target.closest('[data-name]');
+                    if (!item || item.closest('#addRow')) return;
+                    const site = this.sites.find(s => s.name === item.dataset.name);
                     if (!site) return;
                     e.preventDefault();
                     this.openRowMenu(site, e);
-                };
-                for (const el of [$id('siteList'), $id('siteShelf')]) {
-                    el.addEventListener('click', onSiteClick);
-                    el.addEventListener('contextmenu', onSiteMenu);
-                }
+                });
                 $id('layoutToggle').addEventListener('click', (e) => {
-                    const btn = e.target.closest('.layout-btn');
+                    const btn = e.target.closest('[data-layout]');
                     if (btn) this.setLayout(btn.dataset.layout);
                 });
 
@@ -8171,6 +8526,30 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     this.closeRowMenu();
                     if (site) fn(site);
                 };
+                const ctxIcons = {
+                    ctxManage: '<rect x="2.5" y="2.5" width="11" height="11" rx="2"/><path d="M2.5 6h11"/>',
+                    ctxOpen: '<path d="M6.5 4.5h5v5"/><path d="M11.5 4.5 4.5 11.5"/>',
+                    ctxLogin: '<path d="M6 3H3.5v10H6"/><path d="M7 8h6.5M10.5 5l3 3-3 3"/>',
+                    ctxRename: '<path d="M10.5 2.5l3 3-7.5 7.5H3v-3z"/>',
+                    ctxReveal: '<path d="M2 4.5h4l1.5 1.5H14v6.5H2z"/>',
+                    ctxFiles: '<path d="M4 2h5l3 3v9H4z"/><path d="M9 2v3h3"/>',
+                    ctxDb: '<ellipse cx="8" cy="4" rx="5" ry="2"/><path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>',
+                    ctxPhp: '<path d="M5 5 2 8l3 3M11 5l3 3-3 3"/>',
+                    ctxDomains: '<circle cx="8" cy="8" r="5.5"/><path d="M2.5 8h11M8 2.5c2 2 2 9 0 11M8 2.5c-2 2-2 9 0 11"/>',
+                    ctxLog: '<path d="M3 3h10M3 6.5h10M3 10h6M3 13.5h8"/>',
+                    ctxMail: '<rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="m2.5 4.5 5.5 4 5.5-4"/>',
+                    ctxCopy: '<rect x="5" y="5" width="8.5" height="8.5" rx="1.5"/><path d="M3 10.5V3.5A1 1 0 0 1 4 2.5h6.5"/>',
+                    ctxPin: '<path d="M10.6 1.8 14.2 5.4 12.4 6.2 9.8 8.8 10.1 12.1 8.9 13.3 6.5 10.9 3 14.4M6.5 10.9 2.7 7.1 3.9 5.9 7.2 6.2 9.8 3.6Z"/>',
+                    ctxDelete: '<path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.7 9h5.6l.7-9"/>',
+                };
+                for (const [id, d] of Object.entries(ctxIcons)) {
+                    const b = $id(id);
+                    if (b) b.insertAdjacentHTML('afterbegin', '<svg class="ctx-ico" viewBox="0 0 16 16" aria-hidden="true">' + d + '</svg>');
+                }
+                $id('ctxMenu').addEventListener('mouseover', (e) => {
+                    const b = e.target.closest('.ctx-item');
+                    if (b && this.ctxMenu.site) this.setCtxEcho(b.id);
+                });
                 $id('ctxManage').addEventListener('click', withCtxSite(s => this.openSitePage(s.name)));
                 $id('ctxOpen').addEventListener('click', withCtxSite(s => this.openSite(s)));
                 $id('ctxLogin').addEventListener('click', withCtxSite(s => this.getLoginLink(s.name)));
@@ -8266,8 +8645,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             render() {
                 this.renderChrome();
                 this.renderAlerts();
+                this.renderHarbor();
                 this.renderList();
-                this.renderShelf();
                 this.renderFooter();
                 this.renderCtxMenu();
                 this.renderModals();
@@ -8282,21 +8661,19 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             renderChrome() {
                 $id('btnToggleAdd').textContent = this.adding ? 'cancel' : '+ add site';
-                document.querySelectorAll('.layout-btn').forEach(b => {
-                    b.classList.toggle('is-active', b.dataset.layout === this.layout);
-                    b.setAttribute('aria-pressed', b.dataset.layout === this.layout ? 'true' : 'false');
-                });
+                document.querySelectorAll('#layoutToggle [data-layout]').forEach(b => b.setAttribute('aria-pressed', b.dataset.layout === this.layout ? 'true' : 'false'));
+                $id('sortSelect').value = this.sort;
 
-                // Filter row
-                const chip = $id('typeChip');
-                show(chip, !!this.typeFilter);
-                if (this.typeFilter) $id('typeChipLabel').textContent = this.typeFilterLabel;
-                const bulk = $id('btnBulkDelete');
-                const visible = this.filteredSites.length;
-                show(bulk, (this.filter || this.typeFilter) && visible > 0 && visible < this.sites.length);
-                bulk.textContent = 'delete ' + visible + ' shown…';
-                show($id('filterKbd'), !this.filter && !this.typeFilter);
-                show($id('btnFilterClear'), this.filter || this.typeFilter);
+                // Filter box + quick filters. A chip shows only when it would
+                // match something, or is the one in use.
+                show($id('filterKbd'), !this.filter);
+                show($id('btnFilterClear'), !!this.filter || this.chip !== 'all');
+                $id('slChips').innerHTML = this.chips.map(c => {
+                    const n = this.sites.filter(c.test).length;
+                    if (!n && c.id !== this.chip && c.id !== 'all') return '';
+                    return '<button type="button" class="sl-chip" data-chip="' + c.id + '" aria-pressed="' + (this.chip === c.id) + '">'
+                        + (c.dot ? '<i class="sl-dot ' + c.dot + '"></i>' : '') + c.label + ' <span>' + n + '</span></button>';
+                }).join('');
 
                 // Add row
                 const addRow = $id('addRow');
@@ -8311,6 +8688,10 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 show($id('createSpinner'), this.newSite.isLoading);
                 $id('createLabel').textContent = this.newSite.isLoading ? 'creating…' : (this.importFile ? 'create & import' : 'create');
                 this.renderImportProgress();
+                // The same, from a terminal.
+                const nm = this.newSite.name || 'mysite';
+                const fl = this.newSite.isPlain ? ' plain' : (this.newSite.wpVersion && this.newSite.wpVersion !== 'latest' ? ' ' + this.newSite.wpVersion : '');
+                $id('addEcho').textContent = this.importFile ? 'cove import ' + nm + ' ' + this.importFile.name : 'cove add ' + nm + fl;
 
                 // Theme button tooltip tracks the mode it would switch to.
                 $id('btnTheme').title = 'Theme: ' + ({ system: 'System', light: 'Light', dark: 'Dark' })[this.themePref] + ' (click to switch light and dark, right-click for options)';
@@ -8338,124 +8719,243 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 }
             },
 
+            // --- Sites list -------------------------------------------------
+            // Groups by when each site last changed (with the recency sort and
+            // nothing filtered), else one group. Today and This week draw as
+            // rows or cards; This month too; Earlier as a compact index, since
+            // a site untouched for a month is looked up by name.
+            get siteGroups() {
+                const list = this.filteredSites;
+                const filtering = !!String(this.filter || '').trim() || this.chip !== 'all';
+                if (filtering || this.sort !== 'modified') {
+                    const label = filtering ? (list.length === 1 ? '1 match' : list.length + ' matches') : 'all sites';
+                    return [{ id: 'all', label, sites: list }];
+                }
+                const now = Date.now() / 1000;
+                const bands = [
+                    { id: 'today', label: 'today', max: 86400 },
+                    { id: 'week', label: 'this week', max: 7 * 86400 },
+                    { id: 'month', label: 'this month', max: 30 * 86400 },
+                    { id: 'earlier', label: 'earlier', max: Infinity, compact: true },
+                ];
+                let prev = -Infinity;
+                return bands.map(b => {
+                    const sites = list.filter(s => { const age = now - (s.modified_at || 0); return age < b.max && age >= prev; });
+                    prev = b.max;
+                    return { ...b, sites };
+                }).filter(g => g.sites.length);
+            },
+
             renderList() {
-                const list = $id('siteList');
-                const rows = this.filteredSites;
-                const grid = this.layout === 'grid';
-                list.classList.toggle('is-grid', grid);
-                list.querySelectorAll('.site-row, .gallery-tile').forEach(n => n.remove());
+                const esc = (v) => this.escapeHtml(v == null ? '' : String(v));
+                const q = this.siteQuery((String(this.filter || '').split(/\s+/).find(t => t && !t.includes(':'))) || '');
+                const groups = this.isLoading && !this.sites.length ? [] : this.siteGroups;
+                this._groups = groups;
+                const filtering = !!String(this.filter || '').trim() || this.chip !== 'all';
 
-                show($id('siteHead'), !grid && !this.isLoading && rows.length > 0);
-                document.querySelectorAll('.site-head-btn[data-sort]').forEach(btn => {
-                    btn.classList.toggle('active', this.sort === btn.dataset.sort);
-                    btn.querySelector('.sort-arrow').textContent =
-                        this.sort === btn.dataset.sort ? (this.sortDir === 'asc' ? '↑' : '↓') : '';
-                });
+                // Pinned shelf, or the sites last opened from here; never
+                // while filtering, where the results should be all there is.
+                const byName = (names) => names.map(n => this.sites.find(s => s.name === n)).filter(Boolean);
+                let shelf = null;
+                if (!filtering && !this.isLoading) {
+                    const pinned = byName(this.pinned);
+                    if (pinned.length) shelf = { label: 'pinned', sites: pinned.slice(0, 8), hint: 'right-click any site to pin it' };
+                    else if (this.sites.length > 8) { const opened = byName(this.recent).slice(0, 4); if (opened.length) shelf = { label: 'recently opened', sites: opened, hint: 'pin a site to keep it here' }; }
+                }
+                show($id('siteShelf'), !!shelf);
+                if (shelf) {
+                    $id('shelfLabel').textContent = shelf.label;
+                    $id('shelfCount').textContent = shelf.sites.length;
+                    $id('shelfHint').textContent = shelf.hint;
+                    $id('shelfGrid').innerHTML = shelf.sites.map(s => this.siteCardHtml(s, '', true)).join('');
+                    this.attachShots($id('shelfGrid'), 'shelf');
+                }
 
-                show($id('siteLoading'), this.isLoading);
+                const box = $id('siteGroups');
+                const order = [];
+                box.innerHTML = groups.map(g => {
+                    g.sites.forEach(s => order.push(s.name));
+                    const total = g.sites.reduce((t, s) => t + (s.size_bytes || 0), 0);
+                    const every = g.sites.every(s => this.checked.has(s.name));
+                    const head = '<header class="sl-group-head"><h2>' + esc(g.label) + '</h2>'
+                        + '<span class="sl-count">' + (g.id !== 'all' ? g.sites.length + ' site' + (g.sites.length === 1 ? '' : 's') : '') + (total ? (g.id !== 'all' ? ' · ' : '') + this.formatSize(total) : '') + '</span>'
+                        + '<span class="sl-rule"></span>' + (g.compact ? '<span class="sl-hint">untouched for a month or more</span>' : '')
+                        + '<button type="button" class="sl-link" data-selectall="' + g.id + '">' + (every ? 'clear' : 'select all') + '</button></header>';
+                    const body = g.compact
+                        ? '<div class="sl-index">' + g.sites.map(s => this.siteIdxHtml(s, q)).join('') + '</div>'
+                        : this.layout === 'grid'
+                            ? '<div class="sl-cards">' + g.sites.map(s => this.siteCardHtml(s, q, false)).join('') + '</div>'
+                            : '<div class="sl-rows">' + g.sites.map(s => this.siteRowHtml(s, q)).join('') + '</div>';
+                    return '<section class="sl-group" data-group="' + g.id + '">' + head + body + '</section>';
+                }).join('');
+                this._order = order;
+                this.attachShots(box, 'list');
+                box.classList.toggle('has-checked', this.checked.size > 0);
+
+                const visible = order.length;
+                show($id('siteLoading'), this.isLoading && !this.sites.length);
                 show($id('emptyNone'), !this.isLoading && this.sites.length === 0);
-                const emptyFilter = !this.isLoading && this.sites.length > 0 && rows.length === 0;
+                const emptyFilter = !this.isLoading && this.sites.length > 0 && visible === 0;
                 show($id('emptyFilter'), emptyFilter);
-                if (emptyFilter) $id('emptyFilterQuery').textContent = this.filter || this.typeFilterLabel;
+                if (emptyFilter) $id('emptyFilterQuery').textContent = this.filter || this.chipLabel;
 
-                const tpl = $id('tpl-site-row');
-                const anchor = $id('siteLoading'); // rows insert before the loading li to keep list order
-                for (const site of rows) {
-                    if (grid) { list.insertBefore(this.buildTile(site, 'list'), anchor); continue; }
-                    const row = tpl.content.firstElementChild.cloneNode(true);
-                    row.dataset.name = site.name;
-                    row.classList.toggle('is-selected', this.selectedName === site.name);
-                    row.classList.toggle('has-menu', this.ctxMenu.open && this.ctxMenu.site && this.ctxMenu.site.name === site.name);
-                    row.classList.toggle('is-pinned', this.isPinned(site.name));
-
-                    row.querySelector('.site-domain').innerHTML = this.highlightedDomain(site.domain, this.siteQuery(this.filter));
-                    const openLink = row.querySelector('.site-open-link');
-                    openLink.href = site.domain;
-                    openLink.title = 'Open ' + site.domain.replace('https://', '');
-
-                    const isWp = this.isWpLike(site);
-                    this.paintSiteType(row.querySelector('.site-type'), row.querySelector('.site-wp-version'), site);
-
-                    const php = row.querySelector('.site-php-version');
-                    const applying = this.phpApplying[site.name];
-                    if (applying) {
-                        php.classList.add('applying');
-                        php.textContent = applying === 'default' ? 'php default…' : 'php ' + applying + '…';
-                        php.title = 'Switching PHP version…';
-                    } else if (site.php_version) {
-                        php.textContent = 'php ' + site.php_version;
-                        php.title = 'Pinned to PHP ' + site.php_version + ' (native php-fpm). Change via the row menu.';
-                    } else {
-                        php.remove();
-                    }
-
-                    const mod = row.querySelector('.site-modified');
-                    mod.textContent = this.formatRelative(site.modified_at);
-                    mod.title = site.modified_at ? new Date(site.modified_at * 1000).toLocaleString() : '';
-                    row.querySelector('.site-size').textContent = this.formatSize(site.size_bytes);
-
-                    const login = row.querySelector('.site-login-btn');
-                    if (isWp) {
-                        login.classList.toggle('loading', !!site.isLoggingIn);
-                        login.disabled = !!site.isLoggingIn;
-                        login.title = 'One-time admin login for ' + site.name;
-                    } else {
-                        login.remove();
-                    }
-                    list.insertBefore(row, anchor);
-                }
-                if (grid) this.armShots(list);
+                // Bulk bar, only on this view.
+                const n = this.checked.size;
+                show($id('slBulk'), n > 0 && this.view === 'sites');
+                $id('slBulkCount').textContent = n + ' selected';
+                $id('slBulkPin').textContent = n && [...this.checked].every(x => this.isPinned(x)) ? 'unpin' : 'pin';
             },
 
-            // One tile: preview, name, and the row's facts in a line. `where`
-            // is 'list' (the gallery) or 'shelf'; only the gallery shows the
-            // keyboard selection, the pin dot, and filter highlights.
-            buildTile(site, where) {
-                const tile = $id('tpl-gallery-tile').content.firstElementChild.cloneNode(true);
-                const inList = where === 'list';
-                tile.dataset.name = site.name;
-                tile.classList.toggle('is-selected', inList && this.selectedName === site.name);
-                tile.classList.toggle('has-menu', this.ctxMenu.open && this.ctxMenu.site && this.ctxMenu.site.name === site.name);
-                tile.classList.toggle('is-pinned', inList && this.isPinned(site.name));
-                tile.querySelector('.tile-initial').textContent = site.name.charAt(0);
-                const shot = tile.querySelector('.tile-shot');
-                if (site.shot_mtime) shot.insertBefore(this.shotImg(site, where), shot.querySelector('.tile-actions'));
+            // The address, with the filter's match marked.
+            siteHostHtml(site, q) {
+                return '<span class="sl-host">' + this.highlightedDomain(site.domain.replace(/:\d+$/, ''), q) + '</span>';
+            },
 
-                const host = site.domain.replace(/^https?:\/\//, '');
-                const dom = tile.querySelector('.site-domain');
-                dom.innerHTML = this.highlightedDomain(site.domain, inList ? this.siteQuery(this.filter) : '');
-                if (host.length > 26) dom.dataset.tip = host;
-                const open = tile.querySelector('.site-open-link');
-                open.href = site.domain;
-                open.title = 'Open ' + host;
+            siteTypeHtml(site) {
+                const t = this.siteTypeInfo(site.type);
+                return '<button type="button" class="sl-type ' + t.cls + '" data-act="type" title="Show only ' + t.name + ' sites">' + t.pill + '</button>';
+            },
 
-                const isWp = this.isWpLike(site);
-                this.paintSiteType(tile.querySelector('.site-type'), tile.querySelector('.site-wp-version'), site);
-                const php = tile.querySelector('.site-php-version');
-                if (site.php_version) php.textContent = 'php ' + site.php_version; else php.remove();
-                const when = tile.querySelector('.tile-when');
-                when.textContent = [this.formatRelative(site.modified_at), site.size_bytes ? this.formatSize(site.size_bytes) : ''].filter(Boolean).join(' · ');
-                when.title = site.modified_at ? 'Modified ' + new Date(site.modified_at * 1000).toLocaleString() : '';
+            siteVerHtml(site) {
+                const esc = (v) => this.escapeHtml(v == null ? '' : String(v));
+                if (site.type === 'Minn') {
+                    if (!site.minn_version) return '';
+                    return '<span class="sl-ver" title="Minn Engine ' + esc(site.minn_version) + (site.wp_version ? ', speaking WordPress ' + esc(site.wp_version) : '') + '">' + esc(site.minn_version) + '</span>';
+                }
+                if (!site.wp_version) return '';
+                const st = site.wp_status;
+                const dot = st === 'insecure' ? '<i class="sl-dot danger"></i>' : st === 'outdated' ? '<i class="sl-dot warn"></i>' : /alpha|beta|rc/i.test(site.wp_version) ? '<i class="sl-dot pre"></i>' : '';
+                const tip = st === 'insecure' ? 'wordpress.org marks ' + site.wp_version + ' insecure. Update with: cove core update ' + site.name : st === 'outdated' ? 'WordPress ' + site.wp_version + ' is outdated' : 'WordPress ' + site.wp_version;
+                return '<span class="sl-ver" title="' + esc(tip) + '">' + esc(site.wp_version) + '</span>' + dot;
+            },
 
-                const login = tile.querySelector('[data-act="login"]');
-                if (isWp) {
-                    login.disabled = !!site.isLoggingIn;
-                    login.textContent = site.isLoggingIn ? 'opening…' : 'log in';
-                    login.title = 'One-time admin login for ' + site.name;
+            sitePhpHtml(site) {
+                const applying = this.phpApplying[site.name];
+                if (applying) return '<span class="sl-php applying" title="Switching PHP version…">' + (applying === 'default' ? 'php default…' : 'php ' + this.escapeHtml(applying) + '…') + '</span>';
+                if (site.php_version) return '<span class="sl-php" title="Pinned to PHP ' + this.escapeHtml(site.php_version) + ' (native php-fpm). Change via the menu.">php ' + this.escapeHtml(site.php_version) + '</span>';
+                return '';
+            },
+
+            siteSignalsHtml(site) {
+                const mail = this.siteMail[site.name] || 0;
+                const n = (v) => v >= 1000 ? (v / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : String(v);
+                return (mail ? '<span class="sl-sig mail" title="' + mail + ' unread message' + (mail === 1 ? '' : 's') + ' to @' + site.name + '.localhost"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="m2.5 4.5 5.5 4 5.5-4"/></svg>' + n(mail) + '</span>' : '')
+                    + (site.php_errors ? '<span class="sl-sig err" title="' + site.php_errors + ' PHP error' + (site.php_errors === 1 ? '' : 's') + ' in debug.log in the last 24 hours"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5 14 13H2Z"/><path d="M8 6.5v3M8 11.2v.1"/></svg>' + site.php_errors + '</span>' : '');
+            },
+
+            siteFactsHtml(site) {
+                const f = [];
+                if (site.multisite) f.push('multisite · ' + site.multisite);
+                const extra = (site.mappings || []).length;
+                if (extra) f.push('+' + extra + ' domain' + (extra === 1 ? '' : 's'));
+                if (site.twin) f.push('twin ' + site.twin);
+                if (site.type === 'Minn' && site.wp_version) f.push('speaks wp ' + site.wp_version);
+                return f.length ? '<span class="sl-facts" title="' + this.escapeHtml(f.join(' · ')) + '">' + this.escapeHtml(f.join(' · ')) + '</span>' : '';
+            },
+
+            // What runs the site, and the last plugin or theme change the
+            // nightly history save saw. Static sites: page title and files.
+            siteInsideHtml(site) {
+                const esc = (v) => this.escapeHtml(v == null ? '' : String(v));
+                let top, ch = '';
+                if (site.type === 'Plain') {
+                    const st = site.static || {};
+                    const files = st.files ? '<span class="n">' + (st.files >= 5000 ? '5000+' : st.files) + ' file' + (st.files === 1 ? '' : 's') + '</span>' : '';
+                    top = st.title ? '“' + esc(st.title) + '”' + (files ? ' <span class="n">·</span> ' + files : '') : (files || '<span class="n">static files</span>');
                 } else {
-                    login.remove();
+                    const c = site.card;
+                    if (!c) top = '<span class="n">no history saves yet</span>';
+                    else if (c.pending) top = '<span class="n">reading history…</span>';
+                    else {
+                        top = (c.theme ? esc(c.theme) + ' <span class="n">·</span> ' : '') + '<span class="n">' + (c.plugins || 0) + ' plugin' + (c.plugins === 1 ? '' : 's') + '</span>';
+                        const glyph = { up: '↑', down: '↓', add: '+', del: '−', state: '•', edit: '✎' };
+                        if (c.ch) {
+                            const text = c.ch.t + (c.ch.more ? ' +' + c.ch.more + ' more' : '') + ' · ' + this.formatRelative(c.ch.at);
+                            ch = '<span class="sl-change"><span class="sl-g ' + esc(c.ch.k) + '" aria-hidden="true">' + (glyph[c.ch.k] || '•') + '</span><span title="' + esc(text + (c.ch.linked ? ' (a linked folder, shared with other sites)' : '')) + '">' + esc(text) + '</span></span>';
+                        } else if (c.since) {
+                            ch = '<span class="sl-change is-quiet"><span class="sl-g" aria-hidden="true">=</span><span>no plugin or theme changes in ' + this.formatRelative(c.since) + '</span></span>';
+                        }
+                    }
                 }
-                return tile;
+                return '<span class="sl-inside"><span class="sl-inside-top">' + top + '</span>' + ch + '</span>';
             },
 
-            // The 640px WebP thumbnail of a site's preview. Lazy, so a
-            // gallery of hundreds only fetches what scrolls into view; the
-            // src is left off until armShots, after the tile is in the page,
-            // because a browser loads a lazy image at once while it is
-            // detached.
-            shotImg(site, where) {
-                const src = '/api.php?action=site_shot&size=thumb&site=' + encodeURIComponent(site.name) + '&v=' + site.shot_mtime;
-                const key = where + ':' + site.name;
+            siteSeenHtml(site) {
+                if (!site.seen_at) return '<span class="sl-seen" title="No visit from a browser in its access log"><small>visited</small>—</span>';
+                return '<span class="sl-seen" title="Last opened in a browser ' + this.formatRelative(site.seen_at) + ' ago (Cove\'s own preview captures not counted)"><small>visited</small>' + this.formatRelative(site.seen_at) + '</span>';
+            },
+
+            siteButtonsHtml(site, more) {
+                const main = this.isWpLike(site)
+                    ? '<button type="button" class="sl-btn primary" data-act="login"' + (site.isLoggingIn ? ' disabled' : '') + ' title="One-time admin login for ' + site.name + '">' + (site.isLoggingIn ? 'opening…' : 'log in') + '</button>'
+                    : '<button type="button" class="sl-btn" data-act="open">open</button>';
+                return main + (more || '') + '<button type="button" class="sl-btn icon" data-act="menu" aria-label="More for ' + site.name + '" title="More (or right-click)"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/></svg></button>';
+            },
+
+            siteStateClasses(site, base, inList) {
+                const c = [base];
+                if (inList && this.selectedName === site.name) c.push('is-selected');
+                if (inList && this.checked.has(site.name)) c.push('is-checked');
+                if (this.ctxMenu.open && this.ctxMenu.site && this.ctxMenu.site.name === site.name) c.push('has-menu');
+                return c.join(' ');
+            },
+
+            sitePinHtml(site) {
+                return this.isPinned(site.name) ? '<svg class="sl-pin" viewBox="0 0 16 16" fill="currentColor" aria-label="Pinned"><path d="M10.6 1.8 14.2 5.4 12.4 6.2 9.8 8.8 10.1 12.1 8.9 13.3 6.5 10.9 3 14.4 1.6 13 5.1 9.5 2.7 7.1 3.9 5.9 7.2 6.2 9.8 3.6Z"/></svg>' : '';
+            },
+
+            siteOpenHtml(site) {
+                return '<a class="sl-open" href="' + this.escapeHtml(site.domain) + '" target="_blank" rel="noopener" title="Open ' + this.escapeHtml(site.domain.replace(/^https?:\/\//, '')) + '"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4.5h5v5"/><path d="M11.5 4.5 4.5 11.5"/></svg></a>';
+            },
+
+            siteRowHtml(site, q) {
+                const max = this._maxBytes || 1;
+                const w = site.size_bytes ? Math.max(3, Math.sqrt(site.size_bytes / max) * 100) : 0;
+                return '<div class="' + this.siteStateClasses(site, 'sl-row', true) + '" data-name="' + site.name + '">'
+                    + '<button type="button" class="sl-check" data-act="check" aria-label="Select ' + site.name + '" aria-pressed="' + this.checked.has(site.name) + '"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg></button>'
+                    + '<span class="sl-thumb" data-shot="mini"></span>'
+                    + '<span class="sl-who"><span class="sl-who-top">' + this.siteHostHtml(site, q) + this.siteOpenHtml(site) + this.sitePinHtml(site) + this.siteSignalsHtml(site) + '</span>' + this.siteFactsHtml(site) + '</span>'
+                    + this.siteInsideHtml(site)
+                    + '<span class="sl-kind">' + this.siteTypeHtml(site) + this.siteVerHtml(site) + this.sitePhpHtml(site) + '</span>'
+                    + this.siteSeenHtml(site)
+                    + '<span class="sl-size" title="' + (site.size_bytes ? this.formatSize(site.size_bytes) + ' on disk' : 'Not measured yet') + '"><span class="sl-bar"><i style="width:' + w.toFixed(1) + '%"></i></span><span class="sl-num">' + this.formatSize(site.size_bytes) + '</span></span>'
+                    + '<span class="sl-acts">' + this.siteButtonsHtml(site) + '</span>'
+                    + '</div>';
+            },
+
+            siteCardHtml(site, q, shelf) {
+                return '<article class="' + this.siteStateClasses(site, 'sl-card', !shelf) + '" data-name="' + site.name + '">'
+                    + '<div class="sl-shot" data-shot="thumb">' + this.siteTypeHtml(site)
+                    + '<div class="sl-card-acts">' + this.siteButtonsHtml(site, '<button type="button" class="sl-btn" data-act="files">files</button><button type="button" class="sl-btn" data-act="logs">logs</button>') + '</div></div>'
+                    + '<div class="sl-card-body"><span class="sl-who-top">' + this.siteHostHtml(site, q) + this.siteOpenHtml(site) + (shelf ? '' : this.sitePinHtml(site)) + this.siteSignalsHtml(site) + '</span>'
+                    + this.siteInsideHtml(site) + '</div>'
+                    + '</article>';
+            },
+
+            siteIdxHtml(site, q) {
+                const t = this.siteTypeInfo(site.type);
+                const v = site.type === 'Minn' ? site.minn_version : site.wp_version;
+                return '<div class="' + this.siteStateClasses(site, 'sl-idx', true) + '" data-name="' + site.name + '" title="' + this.escapeHtml(t.name + (v ? ' ' + v : '') + ' · changed ' + this.formatRelative(site.modified_at) + ' ago' + (site.size_bytes ? ' · ' + this.formatSize(site.size_bytes) : '')) + '">'
+                    + '<i class="sl-tdot ' + t.cls + '" aria-hidden="true"></i>' + this.siteHostHtml(site, q) + this.sitePinHtml(site) + this.siteSignalsHtml(site) + '<span class="sl-age">' + this.formatRelative(site.modified_at) + '</span></div>';
+            },
+
+            // Preview images go into the drawn rows and cards after the HTML
+            // is in: the same <img> is moved between renders (no reload, no
+            // flicker), and a lazy image only defers once it is in the page.
+            attachShots(root, where) {
+                root.querySelectorAll('[data-shot]').forEach(slot => {
+                    const item = slot.closest('[data-name]');
+                    const site = item && this.sites.find(s => s.name === item.dataset.name);
+                    if (!site) return;
+                    if (!site.shot_mtime) { slot.insertAdjacentHTML('afterbegin', '<span class="sl-blank" aria-hidden="true"><svg viewBox="0 0 56 16"><path d="M2 6 Q 8 2, 14 6 T 26 6 T 38 6 T 50 6"/><path d="M8 12 Q 14 8, 20 12 T 32 12 T 44 12" opacity="0.5"/></svg></span>'); return; }
+                    slot.insertBefore(this.shotImg(site, where, slot.dataset.shot), slot.firstChild);
+                });
+                root.querySelectorAll('img[data-src]:not([src])').forEach(img => { img.src = img.dataset.src; });
+            },
+
+            shotImg(site, where, size) {
+                const src = '/api.php?action=site_shot&size=' + size + '&site=' + encodeURIComponent(site.name) + '&v=' + site.shot_mtime;
+                const key = where + ':' + size + ':' + site.name;
                 let img = this._shots.get(key);
                 if (img && img.dataset.src === src) return img;
                 img = document.createElement('img');
@@ -8470,25 +8970,145 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 return img;
             },
 
-            armShots(root) {
-                root.querySelectorAll('.tile-shot img:not([src])').forEach(img => { img.src = img.dataset.src; });
+            // How many items a row of the current selection holds: 1 for
+            // rows, the grid's column count for cards and the index.
+            selectionColumns() {
+                const el = this.selectedName && document.querySelector('#siteGroups [data-name="' + this.selectedName + '"]');
+                const grid = el ? el.parentElement : null;
+                if (!grid || grid.classList.contains('sl-rows')) return this.layout === 'grid' && !el ? 4 : 1;
+                return getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length || 1;
             },
 
-            renderShelf() {
-                const shelf = this.shelf;
-                show($id('siteShelf'), !!shelf);
-                const grid = $id('shelfGrid');
-                grid.querySelectorAll('.gallery-tile').forEach(n => n.remove());
-                if (!shelf) return;
-                $id('shelfLabel').textContent = shelf.label;
-                grid.style.setProperty('--shelf-cols', shelf.sites.length === 4 ? 4 : 3);
-                show($id('shelfHint'), shelf.label !== 'pinned');
-                for (const site of shelf.sites) grid.appendChild(this.buildTile(site, 'shelf'));
-                this.armShots(grid);
+            toggleChecked(name) {
+                this.checked.has(name) ? this.checked.delete(name) : this.checked.add(name);
+                this.renderList();
             },
 
-            gridColumns() {
-                return getComputedStyle($id('siteList')).gridTemplateColumns.split(' ').filter(Boolean).length || 1;
+            // --- Harbour: the summary over the list ------------------------
+            renderHarbor() {
+                const esc = (v) => this.escapeHtml(v == null ? '' : String(v));
+                const sites = this.sites;
+                this._maxBytes = Math.max(1, ...sites.map(s => s.size_bytes || 0));
+                const need = sites.filter(s => this.siteAttention(s));
+                const words = ['No', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
+                const title = $id('slTitle');
+                if (this.isLoading && !sites.length) title.textContent = 'Sites';
+                else if (!sites.length) title.innerHTML = 'An empty <em>cove</em>.';
+                else if (need.length) title.innerHTML = (words[need.length] || need.length) + ' site' + (need.length === 1 ? ' needs' : 's need') + ' a <em>look</em>.';
+                else title.innerHTML = 'All <em>calm</em> in the cove.';
+
+                const total = this.totalBytes;
+                const unmeasured = sites.filter(s => !s.size_bytes).length;
+                const latest = Math.max(0, ...sites.map(s => s.modified_at || 0));
+                $id('slSub').innerHTML = sites.length
+                    ? '<b>' + sites.length + '</b> site' + (sites.length === 1 ? '' : 's') + ' · <b>' + this.formatSize(total) + '</b> on disk' + (unmeasured ? ' (measuring ' + unmeasured + ')' : '') + (latest ? ' · last change ' + (this.formatRelative(latest) === 'now' ? '<b>just now</b>' : '<b>' + this.formatRelative(latest) + '</b> ago') : '')
+                    : (this.isLoading ? '' : 'Add one with <b>+ add site</b>, or <b>cove add myblog</b>.');
+
+                const types = [
+                    { type: 'WordPress', color: 'var(--accent)' },
+                    { type: 'Minn', color: 'var(--minn)' },
+                    { type: 'Plain', color: 'var(--panel-border-strong)' },
+                ].map(t => ({ ...t, n: sites.filter(s => s.type === t.type).length, b: sites.filter(s => s.type === t.type).reduce((x, s) => x + (s.size_bytes || 0), 0) })).filter(t => t.n);
+                $id('slDiskStack').innerHTML = total ? types.map(t => '<i style="width:' + (t.b / total * 100).toFixed(2) + '%;background:' + t.color + '" title="' + this.siteTypeInfo(t.type).name + ': ' + this.formatSize(t.b) + '"></i>').join('') : '';
+                $id('slDiskLegend').innerHTML = types.map(t => '<li><i style="background:' + t.color + '"></i>' + esc(this.siteTypeInfo(t.type).name.toLowerCase()) + ' ' + t.n + (t.b ? ' · ' + this.formatSize(t.b) : '') + '</li>').join('');
+
+                const behind = sites.filter(s => this.siteBehind(s)).length;
+                const newestWp = (this.wpVersions.find(v => v.status === 'latest') || {}).version;
+                $id('slAttList').innerHTML = (need.length
+                    ? need.slice(0, 4).map(s => { const a = this.siteAttention(s); return '<li><button type="button" data-goto="' + s.name + '"><i class="sl-dot ' + a.level + '"></i>' + this.siteHostHtml(s, '') + '<span class="sl-why">' + esc(a.why) + '</span></button></li>'; }).join('') + (need.length > 4 ? '<li class="sl-quiet">and ' + (need.length - 4) + ' more</li>' : '')
+                    : '<li class="sl-quiet">' + (sites.length ? 'Nothing. No PHP errors today.' : '—') + '</li>')
+                    + (behind ? '<li><button type="button" data-chip-go="behind"><i class="sl-dot warn"></i><span class="sl-why">' + behind + ' site' + (behind === 1 ? ' runs' : 's run') + ' an older WordPress' + (newestWp ? ' than ' + esc(newestWp) : '') + '</span></button></li>' : '');
+
+                const idle = sites.filter(s => this.siteIdle(s));
+                show($id('slTidy'), idle.length > 0);
+                const idleBytes = idle.reduce((x, s) => x + (s.size_bytes || 0), 0);
+                $id('slTidyText').innerHTML = '<b>' + idle.length + '</b> site' + (idle.length === 1 ? '' : 's') + ' untouched for 30+ days' + (idleBytes ? ' hold <b>' + this.formatSize(idleBytes) + '</b>' : '') + '.';
+                this.drawHarbor();
+            },
+
+            // A contour chart behind the summary, Cove's landing-page motif:
+            // three islands of ringed, wavering lines in the brand teal.
+            drawHarbor() {
+                const c = $id('slChart');
+                if (!c || this.view !== 'sites') return;
+                const r = c.getBoundingClientRect();
+                if (!r.width || !r.height) return;
+                const key = Math.round(r.width) + 'x' + Math.round(r.height) + ':' + this.theme;
+                if (this._harborKey === key) return;
+                this._harborKey = key;
+                const dpr = window.devicePixelRatio || 1;
+                c.width = Math.round(r.width * dpr);
+                c.height = Math.round(r.height * dpr);
+                const g = c.getContext('2d');
+                g.setTransform(dpr, 0, 0, dpr, 0, 0);
+                g.clearRect(0, 0, r.width, r.height);
+                g.strokeStyle = this.theme === 'light' ? '#00746f' : '#1dbcb5';
+                g.lineWidth = 1;
+                const islands = [
+                    { x: 0.80, y: 0.62, rings: 13, base: 14, step: 15, seed: 1.7 },
+                    { x: 1.04, y: -0.05, rings: 8, base: 26, step: 19, seed: 4.2 },
+                    { x: 0.46, y: 1.22, rings: 9, base: 30, step: 17, seed: 2.9 },
+                ];
+                for (const isl of islands) {
+                    const cx = isl.x * r.width, cy = isl.y * r.height;
+                    for (let k = 0; k < isl.rings; k++) {
+                        const rad = isl.base + k * isl.step;
+                        g.globalAlpha = (this.theme === 'light' ? 0.16 : 0.2) * (1 - k / (isl.rings + 4));
+                        g.beginPath();
+                        for (let a = 0; a <= Math.PI * 2 + 0.001; a += 0.04) {
+                            const wob = 1 + 0.13 * Math.sin(3 * a + k * 0.35 + isl.seed) + 0.07 * Math.sin(5 * a - k * 0.22 + isl.seed * 2) + 0.035 * Math.sin(9 * a + isl.seed * 3);
+                            const x = cx + Math.cos(a) * rad * wob * 1.35, y = cy + Math.sin(a) * rad * wob * 0.82;
+                            if (a) g.lineTo(x, y); else g.moveTo(x, y);
+                        }
+                        g.closePath();
+                        g.stroke();
+                    }
+                }
+                g.globalAlpha = 1;
+            },
+
+            // Unread mail per site: one search for every unread message,
+            // counted by the site its To address belongs to (a subsite's
+            // store.mysite.localhost counts for mysite).
+            async loadSiteMail() {
+                if (this._siteMailBusy || !this.sites.length) return;
+                this._siteMailBusy = true;
+                this._lastUnread = this.mail.unread;
+                try {
+                    const d = await this.mailApi('/v1/search?query=' + encodeURIComponent('is:unread') + '&limit=5000', { timeoutMs: 10000 });
+                    const names = new Set(this.sites.map(s => s.name));
+                    const counts = {};
+                    for (const m of (d.messages || [])) {
+                        for (const to of (m.To || [])) {
+                            const host = String(to.Address || '').toLowerCase().split('@')[1] || '';
+                            if (!host.endsWith('.localhost')) continue;
+                            let h = host.slice(0, -'.localhost'.length);
+                            while (h && !names.has(h)) { const i = h.indexOf('.'); h = i === -1 ? '' : h.slice(i + 1); }
+                            if (h) { counts[h] = (counts[h] || 0) + 1; break; }
+                        }
+                    }
+                    this.siteMail = counts;
+                } catch (e) { /* Mailpit down: the chips simply stay away */ }
+                this._siteMailBusy = false;
+                if (this.view === 'sites') { this.renderChrome(); this.renderList(); }
+            },
+
+            // Disk sizes the cache has never seen, measured a batch at a time
+            // until none are left, so no row waits on the ↻ button.
+            async fillMissingSizes() {
+                if (this._sizeFilling || !this.sites.some(s => s.size_bytes == null)) return;
+                this._sizeFilling = true;
+                for (let round = 0; round < 20; round++) {
+                    const res = await this.apiPost('refresh_sizes', { missing: true }, { quiet: true, timeoutMs: 60000 });
+                    if (!res.success) break;
+                    const sizes = res.sites || {};
+                    for (const s of this.sites) { const k = s.name + '.localhost'; if (s.size_bytes == null && typeof sizes[k] === 'number') s.size_bytes = sizes[k]; }
+                    this.renderHarbor();
+                    this.renderList();
+                    this.renderFooter();
+                    if (!res.remaining) break;
+                }
+                this._sizeFilling = false;
             },
 
             renderFooter() {
@@ -8508,7 +9128,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 if (!this.ctxMenu.open || !site) return;
                 menu.style.left = this.ctxMenu.x + 'px';
                 menu.style.top = this.ctxMenu.y + 'px';
-                $id('ctxTitle').textContent = site.domain.replace('https://', '');
+                const ti = this.siteTypeInfo(site.type);
+                $id('ctxTitle').innerHTML = '<span class="sl-host">' + this.highlightedDomain(site.domain.replace(/:\d+$/, ''), '') + '</span><span class="sl-type ' + ti.cls + '">' + ti.pill + '</span>';
+                this.setCtxEcho('ctxManage');
                 const isWp = this.isWpLike(site);
                 show($id('ctxLogin'), isWp);
                 show($id('ctxDb'), isWp);
@@ -8523,6 +9145,33 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 // plus the wildcard a subdomain multisite gets for free.
                 const extraDomains = (site.mappings || []).length + (site.multisite === 'subdomain' ? 1 : 0);
                 $id('ctxDomainsMeta').textContent = extraDomains ? '+' + extraDomains : '';
+            },
+
+            // The cove command a menu item corresponds to, shown along the
+            // menu's foot for whichever item the pointer is on.
+            setCtxEcho(id) {
+                const site = this.ctxMenu.site;
+                if (!site) return;
+                const n = site.name;
+                const cmd = {
+                    ctxManage: { note: 'opens the site page: plugins, users, history, snapshots' },
+                    ctxOpen: 'cove url ' + n,
+                    ctxLogin: 'cove login ' + n,
+                    ctxRename: 'cove rename ' + n + ' <new-name>',
+                    ctxReveal: 'open "$(cove path ' + n + ')"',
+                    ctxFiles: 'cd "$(cove path ' + n + ')"',
+                    ctxDb: { note: 'opens ' + n + "'s tables in the dashboard" },
+                    ctxPhp: 'cove php ' + n + ' <version>',
+                    ctxDomains: 'cove mappings ' + n,
+                    ctxLog: 'cove log ' + n + ' --follow',
+                    ctxMail: { note: 'mail sent to anyone @' + n + '.localhost' },
+                    ctxCopy: 'cove path ' + n,
+                    ctxPin: { note: 'pins live in this browser' },
+                    ctxDelete: 'cove delete ' + n,
+                }[id] || { note: '' };
+                const el = $id('ctxEcho');
+                el.className = typeof cmd === 'object' ? 'is-note' : '';
+                el.textContent = typeof cmd === 'object' ? '# ' + cmd.note : cmd;
             },
 
             renderPhpModal() {
@@ -8655,6 +9304,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.theme = this.themePref === 'system' ? this.osTheme() : this.themePref;
                 document.documentElement.dataset.theme = this.theme;
                 document.documentElement.dataset.themePref = this.themePref;
+                if (this.drawHarbor) requestAnimationFrame(() => this.drawHarbor());
                 const menu = $id('themeMenu');
                 if (menu) menu.querySelectorAll('[data-theme-pref]').forEach(b => b.setAttribute('aria-checked', String(b.dataset.themePref === this.themePref)));
             },
@@ -8872,7 +9522,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 document.body.classList.toggle('view-logs', view === 'logs');
                 document.body.classList.toggle('view-files', view === 'files');
                 document.body.classList.toggle('view-site', view === 'site');
-                document.body.classList.toggle('sites-grid', view === 'sites' && this.layout === 'grid');
+                document.body.classList.toggle('view-sites', view === 'sites');
                 document.title = view === 'site' ? 'Cove — ' + (this.sitePage.name || 'site') : { mail: 'Cove — mail', db: 'Cove — databases', logs: 'Cove — logs', files: 'Cove — files', sites: 'Cove — sites' }[view];
                 this.syncUrl();
                 this.render();
@@ -9575,6 +10225,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 });
                 const badge = $id('mailBadge');
                 const n = this.mail.unread;
+                if (this.sites.length && this._lastUnread !== undefined && n !== this._lastUnread) {
+                    clearTimeout(this._siteMailTimer);
+                    this._siteMailTimer = setTimeout(() => this.loadSiteMail(), 1500);
+                }
+                show($id('slBulk'), this.checked.size > 0 && this.view === 'sites');
                 show(badge, n > 0);
                 badge.textContent = n > 99 ? '99+' : String(n);
                 document.querySelector('.nav-view[data-view="mail"]').title = n ? (n + ' unread message' + (n === 1 ? '' : 's')) : 'Mail';
@@ -13948,7 +14603,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             setLayout(layout) {
                 this.layout = layout === 'grid' ? 'grid' : 'list';
                 localStorage.setItem('sitesLayout', this.layout);
-                document.body.classList.toggle('sites-grid', this.view === 'sites' && this.layout === 'grid');
                 this.render();
             },
 
@@ -13966,33 +14620,28 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             // --- Keyboard list navigation ----------------------------------
             moveSelection(delta) {
-                const list = this.filteredSites;
+                const list = this._order;
                 if (!list.length) return;
-                const cur = list.findIndex(s => s.name === this.selectedName);
+                const cur = list.indexOf(this.selectedName);
                 let next = cur === -1 ? (delta > 0 ? 0 : list.length - 1) : cur + delta;
                 next = Math.max(0, Math.min(list.length - 1, next));
-                this.selectedName = list[next].name;
+                this.selectedName = list[next];
                 this.renderList();
-                const el = $id('siteList').querySelectorAll('.site-row, .gallery-tile')[next];
+                this.scrollToSelection();
+            },
+
+            scrollToSelection() {
+                const el = this.selectedName && document.querySelector('#siteGroups [data-name="' + this.selectedName + '"]');
                 if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
             },
 
             selectedSite() {
-                return this.filteredSites.find(s => s.name === this.selectedName) || null;
+                return this._order.includes(this.selectedName) ? (this.sites.find(s => s.name === this.selectedName) || null) : null;
             },
 
             setSort(key) {
-                // Click the active header to flip direction; a new key
-                // starts at its natural default (a→z for name, biggest /
-                // most recent first for size and modified).
-                if (this.sort === key) {
-                    this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
-                } else {
-                    this.sort = key;
-                    this.sortDir = key === 'name' ? 'asc' : 'desc';
-                }
+                this.sort = ['name', 'size', 'type', 'modified'].includes(key) ? key : 'modified';
                 localStorage.setItem('sort', this.sort);
-                localStorage.setItem('sortDir', this.sortDir);
                 this.render();
             },
 
@@ -14052,10 +14701,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 return res;
             },
 
-            async getSites() {
+            async getSites(opts = {}) {
                 this.requestShotSweep();
-                this.isLoading = true;
-                this.render();
+                if (!opts.quiet) { this.isLoading = true; this.render(); }
                 try {
                     const r = await fetch('/api.php?action=list_sites');
                     const data = await r.json();
@@ -14069,10 +14717,29 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         .map(s => ({ ...s, isLoggingIn: false }))
                         .filter(s => !staged.has(s.name));
                 } catch (e) {
-                    this.showSnack('Could not fetch sites.', true);
+                    if (!opts.quiet) this.showSnack('Could not fetch sites.', true);
                 } finally {
                     this.isLoading = false;
                     this.render();
+                }
+                this.afterSitesLoaded(opts.round || 0);
+            },
+
+            // Follow-ups to a listing, none of them blocking it: history
+            // cards the server had no time for this round, sizes never
+            // measured, unread mail per site, and wordpress.org's verdict on
+            // each WordPress version (refetched once it is in).
+            afterSitesLoaded(round) {
+                if (round < 6 && this.sites.some(s => s.card && s.card.pending)) {
+                    clearTimeout(this._cardTimer);
+                    this._cardTimer = setTimeout(() => this.getSites({ quiet: true, round: round + 1 }), 700);
+                }
+                this.fillMissingSizes();
+                this.loadSiteMail();
+                if (!this.wpVersionsLoaded) {
+                    this.loadWpVersions().then(() => {
+                        if (this.sites.some(s => s.type === 'WordPress' && s.wp_version && !s.wp_status)) this.getSites({ quiet: true, round: 99 });
+                    });
                 }
             },
 
@@ -14245,11 +14912,11 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.stageDeletes([site]);
             },
 
-            bulkDelete() {
-                // A dialog, not an armed button: it names every site the
-                // filter matched and asks for the count to be typed before
-                // anything is staged. The undo snackbar still follows.
-                const sites = [...this.filteredSites];
+            bulkDelete(names) {
+                // A dialog, not an armed button: it names every site chosen
+                // and asks for the count to be typed before anything is
+                // staged. The undo snackbar still follows.
+                const sites = names ? this.sites.filter(s => names.includes(s.name)) : [...this.filteredSites];
                 if (!sites.length) return;
                 this.bulkConfirm = { names: sites.map(s => s.name) };
                 const n = sites.length;
@@ -14296,6 +14963,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 // Nothing is deleted server-side until the window passes.
                 if (this.pendingDelete) clearTimeout(this.pendingDelete.timer);
                 const staged = this.pendingDelete ? this.pendingDelete.sites : [];
+                for (const site of sitesToDelete) this.checked.delete(site.name);
                 for (const site of sitesToDelete) {
                     const idx = this.sites.findIndex(s => s.name === site.name);
                     if (idx !== -1) { this.sites.splice(idx, 1); staged.push(site); }
@@ -14387,7 +15055,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 site.isLoggingIn = true;
                 this.touchRecent(name);
                 this.renderList();
-                this.renderShelf();
                 this.renderSitePage();
                 const res = await this.apiPost('get_login_link', { site_name: name });
                 if (res.success && res.url) {
@@ -14396,7 +15063,6 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 }
                 site.isLoggingIn = false;
                 this.renderList();
-                this.renderShelf();
                 this.renderSitePage();
             },
 

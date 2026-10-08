@@ -98,7 +98,7 @@ cove_delete() {
         rm -rf "$COVE_DIR/Snapshots/$site_name"
         echo "📸 Removed $snaps snapshot(s)."
     fi
-    rm -f "$COVE_DIR/cache/screenshots/$site_name.png" "$COVE_DIR/cache/screenshots/$site_name.png.tmp.png" "$COVE_DIR/cache/screenshots/thumbs/$site_name.webp" 2>/dev/null
+    rm -f "$COVE_DIR/cache/screenshots/$site_name.png" "$COVE_DIR/cache/screenshots/$site_name.png.tmp.png" "$COVE_DIR/cache/screenshots/thumbs/$site_name.webp" "$COVE_DIR/cache/screenshots/thumbs/mini/$site_name.webp" 2>/dev/null
     rm -f "$COVE_DIR/cache/imports/$site_name"-*.zip "$COVE_DIR/cache/imports/$site_name"-*.tar.gz "$COVE_DIR/cache/imports/$site_name"-*.tgz 2>/dev/null
     if ls "$COVE_DIR/Backups/$site_name"-*.zip >/dev/null 2>&1; then
         echo "💾 Backups in ~/Cove/Backups were kept: $(ls -1 "$COVE_DIR/Backups/$site_name"-*.zip 2>/dev/null | wc -l | tr -d ' ') file(s)."

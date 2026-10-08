@@ -98,8 +98,8 @@ cove_screenshot_reap() {
     # Gallery thumbnails (made by the dashboard) whose preview is gone, and
     # half-written ones.
     if [ -d "$SCREENSHOTS_DIR/thumbs" ]; then
-        find "$SCREENSHOTS_DIR/thumbs" -maxdepth 1 -name '*.webp.tmp.*' -mmin +2 -delete 2>/dev/null
-        for sp in "$SCREENSHOTS_DIR"/thumbs/*.webp; do
+        find "$SCREENSHOTS_DIR/thumbs" -maxdepth 2 -name '*.webp.tmp.*' -mmin +2 -delete 2>/dev/null
+        for sp in "$SCREENSHOTS_DIR"/thumbs/*.webp "$SCREENSHOTS_DIR"/thumbs/mini/*.webp; do
             [ -f "$sp" ] || continue
             sn=$(basename "$sp" .webp)
             [ -f "$SCREENSHOTS_DIR/$sn.png" ] || rm -f "$sp"
