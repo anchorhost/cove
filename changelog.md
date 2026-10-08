@@ -14,6 +14,11 @@
     * To compare the two request for request, a twin can answer as the site instead: `--as-site=ref.minn.localhost` adds a domain that always does, and any request carrying `X-Cove-Twin: as-site` does too. WordPress then sees the site's own hostname over HTTPS and answers exactly as the site's address would, canonical redirects and stored URLs included.
     * The twin gets the site's guards (this machine only, no logs or dumps served) and its own log, `logs/caddy-twin.log`.
 
+* **The sites list has a gallery, and a shelf for what you're working on:** a switch beside **+ add site** turns the list into a grid of cards, each showing the site's front-page preview, its WordPress version, and when it last changed.
+    * Hovering a card offers **log in**, **files**, and **logs**. A click opens the site page and a right-click opens the usual menu. Arrow keys move between cards, a whole row at a time up and down.
+    * In the list, a shelf above the rows shows pinned sites as preview cards. With nothing pinned it shows the sites last opened from the dashboard, or else the ones changed most recently. It steps aside while a filter is on.
+    * The gallery loads 640px WebP thumbnails, made from each preview the first time they are asked for and kept beside it. They are about a tenth the size of the full capture, and load only as cards scroll into view.
+
 ### 🔒 Security & Bug Fixes
 
 * **`cove push` no longer overwrites a whole WP Freighter host:** a push replaces the remote's files and resets its database, and on a Freighter host that database and those files belong to every tenant at once. A push to such a host without `--tenant` wiped all of them. A push there now goes to one tenant: the prompt lists tenants only, a headless push without `--tenant` is refused, and so is `--tenant=main`.
