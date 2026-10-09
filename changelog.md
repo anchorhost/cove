@@ -38,6 +38,7 @@
 ### 🔒 Security & Bug Fixes
 
 * **`cove push` no longer overwrites a whole WP Freighter host:** a push replaces the remote's files and resets its database, and on a Freighter host that database and those files belong to every tenant at once. A push to such a host without `--tenant` wiped all of them. A push there now goes to one tenant: the prompt lists tenants only, a headless push without `--tenant` is refused, and so is `--tenant=main`.
+* **Mail sent from WP-CLI reaches Mailpit:** `cove wp` runs PHP with `~/Cove/php.ini`, which set no `sendmail_path`, so `wp_mail()` from the command line went to the system's `/usr/sbin/sendmail` instead of Cove's mail catcher. Where a mail server is set up, that could deliver for real. The file now points at the same mail wrapper the sites use; an existing install picks it up on its next `cove reload`.
 * **The dashboard's site filters match the full address:** the sites list and the site pickers in Logs and Files compared what you typed against the bare site name, so `anchor` found anchor.localhost but `anchor.localhost` found nothing. They now match the whole address, a pasted URL such as `https://anchor.localhost/wp-admin/` is cut down to its host first, and a match that spans the dot is highlighted as one.
 
 ## [2.2] - 2026-10-05
