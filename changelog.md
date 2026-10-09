@@ -24,7 +24,8 @@
 
 * **`cove demo` for recording without the rest of your sites:** `cove demo anchor cove-wp wpmanifest` narrows Cove to those sites until `cove demo off`. Nothing on disk changes.
     * The dashboard shows only them: the sites list and its summary, databases, logs, files and the ⌘K palette. Any action on another site is refused, and shared logs drop every entry that names one. Adminer lists only their databases, and `cove list` only them.
-    * Mail goes to a mailbox of its own while it's on. Mail the other sites send meanwhile is held back, and `cove demo off` delivers it to your real mailbox, which comes back untouched. Sites you create during the demo join it.
+    * Mail goes to a mailbox of its own while it's on, empty at the start of each demo. Mail the other sites send meanwhile is held back, including mail that only copies a demo site's address, and `cove demo off` delivers it to your real mailbox, which comes back untouched. If Mailpit isn't back on that mailbox yet, the held mail is kept and `cove demo off` can be run again to deliver it.
+    * Sites you create or clone during the demo join it, and a demo site you rename stays in it under its new name.
 
 * **`cove add <name> minn` creates a Minn Engine site:** it installs the latest WordPress as usual, then puts Minn Engine over it with the engine's own installer. The one-time login link at the end opens Minn Admin.
     * WordPress's own files are parked in `wp-parked/` beside `public/`. `wp-config.php`, `wp-content`, and the database stay as WordPress left them, so `wp minn eject` on the site turns it back into WordPress. Run it on the original: a clone, a renamed site, or an import doesn't carry `wp-parked/`, and Minn's install record still names the original's folders. `wp-parked/` is core files only, so it can't be served as a twin by itself.
