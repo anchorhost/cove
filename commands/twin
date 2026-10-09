@@ -25,28 +25,6 @@ twin_engine_of() {
     fi
 }
 
-# The domain is someone else's when a site, a mapping, or another twin
-# already answers on it.
-twin_domain_taken() {
-    local domain="$1" own_site="$2" path entry
-    [ -d "$SITES_DIR/$domain" ] && return 0
-    for path in "$SITES_DIR"/*; do
-        [ -d "$path" ] || continue
-        if [ -f "$path/mappings" ] && grep -Fxq "$domain" "$path/mappings"; then
-            return 0
-        fi
-        [ "$(basename "$path")" = "$own_site" ] && continue
-        if entry=$(site_twin "$path"); then
-            local other_domain other_folder other_as_site
-            IFS=$'\t' read -r other_domain other_folder other_as_site <<< "$entry"
-            if [ "$other_domain" = "$domain" ] || [ "$other_as_site" = "$domain" ]; then
-                return 0
-            fi
-        fi
-    done
-    return 1
-}
-
 cove_twin() {
     local site_name="" action="" domain="" folder="wp-reference" as_site="" format=""
     while [[ $# -gt 0 ]]; do
@@ -130,8 +108,9 @@ cove_twin() {
                 gum style --foreground red "❌ Error: A twin needs a domain of its own, not the site's."
                 exit 1
             fi
-            if twin_domain_taken "$domain" "$site_host"; then
-                gum style --foreground red "❌ Error: Another site already answers on '$domain'."
+            local owner
+            if owner=$(cove_domain_owner "$domain" "$site_dir"); then
+                gum style --foreground red "❌ Error: '$domain' already answers as $owner."
                 exit 1
             fi
             if [ -n "$as_site" ]; then
@@ -139,8 +118,8 @@ cove_twin() {
                     gum style --foreground red "❌ Error: Invalid --as-site domain '$as_site'." "It needs a hostname of its own, apart from the site's and the twin's."
                     exit 1
                 fi
-                if twin_domain_taken "$as_site" "$site_host"; then
-                    gum style --foreground red "❌ Error: Another site already answers on '$as_site'."
+                if owner=$(cove_domain_owner "$as_site" "$site_dir"); then
+                    gum style --foreground red "❌ Error: '$as_site' already answers as $owner."
                     exit 1
                 fi
             fi

@@ -41,6 +41,11 @@ cove_rename() {
         gum style --foreground red "❌ Error: A site named '$new_name.localhost' already exists."
         exit 1
     fi
+    local owner
+    if owner=$(cove_domain_owner "$new_name.localhost"); then
+        gum style --foreground red "❌ Error: '$new_name.localhost' already answers as $owner."
+        exit 1
+    fi
 
     echo "🔄 Renaming '$old_name.localhost' to '$new_name.localhost'..."
 

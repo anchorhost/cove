@@ -71,6 +71,11 @@ cove_clone() {
         gum style --foreground red "❌ Error: A site named '$new_name.localhost' already exists."
         exit 1
     fi
+    local owner
+    if owner=$(cove_domain_owner "$new_name.localhost"); then
+        gum style --foreground red "❌ Error: '$new_name.localhost' already answers as $owner."
+        exit 1
+    fi
 
     local is_wordpress=false
     [ -f "$source_dir/public/wp-config.php" ] && is_wordpress=true

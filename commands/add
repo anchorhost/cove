@@ -163,6 +163,11 @@ cove_add() {
         echo "⚠️ Site '$full_hostname' already exists."
         exit 1
     fi
+    local owner
+    if owner=$(cove_domain_owner "$full_hostname"); then
+        gum style --foreground red "❌ Error: '$full_hostname' already answers as $owner."
+        exit 1
+    fi
 
     # Resolve the PHP pin before creating anything so a failed brew install
     # leaves no half-made site behind.

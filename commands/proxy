@@ -92,6 +92,12 @@ cove_proxy_add() {
         exit 1
     fi
 
+    local owner
+    if owner=$(cove_domain_owner "$domain" "$proxy_file"); then
+        gum style --foreground red "❌ Error: '$domain' already answers as $owner."
+        exit 1
+    fi
+
     if [ -z "$target" ]; then
         require_interactive "The proxy target" "it positionally: cove proxy add <name> <domain> <target>"
         target=$(gum input --width 0 --placeholder "Target to proxy to (e.g., 127.0.0.1:4096)")

@@ -2810,6 +2810,47 @@ validate_twin_folder() {
     return 0
 }
 
+# Who already answers on a domain: Cove's own hosts, a site, a mapping, a
+# twin (or its as-site domain), or a `cove proxy`. Prints the owner and
+# returns 0, or returns 1 when the domain is free. Two server blocks for one
+# host make FrankenPHP refuse the whole Caddyfile ("ambiguous site
+# definition"), so everything that adds a domain asks here first. $2 is a
+# site directory or proxy file being replaced, which doesn't count.
+cove_domain_owner() {
+    local domain replacing="${2:-}" path name entry other_domain other_folder other_as_site proxy_file
+    domain=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$domain" in
+        cove.localhost|db.cove.localhost|mail.cove.localhost)
+            echo "Cove's dashboard"; return 0 ;;
+    esac
+    if [ -d "$SITES_DIR/$domain" ] && [ "$SITES_DIR/$domain" != "$replacing" ]; then
+        echo "the site $domain"; return 0
+    fi
+    for path in "$SITES_DIR"/*; do
+        [ -d "$path" ] || continue
+        name=$(basename "$path")
+        if [ -f "$path/mappings" ] && grep -Fixq "$domain" "$path/mappings"; then
+            echo "a mapping of $name"; return 0
+        fi
+        [ "$path" = "$replacing" ] && continue
+        if entry=$(site_twin "$path"); then
+            IFS=$'\t' read -r other_domain other_folder other_as_site <<< "$entry"
+            other_domain=$(printf '%s' "$other_domain" | tr '[:upper:]' '[:lower:]')
+            other_as_site=$(printf '%s' "$other_as_site" | tr '[:upper:]' '[:lower:]')
+            if [ "$other_domain" = "$domain" ] || [ "$other_as_site" = "$domain" ]; then
+                echo "the twin of $name"; return 0
+            fi
+        fi
+    done
+    for proxy_file in "$APP_DIR/proxies"/*; do
+        [ -f "$proxy_file" ] && [ "$proxy_file" != "$replacing" ] || continue
+        if [ "$(sed -n 's/^domain=//p' "$proxy_file" | head -1 | tr '[:upper:]' '[:lower:]')" = "$domain" ]; then
+            echo "the proxy $(basename "$proxy_file")"; return 0
+        fi
+    done
+    return 1
+}
+
 # The twin's server block: its folder as the docroot and the site's own
 # guards. PHP is told whose twin it is (COVE_TWIN_OF), and the prepended
 # bootstrap (create_whoops_bootstrap) configures WordPress for the twin's
@@ -2924,6 +2965,13 @@ regenerate_caddyfile() {
     if mailpit_auth=$(mailpit_ui_auth_header); then
         mailpit_auth_up="header_up Authorization \"$mailpit_auth\""
     fi
+    # The file being replaced, kept until the reload below takes the new one.
+    # A Caddyfile FrankenPHP cannot adapt (two sites claiming one domain) is
+    # put back with it, so the running config and the file on disk agree and
+    # the next restart still comes up.
+    local caddyfile_prev="$CADDYFILE_PATH.prev"
+    rm -f "$caddyfile_prev"
+    [ -f "$CADDYFILE_PATH" ] && cp -p "$CADDYFILE_PATH" "$caddyfile_prev"
     cat > "$CADDYFILE_PATH" <<- EOM
 {
 ${port_directives}    frankenphp {
@@ -3356,6 +3404,7 @@ EOM
         # root. Dropping sudo here keeps the caller (incl. the dashboard's
         # shell_exec) running as the invoking user.
         if "$CADDY_CMD" reload --config "$CADDYFILE_PATH" --address localhost:2019 &> "$LOGS_DIR/caddy-reload.log"; then
+            rm -f "$caddyfile_prev"
             echo "✅ Caddy configuration reloaded."
             # A changed config re-runs PHP module startup, and the parallel
             # extension re-installs its SIGSEGV handler with it (see
@@ -3363,6 +3412,19 @@ EOM
             # a plain reload of an unchanged config is a no-op here too.
             ( sleep 3; cove_signals apply --quiet >/dev/null 2>&1 ) &
             disown 2>/dev/null || true
+        elif grep -q 'adapting config' "$LOGS_DIR/caddy-reload.log"; then
+            # The new Caddyfile itself is invalid, so the on-disk binary
+            # refused it before the running server saw anything. A restart
+            # would read the same file, fail, and leave every site down. The
+            # running config is untouched: keep serving it, and put the file
+            # it came from back.
+            gum style --foreground red "❌ The new Caddyfile was not applied: $(grep -o 'adapting config.*' "$LOGS_DIR/caddy-reload.log" | head -1 | sed 's/^adapting config using caddyfile: //')"
+            if [ -f "$caddyfile_prev" ]; then
+                mv -f "$CADDYFILE_PATH" "$CADDYFILE_PATH.rejected"
+                mv -f "$caddyfile_prev" "$CADDYFILE_PATH"
+                echo "   Sites keep running on the previous configuration. The rejected file is $CADDYFILE_PATH.rejected."
+            fi
+            return 1
         else
             # A `caddy reload` adapts the Caddyfile with the *on-disk* binary
             # and POSTs that JSON at the *running* process. After
@@ -3382,6 +3444,7 @@ EOM
                 gum style --foreground red "❌ Caddy failed to restart. See $LOGS_DIR/caddy-process.log for details."
                 return 1
             fi
+            rm -f "$caddyfile_prev"
             echo "✅ Caddy restarted."
         fi
     else

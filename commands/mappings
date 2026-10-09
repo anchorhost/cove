@@ -52,6 +52,12 @@ cove_mappings() {
             exit 0
         fi
 
+        local owner
+        if owner=$(cove_domain_owner "$domain"); then
+            gum style --foreground red "❌ Error: '$domain' already answers as $owner."
+            exit 1
+        fi
+
         # Create file if not exists and append
         echo "$domain" >> "$mappings_file"
         echo "✅ Added mapping: $domain"
