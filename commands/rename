@@ -142,6 +142,12 @@ cove_rename() {
         echo "   - Custom Caddy directive file renamed."
     fi
 
+    # A demo site keeps its place in `cove demo` under the new name; the
+    # dashboard would otherwise hide it and refuse every action on it.
+    if [ -f "$COVE_DIR/demo" ] && grep -qx "$old_name" "$COVE_DIR/demo"; then
+        sed "s/^$old_name\$/$new_name/" "$COVE_DIR/demo" > "$COVE_DIR/demo.tmp" && mv "$COVE_DIR/demo.tmp" "$COVE_DIR/demo"
+    fi
+
     # --- Reload Server Configuration ---
     regenerate_caddyfile
 

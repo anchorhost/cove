@@ -4,6 +4,12 @@
 # other sites is held back (see write_sendmail_wrapper), so a recording shows
 # only what the demo sites send. Nothing on disk changes; `cove demo off`
 # puts the full view and the real mailbox back and delivers the held mail.
+# Is the running Mailpit on the demo mailbox? Its command line names the
+# database it opened (see write_mailpit_run_script).
+demo_mailbox_open() {
+    ps -eo args= 2>/dev/null | grep -E '(^|/)mailpit --database ' | grep -q 'mailpit-demo\.db'
+}
+
 cove_demo() {
     local demo_file="$COVE_DIR/demo"
     case "${1:-}" in
@@ -20,26 +26,45 @@ cove_demo() {
             return 0
             ;;
         off)
-            if [ ! -f "$demo_file" ]; then
+            # Mail the hidden sites sent meanwhile was held back; it is
+            # delivered to the real mailbox once Mailpit is back on it. Run
+            # again after a failed delivery, this retries what is left.
+            local held_dir="$COVE_DIR/cache/demo-held-mail" n=0 failed=0 held f i ready=0
+            held=$(ls "$held_dir"/*.eml 2>/dev/null | wc -l | tr -d ' ')
+            if [ ! -f "$demo_file" ] && [ "$held" = 0 ]; then
                 echo "Demo mode is already off."
                 return 0
             fi
-            rm -f "$demo_file"
-            install_mailpit_service >/dev/null
-            # Mail the hidden sites sent meanwhile was held back; deliver it
-            # to the real mailbox now that Mailpit is back on it.
-            local held_dir="$COVE_DIR/cache/demo-held-mail" n=0 f i
-            if ls "$held_dir"/*.eml >/dev/null 2>&1; then
-                for i in 1 2 3 4 5 6 7 8 9 10; do
-                    nc -z 127.0.0.1 1025 2>/dev/null && break
+            if [ -f "$demo_file" ]; then
+                rm -f "$demo_file"
+                install_mailpit_service >/dev/null
+            fi
+            if [ "$held" -gt 0 ]; then
+                # Wait for Mailpit to answer on the real mailbox: replaying
+                # into the demo one (a restart that didn't happen) would
+                # delete the held copies and leave the mail where the demo was.
+                for i in $(seq 1 20); do
+                    if nc -z 127.0.0.1 1025 2>/dev/null && ! demo_mailbox_open; then ready=1; break; fi
                     sleep 0.5
                 done
-                for f in "$held_dir"/*.eml; do
-                    mailpit sendmail -t -S 127.0.0.1:1025 < "$f" && rm -f "$f" && n=$((n + 1))
-                done
+                if [ "$ready" = 1 ]; then
+                    for f in "$held_dir"/*.eml; do
+                        if mailpit sendmail -t -S 127.0.0.1:1025 < "$f"; then
+                            rm -f "$f"; n=$((n + 1))
+                        else
+                            failed=$((failed + 1))
+                        fi
+                    done
+                else
+                    failed=$held
+                fi
             fi
             echo "✅ Demo mode is off. Every site is back, and so is your mail."
             [ "$n" -gt 0 ] && echo "   Delivered $n message$([ "$n" -eq 1 ] || echo s) held back during the demo."
+            if [ "$failed" -gt 0 ]; then
+                gum style --foreground yellow "⚠️  $failed held message$([ "$failed" -eq 1 ] || echo s) could not be delivered yet, so $([ "$failed" -eq 1 ] && echo "it stays" || echo "they stay") in $held_dir." "Check Mailpit with 'cove status', then run 'cove demo off' again."
+                return 1
+            fi
             return 0
             ;;
         -h|--help)
@@ -60,6 +85,10 @@ cove_demo() {
 
     local was_on=0
     [ -f "$demo_file" ] && was_on=1
+    # Each demo starts with an empty mailbox, not the last demo's mail
+    # (which may name sites this one hides). Mailpit has the real mailbox
+    # open while demo mode is off, so the demo one is free to go.
+    [ "$was_on" = 1 ] || rm -f "$COVE_DIR/mailpit-demo.db" "$COVE_DIR/mailpit-demo.db-wal" "$COVE_DIR/mailpit-demo.db-shm"
     printf '%s\n' "${names[@]}" > "$demo_file"
     # Mailpit picks its mailbox when it starts (see write_mailpit_run_script).
     [ "$was_on" = 1 ] || install_mailpit_service >/dev/null

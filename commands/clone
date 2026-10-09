@@ -182,6 +182,11 @@ cove_clone() {
     # --- Custom Caddy directives ---
     # Carried over so the clone behaves like its source. Directives can hardcode
     # the old hostname, so say so rather than letting it fail mysteriously.
+    # Made during `cove demo`: it joins the demo, like a site from `cove add`.
+    if [ -f "$COVE_DIR/demo" ] && ! grep -qx "$new_name" "$COVE_DIR/demo"; then
+        echo "$new_name" >> "$COVE_DIR/demo"
+    fi
+
     local source_conf="$CUSTOM_CADDY_DIR/$source_name.localhost"
     if [ -f "$source_conf" ]; then
         cp "$source_conf" "$CUSTOM_CADDY_DIR/$new_name.localhost"
