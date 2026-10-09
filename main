@@ -9215,7 +9215,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             siteSignalsHtml(site) {
                 const mail = this.siteMail[site.name] || 0;
                 const n = (v) => v >= 1000 ? (v / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : String(v);
-                return (mail ? '<span class="sl-sig mail" title="' + mail + ' unread message' + (mail === 1 ? '' : 's') + ' to @' + site.name + '.localhost"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="m2.5 4.5 5.5 4 5.5-4"/></svg>' + n(mail) + '</span>' : '')
+                return (mail ? '<span class="sl-sig mail" title="' + mail + ' unread message' + (mail === 1 ? '' : 's') + ' to @' + this.escapeHtml(site.name) + '.localhost"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="m2.5 4.5 5.5 4 5.5-4"/></svg>' + n(mail) + '</span>' : '')
                     + (site.php_errors ? '<span class="sl-sig err" title="' + site.php_errors + ' PHP error' + (site.php_errors === 1 ? '' : 's') + ' in debug.log in the last 24 hours"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5 14 13H2Z"/><path d="M8 6.5v3M8 11.2v.1"/></svg>' + site.php_errors + '</span>' : '');
             },
 
@@ -9263,9 +9263,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             siteButtonsHtml(site, more) {
                 const main = this.isWpLike(site)
-                    ? '<button type="button" class="sl-btn primary" data-act="login"' + (site.isLoggingIn ? ' disabled' : '') + ' title="One-time admin login for ' + site.name + '">' + (site.isLoggingIn ? 'opening…' : 'log in') + '</button>'
+                    ? '<button type="button" class="sl-btn primary" data-act="login"' + (site.isLoggingIn ? ' disabled' : '') + ' title="One-time admin login for ' + this.escapeHtml(site.name) + '">' + (site.isLoggingIn ? 'opening…' : 'log in') + '</button>'
                     : '<button type="button" class="sl-btn" data-act="open">open</button>';
-                return main + (more || '') + '<button type="button" class="sl-btn icon" data-act="menu" aria-label="More for ' + site.name + '" title="More (or right-click)"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/></svg></button>';
+                return main + (more || '') + '<button type="button" class="sl-btn icon" data-act="menu" aria-label="More for ' + this.escapeHtml(site.name) + '" title="More (or right-click)"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/></svg></button>';
             },
 
             siteStateClasses(site, base, inList) {
@@ -9287,8 +9287,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             siteRowHtml(site, q) {
                 const max = this._maxBytes || 1;
                 const w = site.size_bytes ? Math.max(3, Math.sqrt(site.size_bytes / max) * 100) : 0;
-                return '<div class="' + this.siteStateClasses(site, 'sl-row', true) + '" data-name="' + site.name + '">'
-                    + '<button type="button" class="sl-check" data-act="check" aria-label="Select ' + site.name + '" aria-pressed="' + this.checked.has(site.name) + '"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg></button>'
+                return '<div class="' + this.siteStateClasses(site, 'sl-row', true) + '" data-name="' + this.escapeHtml(site.name) + '">'
+                    + '<button type="button" class="sl-check" data-act="check" aria-label="Select ' + this.escapeHtml(site.name) + '" aria-pressed="' + this.checked.has(site.name) + '"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg></button>'
                     + '<span class="sl-thumb" data-shot="mini"></span>'
                     + '<span class="sl-who"><span class="sl-who-top">' + this.siteHostHtml(site, q) + this.siteOpenHtml(site) + this.sitePinHtml(site) + this.siteSignalsHtml(site) + '</span>' + this.siteFactsHtml(site) + '</span>'
                     + this.siteInsideHtml(site)
@@ -9300,7 +9300,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             siteCardHtml(site, q, shelf) {
-                return '<article class="' + this.siteStateClasses(site, 'sl-card', !shelf) + '" data-name="' + site.name + '">'
+                return '<article class="' + this.siteStateClasses(site, 'sl-card', !shelf) + '" data-name="' + this.escapeHtml(site.name) + '">'
                     + '<div class="sl-shot" data-shot="thumb">' + this.siteTypeHtml(site)
                     + '<div class="sl-card-acts">' + this.siteButtonsHtml(site, '<button type="button" class="sl-btn" data-act="files">files</button><button type="button" class="sl-btn" data-act="logs">logs</button>') + '</div></div>'
                     + '<div class="sl-card-body"><span class="sl-who-top">' + this.siteHostHtml(site, q) + this.siteOpenHtml(site) + (shelf ? '' : this.sitePinHtml(site)) + this.siteSignalsHtml(site) + '</span>'
@@ -9311,7 +9311,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             siteIdxHtml(site, q) {
                 const t = this.siteTypeInfo(site.type);
                 const v = site.type === 'Minn' ? site.minn_version : site.wp_version;
-                return '<div class="' + this.siteStateClasses(site, 'sl-idx', true) + '" data-name="' + site.name + '" title="' + this.escapeHtml(t.name + (v ? ' ' + v : '') + ' · changed ' + this.formatRelative(site.modified_at) + ' ago' + (site.size_bytes ? ' · ' + this.formatSize(site.size_bytes) : '')) + '">'
+                return '<div class="' + this.siteStateClasses(site, 'sl-idx', true) + '" data-name="' + this.escapeHtml(site.name) + '" title="' + this.escapeHtml(t.name + (v ? ' ' + v : '') + ' · changed ' + this.formatRelative(site.modified_at) + ' ago' + (site.size_bytes ? ' · ' + this.formatSize(site.size_bytes) : '')) + '">'
                     + '<i class="sl-tdot ' + t.cls + '" aria-hidden="true"></i>' + this.siteHostHtml(site, q) + this.sitePinHtml(site) + this.siteSignalsHtml(site) + '<span class="sl-age">' + this.formatRelative(site.modified_at) + '</span></div>';
             },
 
@@ -9349,7 +9349,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             // How many items a row of the current selection holds: 1 for
             // rows, the grid's column count for cards and the index.
             selectionColumns() {
-                const el = this.selectedName && document.querySelector('#siteGroups [data-name="' + this.selectedName + '"]');
+                const el = this.selectedName && document.querySelector('#siteGroups [data-name="' + CSS.escape(this.selectedName) + '"]');
                 const grid = el ? el.parentElement : null;
                 if (!grid || grid.classList.contains('sl-rows')) return this.layout === 'grid' && !el ? 4 : 1;
                 return getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length || 1;
@@ -15150,7 +15150,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             },
 
             scrollToSelection() {
-                const el = this.selectedName && document.querySelector('#siteGroups [data-name="' + this.selectedName + '"]');
+                const el = this.selectedName && document.querySelector('#siteGroups [data-name="' + CSS.escape(this.selectedName) + '"]');
                 if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
             },
 
