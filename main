@@ -2029,6 +2029,26 @@ EOM
     echo "$wrapper"
 }
 
+# The CLI side of the same: $PHP_INI_FILE (~/Cove/php.ini, PHPRC for wp-cli
+# and every other PHP Cove runs from a terminal) sets no sendmail_path, so
+# wp_mail() from `cove wp` went to /usr/sbin/sendmail, which can deliver for
+# real where a mail server is set up, instead of Mailpit. Points it at the
+# wrapper, touching only that one line of a file `cove memory` and `cove
+# opcache` also edit. Called by install, post-upgrade and every Caddyfile
+# regeneration, so an existing install picks it up on its next reload.
+ensure_cli_sendmail_path() {
+    local wrapper line
+    wrapper=$(write_sendmail_wrapper "$1") || return 0
+    line="sendmail_path = \"$wrapper\""
+    mkdir -p "$(dirname "$PHP_INI_FILE")"
+    touch "$PHP_INI_FILE"
+    grep -qxF "$line" "$PHP_INI_FILE" && return 0
+    if grep -qE '^[[:space:]]*sendmail_path[[:space:]]*=' "$PHP_INI_FILE"; then
+        grep -vE '^[[:space:]]*sendmail_path[[:space:]]*=' "$PHP_INI_FILE" > "$PHP_INI_FILE.tmp" && mv -f "$PHP_INI_FILE.tmp" "$PHP_INI_FILE"
+    fi
+    printf '%s\n' "$line" >> "$PHP_INI_FILE"
+}
+
 write_mailpit_run_script() {
     local script_path="$COVE_DIR/mailpit-run.sh"
     local mailpit_bin
@@ -2914,7 +2934,7 @@ ${port_directives}    frankenphp {
         # RAM so a 16 GB box does not get 32 ZTS workers compiling into
         # one OPcache arena.
         num_threads $(cove_ini_get num_threads "$(cove_num_threads)")
-        php_ini sendmail_path "$(write_sendmail_wrapper "$mailpit_path")"
+        php_ini sendmail_path "$(ensure_cli_sendmail_path "$mailpit_path"; echo "$APP_DIR/cove-sendmail.sh")"
         php_ini log_errors On
         php_ini display_errors Off
         php_ini error_log "$LOGS_DIR/errors.log"
@@ -16401,6 +16421,7 @@ main() {
             deploy_whoops
             create_whoops_bootstrap
             refresh_all_mu_plugins
+            ensure_cli_sendmail_path
             # The Adminer entry point and theme. The upgrade itself also calls
             # this, but from the old script still in memory, which writes the
             # old entry point (and, in earlier versions, fetched the theme from GitHub).
