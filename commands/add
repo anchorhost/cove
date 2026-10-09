@@ -42,7 +42,8 @@ cove_add() {
         case "$arg" in
             --plain)        plain_flag=true ;;
             --minn)         minn=true ;;
-            --minn=*)       minn=true; minn_zip="${arg#*=}" ;;
+            # The shell leaves a ~ after = alone, so expand it here.
+            --minn=*)       minn=true; minn_zip="${arg#*=}"; minn_zip="${minn_zip/#\~/$HOME}" ;;
             --no-reload)    no_reload_flag=true ;;
             --wp-version=*) flavor="${arg#*=}" ;;
             --php=*)        php_pin="${arg#*=}" ;;
