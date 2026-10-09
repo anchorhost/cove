@@ -6132,6 +6132,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             .sl-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem 0.6rem; }
             .sl-card-acts, .sl-keys, .sl-sort-label { display: none; }
             .sl-menu { right: auto; left: 0; }
+            .sl-menu small { display: none; }
             /* The nav's tabs, service dots and theme button don't fit one
                line on a phone: the tabs take their own scrolling line. */
             .nav { flex-wrap: wrap; row-gap: 0.75rem; }
