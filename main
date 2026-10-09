@@ -5765,8 +5765,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if ($only_missing && isset($sizes[$item])) continue;
                     if ($only_missing && microtime(true) - $t_start > 12) { $remaining++; continue; }
                     $out = []; $rc = 0;
+                    // du exits 1 when it meets one unreadable entry but still
+                    // prints the total of everything else. Keep that number:
+                    // dropping it left the site unmeasured, and walked again
+                    // on every dashboard load.
                     exec('du -sk ' . escapeshellarg($p) . ' 2>/dev/null', $out, $rc);
-                    if ($rc === 0 && !empty($out[0])) {
+                    if (!empty($out[0])) {
                         $parts = preg_split('/\s+/', trim($out[0]));
                         if (ctype_digit($parts[0] ?? '')) {
                             $sizes[$item] = ((int) $parts[0]) * 1024;
