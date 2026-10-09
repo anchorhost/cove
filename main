@@ -2772,6 +2772,15 @@ site_multisite_mode() {
     [ -f "$site_path/multisite" ] && cat "$site_path/multisite"
 }
 
+# Does the webroot at $1 run Minn Engine? The engine's own rule, as the
+# dashboard's cove_site_is_minn and `cove list` apply it: its install record,
+# or the engine with no WordPress loader beside it. A Minn site keeps
+# wp-config.php and a version.php naming the WordPress release it speaks,
+# so it passes every "is WordPress" file test.
+site_is_minn() {
+    [ -f "$1/.minn-install.php" ] || { [ -f "$1/minn/bootstrap.php" ] && [ ! -f "$1/wp-load.php" ]; }
+}
+
 # A site's twin (commands/twin): a second domain serving another folder of
 # the same site, the same database behind both, and optionally one more
 # domain that always answers as the site. Prints

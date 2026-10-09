@@ -68,6 +68,9 @@ cove_core_scan() {
             if ($item === "." || $item === "..") continue;
             $public = $sites_dir . "/" . $item . "/public";
             if (!is_file($public . "/wp-config.php")) continue;
+            // Minn Engine sites keep a version.php naming the WordPress
+            // release they speak; there is no WordPress core to update.
+            if (is_file($public . "/.minn-install.php") || (is_file($public . "/minn/bootstrap.php") && !is_file($public . "/wp-load.php"))) continue;
             $file = $public . "/wp-includes/version.php";
             if (!is_file($file)) continue;
             $head = @file_get_contents($file, false, null, 0, 4096);
@@ -199,6 +202,10 @@ cove_core() {
                 fi
                 if [ ! -f "$public_dir/wp-config.php" ]; then
                     gum style --foreground red "❌ Error: '$site.localhost' is not a WordPress site."
+                    exit 1
+                fi
+                if site_is_minn "$public_dir"; then
+                    gum style --foreground red "❌ Error: '$site.localhost' runs Minn Engine, which has no WordPress core to update." "Update the engine with its own tools instead."
                     exit 1
                 fi
                 source_config
