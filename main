@@ -5790,7 +5790,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             if ($only_missing) $sizes = array_intersect_key($sizes, array_flip(array_filter(scandir($sitedir), fn($i) => $i !== '.' && $i !== '..')));
             cove_write_size_cache($__cove_sizes_cache, $sizes);
-            echo json_encode(['success' => true, 'sites' => $sizes, 'remaining' => $remaining, 'updated_at' => time()]);
+            // The cache keeps every site; the answer names only what demo mode shows.
+            $shown = array_filter($sizes, fn($k) => !cove_demo_hides($user_home, $k), ARRAY_FILTER_USE_KEY);
+            echo json_encode(['success' => true, 'sites' => $shown, 'remaining' => $remaining, 'updated_at' => time()]);
             exit;
     }
 
