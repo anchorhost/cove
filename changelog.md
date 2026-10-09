@@ -22,6 +22,10 @@
     * Shift- or ⌘-click (or `x`) selects sites, and a bar offers pin and delete for all of them; each group has a select all. The right-click menu is the same, with icons, and its foot shows the `cove` command for the item under the pointer. The add-site form does the same for what it is about to create.
     * Disk sizes nobody measured fill themselves in the background. The dashboard and the Files editor now use Geist Mono, the brand's monospace.
 
+* **`cove demo` for recording without the rest of your sites:** `cove demo anchor cove-wp wpmanifest` narrows Cove to those sites until `cove demo off`. Nothing on disk changes.
+    * The dashboard shows only them: the sites list and its summary, databases, logs, files and the ⌘K palette. Any action on another site is refused, and shared logs drop every entry that names one. Adminer lists only their databases, and `cove list` only them.
+    * Mail goes to a mailbox of its own while it's on. Mail the other sites send meanwhile is held back, and `cove demo off` delivers it to your real mailbox, which comes back untouched. Sites you create during the demo join it.
+
 * **`cove add <name> minn` creates a Minn Engine site:** it installs the latest WordPress as usual, then puts Minn Engine over it with the engine's own installer. The one-time login link at the end opens Minn Admin.
     * WordPress's own files are parked in `wp-parked/` beside `public/`. `wp-config.php`, `wp-content`, and the database stay as WordPress left them, so `minn eject` turns the site back into WordPress.
     * `--minn` works as an alias, like `--plain`. `--minn=<url or path>` installs a release candidate or a local build instead of the latest release.
