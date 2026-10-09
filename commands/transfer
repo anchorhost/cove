@@ -1153,12 +1153,16 @@ transfer_probe_tenants() {
 }
 
 # The id of the tenant --tenant names: an id, a domain (a URL works too) or a
-# tenant's name, matched against probe rows. Empty when nothing matches.
+# tenant's name, matched against probe rows. Empty when nothing matches, and
+# one id per line when a domain or name is shared, so callers can refuse to
+# guess: a push to the wrong tenant replaces it.
 transfer_match_tenant() {
     printf '%s\n' "$1" | awk -F'\t' -v w="$2" '
         BEGIN { w = tolower(w); sub(/^[a-z]+:\/\//, "", w); sub(/\/.*$/, "", w); sub(/^www\./, "", w) }
         { d = tolower($2); sub(/^www\./, "", d) }
-        $1 == w || (d != "" && d == w) || ($3 != "" && tolower($3) == w) { print $1; exit }'
+        $1 == w { id = $1 }
+        (d != "" && d == w) || ($3 != "" && tolower($3) == w) { m[++n] = $1 }
+        END { if (id != "") print id; else for (i = 1; i <= n; i++) print m[i] }'
 }
 
 # "15 (cove.run), 16 (beckon.run), …" for error messages.

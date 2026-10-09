@@ -32,14 +32,14 @@ cove_pull() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --proxy-uploads) proxy_uploads=true; shift ;;
-            --tenant) arg_tenant="$2"; shift 2 ;;
+            --tenant) [ $# -ge 2 ] || log_error "--tenant needs a value."; arg_tenant="$2"; shift 2 ;;
             --tenant=*) arg_tenant="${1#*=}"; shift ;;
             --force|--yes|-y) force=true; shift ;;
-            --ssh)  arg_ssh="$2";  shift 2 ;;
+            --ssh)  [ $# -ge 2 ] || log_error "--ssh needs a value."; arg_ssh="$2";  shift 2 ;;
             --ssh=*)  arg_ssh="${1#*=}";  shift ;;
-            --path) arg_path="$2"; shift 2 ;;
+            --path) [ $# -ge 2 ] || log_error "--path needs a value."; arg_path="$2"; shift 2 ;;
             --path=*) arg_path="${1#*=}"; shift ;;
-            --site) arg_site="$2"; shift 2 ;;
+            --site) [ $# -ge 2 ] || log_error "--site needs a value."; arg_site="$2"; shift 2 ;;
             --site=*) arg_site="${1#*=}"; shift ;;
             -h|--help) display_command_help pull; exit 0 ;;
             *)
@@ -149,6 +149,8 @@ cove_pull() {
         tenant=$(transfer_match_tenant "$tenant_rows" "$arg_tenant")
         if [ -z "$tenant" ]; then
             log_error "No tenant '${arg_tenant}' on this host. Its tenants: $(transfer_list_tenants "$tenant_rows")."
+        elif [ "$(printf '%s\n' "$tenant" | grep -c .)" -gt 1 ]; then
+            log_error "'${arg_tenant}' names more than one tenant on this host (ids $(echo $tenant)). Pass the id instead."
         fi
     elif [ -z "$arg_tenant" ] && [ -n "$tenant_rows" ]; then
         if is_noninteractive; then
