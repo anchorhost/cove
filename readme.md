@@ -7,11 +7,11 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
 ## ✨ Features
 
   * **Simple CLI**: Manage everything from your terminal with a handful of short commands.
-  * **Web Dashboard**: A built-in GUI at `https://cove.localhost` with five views. **Sites** to view, filter, sort, add, and delete sites with one-click admin logins; **Mail**, an inbox of everything your sites send, scoped per site; **Databases**, a browser with in-place editing and a SQL console; **Logs**, PHP errors per site, `debug.log`, and access logs, live; and **Files**, a file manager and editor over each site's directory. Every view has a real URL.
+  * **Web Dashboard**: A built-in GUI at `https://cove.localhost` with five views. **Sites**, a summary of what your cove holds (plugins, themes, WordPress and PHP versions, disk) over a list grouped by when each site last changed, with filters like `plugin:woo` or `is:outdated`, pins, bulk actions, and one-click admin logins; **Mail**, an inbox of everything your sites send, scoped per site; **Databases**, a browser with in-place editing and a SQL console; **Logs**, PHP errors per site, `debug.log`, and access logs, live; and **Files**, a file manager and editor over each site's directory. Every view has a real URL.
   * **Automatic HTTPS**: Every site is served over HTTPS using Caddy's internal CA — no cert wrangling.
-  * **WordPress & Static Sites**: Spin up a fresh WordPress install — any version, nightly, or a multisite network — or a plain static site with one command.
+  * **WordPress & Static Sites**: Spin up a fresh WordPress install — any version, nightly, or a multisite network — a [Minn Engine](https://minn.run) site, or a plain static site with one command.
   * **Per-site PHP**: Pin any site to an older PHP (`cove php mysite 8.2`); it runs on a native php-fpm behind the same Caddy, with TLS, logs, and URLs unchanged.
-  * **WordPress Migration**: Pull a remote site down via SSH (`cove pull`) or push a local site up (`cove push`).
+  * **WordPress Migration**: Pull a remote site down via SSH (`cove pull`) or push a local site up (`cove push`), including a single tenant of a WP Freighter install (`--tenant`).
   * **Database Management**: Browse and edit any table from the dashboard, run SQL with `⌘↵`, plus Adminer with passwordless auto-login for exports and schema work. `cove db backup` snapshots every site; `cove db list` shows credentials.
   * **Email Catching**: Built-in Mailpit catches every outgoing email so you never risk sending a test to a real inbox. Read it in the dashboard, filtered by site, with reset and login links lifted out of each message — and nothing is ever pruned.
   * **Logs, Parsed**: The shared PHP error log, each site's `debug.log`, Caddy access logs, and the service logs, read backwards in chunks so size never matters, with repeats folded and stack traces a click away.
@@ -26,6 +26,7 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
   * **Instant Public Sharing**: `cove share` spins up a Cloudflare Tunnel so you can share a WIP site with a client in seconds.
   * **Hosts File Automation**: Cove manages `/etc/hosts` entries for you — no manual editing.
   * **Pretty Errors**: Whoops renders beautiful PHP error pages with stack traces and editor integration.
+  * **Demo Mode**: `cove demo mysite another` shows only those sites, with a mailbox of their own, across the dashboard, Adminer, and `cove list` while you record. `cove demo off` brings everything back.
   * **Health Check**: `cove health` diagnoses crashes, OPcache pressure, and on-disk hygiene, and recommends fixes without changing anything.
   * **Menu Bar App**: `cove menubar enable` adds a tiny companion showing service status at a glance — a native menu bar app on macOS, a system tray app on Linux desktops — with start/stop, one-click site open or admin login, and quick links.
   * **Custom Caddy Rules**: Per-site directives for reverse proxies, auth, headers, or anything else Caddy supports.
@@ -76,7 +77,7 @@ Cove provides a simple set of commands to manage your local environment.
 
 | Command | Description |
 | --- | --- |
-| `cove add <name> [flavor]` | Creates a new WordPress site (`<name>.localhost`). The optional flavor says what goes inside it: a version (`6.4.3`, `6.9-RC1`), `nightly`, `latest` (the default), or `plain` for a static site with no database. `--multisite` builds a subdirectory network, `--multisite=subdomain` a subdomain one (subsites get HTTPS automatically); `--php=<ver>` pins the PHP version. Every WordPress site is created with `WP_ENVIRONMENT_TYPE` set to `local` (so core and plugins that check `wp_get_environment_type()` treat it as a sandbox) and `WP_DEBUG_LOG` on, writing to `wp-content/debug.log`. |
+| `cove add <name> [flavor]` | Creates a new WordPress site (`<name>.localhost`). The optional flavor says what goes inside it: a version (`6.4.3`, `6.9-RC1`), `nightly`, `latest` (the default), `minn` for a Minn Engine site (the latest WordPress with the engine installed over it, WordPress's own files parked in `wp-parked/` for `wp minn eject`), or `plain` for a static site with no database. `--multisite` builds a subdirectory network, `--multisite=subdomain` a subdomain one (subsites get HTTPS automatically); `--php=<ver>` pins the PHP version. Every WordPress site is created with `WP_ENVIRONMENT_TYPE` set to `local` (so core and plugins that check `wp_get_environment_type()` treat it as a sandbox) and `WP_DEBUG_LOG` on, writing to `wp-content/debug.log`. |
 | `cove clone <source> <new-name>` | Copies a site — files, database, and custom Caddy rules — under a new name, rewriting stored URLs to the new domain. Uses a copy-on-write clone on APFS and btrfs, so it's fast and the two copies share disk until one is written to. |
 | `cove delete <name> [--force]` | Deletes a site's directory and its associated database. |
 | `cove rename <old-name> <new-name>` | Renames a site, its directory, database, and runs `wp search-replace` so stored URLs (siteurl, home, serialized content) all update to the new domain. |
@@ -99,9 +100,9 @@ Cove provides a simple set of commands to manage your local environment.
 
 | Command | Description |
 | --- | --- |
-| `cove pull [--proxy-uploads]` | Pulls a remote WordPress site into Cove via SSH. Use `--proxy-uploads` to proxy media instead of downloading. |
-| `cove push` | Pushes a local Cove site to a remote WordPress site via SSH. |
-| `cove transfer probe [site]` | Reports which tools the backup/restore engine behind `pull` and `push` will use on a host. The engine degrades gracefully — zip, then tar, then PHP; mysqldump, or WordPress's own `$wpdb` when there is no MySQL client. |
+| `cove pull [--proxy-uploads] [--tenant <id\|domain>]` | Pulls a remote WordPress site into Cove via SSH. Use `--proxy-uploads` to proxy media instead of downloading. On a WP Freighter host, `--tenant` (or the picker) pulls one tenant: its tables, its own files, and the core it runs on. |
+| `cove push [--tenant <id\|domain>]` | Pushes a local Cove site to a remote WordPress site via SSH. On a WP Freighter host it always goes to one tenant, replacing only that tenant's tables and own folder; a push over the whole install is refused. |
+| `cove transfer probe [site] [--tenant=<id>]` | Reports which tools the backup/restore engine behind `pull` and `push` will use on a host. The engine degrades gracefully — zip, then tar, then PHP; mysqldump, or WordPress's own `$wpdb` when there is no MySQL client. |
 
 ### Services
 
@@ -131,6 +132,7 @@ For browsing and editing, the dashboard's **databases** view lists every databas
 | `cove memory [set <value>]` | Audits `memory_limit` across Cove's ini, the FrankenPHP web server, and every `php` on your PATH. `set 2G` bumps Cove's ini and offers to update each Homebrew/system ini. |
 | `cove directive <add\|update\|delete\|list> [site]` | Manages custom Caddyfile rules for a specific site. |
 | `cove mappings <site> [add\|remove] [domain]` | Manages additional domain mappings for a site. A leading `*.` (quote it: `'*.mysite.localhost'`) answers on every subdomain. Also in the dashboard under a site's **Domains…** menu item. |
+| `cove twin <site> [add\|remove] [--domain=…] [--root=…] [--as-site=…]` | Serves another folder of a site, on the same database, at a domain of its own (`wp.<site>.localhost` by default). Built for Minn Engine's test sites, which keep a complete reference WordPress in `wp-reference/`: the engine answers at the site's address and WordPress at the twin's. `--as-site` adds a domain that answers as the site itself, for comparing the two request for request. |
 | `cove proxy <add\|list\|delete>` | Manages standalone reverse proxy entries in the Caddyfile. |
 
 ### Network Access
@@ -150,6 +152,7 @@ For browsing and editing, the dashboard's **databases** view lists every databas
 | `cove trust` | Installs Cove's local root certificate into the system trust store and every browser certificate database it can find: Chrome/Chromium/Brave/Edge's shared `~/.pki/nssdb`, Firefox profiles, snap and Flatpak browsers. Fresh installs run it automatically; re-run any time the root rotates. |
 | `cove upgrade` | Upgrades Cove, FrankenPHP, and Adminer to the latest versions, and refreshes the managed bits (Whoops, the login helper, the watchdog) across every site. |
 | `cove version` | Displays the current version of Cove. |
+| `cove demo <site>… \| off` | Narrows Cove to the sites you name, for recording a demo: the dashboard, Adminer's database list, and `cove list` show only them, and mail goes to a mailbox of its own (other sites' mail is held and delivered by `cove demo off`). Nothing on disk changes. |
 
 *You can get help for any command by running `cove <command> --help`.*
 
