@@ -14,7 +14,8 @@
 #  The box (override with COVE_TEST_BOX) hosts six Incus containers, each with
 #  a "baseline" snapshot (clean OS + curl). Lanes:
 #    A (all six):      fresh --dev install → add/clone/rename/login/delete →
-#                      status/health/mailpit → container reboot survival
+#                      status/health/mailpit → mail from a page and WP-CLI →
+#                      container reboot survival
 #    B (one apt/dnf):  previous GitHub release → candidate + post-upgrade
 #    C (one apt/dnf):  install + add as a non-root sudo user
 # ====================================================
@@ -187,7 +188,7 @@ lane_a() {
             res "$c" install PASS
         else
             res "$c" install FAIL
-            for k in add_latest add_pinned add_plain clone rename login delete status health mailpit reboot; do res "$c" "$k" SKIP; done
+            for k in add_latest add_pinned add_plain clone rename login delete status health mailpit mail reboot; do res "$c" "$k" SKIP; done
             return
         fi
 
@@ -243,6 +244,29 @@ lane_a() {
             res "$c" mailpit PASS
         else
             res "$c" mailpit FAIL
+        fi
+
+        # Mail reaches Mailpit from a page and from WP-CLI. Both go through
+        # Cove's sendmail wrapper (FrankenPHP's php_ini, and ~/Cove/php.ini
+        # for the CLI), which nothing above exercises.
+        if cx "$c" bash -s <<'MAILCHECK'
+set -e
+pub=/root/Cove/Sites/alpha.localhost/public
+cove wp alpha eval 'wp_mail("cli@matrix.test", "matrix cli", "x");' >/dev/null 2>&1
+printf '%s\n' '<?php require __DIR__ . "/wp-load.php"; echo wp_mail("web@matrix.test", "matrix web", "x") ? "sent" : "failed";' > "$pub/matrix-mail.php"
+curl -sk --max-time 30 https://alpha.localhost/matrix-mail.php | grep -q sent
+rm -f "$pub/matrix-mail.php"
+for i in 1 2 3 4 5 6; do
+    r=$(curl -sk --max-time 10 "https://mail.cove.localhost/api/v1/search?query=matrix")
+    if echo "$r" | grep -q "matrix cli" && echo "$r" | grep -q "matrix web"; then exit 0; fi
+    sleep 2
+done
+exit 1
+MAILCHECK
+        then
+            res "$c" mail PASS
+        else
+            res "$c" mail FAIL
         fi
 
         incus restart "$c"; sleep 25
