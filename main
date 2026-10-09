@@ -8331,7 +8331,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             filterTokens() {
                 return (String(this.filter || '').trim().toLowerCase().match(/[a-z]+:"[^"]*"?|\S+/g) || []).map(tok => {
                     const m = tok.match(/^(type|is|has|plugin|theme|php|wp):(.*)$/);
-                    return m ? { key: m[1], value: m[2].replace(/^"|"$/g, ''), exact: m[2].startsWith('"') } : { word: tok };
+                    // Exact only once the quote is closed, so a name still
+                    // being typed (theme:"twenty) matches as it grows.
+                    return m ? { key: m[1], value: m[2].replace(/^"|"$/g, ''), exact: m[2].length > 1 && m[2].startsWith('"') && m[2].endsWith('"') } : { word: tok };
                 });
             },
 
@@ -8354,7 +8356,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                         if (v === 'preview') return !!s.shot_mtime;
                         if (v === 'twin') return !!s.twin;
                         return false;
-                    case 'plugin': return !!card && (card.pl || []).some(p => exact ? p === v : p.includes(v));
+                    // Slugs keep their case (LayerSlider); the filter is lowercased.
+                    case 'plugin': return !!card && (card.pl || []).some(p => { const l = String(p).toLowerCase(); return exact ? l === v : l.includes(v); });
                     case 'theme': return !!card && !!card.theme && (exact ? card.theme.toLowerCase() === v : card.theme.toLowerCase().includes(v));
                     case 'php': return (s.php_version || '') === v;
                     // Exact (wp:7.1 is 7.1, not 7.1.3); wp:6.* or wp:6.x for a branch.
