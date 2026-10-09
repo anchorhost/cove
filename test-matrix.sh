@@ -284,15 +284,22 @@ lane_b() { # previous release -> candidate + post-upgrade
         restore "$c"
         incus file push "$SRC/install-cove.sh" "$c/root/install-cove.sh"
         # Install the PREVIOUS (latest published) release via the fixed installer
-        if cx "$c" bash -c 'curl -fsSL https://github.com/anchorhost/cove/releases/latest/download/cove.sh -o /root/cove.sh' \
-            && cx "$c" bash /root/install-cove.sh --dev \
-            && cx "$c" cove add u1 && site_has "$c" u1 "Welcome to u1"; then
-            res "$c" upgrade_prev PASS
-        else
+        if ! cx "$c" bash -c 'curl -fsSL https://github.com/anchorhost/cove/releases/latest/download/cove.sh -o /root/cove.sh' \
+            || ! cx "$c" bash /root/install-cove.sh --dev; then
             res "$c" upgrade_prev FAIL
             res "$c" upgrade_post SKIP
             res "$c" upgrade_site SKIP
             return
+        fi
+        # A release that can't make a site still gets upgraded: that user is
+        # exactly who the candidate has to rescue (v2.2 on FrankenPHP 1.13.0,
+        # whose php-cli broke WP-CLI). The candidate then makes the site.
+        local prev_made_site=true
+        if cx "$c" cove add u1 && site_has "$c" u1 "Welcome to u1"; then
+            res "$c" upgrade_prev PASS
+        else
+            res "$c" upgrade_prev FAIL
+            prev_made_site=false
         fi
         # Drop the candidate in place and run its post-upgrade hook —
         # the same sequence cove upgrade performs after downloading.
@@ -302,6 +309,7 @@ lane_b() { # previous release -> candidate + post-upgrade
         else
             res "$c" upgrade_post FAIL
         fi
+        $prev_made_site || cx "$c" cove add u1
         if site_has "$c" u1 "Welcome to u1"; then
             res "$c" upgrade_site PASS
         else
