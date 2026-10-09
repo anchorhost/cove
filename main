@@ -2010,17 +2010,27 @@ fi
 msg=\$(mktemp "\${TMPDIR:-/tmp}/cove-mail.XXXXXX") || exec "\$mailpit_bin" sendmail -t -S 127.0.0.1:1025 "\$@"
 cat > "\$msg"
 # Every host named in the headers (up to the first blank line) or the args.
-hosts=\$( { sed -n '1,/^\$/p;/^\r\$/q' "\$msg"; printf '%s\n' "\$@"; } | grep -oiE '@[a-z0-9.-]+' | tr 'A-Z' 'a-z' | cut -c2-)
-while IFS= read -r site; do
-    site=\$(printf '%s' "\$site" | tr -d '[:space:]')
-    [ -n "\$site" ] || continue
-    if printf '%s\n' "\$hosts" | grep -qE "(^|\\.)\${site}\\.localhost\$"; then
-        "\$mailpit_bin" sendmail -t -S 127.0.0.1:1025 "\$@" < "\$msg"
-        rc=\$?
-        rm -f "\$msg"
-        exit \$rc
-    fi
-done < "\$demo_file"
+hosts=\$( { sed -n '1,/^\$/p;/^\r\$/q' "\$msg"; printf '%s\n' "\$@"; } | grep -oiE '@[a-z0-9.-]+' | tr 'A-Z' 'a-z' | cut -c2- | sort -u)
+# Delivered when it names a demo site and no other local one: a hidden
+# site's mail that only copies a demo address would still show its sender
+# and subject on screen.
+ours=0 theirs=0
+while IFS= read -r host; do
+    case "\$host" in *.localhost) ;; *) continue ;; esac
+    hit=0
+    while IFS= read -r site; do
+        site=\$(printf '%s' "\$site" | tr -d '[:space:]')
+        [ -n "\$site" ] || continue
+        case "\$host" in "\$site.localhost"|*".\$site.localhost") hit=1; break ;; esac
+    done < "\$demo_file"
+    if [ "\$hit" = 1 ]; then ours=1; else theirs=1; fi
+done <<< "\$hosts"
+if [ "\$ours" = 1 ] && [ "\$theirs" = 0 ]; then
+    "\$mailpit_bin" sendmail -t -S 127.0.0.1:1025 "\$@" < "\$msg"
+    rc=\$?
+    rm -f "\$msg"
+    exit \$rc
+fi
 mkdir -p "\$held_dir" && chmod 700 "\$held_dir"
 mv "\$msg" "\$held_dir/\$(date +%Y%m%d-%H%M%S)-\$\$.eml"
 exit 0
