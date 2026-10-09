@@ -5971,8 +5971,21 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         .sl-seg button:hover { color: var(--text); }
         .sl-seg button[aria-pressed="true"] { color: var(--accent); background: var(--bg-sunk); }
         .sl-seg svg { width: 16px; height: 16px; }
-        .sl-sort { display: inline-flex; align-items: center; gap: 0.5rem; height: 2.6rem; padding: 0 0.6rem 0 0.75rem; border: 1px solid var(--hairline); border-radius: 8px; background: var(--panel); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.78rem; }
-        .sl-sort select { border: 0; background: transparent; color: var(--text); font: inherit; font-weight: 500; outline: 0; cursor: pointer; }
+        /* Sort: a button and the dashboard's own menu, not a native <select>,
+           whose OS-drawn list ignores the theme. */
+        .sl-sort { position: relative; }
+        .sl-sort-btn { display: inline-flex; align-items: center; gap: 0.5rem; height: 2.6rem; padding: 0 0.65rem 0 0.75rem; border: 1px solid var(--hairline); border-radius: 8px; background: var(--panel); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.78rem; cursor: pointer; }
+        .sl-sort-btn:hover, .sl-sort-btn[aria-expanded="true"] { border-color: var(--panel-border); }
+        .sl-sort-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+        .sl-sort-value { color: var(--text); font-weight: 500; }
+        .sl-sort-btn > svg { width: 12px; height: 12px; transition: transform 140ms; }
+        .sl-sort-btn[aria-expanded="true"] > svg { transform: rotate(180deg); }
+        .sl-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; min-width: 100%; width: max-content; padding: 0.3rem; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px; box-shadow: var(--shadow-pop); }
+        .sl-menu button { display: flex; align-items: center; gap: 0.55rem; width: 100%; padding: 0.45rem 0.65rem 0.45rem 0.5rem; border: 0; border-radius: var(--radius-md); background: none; color: var(--text); font-family: var(--font-mono); font-size: 0.8rem; text-align: left; cursor: pointer; }
+        .sl-menu button:hover, .sl-menu button:focus-visible { background: var(--panel-hover); outline: 0; }
+        .sl-menu button svg { width: 13px; height: 13px; flex: none; fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; opacity: 0; }
+        .sl-menu button[aria-selected="true"] svg { opacity: 1; }
+        .sl-menu small { margin-left: auto; padding-left: 1.25rem; font-size: 0.7rem; color: var(--text-faint); }
         .pill.sl-new { height: 2.6rem; padding: 0 1rem; }
         .sl-chips { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.6rem; }
         .sl-chip { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.28rem 0.7rem; border: 1px solid var(--hairline); border-radius: 999px; background: var(--panel); color: var(--text-dim); font: 500 0.78rem/1.3 var(--font-sans); cursor: pointer; }
@@ -6117,7 +6130,8 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             .sl-row .sl-check, .sl-row .sl-inside, .sl-row .sl-acts { display: none; }
             .sl-thumb { width: 52px; }
             .sl-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem 0.6rem; }
-            .sl-card-acts, .sl-keys, .sl-sort span { display: none; }
+            .sl-card-acts, .sl-keys, .sl-sort-label { display: none; }
+            .sl-menu { right: auto; left: 0; }
             /* The nav's tabs, service dots and theme button don't fit one
                line on a phone: the tabs take their own scrolling line. */
             .nav { flex-wrap: wrap; row-gap: 0.75rem; }
@@ -6911,14 +6925,18 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="0.8"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="0.8"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="0.8"/><rect x="9" y="9" width="4.5" height="4.5" rx="0.8"/></svg>
                         </button>
                     </div>
-                    <label class="sl-sort" for="sortSelect"><span>sort</span>
-                        <select id="sortSelect">
-                            <option value="modified">recently changed</option>
-                            <option value="name">name</option>
-                            <option value="size">size</option>
-                            <option value="type">type</option>
-                        </select>
-                    </label>
+                    <div class="sl-sort">
+                        <button type="button" class="sl-sort-btn" id="sortBtn" aria-haspopup="listbox" aria-expanded="false" aria-controls="sortMenu">
+                            <span class="sl-sort-label">sort</span><span class="sl-sort-value" id="sortValue">recently changed</span>
+                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                        </button>
+                        <div class="sl-menu" id="sortMenu" role="listbox" aria-label="Sort sites by" style="display: none;">
+                            <button type="button" role="option" data-sort="modified"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg>recently changed<small>newest first</small></button>
+                            <button type="button" role="option" data-sort="name"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg>name<small>a → z</small></button>
+                            <button type="button" role="option" data-sort="size"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg>size<small>largest first</small></button>
+                            <button type="button" role="option" data-sort="type"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg>type<small>wp, minn, static</small></button>
+                        </div>
+                    </div>
                     <button class="pill primary sl-new" id="btnToggleAdd">+ add site</button>
                 </div>
                 <div class="sl-chips" id="slChips" role="group" aria-label="Quick filters"></div>
@@ -8457,7 +8475,46 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                     }
                 });
                 $id('btnFilterClear').addEventListener('click', (e) => { e.preventDefault(); this.clearAllFilters(); filterInput.focus(); });
-                $id('sortSelect').addEventListener('change', (e) => this.setSort(e.target.value));
+                // Sort menu: click or ↓/Enter/Space opens it; ↑↓ move, Enter or
+                // Space picks, Esc or Tab closes; a click elsewhere closes it.
+                const sortBtn = $id('sortBtn'), sortMenu = $id('sortMenu');
+                const sortItems = () => [...sortMenu.querySelectorAll('[data-sort]')];
+                const openSort = (focusIt) => {
+                    show(sortMenu, true);
+                    sortBtn.setAttribute('aria-expanded', 'true');
+                    if (focusIt) (sortItems().find(b => b.dataset.sort === this.sort) || sortItems()[0]).focus();
+                };
+                const closeSort = (refocus) => {
+                    if (sortMenu.style.display === 'none') return;
+                    show(sortMenu, false);
+                    sortBtn.setAttribute('aria-expanded', 'false');
+                    if (refocus) sortBtn.focus();
+                };
+                sortBtn.addEventListener('click', (e) => { sortMenu.style.display === 'none' ? openSort(e.detail === 0) : closeSort(false); });
+                sortBtn.addEventListener('keydown', (e) => {
+                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); e.stopPropagation(); openSort(true); }
+                    else if (e.key === 'Escape' && sortMenu.style.display !== 'none') { e.preventDefault(); e.stopPropagation(); closeSort(true); }
+                });
+                sortMenu.addEventListener('click', (e) => {
+                    const b = e.target.closest('[data-sort]');
+                    if (!b) return;
+                    closeSort(true);
+                    this.setSort(b.dataset.sort);
+                });
+                sortMenu.addEventListener('keydown', (e) => {
+                    const items = sortItems();
+                    const i = items.indexOf(document.activeElement);
+                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { items[(i + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length].focus(); }
+                    else if (e.key === 'Home') items[0].focus();
+                    else if (e.key === 'End') items[items.length - 1].focus();
+                    else if (e.key === 'Escape') closeSort(true);
+                    else if (e.key === 'Tab') { closeSort(false); return; }
+                    else if (e.key !== 'Enter' && e.key !== ' ') return;
+                    else { e.preventDefault(); e.stopPropagation(); if (i >= 0) { closeSort(true); this.setSort(items[i].dataset.sort); } return; }
+                    e.preventDefault();
+                    e.stopPropagation();
+                });
+                document.addEventListener('click', (e) => { if (!e.target.closest('.sl-sort')) closeSort(false); });
                 $id('slChips').addEventListener('click', (e) => { const b = e.target.closest('[data-chip]'); if (b) this.setChip(b.dataset.chip); });
                 // The full plugins / themes / versions list.
                 const insideSearch = $id('insideSearch');
@@ -8747,7 +8804,9 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
             renderChrome() {
                 $id('btnToggleAdd').textContent = this.adding ? 'cancel' : '+ add site';
                 document.querySelectorAll('#layoutToggle [data-layout]').forEach(b => b.setAttribute('aria-pressed', b.dataset.layout === this.layout ? 'true' : 'false'));
-                $id('sortSelect').value = this.sort;
+                const sortNames = { modified: 'recently changed', name: 'name', size: 'size', type: 'type' };
+                $id('sortValue').textContent = sortNames[this.sort] || sortNames.modified;
+                $id('sortMenu').querySelectorAll('[data-sort]').forEach(b => b.setAttribute('aria-selected', b.dataset.sort === this.sort ? 'true' : 'false'));
 
                 // Filter box + quick filters. A chip shows only when it would
                 // match something, or is the one in use.
