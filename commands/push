@@ -148,9 +148,15 @@ cove_push() {
     # to the install replaces its files and empties its database: every
     # tenant would go with it. So on such a host a push goes to one tenant,
     # and only that tenant's tables and own folder are replaced.
-    local tenant="" tenant_rows
+    local tenant="" tenant_rows freighter_host
     tenant_rows=$(transfer_probe_tenants "$remote_probe")
-    if [ -n "$tenant_rows" ]; then
+    # Read from the host's files rather than through WordPress, so a host
+    # whose tenant list could not be read (PHP failed, /tmp full) is still
+    # known for what it is and refused instead of pushed over whole.
+    freighter_host=$(echo "$remote_probe" | sed -n 's/^freighter_host=//p')
+    if [ -z "$tenant_rows" ] && [ "$freighter_host" = y ]; then
+        log_error "${remote_url} runs WP Freighter, but its tenant sites could not be listed, and a push to the whole install would replace every one of them. Nothing was changed."
+    elif [ -n "$tenant_rows" ]; then
         local tenant_count
         tenant_count=$(printf '%s\n' "$tenant_rows" | grep -c .)
         if [ "$arg_tenant" = main ]; then
@@ -258,8 +264,12 @@ cove_push() {
 
     # --- 7. Remote Restore ---
     log_step "Restoring backup on remote server..."
+    # Without a tenant, the helper re-checks the host's files and refuses a
+    # WP Freighter install itself, whatever the probe said.
+    local refuse_flag=""
+    [ -z "$tenant" ] && refuse_flag="--refuse-freighter"
     if ! transfer_remote "$ssh_opts" "$remote_ssh" restore "$remote_path" "$remote_tmp" \
-            --url-to="$remote_url" --keep="$cove_helper" $tenant_flag $wp_cli_flag; then
+            --url-to="$remote_url" --keep="$cove_helper" $tenant_flag $refuse_flag $wp_cli_flag; then
         rm -f "$backup_path"
         ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
         log_error "The remote restore failed."

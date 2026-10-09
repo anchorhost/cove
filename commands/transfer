@@ -31,7 +31,7 @@ cat << 'COVE_TRANSFER_HELPER'
 #   probe   <site_dir>                     report tool capabilities as key=value
 #   backup  <site_dir> [--exclude=GLOB]... [--only-prefix]
 #                                          create an archive, print its path
-#   restore <site_dir> <archive> [--url-to=URL] [--keep=PATH]...
+#   restore <site_dir> <archive> [--url-to=URL] [--keep=PATH]... [--refuse-freighter]
 #
 # All three take --tenant=<id> to work on one WP Freighter tenant of the
 # install at <site_dir> rather than the install itself: its stacked_<id>_
@@ -55,6 +55,7 @@ DB_LOAD=""       # native | php
 WP_CLI_PHAR=""   # optional sideloaded phar path (--wp-cli=)
 TENANT=""        # WP Freighter tenant id (--tenant=), exported as STACKED_SITE_ID
 ONLY_PREFIX=false  # dump only the tables under the site's own prefix (--only-prefix)
+REFUSE_FREIGHTER=false  # a whole-site restore refuses a WP Freighter host (--refuse-freighter)
 
 log()  { [ "${QUIET:-false}" = true ] || echo "$@" >&2; }
 die()  { echo "cove-transfer: $*" >&2; exit 1; }
@@ -405,6 +406,15 @@ WP_CLI::log( "Renamed {$from}user_roles and {$from}* user meta to $to." );
 PHPKEYS
 }
 
+# Does the install at $1 run WP Freighter? Read from the files, not through
+# PHP, so the answer holds when WordPress fails to boot: push uses it to
+# refuse a whole-install restore that would take every tenant with it.
+is_freighter_host() {
+    local cfg="$1/wp-config.php"
+    [ -f "$cfg" ] || cfg="$(dirname "$1")/wp-config.php"
+    [ -f "$1/wp-content/freighter.php" ] || grep -q 'freighter\.php' "$cfg" 2>/dev/null
+}
+
 # Boot the site at $1 once (as the tenant, when --tenant exported
 # STACKED_SITE_ID) and keep its facts in FACTS.
 FACTS=""
@@ -529,6 +539,7 @@ cmd_probe() {
     echo "php=$(have php && echo y || echo n)"
     if [ -n "$site_dir" ] && [ -d "$site_dir" ]; then
         echo "home=$($WP option get home --path="$site_dir" --skip-plugins --skip-themes 2>/dev/null)"
+        echo "freighter_host=$(is_freighter_host "$site_dir" && echo y || echo n)"
         # Prefix, folders, URLs and WP Freighter's tenant list (tenant=<id>
         # TAB <domain> TAB <name>), so pull and push can offer the tenants.
         if load_facts "$site_dir"; then
@@ -870,6 +881,13 @@ cmd_restore() {
     if [ ! -f "$site_dir/wp-config.php" ] && [ ! -f "$site_dir/wp-load.php" ] && [ ! -d "$site_dir/wp-includes" ]; then
         die "Refusing to restore over $site_dir: it does not look like a WordPress install."
     fi
+    # Push asks for this: replacing a WP Freighter install replaces every
+    # tenant on it. Checked from the files, so a host whose tenant list could
+    # not be read is still refused. (Pull does not ask: a whole host pulled
+    # into Cove is restored over Cove's own copy of it.)
+    if [ -z "$TENANT" ] && $REFUSE_FREIGHTER && is_freighter_host "$site_dir"; then
+        die "Refusing to restore over $site_dir: it runs WP Freighter, and the whole install holds every tenant's files and tables. Restore one tenant with --tenant=<id>. Nothing was changed."
+    fi
     # A tenant is checked before anything is unpacked.
     if [ -n "$TENANT" ]; then
         load_facts "$site_dir" || die "WordPress did not boot as tenant $TENANT. Does it exist on this host?"
@@ -1040,6 +1058,7 @@ for a in "$@"; do
         --wp-cli=*) WP_CLI_PHAR="${a#--wp-cli=}" ;;
         --tenant=*) TENANT="${a#--tenant=}" ;;
         --only-prefix) ONLY_PREFIX=true ;;
+        --refuse-freighter) REFUSE_FREIGHTER=true ;;
         *)          ARGS+=("$a") ;;
     esac
 done
