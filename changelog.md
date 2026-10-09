@@ -32,7 +32,7 @@
     * The engine is downloaded and checked before anything is created, so a missing release or a bad zip costs nothing. A plain site, a pinned or nightly WordPress, a multisite network, or PHP older than 8.2 is refused up front.
 
 * **The dashboard knows Minn Engine sites:** they get a MINN pill of their own, in the coral that sits beside Cove's teal, with the engine's version beside it (the WordPress release it speaks is in the tooltip), and a type filter of their own. The site page says Minn Engine and logs in to Minn Admin. Sign-in, the database, and the plugins, themes, users, cron, history, snapshots, traffic, and wp-cli tabs all work on them.
-    * A site counts as Minn by the engine's own rule: its install record (`.minn-install.php`) at the webroot, or the engine there without WordPress's loader. `cove list` shows those sites as `Minn`, and its JSON carries `minn_version`.
+    * A site counts as Minn by the engine's own rule: its install record (`.minn-install.php`) at the webroot, or the engine there without WordPress's loader. `cove list` shows those sites as `Minn`, and its JSON carries `minn_version`. `cove core check` and `cove core update --all` leave them out, since there is no WordPress core in them to update, and `cove core update <site>` refuses one.
     * The add-site form offers Minn Engine beside `latest` and `nightly` once a release is out: it asks GitHub for the latest release when the form opens and lists the option only when that release carries `minn.zip`.
 
 ### 🔒 Security & Bug Fixes
