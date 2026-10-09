@@ -1,8 +1,10 @@
 # A twin: a second domain that serves another folder of the same site, the
-# same database behind both. Built for sites that run Minn Engine, which
-# parks WordPress in wp-reference/ beside the engine in public/:
+# same database behind both. Built for Minn Engine's test sites, which keep
+# a complete WordPress in wp-reference/ beside the engine in public/ (the
+# parked core, a copy of wp-config.php, wp-content linked back to public/):
 # minn.localhost answers through Minn and wp.minn.localhost through
-# WordPress, on the same data. The twin answers as itself (the prepended
+# WordPress, on the same data. The wp-parked/ folder `cove add <name> minn`
+# leaves is the core files alone, kept for `wp minn eject`. The twin answers as itself (the prepended
 # bootstrap configures WordPress for its address), so it browses as a site
 # of its own. A
 # request carrying X-Cove-Twin: as-site is answered as the site instead,
@@ -124,17 +126,23 @@ cove_twin() {
                 fi
             fi
             if ! validate_twin_folder "$folder"; then
-                gum style --foreground red "❌ Error: Invalid folder '$folder'." "Name a folder inside the site's directory (not public/), e.g. --root=wp-reference."
+                gum style --foreground red "❌ Error: Invalid folder '$folder'." "Name a folder inside the site's directory (not public/ or anything in it), e.g. --root=wp-reference."
                 exit 1
             fi
             if [ ! -d "$site_dir/$folder" ]; then
-                gum style --foreground red "❌ Error: $site_dir/$folder does not exist."
+                if [ -d "$site_dir/wp-parked" ]; then
+                    gum style --foreground red "❌ Error: $site_dir/$folder does not exist." "wp-parked/ holds only WordPress's core files (kept for 'wp minn eject'), so it can't be a twin by itself. A twin needs a complete WordPress: copy the parked core to a folder of its own, add a copy of public/wp-config.php, and link its wp-content to ../public/wp-content."
+                else
+                    gum style --foreground red "❌ Error: $site_dir/$folder does not exist."
+                fi
                 exit 1
             fi
             local twin_engine
             twin_engine=$(twin_engine_of "$site_dir/$folder")
             if [ "$twin_engine" = "nothing servable" ]; then
                 gum style --foreground yellow "⚠️  $folder/ has no index.php or index.html yet; the twin answers once it does."
+            elif [[ "$twin_engine" == WordPress* ]] && [ ! -f "$site_dir/$folder/wp-config.php" ] && [ ! -f "$(dirname "$site_dir/$folder")/wp-config.php" ]; then
+                gum style --foreground yellow "⚠️  $folder/ has no wp-config.php, so WordPress there will offer to install itself. Copy public/wp-config.php into it to share the site's database."
             fi
             {
                 printf 'domain=%s\nroot=%s\n' "$domain" "$folder"

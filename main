@@ -2811,11 +2811,11 @@ site_twin() {
 
 # A twin's folder: relative to the site's directory, plain path segments
 # only (none starting with a dot, so no "..", and nothing Caddy would read
-# as syntax), and never public/, which is the site itself.
+# as syntax), and never public/ or anything inside it, which is the site.
 validate_twin_folder() {
     local folder="$1"
     [[ "$folder" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] || return 1
-    [ "$folder" != "public" ] || return 1
+    case "$folder" in public|public/*) return 1 ;; esac
     return 0
 }
 
@@ -16072,9 +16072,12 @@ display_command_help() {
             echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>] [--as-site=<domain>] [--format=json]"
             echo ""
             echo "A twin is a second domain that serves another folder of the same site, with the"
-            echo "same database behind both. Minn Engine parks WordPress in wp-reference/ beside the"
-            echo "engine in public/, so 'cove twin minn add' serves it at wp.minn.localhost while"
-            echo "minn.localhost keeps answering through Minn."
+            echo "same database behind both. Minn Engine's test sites keep a complete WordPress in"
+            echo "wp-reference/ beside the engine in public/ (the parked core, a copy of the site's"
+            echo "wp-config.php, and a wp-content linked back to public/), so 'cove twin minn add'"
+            echo "serves it at wp.minn.localhost while minn.localhost keeps answering through Minn."
+            echo "The wp-parked/ folder 'cove add <name> minn' leaves holds WordPress's core files"
+            echo "only, for 'wp minn eject'; it is not a twin on its own."
             echo ""
             echo "The twin answers as itself: WordPress there gets the twin's own URLs, so it"
             echo "browses as a site of its own. A request carrying 'X-Cove-Twin: as-site' is"
