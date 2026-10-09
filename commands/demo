@@ -1,0 +1,69 @@
+# `cove demo <site>…` narrows what Cove shows to those sites: the dashboard
+# (sites, databases, logs and every site action), Adminer's database list and
+# `cove list`. Mail goes to a mailbox of its own while it is on, and mail from
+# other sites is held back (see write_sendmail_wrapper), so a recording shows
+# only what the demo sites send. Nothing on disk changes; `cove demo off`
+# puts the full view and the real mailbox back and delivers the held mail.
+cove_demo() {
+    local demo_file="$COVE_DIR/demo"
+    case "${1:-}" in
+        ""|status)
+            if [ -f "$demo_file" ]; then
+                echo "🎬 Demo mode is on, showing: $(tr '\n' ' ' < "$demo_file")"
+                local held
+                held=$(ls "$COVE_DIR/cache/demo-held-mail"/*.eml 2>/dev/null | wc -l | tr -d ' ')
+                echo "   Mail is going to the demo mailbox; $held message$([ "$held" = 1 ] || echo s) from other sites held for later."
+                echo "   'cove demo off' puts everything back."
+            else
+                echo "Demo mode is off."
+            fi
+            return 0
+            ;;
+        off)
+            if [ ! -f "$demo_file" ]; then
+                echo "Demo mode is already off."
+                return 0
+            fi
+            rm -f "$demo_file"
+            install_mailpit_service >/dev/null
+            # Mail the hidden sites sent meanwhile was held back; deliver it
+            # to the real mailbox now that Mailpit is back on it.
+            local held_dir="$COVE_DIR/cache/demo-held-mail" n=0 f i
+            if ls "$held_dir"/*.eml >/dev/null 2>&1; then
+                for i in 1 2 3 4 5 6 7 8 9 10; do
+                    nc -z 127.0.0.1 1025 2>/dev/null && break
+                    sleep 0.5
+                done
+                for f in "$held_dir"/*.eml; do
+                    mailpit sendmail -t -S 127.0.0.1:1025 < "$f" && rm -f "$f" && n=$((n + 1))
+                done
+            fi
+            echo "✅ Demo mode is off. Every site is back, and so is your mail."
+            [ "$n" -gt 0 ] && echo "   Delivered $n message$([ "$n" -eq 1 ] || echo s) held back during the demo."
+            return 0
+            ;;
+        -h|--help)
+            display_command_help demo
+            return 0
+            ;;
+    esac
+
+    local names=() s
+    for s in "$@"; do
+        s="${s%.localhost}"
+        if [[ ! "$s" =~ ^[a-z0-9-]+$ ]] || [ ! -d "$SITES_DIR/$s.localhost" ]; then
+            gum style --foreground red "❌ Error: There is no site named '$s'." "Run 'cove list' to see them."
+            exit 1
+        fi
+        names+=("$s")
+    done
+
+    local was_on=0
+    [ -f "$demo_file" ] && was_on=1
+    printf '%s\n' "${names[@]}" > "$demo_file"
+    # Mailpit picks its mailbox when it starts (see write_mailpit_run_script).
+    [ "$was_on" = 1 ] || install_mailpit_service >/dev/null
+    echo "🎬 Demo mode is on, showing ${#names[@]} site$([ ${#names[@]} -eq 1 ] || echo s): ${names[*]}"
+    echo "   The dashboard, Adminer and 'cove list' show only these, and mail goes to a"
+    echo "   separate mailbox. Sites you create now join the demo. 'cove demo off' ends it."
+}

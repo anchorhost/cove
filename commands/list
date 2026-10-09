@@ -73,9 +73,12 @@ cove_list() {
 
         $sites = [];
         $items = scandir($sites_dir);
+        // `cove demo`: only the sites named in ~/Cove/demo.
+        $demo = @file(getenv("HOME") . "/Cove/demo", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
 
         foreach ($items as $item) {
             if ($item === "." || $item === "..") continue;
+            if ($demo && !in_array(str_replace(".localhost", "", $item), array_map("trim", $demo), true)) continue;
             $site_path = $sites_dir . "/" . $item;
             if (is_dir($site_path)) {
                 $public_path = $site_path . "/public";
