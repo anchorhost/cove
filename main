@@ -3537,8 +3537,12 @@ function cove_demo_databases($user_home, $sitedir) {
 }
 // Shared logs during `cove demo`: an entry stays only if every *.localhost
 // host it names belongs to a demo site (the site, a subdomain of it, one of
-// its extra domains or its twin) or to Cove itself. Sites deleted long ago
-// and the extra domains of hidden ones go too. Null when demo mode is off.
+// its extra domains or its twin) or to Cove itself, and it doesn't name a
+// hidden site's database or the site itself as a word ("Table
+// 'wpfreighter.wp_x' doesn't exist" names no host). Sites deleted long ago
+// and the extra domains of hidden ones go too. A hidden site called "cache"
+// costs the demo every line with that word, which is the right way round.
+// Null when demo mode is off.
 function cove_demo_log_filter($user_home, $sitedir) {
     $demo = cove_demo_sites($user_home);
     if ($demo === null) return null;
@@ -3551,7 +3555,16 @@ function cove_demo_log_filter($user_home, $sitedir) {
         $twin = @file_get_contents($sitedir . '/' . $site . '.localhost/twin');
         if ($twin && preg_match('/^domain=(.+)$/m', $twin, $t) && ($r = $local($t[1])) !== null) $roots[] = $r;
     }
-    return function ($entry) use ($cove_hosts, $roots) {
+    $words = [];
+    foreach (scandir($sitedir) ?: [] as $item) {
+        if (substr($item, -10) !== '.localhost' || !cove_demo_hides($user_home, $item)) continue;
+        $words[] = preg_quote(substr($item, 0, -10), '/');
+        $cfg = @file_get_contents($sitedir . '/' . $item . '/public/wp-config.php', false, null, 0, 16384);
+        if ($cfg !== false && preg_match('/define\s*\(\s*[\'"]DB_NAME[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $cfg, $dm)) $words[] = preg_quote($dm[1], '/');
+    }
+    $hidden_words = $words ? '/(?<![a-z0-9_])(?:' . implode('|', array_unique($words)) . ')(?![a-z0-9_])/i' : null;
+    return function ($entry) use ($cove_hosts, $roots, $hidden_words) {
+        if ($hidden_words !== null && preg_match($hidden_words, $entry)) return false;
         if (!preg_match_all('/(?<![a-z0-9.-])([a-z0-9][a-z0-9.-]*)\.localhost/i', $entry, $m)) return true;
         foreach ($m[1] as $h) {
             $h = strtolower($h);
