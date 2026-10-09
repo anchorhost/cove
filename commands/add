@@ -416,7 +416,9 @@ cove_minn_fetch() {
     if command -v unzip >/dev/null 2>&1; then
         unzip -q "$work/minn.zip" -d "$work/x" >&2
     else
-        $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open($argv[1]) === true && $z->extractTo($argv[2]) ? 0 : 1);' "$work/minn.zip" "$work/x" >&2
+        # Paths by environment, not $argv: FrankenPHP 1.13.0's php-cli shifts
+        # $argv (see ensure_cli_argv_fix, which can't reach -r code).
+        COVE_ZIP="$work/minn.zip" COVE_DEST="$work/x" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->extractTo(getenv("COVE_DEST")) ? 0 : 1);' >&2
     fi
     rc=$?
     if [ "$rc" -ne 0 ] || [ ! -f "$work/x/minn/bootstrap.php" ] || [ ! -f "$work/x/minn/bin/minn" ]; then

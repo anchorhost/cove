@@ -519,6 +519,8 @@ error_reporting = 6143
 INI
     # wp_mail() from the CLI goes to Mailpit too (see ensure_cli_sendmail_path).
     ensure_cli_sendmail_path
+    # WP-CLI under FrankenPHP 1.13.0's php-cli (see ensure_cli_argv_fix).
+    ensure_cli_argv_fix
     echo "🗃️ Downloading Adminer 6.0.0..."
     curl -sL "https://github.com/vrana/adminer/releases/download/v6.0.0/adminer-6.0.0.php" -o "$ADMINER_DIR/adminer-core.php"
     # Entry point + theme assets. Keep in sync with cove_upgrade so upgraders
