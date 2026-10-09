@@ -772,9 +772,10 @@ restore_tenant() {
         for k in "$@"; do
             case "$k" in "$rel"/*) ;; *) continue ;; esac
             inner="${k#"$rel"/}"
-            if [ -f "$target/$inner" ]; then
+            if [ -e "$target/$inner" ]; then
+                rm -rf "$incoming/$inner"
                 mkdir -p "$incoming/$(dirname "$inner")"
-                cp -p "$target/$inner" "$incoming/$inner"
+                cp -Rp "$target/$inner" "$incoming/$inner"
             fi
         done
         if [ -e "$target" ]; then
@@ -963,14 +964,15 @@ cmd_restore() {
         cp "$site_dir/wp-config.php" "$keep_config"
     fi
 
-    # --keep paths: the destination's own copy survives the swap, the same
-    # way wp-config.php does. `cove push` keeps the remote's mu-plugin of the
-    # same name as Cove's local-only helper, which never leaves the machine.
+    # --keep paths (files or folders): the destination's own copy survives
+    # the swap, the same way wp-config.php does. `cove push` keeps the
+    # remote's mu-plugin of the same name as Cove's local-only helper, which
+    # never leaves the machine, and the host's own mu-plugins (Kinsta's).
     local k
     for k in ${keeps[@]+"${keeps[@]}"}; do
-        if [ -f "$site_dir/$k" ]; then
+        if [ -e "$site_dir/$k" ]; then
             mkdir -p "$held/keep/$(dirname "$k")"
-            cp -p "$site_dir/$k" "$held/keep/$k"
+            cp -Rp "$site_dir/$k" "$held/keep/$k"
         fi
     done
 
@@ -984,9 +986,10 @@ cmd_restore() {
         ! -name '*.sql' ! -name '*.sql.gz' ! -name '.cove-source' \
         -exec cp -R {} "$site_dir/" \; ) || die "Copying files failed."
     for k in ${keeps[@]+"${keeps[@]}"}; do
-        if [ -f "$held/keep/$k" ]; then
+        if [ -e "$held/keep/$k" ]; then
+            rm -rf "${site_dir:?}/$k"
             mkdir -p "$site_dir/$(dirname "$k")"
-            cp -p "$held/keep/$k" "$site_dir/$k"
+            cp -Rp "$held/keep/$k" "$site_dir/$k"
         fi
     done
     if [ -n "$keep_config" ]; then

@@ -232,6 +232,13 @@ cove_push() {
     # out of the archive, and the restore keeps whatever the remote had at
     # that path (a host's own helper of the same name, or nothing at all).
     local cove_helper="wp-content/mu-plugins/captaincore-helper.php"
+    # The host's own mu-plugins stay too. Kinsta installs its cache and CDN
+    # plugin there (WP Freighter copies it into each dedicated tenant), and
+    # `wp kinsta cache purge` goes with it if a push replaces the folder.
+    local -a host_keeps=(
+        --keep=wp-content/mu-plugins/kinsta-mu-plugins.php
+        --keep=wp-content/mu-plugins/kinsta-mu-plugins
+    )
     local backup_path
     # A tenant gets only this site's own tables: anything else in the local
     # database would land in the host's shared one.
@@ -269,7 +276,7 @@ cove_push() {
     local refuse_flag=""
     [ -z "$tenant" ] && refuse_flag="--refuse-freighter"
     if ! transfer_remote "$ssh_opts" "$remote_ssh" restore "$remote_path" "$remote_tmp" \
-            --url-to="$remote_url" --keep="$cove_helper" $tenant_flag $refuse_flag $wp_cli_flag; then
+            --url-to="$remote_url" --keep="$cove_helper" "${host_keeps[@]}" $tenant_flag $refuse_flag $wp_cli_flag; then
         rm -f "$backup_path"
         ssh $ssh_opts $remote_ssh "rm -f $remote_tmp_q" 2>/dev/null
         log_error "The remote restore failed."
