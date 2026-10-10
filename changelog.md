@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.3] - 2026-10-09
 
 The Sites view is rebuilt around what's in your cove: a summary of the plugins, themes, and WordPress and PHP versions your sites run, each one a filter, over a list grouped by when each site last changed. `cove add <name> minn` makes Minn Engine sites, `cove demo` narrows everything to a few sites and a mailbox of their own for a recording, and `cove pull` and `cove push` work with a single WP Freighter tenant. WP-CLI works again on FrankenPHP 1.13.0, which broke `cove add` and `cove wp` on every fresh install. A push can no longer wipe a whole Freighter host, and a domain claimed twice no longer takes every site down.
 

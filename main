@@ -186,7 +186,7 @@ RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="2.2"
+COVE_VERSION="2.3"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
