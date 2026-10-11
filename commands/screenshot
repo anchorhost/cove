@@ -156,11 +156,12 @@ cove_screenshot_sweep() {
 }
 
 cove_screenshot() {
-    local site_name="" out="" width=1280 height=800 quiet=0 sweep=0 max=3 idle_only=0 check=0
+    local site_name="" out="" path="" width=1280 height=800 quiet=0 sweep=0 max=3 idle_only=0 check=0
     local arg
     for arg in "$@"; do
         case "$arg" in
             --out=*)    out="${arg#*=}" ;;
+            --path=*)   path="${arg#*=}" ;;
             --width=*)  width="${arg#*=}" ;;
             --height=*) height="${arg#*=}" ;;
             --quiet)    quiet=1 ;;
@@ -169,11 +170,12 @@ cove_screenshot() {
             --max=*)    max="${arg#*=}" ;;
             --idle-only) idle_only=1 ;;
             -h|--help)
-                echo "Usage: cove screenshot <site> [--out=<file.png>] [--width=1280] [--height=800]"
+                echo "Usage: cove screenshot <site> [--out=<file.png>] [--path=/<page>] [--width=1280] [--height=800]"
                 echo ""
                 echo "Captures the site's front page with a headless Chromium-family browser"
                 echo "(Chrome, Chromium, Brave, Edge, Arc, Vivaldi). Without --out the image"
                 echo "goes to ~/Cove/cache/screenshots/<site>.png, where the dashboard shows it."
+                echo "--path captures another page of the site instead, and needs --out."
                 echo ""
                 echo "  --check       Print the browser that would be used; exit 2 when there is none."
                 echo "  --sweep [--max=N] [--idle-only]"
@@ -216,6 +218,21 @@ cove_screenshot() {
         gum style --foreground red "❌ Error: --width and --height take a number of pixels."
         exit 1
     fi
+    # Another page of the site. The preview the dashboard shows is always the
+    # front page, so this one goes to a file of the caller's choosing.
+    if [ -n "$path" ] && [ "$path" != "/" ]; then
+        local path_re='^/[A-Za-z0-9._~/?=&%:+,@!;#-]*$'
+        if [[ ! "$path" =~ $path_re ]]; then
+            gum style --foreground red "❌ Error: --path takes a path on the site, such as /shop/ or /?p=12."
+            exit 1
+        fi
+        if [ -z "$out" ]; then
+            gum style --foreground red "❌ Error: --path needs --out=<file.png>; the site's preview is always its front page."
+            exit 1
+        fi
+    else
+        path=""
+    fi
 
     local browser
     if ! browser=$(find_headless_browser); then
@@ -226,7 +243,7 @@ cove_screenshot() {
     [ -z "$out" ] && { mkdir -p "$SCREENSHOTS_DIR"; out="$SCREENSHOTS_DIR/$site_name.png"; }
     cove_screenshot_reap
     local url
-    url=$(url_for "$site_name.localhost")
+    url=$(url_for "$site_name.localhost")$path
     local tmp_profile tmp_out
     tmp_profile=$(mktemp -d "$SHOT_TMP/cove-shot-profile.XXXXXX")
     tmp_out="$out.tmp.png"
