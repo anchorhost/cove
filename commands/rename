@@ -150,6 +150,7 @@ cove_rename() {
 
     # --- Reload Server Configuration ---
     regenerate_caddyfile
+    prune_etc_hosts "$old_name.localhost"
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: $(url_for "$new_name.localhost")"
 }

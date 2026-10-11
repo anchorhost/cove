@@ -1384,66 +1384,69 @@ get_mariadb_service_name() {
     fi
 }
 
+# Every hostname Cove keeps in /etc/hosts, one per line: its own three, each
+# site, and each site's mappings and twin. Warnings go to stderr.
+cove_required_hosts() {
+    printf '%s\n' cove.localhost db.cove.localhost mail.cove.localhost
+    [ -d "$SITES_DIR" ] || return 0
+    local site_path host_site_name mapping twin_entry twin_domain twin_folder twin_as_site
+    for site_path in "$SITES_DIR"/*; do
+        [ -d "$site_path" ] || continue
+        host_site_name=$(basename "$site_path")
+
+        # Same skip as regenerate_caddyfile: a dir with no public/
+        # and no custom directive isn't a servable site (e.g. the
+        # logs/-only skeleton left by a reload racing a delete) —
+        # adding its hosts entry back would undo the delete's cleanup.
+        if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$host_site_name" ]; then
+            continue
+        fi
+        # A folder name is a hostname only if it looks like one; any
+        # process running as this user can create folders here.
+        if ! validate_hostname "$host_site_name"; then
+            echo "   - ⚠️  Skipping a folder in $SITES_DIR whose name isn't a hostname: $host_site_name" >&2
+            continue
+        fi
+        printf '%s\n' "$host_site_name"
+
+        # Check for additional mappings
+        if [ -f "$site_path/mappings" ]; then
+            while IFS= read -r mapping || [ -n "$mapping" ]; do
+                # Skip empty lines and wildcards: /etc/hosts has no
+                # wildcard syntax and *.localhost already resolves to
+                # loopback natively, so a "*.name" line would be inert
+                # — and would prompt for sudo on every reload.
+                if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]]; then
+                    # Checked again on the way to a root-written
+                    # file: the mappings file sits where a site's
+                    # own PHP can rewrite it, and a line holding
+                    # spaces would alias any domain to this machine.
+                    if validate_hostname "$mapping"; then
+                        printf '%s\n' "$mapping"
+                    else
+                        echo "   - ⚠️  Skipping invalid mapping in $site_path/mappings: $mapping" >&2
+                    fi
+                fi
+            done < "$site_path/mappings"
+        fi
+
+        # A twin's domains (site_twin checks them before they get here).
+        if twin_entry=$(site_twin "$site_path"); then
+            IFS=$'\t' read -r twin_domain twin_folder twin_as_site <<< "$twin_entry"
+            printf '%s\n' "$twin_domain"
+            [ -n "$twin_as_site" ] && printf '%s\n' "$twin_as_site"
+        fi
+    done
+}
+
 # Manage /etc/hosts file for local domains
 update_etc_hosts() {
     echo "🔎 Checking /etc/hosts for required entries..."
 
-    # An array of all hostnames Cove will manage
-    local required_hosts=("cove.localhost" "db.cove.localhost" "mail.cove.localhost")
-
-    # Also find all site-specific hostnames
-    if [ -d "$SITES_DIR" ]; then
-        for site_path in "$SITES_DIR"/*; do
-            if [ -d "$site_path" ]; then
-                local host_site_name
-                host_site_name=$(basename "$site_path")
-
-                # Same skip as regenerate_caddyfile: a dir with no public/
-                # and no custom directive isn't a servable site (e.g. the
-                # logs/-only skeleton left by a reload racing a delete) —
-                # adding its hosts entry back would undo the delete's cleanup.
-                if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$host_site_name" ]; then
-                    continue
-                fi
-                # A folder name is a hostname only if it looks like one; any
-                # process running as this user can create folders here.
-                if ! validate_hostname "$host_site_name"; then
-                    echo "   - ⚠️  Skipping a folder in $SITES_DIR whose name isn't a hostname: $host_site_name"
-                    continue
-                fi
-                required_hosts+=("$host_site_name")
-
-                # Check for additional mappings
-                if [ -f "$site_path/mappings" ]; then
-                    while IFS= read -r mapping || [ -n "$mapping" ]; do
-                        # Skip empty lines and wildcards: /etc/hosts has no
-                        # wildcard syntax and *.localhost already resolves to
-                        # loopback natively, so a "*.name" line would be inert
-                        # — and would prompt for sudo on every reload.
-                        if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]]; then
-                            # Checked again on the way to a root-written
-                            # file: the mappings file sits where a site's
-                            # own PHP can rewrite it, and a line holding
-                            # spaces would alias any domain to this machine.
-                            if validate_hostname "$mapping"; then
-                                required_hosts+=("$mapping")
-                            else
-                                echo "   - ⚠️  Skipping invalid mapping in $site_path/mappings: $mapping"
-                            fi
-                        fi
-                    done < "$site_path/mappings"
-                fi
-
-                # A twin's domains (site_twin checks them before they get here).
-                local twin_entry twin_domain twin_folder twin_as_site
-                if twin_entry=$(site_twin "$site_path"); then
-                    IFS=$'\t' read -r twin_domain twin_folder twin_as_site <<< "$twin_entry"
-                    required_hosts+=("$twin_domain")
-                    [ -n "$twin_as_site" ] && required_hosts+=("$twin_as_site")
-                fi
-            fi
-        done
-    fi
+    local required_hosts=() host
+    while IFS= read -r host; do
+        [ -n "$host" ] && required_hosts+=("$host")
+    done < <(cove_required_hosts)
 
     local missing_hosts=()
     for host in "${required_hosts[@]}"; do
@@ -1468,6 +1471,42 @@ update_etc_hosts() {
         echo "   - ✅ Done."
     else
         echo "   - ✅ All entries are present."
+    fi
+}
+
+# The other direction: takes out the lines for hostnames Cove stopped serving
+# (a deleted or renamed site, a removed mapping or twin). update_etc_hosts
+# only ever adds, so without this they stayed, and a real domain once used as
+# a mapping or twin kept resolving to this machine. A name something still
+# needs stays, and only exact "127.0.0.1 <host>" lines go. Each name is
+# checked again first: it is spliced into a sudo sed expression, and GNU
+# sed's `e` command runs a shell.
+prune_etc_hosts() {
+    local required host stale=() sed_args=()
+    required=$(cove_required_hosts 2>/dev/null)
+    for host in "$@"; do
+        [ -n "$host" ] && [[ "$host" != \*.* ]] && validate_hostname "$host" || continue
+        printf '%s\n' "$required" | grep -qxF "$host" && continue
+        grep -qE "^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$" /etc/hosts 2>/dev/null || continue
+        stale+=("$host")
+    done
+    [ ${#stale[@]} -gt 0 ] || return 0
+
+    echo "🧹 Removing /etc/hosts entries (requires sudo)..."
+    for host in "${stale[@]}"; do
+        sed_args+=(-e "/^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$/d")
+    done
+    # Use non-interactive sudo when we don't have a TTY (e.g., the dashboard's
+    # PHP shell_exec). In that context an interactive sudo prompt can hang
+    # the caller waiting for a password that will never arrive. From a real
+    # terminal the flag is empty, so sudo prompts as normal.
+    local sudo_flag=""
+    [ -t 0 ] || sudo_flag="-n"
+    if sudo $sudo_flag sed -i.bak -E "${sed_args[@]}" /etc/hosts 2>/dev/null; then
+        sudo $sudo_flag rm -f /etc/hosts.bak 2>/dev/null
+        echo "   - ✅ /etc/hosts cleaned."
+    else
+        gum style --foreground yellow "   - ⚠️ Couldn't edit /etc/hosts (sudo unavailable from this context). These lines are left in it: ${stale[*]}"
     fi
 }
 

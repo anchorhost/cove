@@ -144,6 +144,8 @@ cove_twin() {
             elif [[ "$twin_engine" == WordPress* ]] && [ ! -f "$site_dir/$folder/wp-config.php" ] && [ ! -f "$(dirname "$site_dir/$folder")/wp-config.php" ]; then
                 gum style --foreground yellow "⚠️  $folder/ has no wp-config.php, so WordPress there will offer to install itself. Copy public/wp-config.php into it to share the site's database."
             fi
+            local old_twin old_domain old_folder old_as_site
+            old_twin=$(site_twin "$site_dir") && IFS=$'\t' read -r old_domain old_folder old_as_site <<< "$old_twin"
             {
                 printf 'domain=%s\nroot=%s\n' "$domain" "$folder"
                 [ -n "$as_site" ] && printf 'as_site=%s\n' "$as_site"
@@ -154,15 +156,20 @@ cove_twin() {
             fi
             regenerate_caddyfile
             update_etc_hosts
+            # The domains a twin it replaced answered on.
+            [ -n "$old_twin" ] && prune_etc_hosts "$old_domain" "$old_as_site"
             ;;
         remove)
             if [ ! -f "$site_dir/twin" ]; then
                 echo "ℹ️  $site_host has no twin."
                 return 0
             fi
+            local old_twin old_domain old_folder old_as_site
+            old_twin=$(site_twin "$site_dir") && IFS=$'\t' read -r old_domain old_folder old_as_site <<< "$old_twin"
             rm -f "$site_dir/twin"
             echo "✅ Removed the twin of $site_host."
             regenerate_caddyfile
+            [ -n "$old_twin" ] && prune_etc_hosts "$old_domain" "$old_as_site"
             ;;
         *)
             gum style --foreground red "❌ Error: Unknown action '$action'."

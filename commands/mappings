@@ -82,7 +82,7 @@ cove_mappings() {
                 echo "✅ Removed mapping: $domain"
                 
                 regenerate_caddyfile
-                update_etc_hosts
+                prune_etc_hosts "$domain"
             else
                 gum style --foreground red "❌ Error: Mapping '$domain' not found."
             fi
