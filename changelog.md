@@ -4,6 +4,7 @@
 
 ### 🔒 Security & Bug Fixes
 
+* **Removing a twin or a mapping takes its `/etc/hosts` line out:** Cove adds a line to `/etc/hosts` for every site, mapping, and twin, but only `cove delete` ever took one out. `cove twin <site> remove`, a twin replaced by another, `cove mappings <site> remove`, and `cove rename` left theirs behind, so a real domain once used as a mapping or twin kept pointing at this machine. Each now removes the lines it no longer needs, keeping any another site still uses. When there's no terminal to ask for the sudo password, Cove names the lines it left instead of suggesting `cove reload`, which only adds.
 * **Settings no longer glued onto the last line of `php.ini`:** `cove memory set`, `cove opcache set`, the upgrade's memory floor, and the mail and WP-CLI fixes Cove writes into `~/Cove/php.ini` each appended their line to the end of the file. On a file edited by hand that doesn't end in a newline, the new setting landed on the same line as the last one, and PHP read neither. They now share one helper that adds the missing newline first, rewrites a setting in place when it's already there, and leaves the file untouched when nothing changes.
 
 ## [2.3] - 2026-10-09
