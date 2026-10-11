@@ -15861,6 +15861,7 @@ show_general_help() {
     help_cmd upgrade "Upgrades Cove to the latest available version."
     help_cmd version "Displays the current version of Cove."
     help_cmd demo "Show only a few sites (and a mailbox of their own) for recording a demo."
+    help_cmd mcp "Let an AI agent work with your sites: claude mcp add cove -- cove mcp"
     if [ "$OS" == "macos" ]; then
         help_cmd menubar "Manage the macOS menu bar companion app."
     elif [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; then
@@ -16205,6 +16206,25 @@ display_command_help() {
             echo "  cove demo anchor minnadmin cove-wp   Show only these three."
             echo "  cove demo                            Is it on, and for which sites?"
             echo "  cove demo off                        Everything back, your mail included."
+            ;;
+        mcp)
+            local mcp_self
+            mcp_self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+            command -v cove >/dev/null 2>&1 && mcp_self="$(command -v cove)"
+            echo "Usage: cove mcp [tools]"
+            echo ""
+            echo "Runs a Model Context Protocol server on stdin and stdout, so an AI agent can"
+            echo "work with your sites: list and create them, run WP-CLI, get a one-time login"
+            echo "link, read the logs and the mail a site sent, look at a page, and take or"
+            echo "restore a snapshot. Nothing it offers deletes a site or reaches a remote host,"
+            echo "and during 'cove demo' it sees only the demo's sites."
+            echo ""
+            echo "Add it to your agent:"
+            echo "  Claude Code   claude mcp add cove -- cove mcp"
+            echo "  Others        a stdio server with the command \"$mcp_self\" and the argument \"mcp\":"
+            echo "                {\"mcpServers\": {\"cove\": {\"command\": \"$mcp_self\", \"args\": [\"mcp\"]}}}"
+            echo ""
+            echo "  cove mcp tools   List the tools it offers."
             ;;
         twin)
             echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>] [--as-site=<domain>] [--format=json]"
@@ -16755,6 +16775,10 @@ main() {
             ;;
         demo)
             cove_demo "$@"
+            ;;
+        mcp)
+            # No dependency check: stdout is the protocol, and it prints.
+            cove_mcp "$@"
             ;;
         lan)
             check_dependencies
