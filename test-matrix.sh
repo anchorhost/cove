@@ -15,7 +15,7 @@
 #  a "baseline" snapshot (clean OS + curl). Lanes:
 #    A (all six):      fresh --dev install → add/clone/rename/login/delete →
 #                      status/health/mailpit → mail from a page and WP-CLI →
-#                      container reboot survival
+#                      `cove mcp` over stdio → container reboot survival
 #    B (one apt/dnf):  previous GitHub release → candidate + post-upgrade
 #    C (one apt/dnf):  install + add as a non-root sudo user
 # ====================================================
@@ -188,7 +188,7 @@ lane_a() {
             res "$c" install PASS
         else
             res "$c" install FAIL
-            for k in add_latest add_pinned add_plain clone rename login delete status health mailpit mail reboot; do res "$c" "$k" SKIP; done
+            for k in add_latest add_pinned add_plain clone rename login delete status health mailpit mail mcp reboot; do res "$c" "$k" SKIP; done
             return
         fi
 
@@ -267,6 +267,23 @@ MAILCHECK
             res "$c" mail PASS
         else
             res "$c" mail FAIL
+        fi
+
+        # `cove mcp` speaks MCP on stdio through FrankenPHP's php-cli: one
+        # session that initializes, lists a site and runs WP-CLI in it.
+        if cx "$c" bash -s <<'MCPCHECK'
+out=$(printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"matrix","version":"0"}}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_sites","arguments":{"filter":"alpha"}}}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wp","arguments":{"site":"alpha","args":["option","get","siteurl"]}}}' \
+    | timeout 120 cove mcp)
+echo "$out" | grep -q '"serverInfo"' && echo "$out" | grep -q 'https://alpha.localhost' && echo "$out" | grep -q 'exit 0'
+MCPCHECK
+        then
+            res "$c" mcp PASS
+        else
+            res "$c" mcp FAIL
         fi
 
         incus restart "$c"; sleep 25
