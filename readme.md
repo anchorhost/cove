@@ -96,7 +96,7 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove url <name>` | Prints the full HTTPS URL for a site (including the port suffix when on alternative ports). |
 | `cove php [<site>] [<version>\|default]` | Per-site PHP version switching. Pinning routes a site through a native Homebrew `php@<version>` php-fpm behind Caddy; `default` returns it to FrankenPHP's bundled PHP. The pin travels with the site through clone and rename. |
 | `cove log [<site>] [-f]` | Shows error logs. Use `-f` to follow logs in real-time. The dashboard's **logs** view shows the same files parsed, filtered by level, and scoped per site. |
-| `cove log rotate [<MB>\|off]` | Cove keeps every line of its own logs in `~/Cove/Logs` by default. `cove log rotate 50` turns rotation on: the watchdog moves a log past 50 MB to `<name>.log.1` (replacing the one before) and starts it again empty. With no size it shows the setting and each log's size. |
+| `cove log rotate` | How long each log is kept, with sizes. Cove keeps every line of its own logs in `~/Cove/Logs` by default; `cove log rotate 50` moves a log past 50 MB to `<name>.log.1` (replacing the one before). `cove log rotate services <MB>\|off\|default` sets the restart-storm cap on FrankenPHP's and Mailpit's own output (50 MB by default, the last tenth kept). `cove log rotate access <MB>\|off\|default [--keep=N] [--days=N]` sets how Caddy rolls each site's access log (100 MB, 10 files, 90 days by default). |
 
 ### Migration
 
