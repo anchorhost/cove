@@ -85,7 +85,7 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove list [--totals]` | Lists all sites managed by Cove, including each one's WordPress version. Use `--totals` to show disk usage. |
 | `cove core check` | Reports the WordPress version of every site, flagging releases wp.org marks outdated or insecure. |
 | `cove core update <site> [version]` | Updates a site's WordPress core to the latest release, or to a specific version (which may be a downgrade). Use `--all` to update every site that's behind. |
-| `cove login <site> [<user>] [--url=<subsite-url>]` | Generates a one-time login link for a WordPress site. On a multisite network, `--url` picks the subsite to log in to. |
+| `cove login <site> [<user>] [--url=<subsite-url>]` | Generates a one-time login link for a WordPress site. On a multisite network, `--url` picks the subsite to log in to. A site copied in by hand whose stored URLs still name its live domain has them rewritten to its local address first (the database is saved to its `private/` folder). |
 | `cove network <site> [--format=json]` | Lists the sites on a multisite network: name, URL, and ID. |
 | `cove import <site> <archive.zip\|.tar.gz>` | Creates a new site from a backup archive — a Cove snapshot export, a Local export, or a host backup with a WordPress tree and a `.sql` dump anywhere inside — and rewrites its URLs. |
 | `cove backup <site> [--out=<file.zip>] [--keep]` | Files and database as one zip in `~/Cove/Backups/`, ready for `cove import`. |
