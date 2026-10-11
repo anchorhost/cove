@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### 🔒 Security & Bug Fixes
+
+* **Settings no longer glued onto the last line of `php.ini`:** `cove memory set`, `cove opcache set`, the upgrade's memory floor, and the mail and WP-CLI fixes Cove writes into `~/Cove/php.ini` each appended their line to the end of the file. On a file edited by hand that doesn't end in a newline, the new setting landed on the same line as the last one, and PHP read neither. They now share one helper that adds the missing newline first, rewrites a setting in place when it's already there, and leaves the file untouched when nothing changes.
+
 ## [2.3] - 2026-10-09
 
 The Sites view is rebuilt around what's in your cove: a summary of the plugins, themes, and WordPress and PHP versions your sites run, each one a filter, over a list grouped by when each site last changed. `cove add <name> minn` makes Minn Engine sites, `cove demo` narrows everything to a few sites and a mailbox of their own for a recording, and `cove pull` and `cove push` work with a single WP Freighter tenant. WP-CLI works again on FrankenPHP 1.13.0, which broke `cove add` and `cove wp` on every fresh install. A push can no longer wipe a whole Freighter host, and a domain claimed twice no longer takes every site down.
