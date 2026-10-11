@@ -406,6 +406,260 @@ WP_CLI::log( "Renamed {$from}user_roles and {$from}* user meta to $to." );
 PHPKEYS
 }
 
+php_dump_check_script() {
+cat << 'PHPCHECK'
+<?php
+// $args: 0=dump, 1=the tenant's prefix, 2=file to list the tables the dump
+// creates, 3=file to write the first problem to, 4="tenant <id>".
+// Reads the dump statement by statement, with strings, comments and MySQL's
+// executable /*! */ comments taken into account, and accepts only what a
+// table dump is made of: session SET, LOCK/UNLOCK, and DROP/CREATE/ALTER/
+// INSERT/REPLACE/TRUNCATE/RENAME/DELETE/UPDATE on tables under the prefix.
+// Triggers, views, routines, events, users, global settings, another
+// database, or a mysql client command could all reach past the tenant.
+$file   = $args[0];
+$prefix = $args[1];
+$label  = $args[4];
+$fh     = fopen( $file, 'rb' );
+if ( ! $fh ) { WP_CLI::error( "Cannot read $file" ); }
+
+$problem = null;
+$created = array();
+$foreign = array();
+
+$check = function ( $sql ) use ( $prefix, $label, &$created, &$foreign, &$problem ) {
+    preg_match_all( '/`(?:[^`]|``)*`|\'\'|@@?[A-Za-z0-9_.$]+|[A-Za-z0-9_$]+|\S/', $sql, $m );
+    $t = $m[0];
+    if ( ! $t ) { return; }
+    $kw = function ( $i, $words ) use ( &$t ) {
+        return isset( $t[ $i ] ) && '`' !== $t[ $i ][0] && in_array( strtoupper( $t[ $i ] ), (array) $words, true );
+    };
+    $name = function ( &$i ) use ( &$t, &$problem ) {
+        if ( ! isset( $t[ $i ] ) ) { return null; }
+        $tok = $t[ $i ];
+        if ( '`' === $tok[0] ) {
+            $n = str_replace( '``', '`', substr( $tok, 1, -1 ) );
+        } elseif ( preg_match( '/^[A-Za-z0-9_$]+$/', $tok ) ) {
+            $n = $tok;
+        } else {
+            return null;
+        }
+        $i++;
+        if ( isset( $t[ $i ] ) && '.' === $t[ $i ] ) {
+            $problem = "The dump names a table in another database ($n." . ( isset( $t[ $i + 1 ] ) ? $t[ $i + 1 ] : '' ) . ').';
+            return null;
+        }
+        return $n;
+    };
+    $own = function ( $n ) use ( $prefix, &$foreign ) {
+        if ( null !== $n && 0 !== strpos( $n, $prefix ) ) { $foreign[ $n ] = true; }
+        return null !== $n;
+    };
+    $refuse = function () use ( &$t, &$problem, $label ) {
+        $text = '';
+        foreach ( $t as $tok ) {
+            $glue  = '' === $text || in_array( $tok, array( ',', ')', '.', '@', '/' ), true ) || in_array( substr( $text, -1 ), array( '(', '.', '@', '/' ), true );
+            $text .= $glue ? $tok : ' ' . $tok;
+            if ( strlen( $text ) > 70 ) { $text = substr( $text, 0, 70 ) . '…'; break; }
+        }
+        $problem = "The dump holds a statement that can reach past $label's tables, which a tenant restore refuses: $text.";
+    };
+    $i     = 1;
+    $first = strtoupper( $t[0] );
+    switch ( $first ) {
+        case 'SET':
+            foreach ( $t as $tok ) {
+                $u = strtoupper( $tok );
+                if ( in_array( $u, array( 'GLOBAL', 'PERSIST', 'PERSIST_ONLY', 'PASSWORD', 'ROLE', 'STATEMENT' ), true )
+                    || 0 === strpos( $u, '@@GLOBAL.' ) || 0 === strpos( $u, '@@PERSIST' ) ) {
+                    return $refuse();
+                }
+            }
+            return;
+        case 'UNLOCK': case 'START': case 'BEGIN': case 'COMMIT': case 'ROLLBACK':
+            return;
+        case 'SELECT':
+            foreach ( $t as $tok ) {
+                if ( in_array( strtoupper( $tok ), array( 'OUTFILE', 'DUMPFILE' ), true ) ) { return $refuse(); }
+            }
+            return;
+        case 'USE':
+            $problem = 'The dump switches or creates databases.';
+            return;
+        case 'LOCK':
+            if ( ! $kw( $i++, array( 'TABLE', 'TABLES' ) ) ) { return $refuse(); }
+            do {
+                if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+                while ( isset( $t[ $i ] ) && ',' !== $t[ $i ] ) { $i++; }
+            } while ( isset( $t[ $i ] ) && ',' === $t[ $i++ ] );
+            return;
+        case 'DROP':
+            if ( $kw( $i, 'TEMPORARY' ) ) { $i++; }
+            if ( $kw( $i, array( 'DATABASE', 'SCHEMA' ) ) ) { $problem = 'The dump switches or creates databases.'; return; }
+            if ( ! $kw( $i++, array( 'TABLE', 'TABLES' ) ) ) { return $refuse(); }
+            if ( $kw( $i, 'IF' ) && $kw( $i + 1, 'EXISTS' ) ) { $i += 2; }
+            do {
+                if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            } while ( isset( $t[ $i ] ) && ',' === $t[ $i++ ] );
+            return;
+        case 'CREATE':
+            if ( $kw( $i, 'OR' ) && $kw( $i + 1, 'REPLACE' ) ) { $i += 2; }
+            if ( $kw( $i, 'TEMPORARY' ) ) { $i++; }
+            if ( $kw( $i, array( 'DATABASE', 'SCHEMA' ) ) ) { $problem = 'The dump switches or creates databases.'; return; }
+            if ( ! $kw( $i++, 'TABLE' ) ) { return $refuse(); }
+            if ( $kw( $i, 'IF' ) && $kw( $i + 1, 'NOT' ) && $kw( $i + 2, 'EXISTS' ) ) { $i += 3; }
+            $n = $name( $i );
+            if ( ! $own( $n ) ) { return $problem ? null : $refuse(); }
+            $created[ $n ] = true;
+            break;
+        case 'ALTER':
+            while ( $kw( $i, array( 'ONLINE', 'IGNORE' ) ) ) { $i++; }
+            if ( $kw( $i, array( 'DATABASE', 'SCHEMA' ) ) ) { $problem = 'The dump switches or creates databases.'; return; }
+            if ( ! $kw( $i++, 'TABLE' ) ) { return $refuse(); }
+            if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            break;
+        case 'INSERT': case 'REPLACE':
+            while ( $kw( $i, array( 'LOW_PRIORITY', 'DELAYED', 'HIGH_PRIORITY', 'IGNORE' ) ) ) { $i++; }
+            if ( $kw( $i, 'INTO' ) ) { $i++; }
+            if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            return;
+        case 'TRUNCATE':
+            if ( $kw( $i, 'TABLE' ) ) { $i++; }
+            if ( ! $own( $name( $i ) ) || isset( $t[ $i ] ) ) { return $problem ? null : $refuse(); }
+            return;
+        case 'RENAME':
+            if ( ! $kw( $i++, array( 'TABLE', 'TABLES' ) ) ) { return $refuse(); }
+            do {
+                if ( ! $own( $name( $i ) ) || ! $kw( $i++, 'TO' ) || ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            } while ( isset( $t[ $i ] ) && ',' === $t[ $i++ ] );
+            return;
+        case 'DELETE':
+            while ( $kw( $i, array( 'LOW_PRIORITY', 'QUICK', 'IGNORE' ) ) ) { $i++; }
+            if ( ! $kw( $i++, 'FROM' ) || ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            if ( isset( $t[ $i ] ) && ! $kw( $i, array( 'WHERE', 'ORDER', 'LIMIT', 'RETURNING' ) ) ) { return $refuse(); }
+            return;
+        case 'UPDATE':
+            while ( $kw( $i, array( 'LOW_PRIORITY', 'IGNORE' ) ) ) { $i++; }
+            if ( ! $own( $name( $i ) ) || ! $kw( $i, 'SET' ) ) { return $problem ? null : $refuse(); }
+            return;
+        default:
+            return $refuse();
+    }
+    // CREATE TABLE and ALTER TABLE: the other tables they name.
+    for ( $n = count( $t ); $i < $n; $i++ ) {
+        if ( $kw( $i, 'WITH' ) && $kw( $i + 1, 'TABLE' ) ) {
+            $i++;
+        } elseif ( $kw( $i, 'RENAME' ) && ! $kw( $i + 1, array( 'COLUMN', 'INDEX', 'KEY', 'CONSTRAINT' ) ) ) {
+            if ( $kw( $i + 1, array( 'TO', 'AS' ) ) ) { $i++; }
+        } elseif ( ! $kw( $i, array( 'REFERENCES', 'LIKE' ) ) ) {
+            continue;
+        }
+        $j = $i + 1;
+        if ( ! $own( $name( $j ) ) && $problem ) { return; }
+    }
+};
+
+$head    = '';     // the statement so far: code only, strings as ''
+$cap     = 65536;  // a CREATE TABLE fits; an INSERT's rows don't matter
+$state   = 'code'; // code | sq | dq | bt | comment
+$exec    = 0;      // executable comments open (/*! … */): their text is code
+$esc     = false;  // the last character in a string was a backslash
+$line_no = 0;
+$add     = function ( $s ) use ( &$head, $cap ) {
+    if ( strlen( $head ) < $cap ) { $head .= $s; }
+};
+while ( null === $problem && false !== ( $line = fgets( $fh ) ) ) {
+    $line_no++;
+    // MariaDB's dump tools put this first. It is a client command, but the
+    // one that turns the client's other commands off.
+    if ( 1 === $line_no && '/*M!999999\- enable the sandbox mode */' === rtrim( $line ) ) { continue; }
+    $len = strlen( $line );
+    $i   = 0;
+    while ( $i < $len && null === $problem ) {
+        if ( 'sq' === $state || 'dq' === $state ) {
+            if ( $esc ) { $esc = false; $i++; continue; }
+            $q  = 'sq' === $state ? "'" : '"';
+            $i += strcspn( $line, $q . '\\', $i );
+            if ( $i >= $len ) { break; }
+            if ( '\\' === $line[ $i ] ) { $esc = true; $i++; continue; }
+            if ( $i + 1 < $len && $q === $line[ $i + 1 ] ) { $i += 2; continue; }
+            $state = 'code';
+            $add( "''" );
+            $i++;
+        } elseif ( 'bt' === $state ) {
+            $n = strcspn( $line, '`', $i );
+            $add( substr( $line, $i, $n ) );
+            $i += $n;
+            if ( $i >= $len ) { break; }
+            if ( $i + 1 < $len && '`' === $line[ $i + 1 ] ) { $add( '``' ); $i += 2; continue; }
+            $add( '`' );
+            $state = 'code';
+            $i++;
+        } elseif ( 'comment' === $state ) {
+            $p = strpos( $line, '*/', $i );
+            if ( false === $p ) { break; }
+            $state = 'code';
+            $add( ' ' );
+            $i = $p + 2;
+        } else {
+            $n = strcspn( $line, "'\"`;/-#*\\", $i );
+            $add( substr( $line, $i, $n ) );
+            $i += $n;
+            if ( $i >= $len ) { break; }
+            $c    = $line[ $i ];
+            $next = $i + 1 < $len ? $line[ $i + 1 ] : '';
+            if ( "'" === $c ) {
+                $state = 'sq';
+                $i++;
+            } elseif ( '"' === $c ) {
+                $state = 'dq';
+                $i++;
+            } elseif ( '`' === $c ) {
+                $state = 'bt';
+                $add( '`' );
+                $i++;
+            } elseif ( ';' === $c ) {
+                $check( $head );
+                $head = '';
+                $i++;
+            } elseif ( '\\' === $c ) {
+                $problem = "The dump holds a mysql client command (\\$next on line $line_no), which a tenant restore refuses.";
+            } elseif ( '#' === $c || ( '-' === $c && '-' === $next && ( $i + 2 >= $len || ctype_space( $line[ $i + 2 ] ) ) ) ) {
+                $add( ' ' );
+                break;
+            } elseif ( '/' === $c && '*' === $next ) {
+                if ( preg_match( '/\G\/\*M?!\d*/', $line, $m, 0, $i ) ) {
+                    $exec++;
+                    $i += strlen( $m[0] );
+                } else {
+                    $state = 'comment';
+                    $i += 2;
+                }
+                $add( ' ' );
+            } elseif ( '*' === $c && '/' === $next && $exec > 0 ) {
+                $exec--;
+                $add( ' ' );
+                $i += 2;
+            } else {
+                $add( $c );
+                $i++;
+            }
+        }
+    }
+}
+fclose( $fh );
+if ( null === $problem && '' !== trim( $head ) ) { $check( $head ); }
+if ( null === $problem && $foreign ) {
+    $problem = "The dump touches tables outside $label: " . implode( ' ', array_slice( array_keys( $foreign ), 0, 5 ) ) . '.';
+}
+if ( null !== $problem ) {
+    file_put_contents( $args[3], $problem );
+    return;
+}
+file_put_contents( $args[2], implode( "\n", array_keys( $created ) ) . "\n" );
+PHPCHECK
+}
+
 # Does the install at $1 run WP Freighter? Read from the files, not through
 # PHP, so the answer holds when WordPress fails to boot: push uses it to
 # refuse a whole-install restore that would take every tenant with it.
@@ -469,12 +723,6 @@ tenant_check() {
                 return 1 ;;
         esac
     fi
-}
-
-# Every table a dump drops, creates or writes to, one per line.
-dump_tables_touched() {
-    grep -oE '^(DROP TABLE( IF EXISTS)?|CREATE TABLE( IF NOT EXISTS)?|INSERT( IGNORE)? INTO|REPLACE INTO|LOCK TABLES|ALTER TABLE|TRUNCATE( TABLE)?|RENAME TABLE|DELETE FROM|UPDATE) `[^`]+`' "$1" \
-        | sed -E 's/.*`([^`]+)`$/\1/' | sort -u
 }
 
 # Copy dump $1 to $4 with every table renamed from prefix $2 to $3. Only the
@@ -734,15 +982,10 @@ restore_tenant() {
             || die "Could not rewrite the dump's table names. Nothing was changed."
         sql="$held/tenant.sql"
     fi
-    if grep -qiE '^(USE|CREATE DATABASE|DROP DATABASE|CREATE SCHEMA|DROP SCHEMA)[[:space:]]' "$sql"; then
-        die "The dump switches or creates databases. Nothing was changed."
-    fi
-    local foreign
-    foreign=$(dump_tables_touched "$sql" | grep -v "^${dest_prefix}" | head -5 | tr '\n' ' ')
-    if [ -n "$foreign" ]; then
-        die "The dump touches tables outside tenant $TENANT: ${foreign% }. Nothing was changed."
-    fi
-    grep -oE '^CREATE TABLE( IF NOT EXISTS)? `[^`]+`' "$sql" | sed -E 's/.*`([^`]+)`$/\1/' > "$held/tables.txt"
+    log "Checking the dump..."
+    wp_eval "$site_dir" php_dump_check_script "$sql" "$dest_prefix" "$held/tables.txt" "$held/dump-problem.txt" "tenant $TENANT" \
+        || die "Could not check the dump. Nothing was changed."
+    [ -s "$held/dump-problem.txt" ] && die "$(cat "$held/dump-problem.txt") Nothing was changed."
     grep -qx "${dest_prefix}options" "$held/tables.txt" \
         || die "The dump has no ${dest_prefix}options table once renamed. Nothing was changed."
 
