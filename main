@@ -252,6 +252,21 @@ config_set() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
+# A value from ~/Cove/config (the last line that sets it, quotes stripped),
+# or nothing.
+config_get() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    grep "^${1}=" "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "'\""
+}
+
+config_unset() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    local tmp
+    tmp=$(mktemp)
+    grep -v "^${1}=" "$CONFIG_FILE" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$CONFIG_FILE"
+}
+
 # Emit a base64-encoded random password. Uses openssl when present, falls
 # back to /dev/urandom otherwise — Fedora Workstation doesn't ship openssl
 # in its base install, and a missing openssl used to yield an empty $db_pass
@@ -1695,7 +1710,11 @@ warmup_ticks=60           # ~5min after a pid first answers a probe. Until then
                           # with nothing actually wedged.
 fail_threshold_warm=24    # ~2min of sustained failure inside that warmup window
 never_healthy_ticks=120   # ~10min (120 x 5s) stuck in startup -> retry once
-log_cap_bytes=52428800    # 50MB — a restart storm must not fill the disk
+# The cap on the services' own output (cove log rotate services <MB>|off;
+# default 50 MB, so a restart storm can't fill the disk). Past it, the last
+# tenth is kept.
+log_cap_mb=\$(sed -n 's/^SERVICE_LOG_CAP_MB=//p' "$CONFIG_FILE" 2>/dev/null | tail -1 | tr -cd '0-9')
+log_cap_bytes=\$(( \${log_cap_mb:-50} * 1048576 ))
 
 [ -f "\$pidfile" ] || exit 0
 pid=\$(cat "\$pidfile" 2>/dev/null)
@@ -1707,11 +1726,11 @@ mkdir -p "$LOGS_DIR"
 
 # Cap the FrankenPHP process log. It grows unbounded (info-level auto-HTTPS
 # lines on every startup) and a restart storm can push it into the GBs, which
-# is itself a drag on the box. Keep the most recent 5MB.
-if [ -f "\$process_log" ]; then
+# is itself a drag on the box. Keep the most recent tenth of the cap.
+if [ "\$log_cap_bytes" -gt 0 ] && [ -f "\$process_log" ]; then
     lsize=\$(stat -f%z "\$process_log" 2>/dev/null || stat -c%s "\$process_log" 2>/dev/null || echo 0)
     if [ "\$lsize" -gt "\$log_cap_bytes" ]; then
-        tail -c 5242880 "\$process_log" > "\$process_log.tmp" 2>/dev/null \\
+        tail -c \$((log_cap_bytes / 10)) "\$process_log" > "\$process_log.tmp" 2>/dev/null \\
             && mv "\$process_log.tmp" "\$process_log" 2>/dev/null
     fi
 fi
@@ -2173,17 +2192,21 @@ db_path="$COVE_DIR/mailpit.db"
 # \`cove demo\` keeps its own mailbox, so a recording shows only demo mail.
 [ -f "$COVE_DIR/demo" ] && db_path="$COVE_DIR/mailpit-demo.db"
 log_file="$LOGS_DIR/mailpit.log"
-log_cap_bytes=52428800    # 50MB — a restart storm must not fill the disk
+# The cap on the services' own output (cove log rotate services <MB>|off;
+# default 50 MB, so a restart storm can't fill the disk). Past it, the last
+# tenth is kept.
+log_cap_mb=\$(sed -n 's/^SERVICE_LOG_CAP_MB=//p' "$CONFIG_FILE" 2>/dev/null | tail -1 | tr -cd '0-9')
+log_cap_bytes=\$(( \${log_cap_mb:-50} * 1048576 ))
 
 mkdir -p "$LOGS_DIR"
 
 # Cap the log. A bind-failure restart storm used to push this into the tens of
 # MBs with nothing useful but "address already in use" lines. Keep the most
-# recent 1MB so a real error still has context.
-if [ -f "\$log_file" ]; then
+# recent tenth of the cap so a real error still has context.
+if [ "\$log_cap_bytes" -gt 0 ] && [ -f "\$log_file" ]; then
     lsize=\$(stat -f%z "\$log_file" 2>/dev/null || stat -c%s "\$log_file" 2>/dev/null || echo 0)
     if [ "\$lsize" -gt "\$log_cap_bytes" ]; then
-        tail -c 1048576 "\$log_file" > "\$log_file.tmp" 2>/dev/null \\
+        tail -c \$((log_cap_bytes / 10)) "\$log_file" > "\$log_file.tmp" 2>/dev/null \\
             && mv "\$log_file.tmp" "\$log_file" 2>/dev/null
     fi
 fi
@@ -2846,6 +2869,31 @@ emit_site_php_handler() {
 # ignores .htaccess, so without this they download to anyone who can reach
 # the site — a `cove share` visitor included. A `handle` block, not a bare
 # `respond`: php_server is ordered ahead of respond.
+# A site's access log, as the `output` line of its log block. Caddy rolls
+# the file by default (at 100 MB, the newest 10 rolled files kept, none older
+# than 90 days); `cove log rotate access` sets other numbers, or off, which
+# keeps one file growing for good.
+site_log_output() {
+    local file="$1" mb keep days
+    mb=$(config_get ACCESS_LOG_ROLL_MB)
+    keep=$(config_get ACCESS_LOG_ROLL_KEEP | tr -cd '0-9')
+    days=$(config_get ACCESS_LOG_ROLL_DAYS | tr -cd '0-9')
+    if [ "$mb" = off ]; then
+        printf '        output file "%s" {\n            roll_disabled\n        }\n' "$file"
+        return
+    fi
+    mb=$(printf '%s' "$mb" | tr -cd '0-9')
+    if [ -z "$mb$keep$days" ]; then
+        printf '        output file "%s"\n' "$file"
+        return
+    fi
+    printf '        output file "%s" {\n' "$file"
+    [ -n "$mb" ] && printf '            roll_size %sMiB\n' "$mb"
+    [ -n "$keep" ] && printf '            roll_keep %s\n' "$keep"
+    [ -n "$days" ] && printf '            roll_keep_for %sh\n' "$((days * 24))"
+    printf '        }\n'
+}
+
 emit_site_deny_rules() {
     cat >> "$CADDYFILE_PATH" <<'EOM'
     @cove_private {
@@ -2995,7 +3043,7 @@ emit_site_twin_block() {
     {
         echo "    tls internal"
         echo "    log {"
-        echo "        output file \"$site_path/logs/caddy-twin.log\""
+        site_log_output "$site_path/logs/caddy-twin.log"
         echo "    }"
         echo "    @cove_as_site header X-Cove-Twin as-site"
         echo "    request_header @cove_as_site Host $site_host"
@@ -3268,7 +3316,7 @@ EOM
                 echo "    tls internal" >> "$CADDYFILE_PATH"
                 
                 echo "    log {" >> "$CADDYFILE_PATH"
-                echo "        output file \"$site_path/logs/caddy.log\"" >> "$CADDYFILE_PATH"
+                site_log_output "$site_path/logs/caddy.log" >> "$CADDYFILE_PATH"
                 echo "    }" >> "$CADDYFILE_PATH"
                 
                 local custom_conf_file="$CUSTOM_CADDY_DIR/$site_name"
@@ -3310,7 +3358,7 @@ EOM
                         echo "    tls internal" >> "$CADDYFILE_PATH"
                         
                         echo "    log {" >> "$CADDYFILE_PATH"
-                        echo "        output file \"$site_path/logs/caddy-lan.log\"" >> "$CADDYFILE_PATH"
+                        site_log_output "$site_path/logs/caddy-lan.log" >> "$CADDYFILE_PATH"
                         echo "    }" >> "$CADDYFILE_PATH"
                         
                         if [ -f "$custom_conf_file" ]; then
@@ -3432,7 +3480,7 @@ EOM
                         emit_site_deny_rules
 
                         echo "    log {" >> "$CADDYFILE_PATH"
-                        echo "        output file \"$site_path/logs/caddy-tailscale.log\"" >> "$CADDYFILE_PATH"
+                        site_log_output "$site_path/logs/caddy-tailscale.log" >> "$CADDYFILE_PATH"
                         echo "    }" >> "$CADDYFILE_PATH"
                         
                         # Include custom directives if present
@@ -16384,14 +16432,19 @@ display_command_help() {
             ;;
         log)
             echo "Usage: cove log [site] [--follow]"
-            echo "       cove log rotate [<MB>|off]"
+            echo "       cove log rotate                     How long each log is kept, and sizes"
+            echo "       cove log rotate <MB> | off           Cove's own logs (~/Cove/Logs)"
+            echo "       cove log rotate services <MB> | off | default"
+            echo "       cove log rotate access <MB> | off | default [--keep=<files>] [--days=<days>]"
             echo ""
             echo "View logs for a site or the global error log."
             echo ""
-            echo "Cove keeps every line of its own logs (~/Cove/Logs) unless asked otherwise."
-            echo "'cove log rotate 50' turns rotation on: a log past 50 MB moves to <name>.log.1,"
-            echo "replacing the one before, and starts again empty. 'cove log rotate' shows the"
-            echo "setting and each log's size; 'cove log rotate off' keeps everything again."
+            echo "Cove keeps every line of its own logs unless asked otherwise: 'cove log rotate 50'"
+            echo "moves a log past 50 MB to <name>.log.1, replacing the one before. The services'"
+            echo "own output (caddy-process.log, mailpit.log) is trimmed to its last tenth past"
+            echo "50 MB, so a restart storm can't fill the disk; 'services' changes that size or"
+            echo "turns it off. Caddy rolls each site's access log at 100 MB and keeps 10 rolled"
+            echo "files for up to 90 days; 'access' sets other numbers, or off to keep one file."
             echo ""
             echo "Arguments:"
             echo "  [site]           The site name (optional). If omitted, shows global error log."

@@ -247,7 +247,10 @@ cove_health() {
                 echo "  ℹ️  errors.log is $((sz/1048576)) MB, kept in full. To cap it: cove log rotate <MB>"
             fi
             biglog=$((biglog+1))
-        elif [ "$sz" -gt 52428800 ]; then
+        elif [ "$(log_service_cap)" -eq 0 ]; then
+            # Kept in full on purpose (cove log rotate services off).
+            [ "$sz" -gt 52428800 ] && echo "  ℹ️  $(basename "$lf") is $((sz/1048576)) MB, kept in full (cove log rotate services off)" && biglog=$((biglog+1))
+        elif [ "$sz" -gt $(( $(log_service_cap) > 50 ? $(log_service_cap) * 1048576 : 52428800 )) ]; then
             echo "  ⚠️  $(basename "$lf") is $((sz/1048576)) MB"
             if [ "$(basename "$lf")" = "mailpit.log" ]; then
                 echo "     (bind-failure thrash? reinstall with: cove enable)"

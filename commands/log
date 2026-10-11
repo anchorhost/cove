@@ -1,13 +1,42 @@
-# Rotation of Cove's own logs (~/Cove/Logs/*.log) is off unless asked for:
-# Cove is for local development, where last month's error can be the clue,
-# so by default every line is kept. `cove log rotate <MB>` turns it on. The
-# watchdog then looks every five minutes, and a log past that size moves to
-# <name>.log.1 (replacing the one before) and starts again empty, so each
-# log keeps at most about twice the size. The copy is taken and the original
-# emptied in place, because FrankenPHP, Mailpit and the watchdog keep their
-# logs open. Sites' own debug.log and access logs are not Cove's to trim.
+# How long Cove keeps each log. Three settings, in ~/Cove/config:
+#   - Cove's own logs (~/Cove/Logs/*.log): kept in full unless asked for.
+#     Cove is for local development, where last month's error can be the
+#     clue. `cove log rotate <MB>` turns rotation on: the watchdog looks every
+#     five minutes, and a log past that size moves to <name>.log.1 (replacing
+#     the one before) and starts again empty. The copy is taken and the
+#     original emptied in place, because FrankenPHP, Mailpit and the watchdog
+#     keep their logs open. (LOG_ROTATE_MB)
+#   - The services' own output (caddy-process.log, mailpit.log): a guard
+#     against restart storms, on by default. Past 50 MB the last tenth is
+#     kept; the watchdog trims FrankenPHP's, Mailpit's start script its own.
+#     `cove log rotate services <MB>|off|default`. (SERVICE_LOG_CAP_MB)
+#   - Sites' access logs: Caddy rolls them by default (100 MB, 10 rolled
+#     files, 90 days). `cove log rotate access <MB>|off|default [--keep=N]
+#     [--days=N]` writes other numbers, or roll_disabled, into every site's
+#     log block (see site_log_output). (ACCESS_LOG_ROLL_MB/_KEEP/_DAYS)
+# Sites' own debug.log files are WordPress's, and left alone.
 log_rotate_limit() {
-    sed -n 's/^LOG_ROTATE_MB=//p' "$CONFIG_FILE" 2>/dev/null | tail -1 | tr -cd '0-9'
+    config_get LOG_ROTATE_MB | tr -cd '0-9'
+}
+
+log_service_cap() {
+    local v
+    v=$(config_get SERVICE_LOG_CAP_MB | tr -cd '0-9')
+    echo "${v:-50}"
+}
+
+log_size_label() {
+    awk -v b="$1" 'BEGIN { if (b >= 1073741824) printf "%.1f GB", b / 1073741824; else if (b >= 1048576) printf "%.1f MB", b / 1048576; else printf "%d KB", (b + 1023) / 1024 }'
+}
+
+# Scripts written by an older Cove read none of these settings yet.
+log_rotate_refresh_scripts() {
+    if [ -f "$COVE_DIR/watchdog.sh" ] && ! grep -q 'SERVICE_LOG_CAP_MB' "$COVE_DIR/watchdog.sh"; then
+        write_watchdog_script >/dev/null
+    fi
+    if [ -f "$COVE_DIR/mailpit-run.sh" ] && ! grep -q 'SERVICE_LOG_CAP_MB' "$COVE_DIR/mailpit-run.sh"; then
+        write_mailpit_run_script >/dev/null
+    fi
 }
 
 log_rotate_apply() {
@@ -26,41 +55,145 @@ log_rotate_apply() {
     done
 }
 
-cove_log_rotate() {
-    local mb f size
-    case "${1:-}" in
-        --apply)
-            log_rotate_apply quiet
+log_rotate_status() {
+    local mb cap roll keep days f size total sites
+    mb=$(log_rotate_limit)
+    echo "📜 Cove's own logs ($LOGS_DIR)"
+    if [ -n "$mb" ] && [ "$mb" -gt 0 ]; then
+        echo "   Rotated: a log past $mb MB moves to <name>.log.1, replacing the one before."
+    else
+        echo "   Kept in full (the default)."
+    fi
+    for f in "$LOGS_DIR"/*.log "$LOGS_DIR"/*.log.1; do
+        [ -f "$f" ] || continue
+        size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+        printf '     %-28s %s\n' "$(basename "$f")" "$(log_size_label "$size")"
+    done
+    echo "   Change: cove log rotate <MB> | off"
+    echo ""
+    cap=$(log_service_cap)
+    echo "🛟 The services' own output (caddy-process.log, mailpit.log)"
+    if [ "$cap" -gt 0 ]; then
+        echo "   Trimmed to the last $(log_size_label $((cap * 104858))) once past $cap MB$([ "$cap" = 50 ] && echo " (the default)"), so a restart storm can't fill the disk."
+    else
+        echo "   Kept in full: the restart-storm cap is off."
+    fi
+    echo "   Change: cove log rotate services <MB> | off | default"
+    echo ""
+    roll=$(config_get ACCESS_LOG_ROLL_MB)
+    keep=$(config_get ACCESS_LOG_ROLL_KEEP | tr -cd '0-9')
+    days=$(config_get ACCESS_LOG_ROLL_DAYS | tr -cd '0-9')
+    echo "🌐 Sites' access logs (<site>/logs/caddy*.log)"
+    if [ "$roll" = off ]; then
+        echo "   Kept in full: Caddy doesn't roll them."
+    else
+        roll=$(printf '%s' "$roll" | tr -cd '0-9')
+        echo "   Caddy rolls each at ${roll:-100} MB and keeps the newest ${keep:-10} rolled files, none older than ${days:-90} days$([ -z "$roll$keep$days" ] && echo " (Caddy's default)")."
+    fi
+    total=$(find "$SITES_DIR" -mindepth 3 -maxdepth 3 -path '*/logs/*' -name 'caddy*' -type f -exec stat -f%z {} + 2>/dev/null || find "$SITES_DIR" -mindepth 3 -maxdepth 3 -path '*/logs/*' -name 'caddy*' -type f -exec stat -c%s {} + 2>/dev/null)
+    total=$(printf '%s\n' "$total" | awk '{ s += $1 } END { print s + 0 }')
+    sites=$(find "$SITES_DIR" -mindepth 3 -maxdepth 3 -path '*/logs/*' -name 'caddy.log' -type f 2>/dev/null | wc -l | tr -d ' ')
+    echo "     $(log_size_label "$total") across $sites sites, rolled files included"
+    echo "   Change: cove log rotate access <MB> | off | default [--keep=<files>] [--days=<days>]"
+}
+
+log_rotate_services() {
+    local v="${1:-}"
+    case "$v" in
+        off)
+            config_set SERVICE_LOG_CAP_MB 0
+            echo "✅ The services' own output is kept in full from here on."
             ;;
-        ""|status)
-            mb=$(log_rotate_limit)
-            if [ -n "$mb" ] && [ "$mb" -gt 0 ]; then
-                echo "↻ Log rotation is on: a log in $LOGS_DIR past $mb MB moves to <name>.log.1."
-            else
-                echo "Log rotation is off: Cove keeps every log line. Turn it on with: cove log rotate <MB>"
+        default)
+            config_unset SERVICE_LOG_CAP_MB
+            echo "✅ The services' own output is trimmed to its last 5 MB once past 50 MB (the default)."
+            ;;
+        *)
+            if ! [[ "$v" =~ ^[0-9]+$ ]] || [ "$v" -lt 1 ] || [ "$v" -gt 100000 ]; then
+                gum style --foreground red "❌ Error: Give a size in MB, such as 'cove log rotate services 200', or off, or default."
+                exit 1
             fi
-            for f in "$LOGS_DIR"/*.log "$LOGS_DIR"/*.log.1; do
-                [ -f "$f" ] || continue
-                size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
-                printf '   %-28s %s\n' "$(basename "$f")" "$(awk -v b="$size" 'BEGIN { if (b >= 1048576) printf "%.1f MB", b / 1048576; else printf "%d KB", (b + 1023) / 1024 }')"
-            done
+            config_set SERVICE_LOG_CAP_MB "$v"
+            echo "✅ The services' own output is trimmed to its last $(log_size_label $((v * 104858))) once past $v MB."
             ;;
+    esac
+    log_rotate_refresh_scripts
+    echo "   The watchdog applies it to caddy-process.log; Mailpit's start script to mailpit.log."
+}
+
+log_rotate_access() {
+    local mb="" keep="" days="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --keep=*) keep="${arg#*=}" ;;
+            --days=*) days="${arg#*=}" ;;
+            off|default) mb="$arg" ;;
+            *)
+                if [[ "$arg" =~ ^[0-9]+$ ]]; then mb="$arg"; else
+                    gum style --foreground red "❌ Error: Unknown '$arg'." "Usage: cove log rotate access <MB> | off | default [--keep=<files>] [--days=<days>]"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+    if [ -z "$mb$keep$days" ]; then
+        gum style --foreground red "❌ Error: Give a size in MB, off, default, --keep or --days." "Usage: cove log rotate access <MB> | off | default [--keep=<files>] [--days=<days>]"
+        exit 1
+    fi
+    if [ -n "$keep" ] && { ! [[ "$keep" =~ ^[0-9]+$ ]] || [ "$keep" -lt 1 ] || [ "$keep" -gt 1000 ]; }; then
+        gum style --foreground red "❌ Error: --keep takes a number of rolled files, 1 to 1000."
+        exit 1
+    fi
+    if [ -n "$days" ] && { ! [[ "$days" =~ ^[0-9]+$ ]] || [ "$days" -lt 1 ] || [ "$days" -gt 36500 ]; }; then
+        gum style --foreground red "❌ Error: --days takes a number of days, 1 to 36500."
+        exit 1
+    fi
+    if [[ "$mb" =~ ^[0-9]+$ ]] && { [ "$mb" -lt 1 ] || [ "$mb" -gt 100000 ]; }; then
+        gum style --foreground red "❌ Error: Give a size in MB, 1 to 100000."
+        exit 1
+    fi
+    case "$mb" in
+        off)
+            config_set ACCESS_LOG_ROLL_MB off
+            echo "✅ Sites' access logs are kept in full from here on: Caddy won't roll them."
+            ;;
+        default)
+            config_unset ACCESS_LOG_ROLL_MB; config_unset ACCESS_LOG_ROLL_KEEP; config_unset ACCESS_LOG_ROLL_DAYS
+            echo "✅ Sites' access logs are back on Caddy's default: rolled at 100 MB, 10 rolled files kept, none older than 90 days."
+            ;;
+        *)
+            if [ -n "$mb" ]; then config_set ACCESS_LOG_ROLL_MB "$mb"
+            elif [ "$(config_get ACCESS_LOG_ROLL_MB)" = off ]; then config_unset ACCESS_LOG_ROLL_MB
+            fi
+            [ -n "$keep" ] && config_set ACCESS_LOG_ROLL_KEEP "$keep"
+            [ -n "$days" ] && config_set ACCESS_LOG_ROLL_DAYS "$days"
+            local r k d
+            r=$(config_get ACCESS_LOG_ROLL_MB); k=$(config_get ACCESS_LOG_ROLL_KEEP); d=$(config_get ACCESS_LOG_ROLL_DAYS)
+            echo "✅ Caddy rolls each site's access log at ${r:-100} MB and keeps the newest ${k:-10} rolled files, none older than ${d:-90} days."
+            ;;
+    esac
+    regenerate_caddyfile
+}
+
+cove_log_rotate() {
+    case "${1:-}" in
+        --apply) log_rotate_apply quiet ;;
+        ""|status) log_rotate_status ;;
+        services) shift; log_rotate_services "$@" ;;
+        access) shift; log_rotate_access "$@" ;;
         off)
             config_set LOG_ROTATE_MB 0
             echo "✅ Log rotation is off: Cove keeps every log line from here on."
             ls "$LOGS_DIR"/*.log.1 >/dev/null 2>&1 && echo "   The .log.1 files from earlier rotations stay in $LOGS_DIR."
             ;;
         *)
-            mb="$1"
+            local mb="$1"
             if ! [[ "$mb" =~ ^[0-9]+$ ]] || [ "$mb" -lt 1 ] || [ "$mb" -gt 100000 ]; then
-                gum style --foreground red "❌ Error: Give a size in MB, such as 'cove log rotate 50', or 'off'."
+                gum style --foreground red "❌ Error: Give a size in MB, such as 'cove log rotate 50', or off." "'cove log rotate' shows every setting."
                 exit 1
             fi
             config_set LOG_ROTATE_MB "$mb"
-            # A watchdog written by an older Cove has no rotation check yet.
-            if [ -f "$COVE_DIR/watchdog.sh" ] && ! grep -q 'LOG_ROTATE_MB' "$COVE_DIR/watchdog.sh"; then
-                write_watchdog_script >/dev/null
-            fi
+            log_rotate_refresh_scripts
             echo "✅ Log rotation is on: a log in $LOGS_DIR past $mb MB moves to <name>.log.1."
             echo "   The watchdog checks every five minutes. 'cove log rotate off' keeps everything again."
             log_rotate_apply
