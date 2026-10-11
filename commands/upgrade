@@ -379,14 +379,7 @@ cove_upgrade() {
         if [ "$current" = "-1" ]; then
             echo "   ✓ ${k}: -1 (unlimited)"
         elif [ -z "$current" ] || [ "$current_bytes" -lt "$floor_bytes" ]; then
-            mkdir -p "$(dirname "$PHP_INI_FILE")"
-            touch "$PHP_INI_FILE"
-            if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
-                sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${install_default_memory}|" "$PHP_INI_FILE"
-            else
-                echo "${k} = ${install_default_memory}" >> "$PHP_INI_FILE"
-            fi
-            rm -f "${PHP_INI_FILE}.bak"
+            cove_ini_set "$k" "$install_default_memory"
             echo "   ↑ ${k}: ${current:-unset} → ${install_default_memory}"
             bumped_any=true
         else

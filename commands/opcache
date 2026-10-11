@@ -143,21 +143,14 @@ cove_opcache() {
     fi
     echo ""
     gum style --foreground "212" --bold "Setting opcache.memory_consumption = ${mem} MB"
-    mkdir -p "$(dirname "$PHP_INI_FILE")"
-    touch "$PHP_INI_FILE"
     echo "📁 Updating $PHP_INI_FILE"
     local k v
     for pair in "opcache.memory_consumption=$mem" "opcache.interned_strings_buffer=$interned" "opcache.max_accelerated_files=$files"; do
         k="${pair%%=*}"; v="${pair#*=}"
         [ -z "$v" ] && continue
-        if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
-            sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${v}|" "$PHP_INI_FILE"
-        else
-            echo "${k} = ${v}" >> "$PHP_INI_FILE"
-        fi
+        cove_ini_set "$k" "$v"
         echo "   ✓ ${k} = ${v}"
     done
-    rm -f "${PHP_INI_FILE}.bak"
     echo ""
     regenerate_caddyfile
     echo ""

@@ -178,19 +178,12 @@ cove_memory_set() {
     echo ""
 
     # 1) Cove CLI ini — source of truth for Cove
-    mkdir -p "$(dirname "$PHP_INI_FILE")"
-    touch "$PHP_INI_FILE"
     echo "📁 Updating $PHP_INI_FILE"
     local k
     for k in memory_limit upload_max_filesize post_max_size; do
-        if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
-            sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${value}|" "$PHP_INI_FILE"
-        else
-            echo "${k} = ${value}" >> "$PHP_INI_FILE"
-        fi
+        cove_ini_set "$k" "$value"
         echo "   ✓ ${k} = ${value}"
     done
-    rm -f "${PHP_INI_FILE}.bak"
 
     # 2) Regenerate Caddyfile so FrankenPHP web server picks up the new values
     echo ""
