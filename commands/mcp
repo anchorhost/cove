@@ -224,6 +224,18 @@ function tools(): array {
             ], ['name']),
             'annotations' => $rw,
         ],
+        'clone_site' => [
+            'title' => 'Clone a site',
+            'description' => "Copies a site, files and database, to a new site at https://<name>.localhost with its URLs rewritten. A safe place to try a risky change: the original is left alone.",
+            'inputSchema' => $obj(['site' => $site, 'name' => ['type' => 'string', 'description' => 'The new site\'s name: lowercase letters, numbers and hyphens.']], ['site', 'name']),
+            'annotations' => $rw,
+        ],
+        'set_php' => [
+            'title' => 'Set a site\'s PHP version',
+            'description' => "Pins a site to an older PHP (e.g. 8.2), served by a native php-fpm behind the same web server, or puts it back on Cove's bundled PHP with version default. For checking a plugin or theme on another PHP. macOS with Homebrew only; the first pin to a version installs php@<version>, which can take a few minutes.",
+            'inputSchema' => $obj(['site' => $site, 'version' => ['type' => 'string', 'description' => 'A PHP version such as 8.2 or 8.3, or default.']], ['site', 'version']),
+            'annotations' => ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false],
+        ],
         'login_link' => [
             'title' => 'One-time login link',
             'description' => "A one-time link that signs into a WordPress site's admin as an administrator (or the user named), for a browser or a browser-automation tool. Each link works once.",
@@ -298,6 +310,20 @@ function tools(): array {
             'inputSchema' => $obj(['site' => $site, 'limit' => ['type' => 'integer', 'description' => 'How many saves (up to 100). Default 20.']], ['site']),
             'annotations' => $ro,
         ],
+        'history_diff' => [
+            'title' => 'What a save changed',
+            'description' => "The code diff of one history save against the save before it: what a plugin or theme update actually changed. Name a plugin, theme, mu-plugin or file to narrow it, or ask for stat_only for the list of files.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'id' => ['type' => 'string', 'description' => 'The save id from history_list (or latest).'],
+                'plugin' => ['type' => 'string', 'description' => 'Only this plugin (slug).'],
+                'theme' => ['type' => 'string', 'description' => 'Only this theme (slug).'],
+                'mu_plugin' => ['type' => 'string', 'description' => 'Only this mu-plugin.'],
+                'file' => ['type' => 'string', 'description' => 'Only this file, relative to wp-content (plugins/akismet/akismet.php).'],
+                'stat_only' => ['type' => 'boolean', 'description' => 'Just the files and line counts.'],
+            ], ['site', 'id']),
+            'annotations' => $ro,
+        ],
         'history_rollback' => [
             'title' => 'Roll back a plugin or theme',
             'description' => "Puts one plugin, theme or mu-plugin (or all of them) back as a history save had it. The current state is saved first, so it can be undone. Files only: the database is left as it is.",
@@ -310,6 +336,12 @@ function tools(): array {
                 'all' => ['type' => 'boolean', 'description' => 'Every plugin, theme and mu-plugin.'],
             ], ['site', 'id']),
             'annotations' => $over,
+        ],
+        'health' => [
+            'title' => 'Cove health check',
+            'description' => "Cove's own diagnosis, for when sites are slow or crashing: the web server process and its recent crashes, OPcache pressure (one cache shared by every site), leftover files and logs, and what the network can reach. Reads only.",
+            'inputSchema' => $obj([]),
+            'annotations' => $ro,
         ],
         'status' => [
             'title' => 'Cove status',
@@ -358,7 +390,7 @@ function call_tool(string $name, array $a): array {
             } else {
                 $info['type'] = 'Plain (static files)';
             }
-            $pin = trim((string) @file_get_contents("$dir/php"));
+            $pin = trim((string) @file_get_contents("$dir/php_version"));
             if ($pin !== '') $info['php_pinned'] = $pin;
             $info['logs'] = ['php errors' => COVE_DIR . '/Logs/errors.log (shared by every site)', 'debug' => "$dir/public/wp-content/debug.log", 'access' => "$dir/logs/caddy.log"];
             $maps = @file("$dir/mappings", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
@@ -396,6 +428,26 @@ function call_tool(string $name, array $a): array {
             if (preg_match('~https://\S*wp-login\.php\S*~', $out, $m)) $reply .= "\nOne-time admin login: " . $m[0];
             $lines = explode("\n", $out);
             return text($reply . "\n\n" . implode("\n", array_slice($lines, -25)));
+
+        case 'clone_site':
+            $site = site_arg($a);
+            $name = strtolower(trim((string) ($a['name'] ?? '')));
+            if (!preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/', $name)) throw new ToolError('A site name takes lowercase letters, numbers and hyphens, and cannot start or end with a hyphen.');
+            if (is_dir(SITES . "/$name.localhost")) throw new ToolError("There is already a site named '$name'.");
+            [$out, , $code] = cove(['clone', $site, $name], true);
+            $out = clean($out);
+            if ($code !== 0 || !is_dir(SITES . "/$name.localhost/public")) throw new ToolError(cut($out) ?: 'cove clone failed.');
+            $lines = explode("\n", $out);
+            return text("Cloned $site to " . url_of($name) . "\nFiles: " . SITES . "/$name.localhost/public\n\n" . implode("\n", array_slice($lines, -15)));
+
+        case 'set_php':
+            $site = site_arg($a);
+            $ver = strtolower(trim((string) ($a['version'] ?? '')));
+            if ($ver !== 'default' && !preg_match('/^(php@)?\d+\.\d+$/', $ver)) throw new ToolError('version is a PHP version such as 8.2, or default.');
+            [$out, , $code] = cove(['php', $site, $ver], true);
+            $out = clean($out);
+            if ($code !== 0) throw new ToolError(cut($out) ?: 'cove php failed.');
+            return text($out);
 
         case 'login_link':
             $site = site_arg($a, true);
@@ -564,6 +616,34 @@ function call_tool(string $name, array $a): array {
             }
             return json_result(['saves' => $saves, 'hint' => $saves ? 'history_rollback puts a plugin or theme back as one of these saves had it.' : 'No saves yet.']);
 
+        case 'history_diff':
+            $site = site_arg($a);
+            $id = (string) ($a['id'] ?? '');
+            if (!preg_match('/^([0-9a-f]{4,40}|latest|HEAD(~\d+)?)$/', $id)) throw new ToolError('id is a save id from history_list, or latest, or HEAD~1.');
+            $targets = [];
+            foreach (['plugin' => '--plugin=', 'theme' => '--theme=', 'mu_plugin' => '--mu-plugin='] as $k => $flag) {
+                if (!empty($a[$k])) {
+                    if (!preg_match('/^[A-Za-z0-9._-]+$/', (string) $a[$k])) throw new ToolError("$k is a slug or file name.");
+                    $targets[] = $flag . $a[$k];
+                }
+            }
+            if (!empty($a['file'])) {
+                $f = (string) $a['file'];
+                if (!preg_match('~^[A-Za-z0-9._/-]+$~', $f) || preg_match('~(^|/)\.\.(/|$)~', $f)) throw new ToolError('file is a path relative to wp-content.');
+                $targets[] = '--file=' . $f;
+            }
+            if (count($targets) > 1) throw new ToolError('Name at most one of plugin, theme, mu_plugin, or file.');
+            $base = array_merge(['history', $site, 'diff', $id], $targets);
+            [$stat, $err, $code] = cove(array_merge($base, ['--stat']));
+            if ($code !== 0) throw new ToolError(clean($stat . "\n" . $err) ?: 'Could not read that save.');
+            if (trim($stat) === '') return text('That save changed nothing' . ($targets ? ' there.' : '.'));
+            if (!empty($a['stat_only'])) return text(trim($stat));
+            [$diff] = cove($base);
+            if (strlen($diff) > 60000) {
+                return text(trim($stat) . "\n\nThe full diff is " . strlen($diff) . " bytes, so here is its start. Name a plugin, theme or file to see one part whole.\n\n" . substr($diff, 0, 50000));
+            }
+            return text(trim($diff));
+
         case 'history_rollback':
             $site = site_arg($a);
             $id = (string) ($a['id'] ?? '');
@@ -581,6 +661,13 @@ function call_tool(string $name, array $a): array {
             $data = last_json($out);
             if ($code !== 0 || $data === null) throw new ToolError(clean($out . "\n" . $err) ?: 'The rollback failed.');
             return json_result($data);
+
+        case 'health':
+            if (demo_sites() !== null) throw new ToolError('The health check names sites outside the demo, so it is off while cove demo is on.');
+            [$out] = cove(['health'], true);
+            $out = clean($out);
+            if ($out === '') throw new ToolError('cove health printed nothing.');
+            return text(cut($out));
 
         case 'status':
             $cfg = @parse_ini_file(COVE_DIR . '/config') ?: [];
@@ -660,7 +747,7 @@ function rpc_error($id, int $code, string $message): array {
     return ['jsonrpc' => '2.0', 'id' => $id, 'error' => ['code' => $code, 'message' => $message]];
 }
 
-const INSTRUCTIONS = "Cove runs local WordPress sites on this machine, each at https://<name>.localhost with its files in ~/Cove/Sites/<name>.localhost/public and a database of its own. Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin, screenshot to see a page, and read_logs for PHP errors. Take a snapshot (snapshot_create) before a change you might want to undo; snapshot_restore and history_rollback each save the current state first. This server cannot delete sites or reach remote hosts.";
+const INSTRUCTIONS = "Cove runs local WordPress sites on this machine, each at https://<name>.localhost with its files in ~/Cove/Sites/<name>.localhost/public and a database of its own. Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin, screenshot to see a page, and read_logs for PHP errors. Take a snapshot (snapshot_create) before a change you might want to undo, or try it on a copy (clone_site); snapshot_restore and history_rollback each save the current state first. This server cannot delete sites or reach remote hosts.";
 
 function handle(array $msg): ?array {
     $id = $msg['id'] ?? null;
@@ -708,7 +795,7 @@ function handle(array $msg): ?array {
 // `cove mcp tools`: the list, for people.
 if (getenv('COVE_MCP_LIST') === '1') {
     foreach (tools() as $name => $t) {
-        $kind = $t['annotations']['readOnlyHint'] ? 'reads' : ($t['annotations']['destructiveHint'] ? 'changes' : 'adds');
+        $kind = $t['annotations']['readOnlyHint'] ? 'reads' : ($t['annotations']['destructiveHint'] ? 'changes' : ($t['annotations']['idempotentHint'] ? 'sets' : 'adds'));
         printf("  %-18s %-30s %s\n", $name, $t['title'], $kind);
     }
     exit(0);
