@@ -5029,6 +5029,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 if (!empty($login_url)) {
                     $response = ['success' => true, 'url' => $login_url];
+                    // A site whose stored URLs still named its live domain had
+                    // them rewritten first (or couldn't): say so.
+                    $note = [];
+                    foreach ($output_lines as $line) {
+                        $line = trim(preg_replace('/\x1b\[[0-9;]*m/', '', $line));
+                        if (preg_match('/^(🔧|⚠️|Done\. The database)/u', $line)) $note[] = preg_replace('/^(🔧|⚠️)\s*/u', '', $line);
+                    }
+                    if ($note) $response['note'] = implode(' ', $note);
                 } else {
                     $response = ['success' => false, 'message' => 'Failed to generate login link.', 'output' => $full_output];
                 }
@@ -13268,7 +13276,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.renderSiteTab();
                 const res = await this.apiPost('get_login_link', url ? { site_name: site.name, user: login, url } : { site_name: site.name, user: login });
                 delete t.busy[login];
-                if (res.success && res.url) { this.openUrl(res.url); this.showSnack('Login link for ' + login + ' opened in a new tab.'); }
+                if (res.success && res.url) { this.openUrl(res.url); this.showSnack(res.note || 'Login link for ' + login + ' opened in a new tab.', false, res.note ? { duration: 12000 } : {}); }
                 if (this.sitePage.name === site.name) this.renderSiteTab();
             },
 
@@ -15716,7 +15724,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const res = await this.apiPost('get_login_link', { site_name: name });
                 if (res.success && res.url) {
                     this.openUrl(res.url);
-                    this.showSnack('Login link opened in a new tab.');
+                    this.showSnack(res.note || 'Login link opened in a new tab.', false, res.note ? { duration: 12000 } : {});
                 }
                 site.isLoggingIn = false;
                 this.renderList();

@@ -457,12 +457,15 @@ function call_tool(string $name, array $a): array {
             $args[] = '--plain';
             [$out, $err, $code] = cove($args, true);
             $out = clean($out);
-            if ($code !== 0 || !preg_match('~https?://\S+~', $out, $m)) throw new ToolError($out ?: 'cove login failed.');
+            if ($code !== 0 || !preg_match('~https?://\S+wp-login\.php\S*~', $out, $m)) throw new ToolError($out ?: 'cove login failed.');
+            // Anything cove login said first: it rewrote the site's stored URLs, or couldn't.
+            $said = trim(preg_replace('~^.*wp-login\.php.*$~m', '', $out));
             // WordPress builds the link from the home URL in the database. A
             // site imported without its URLs rewritten still names its live
             // domain, and signing in there would leave this machine.
             $host = strtolower((string) parse_url($m[0], PHP_URL_HOST));
             $maps = array_map('strtolower', array_map('trim', @file(SITES . "/$site.localhost/mappings", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []));
+            if ($said !== '') return text($m[0] . "\n\n" . $said);
             if ($host !== '' && substr($host, -10) !== '.localhost' && $host !== 'localhost' && !in_array($host, $maps, true)) {
                 return text($m[0] . "\n\nThis link points at $host, not " . url_of($site) . ": the site's home URL in its database is still that address, so after signing in WordPress would send the browser there. To use the site locally, rewrite its URLs first: wp with args [\"search-replace\", \"//$host\", \"//$site.localhost\", \"--all-tables\"] (take a snapshot first).");
             }

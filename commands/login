@@ -1,3 +1,68 @@
+# A site restored or copied in by hand keeps the address it had where it
+# came from: its home and siteurl options still name the live domain (or
+# Local's localhost:10003). WordPress builds the login link from them, so the
+# link opened that address, and so did every redirect after signing in.
+# Rewrite them to this site's own address, as `cove import` and `cove pull`
+# do, after saving the database to the site's private/ folder. Only a plain
+# single site: a multisite network keeps its domains in tables of its own, a
+# Minn Engine site has no WordPress to run search-replace, and WP_HOME or
+# WP_SITEURL in wp-config.php win over the database anyway; those get a
+# warning instead. An address the site answers on here (a mapping, its twin)
+# is left alone. Messages go to stderr with --plain, where stdout is the link.
+login_localize_urls() {
+    local site_name="$1" site_dir="$2" wp_cmd="$3" plain="$4"
+    local public_dir="$site_dir/public" cfg="$site_dir/public/wp-config.php"
+    local fd=1 url origin host m entry twin_domain twin_folder twin_as_site key path backup local_url
+    local -a wpa=(--skip-plugins --skip-themes) foreign=()
+    [ "$plain" = true ] && fd=2
+    site_is_minn "$public_dir" && return 0
+    local_url=$(url_for "$site_name.localhost")
+    for key in home siteurl; do
+        url=$( (cd "$public_dir" && $wp_cmd option get "$key" "${wpa[@]}" 2>/dev/null) )
+        origin=$(printf '%s' "$url" | sed -nE 's~^([A-Za-z]+://[^/?#]+).*~\1~p')
+        host=$(printf '%s' "$origin" | sed -E 's~^[A-Za-z]+://~~; s~:[0-9]+$~~' | tr '[:upper:]' '[:lower:]')
+        [ -n "$host" ] || continue
+        [ "$host" = "$site_name.localhost" ] && continue
+        if [ -f "$site_dir/mappings" ]; then
+            grep -Fixq "$host" "$site_dir/mappings" && continue
+            while IFS= read -r m || [ -n "$m" ]; do
+                case "$m" in \*.*) [[ "$host" == *".${m#\*.}" ]] && continue 2 ;; esac
+            done < "$site_dir/mappings"
+        fi
+        if entry=$(site_twin "$site_dir"); then
+            IFS=$'\t' read -r twin_domain twin_folder twin_as_site <<< "$entry"
+            [ "$host" = "$twin_domain" ] || [ "$host" = "$twin_as_site" ] && continue
+        fi
+        [[ " ${foreign[*]} " == *" $origin "* ]] || foreign+=("$origin")
+    done
+    [ ${#foreign[@]} -gt 0 ] || return 0
+
+    if grep -Eq "^[[:space:]]*define\([[:space:]]*['\"]MULTISITE['\"][[:space:]]*,[[:space:]]*true" "$cfg" \
+        || grep -Eq "^[[:space:]]*define\([[:space:]]*['\"]WP_(HOME|SITEURL)['\"]" "$cfg"; then
+        echo "⚠️  $site_name's stored URLs name ${foreign[*]}, so this link opens that address. Its wp-config.php sets them (multisite, WP_HOME or WP_SITEURL), so Cove left them alone." >&"$fd"
+        return 0
+    fi
+    backup="$site_dir/private/database-before-url-rewrite-$(date +%Y%m%d-%H%M%S).sql"
+    mkdir -p "$site_dir/private"
+    echo "🔧 $site_name's stored URLs still name ${foreign[*]}, so the login link would open that address, not this site. Rewriting them to $local_url..." >&"$fd"
+    if ! (umask 077; cd "$public_dir" && $wp_cmd db export "$backup" "${wpa[@]}" >/dev/null 2>&1); then
+        rm -f "$backup"
+        echo "⚠️  Couldn't save the database first, so the URLs were left alone." >&"$fd"
+        return 0
+    fi
+    for origin in "${foreign[@]}"; do
+        (cd "$public_dir" && $wp_cmd search-replace "//${origin#*://}" "//${local_url#*://}" --all-tables-with-prefix --skip-columns=guid "${wpa[@]}" --quiet >/dev/null 2>&1)
+    done
+    # Set outright too: search-replace keeps an http:// scheme, and Cove serves https.
+    for key in home siteurl; do
+        url=$( (cd "$public_dir" && $wp_cmd option get "$key" "${wpa[@]}" 2>/dev/null) )
+        path=$(printf '%s' "$url" | sed -nE 's~^[A-Za-z]+://[^/?#]+(/[^?#]*)?.*$~\1~p')
+        (cd "$public_dir" && $wp_cmd option update "$key" "$local_url${path%/}" "${wpa[@]}" >/dev/null 2>&1)
+    done
+    (cd "$public_dir" && $wp_cmd cache flush "${wpa[@]}" >/dev/null 2>&1)
+    echo "   Done. The database from before is in $site_name.localhost/private/$(basename "$backup")." >&"$fd"
+}
+
 cove_login() {
     local site_name=""
     local user_identifier="" # Optional: the user to log in as
@@ -69,6 +134,8 @@ cove_login() {
         url_flag=(--url="$wanted")
         label="$wanted"
     fi
+
+    [ -z "$subsite_url" ] && login_localize_urls "$site_name" "$site_dir" "$wp_cmd" "$plain"
 
     local admin_to_login
     if [ -n "$user_identifier" ]; then
