@@ -953,6 +953,24 @@ cmd_backup() {
     echo "$archive"
 }
 
+# Import dump $2 into the site at $1, with the mysql client or through $wpdb.
+# WP-CLI's import carries on past a statement that fails and still reports
+# success, so IMPORT_ERRORS counts the statements the database refused.
+IMPORT_ERRORS=0
+db_load() {
+    local err rc=0
+    err=$(mktemp "${TMPDIR:-/tmp}/cove-import-XXXXXX") || return 1
+    if [ "$DB_LOAD" = native ]; then
+        $WP db import "$2" --path="$1" --skip-plugins --skip-themes >&2 2>"$err" || rc=$?
+    else
+        wp_eval "$1" php_load_script "$2" 2>"$err" || rc=$?
+    fi
+    cat "$err" >&2
+    IMPORT_ERRORS=$(grep -cE '^(ERROR [0-9]|WordPress database error)' "$err")
+    rm -f "$err"
+    return $rc
+}
+
 # MariaDB's dump tools (11.x, and 10.x point releases since mid-2024) start
 # every dump with /*M!999999\- enable the sandbox mode */, which MySQL's
 # client and older MariaDB clients refuse ("Unknown command '\-'"), so a site
@@ -971,6 +989,39 @@ dump_for_this_client() {
     log "  (this database client doesn't take MariaDB's sandbox line; importing without it)"
     ( umask 077; tail -n +2 "$sql" > "$out" ) || return 1
     echo "$out"
+}
+
+# What a tenant restore needs to undo itself once it has changed anything:
+# the tenant's folder and where its previous files wait, whether the folder
+# is new, and a dump of its previous tables with their names.
+UNDO_SITE="" UNDO_DIR="" UNDO_OLD="" UNDO_CREATED=false UNDO_SQL="" UNDO_TABLES=""
+
+# Put tenant $TENANT back the way restore_tenant found it, then stop with $1.
+tenant_undo() {
+    local why="$1" ok=true sql keep
+    trap '' HUP INT TERM PIPE
+    log "$why Putting tenant $TENANT back as it was..."
+    if [ -n "$UNDO_OLD" ] && [ -e "$UNDO_OLD" ]; then
+        if [ -e "$UNDO_DIR" ]; then
+            mv "$UNDO_DIR" "$UNDO_OLD.failed" && rm -rf "$UNDO_OLD.failed"
+        fi
+        mv "$UNDO_OLD" "$UNDO_DIR" || { ok=false; log "  Could not put its files back. The previous ones are in $UNDO_OLD."; }
+    elif $UNDO_CREATED && [ -n "$UNDO_DIR" ]; then
+        rm -rf "$UNDO_DIR"
+    fi
+    if [ -n "$UNDO_SQL" ]; then
+        if sql=$(dump_for_this_client "$UNDO_SITE" "$UNDO_SQL" "$UNDO_SQL.client") \
+            && db_load "$UNDO_SITE" "$sql" && [ "$IMPORT_ERRORS" = 0 ] \
+            && wp_eval "$UNDO_SITE" php_drop_leftovers_script "$UNDO_TABLES" "stacked_${TENANT}_"; then
+            :
+        else
+            ok=false
+            keep="$HOME/cove-tenant-$TENANT-before-$(date +%Y%m%d-%H%M%S).sql"
+            ( umask 077; cp "$UNDO_SQL" "$keep" ) && log "  Could not put its tables back. They are saved in $keep."
+        fi
+    fi
+    $ok && die "$why Tenant $TENANT is back as it was."
+    die "$why Tenant $TENANT could not be put back completely (see above)."
 }
 
 # Restore the unpacked site in $2 (dump $3) into tenant $TENANT of the install
@@ -1011,6 +1062,22 @@ restore_tenant() {
     sql=$(dump_for_this_client "$site_dir" "$sql" "$held/client.sql") \
         || die "Could not prepare the dump for this host's database client. Nothing was changed."
 
+    # The tenant's tables as they are, dumped the way a backup dumps them, so
+    # a failed import can be undone.
+    log "Saving tenant $TENANT's current tables, in case the import fails..."
+    local before_tables
+    before_tables=$($WP db tables --all-tables-with-prefix --format=csv --path="$site_dir" --skip-plugins --skip-themes 2>/dev/null)
+    [ -n "$before_tables" ] || die "Could not list tenant $TENANT's tables. Nothing was changed."
+    printf '%s\n' "$before_tables" | tr ',' '\n' > "$held/before-tables.txt"
+    if [ "$DB_DUMP" = native ]; then
+        ( umask 077; $WP db export "$held/before.sql" --path="$site_dir" --add-drop-table \
+            --default-character-set=utf8mb4 --tables="$before_tables" --skip-plugins --skip-themes >&2 )
+    else
+        ( umask 077; wp_eval "$site_dir" php_dump_script "$held/before.sql" prefix )
+    fi || die "Could not save tenant $TENANT's current tables. Nothing was changed."
+    UNDO_SITE="$site_dir"
+    UNDO_TABLES="$held/before-tables.txt"
+
     # Files: the tenant's own folder is built beside the live one and swapped
     # in, so the site serves its old files right up until the swap.
     local from=""
@@ -1043,39 +1110,48 @@ restore_tenant() {
                 cp -Rp "$target/$inner" "$incoming/$inner"
             fi
         done
+        # From here on a failure, or the connection dropping, puts the
+        # tenant's previous files (kept aside until the end) back in place.
+        UNDO_DIR="$target"
+        trap 'tenant_undo "The restore was interrupted."' HUP INT TERM PIPE
         if [ -e "$target" ]; then
             mv "$target" "$old" || { rm -rf "$incoming"; die "Could not move $target aside. Nothing was changed."; }
+            UNDO_OLD="$old"
+        else
+            UNDO_CREATED=true
         fi
         if ! mv "$incoming" "$target"; then
-            [ -e "$old" ] && mv "$old" "$target"
             rm -rf "$incoming"
-            die "Could not move the new files into $target. Nothing was changed."
+            tenant_undo "Could not move the new files into $target."
         fi
-        rm -rf "$old"
     fi
+    # (Again for the files modes that leave the folder alone.)
+    trap 'tenant_undo "The restore was interrupted."' HUP INT TERM PIPE
 
     # Database: import, then drop the tenant's tables the archive doesn't
     # have. Never `wp db reset` here: that empties the whole shared database.
     log "Importing database..."
-    if [ "$DB_LOAD" = native ]; then
-        $WP db import "$sql" --path="$site_dir" --skip-plugins --skip-themes >&2 \
-            || die "Database import failed."
-    else
-        log "  (no mysql client — importing through WordPress)"
-        wp_eval "$site_dir" php_load_script "$sql" || die "Database import failed."
-    fi
+    [ "$DB_LOAD" = native ] || log "  (no mysql client — importing through WordPress)"
+    UNDO_SQL="$held/before.sql"
+    db_load "$site_dir" "$sql" || tenant_undo "Database import failed."
+    [ "$IMPORT_ERRORS" = 0 ] || tenant_undo "The database refused $IMPORT_ERRORS statement(s) from the dump (above)."
     wp_eval "$site_dir" php_drop_leftovers_script "$held/tables.txt" "$dest_prefix" \
-        || die "Could not remove the tenant's old tables."
+        || tenant_undo "Could not remove the tenant's old tables."
     if [ "$src_prefix" != "$dest_prefix" ]; then
         wp_eval "$site_dir" php_prefix_keys_script "$src_prefix" \
-            || die "Could not rename the prefix-keyed role option and user meta."
+            || tenant_undo "Could not rename the prefix-keyed role option and user meta."
     fi
+    load_facts "$site_dir" || tenant_undo "WordPress did not boot as tenant $TENANT after the import."
+
+    # The tenant is in: nothing below fails the restore, so the way back goes.
+    trap - HUP INT TERM PIPE
+    [ -n "$UNDO_OLD" ] && rm -rf "$UNDO_OLD"
+    UNDO_OLD="" UNDO_SQL="" UNDO_CREATED=false
 
     # URLs, in this tenant's tables only: wp-content links move to the
     # tenant's own folder first, then the address changes over. Scheme-less,
     # so http, https and protocol-relative links all follow.
     if [ -n "$url_to" ]; then
-        load_facts "$site_dir" || die "WordPress did not boot as tenant $TENANT after the import."
         local url_from from_content
         url_from=$(fact raw_home)
         if [ -n "$url_from" ]; then
@@ -1289,14 +1365,15 @@ cmd_restore() {
             || die "Could not prepare the dump for this host's database client."
         $WP db reset --yes --path="$site_dir" --skip-plugins --skip-themes >&2 \
             || die "Database reset failed."
-        $WP db import "$sql" --path="$site_dir" --skip-plugins --skip-themes >&2 \
-            || die "Database import failed."
     else
         log "  (no mysql client — importing through WordPress)"
         # The dump's DROP TABLE statements make a separate reset unnecessary,
         # which matters here because `wp db reset` also needs the native client.
-        wp_eval "$site_dir" php_load_script "$sql" || die "Database import failed."
     fi
+    db_load "$site_dir" "$sql" || die "Database import failed."
+    # Not fatal: a dump from a MySQL server with GTIDs sets @@GLOBAL.GTID_PURGED,
+    # which MariaDB refuses while everything else imports fine.
+    [ "$IMPORT_ERRORS" = 0 ] || log "⚠️  The database refused $IMPORT_ERRORS statement(s) from the dump (above). Check that the site's tables all arrived."
 
     if [ -n "$url_to" ]; then
         local url_from
