@@ -2556,6 +2556,14 @@ function adminer_object() {
         }
         function credentials() {
             $configFile = getenv('HOME') . '/Cove/config';
+            // `cove demo`: the demo's own account, which can open only the
+            // demo sites' databases, so ?db= reaches nothing else. Without it
+            // there is no automatic sign-in at all.
+            if (file_exists(getenv('HOME') . '/Cove/demo')) {
+                $demo = @parse_ini_file(getenv('HOME') . '/Cove/demo-db') ?: [];
+                if (empty($demo['DB_USER']) || empty($demo['DB_PASSWORD'])) return ['localhost', null, null];
+                return ['localhost', $demo['DB_USER'], $demo['DB_PASSWORD']];
+            }
             if (file_exists($configFile)) {
                 $config = parse_ini_file($configFile);
                 $db_user = $config['DB_USER'] ?? null;
@@ -3947,6 +3955,18 @@ function cove_write_size_cache($path, array $sizes) {
 // Handle GET requests for listing sites
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $action = $_GET['action'] ?? '';
+    // `cove demo`: a hidden site's preview, files and downloads answer 404,
+    // the same as a site that doesn't exist (the POST actions refuse too).
+    if (cove_demo_sites($user_home) !== null) {
+        $__demo_get = $action === 'backup_download'
+            ? preg_replace('/-\d{8}-\d{6}\.zip$/', '', (string) ($_GET['name'] ?? ''))
+            : (string) ($_GET['site'] ?? '');
+        if ($__demo_get !== '' && cove_demo_hides($user_home, $__demo_get)) {
+            http_response_code(404);
+            echo json_encode(['success' => false, 'message' => 'Not found.']);
+            exit;
+        }
+    }
     if ($action === 'list_sites') {
         $sites_info = [];
         $size_cache = cove_read_size_cache($__cove_sizes_cache);
@@ -5193,7 +5213,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // like every action here. This is a local dev box: the SQL console
             // is deliberately unrestricted, and every identifier is quoted
             // rather than allow-listed so any schema a site created works.
+            // During `cove demo` it signs in as the demo's own account, which
+            // can open only the demo sites' databases (see demo_db_sync).
             $__db_cfg = isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : [];
+            if (cove_demo_sites($user_home) !== null) {
+                $__db_cfg = @parse_ini_file($user_home . '/Cove/demo-db') ?: [];
+                if (empty($__db_cfg['DB_USER']) || empty($__db_cfg['DB_PASSWORD'])) {
+                    echo json_encode(['success' => false, 'message' => 'The demo\'s database account is missing. Run cove demo with the same sites again to set it up.']);
+                    exit;
+                }
+            }
             mysqli_report(MYSQLI_REPORT_OFF);
             $__db = @new mysqli('127.0.0.1', $__db_cfg['DB_USER'] ?? '', $__db_cfg['DB_PASSWORD'] ?? '', null, 3306);
             if ($__db->connect_error) {
@@ -5955,6 +5984,8 @@ $config_file = getenv('HOME') . '/Cove/config';
 $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
 $__cove_https_port = isset($config_data['HTTPS_PORT']) ? (int) $config_data['HTTPS_PORT'] : 443;
 $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_port;
+// `cove demo`: each demo keeps console history of its own (see historyKey).
+$__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file_get_contents(getenv('HOME') . '/Cove/demo-started')) ?: '1') : '';
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -7159,7 +7190,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         }
     </style>
 </head>
-<body>
+<body<?php if ($__cove_demo !== '') echo ' data-demo="' . htmlspecialchars($__cove_demo, ENT_QUOTES) . '"'; ?>>
     <div class="wrap">
         <nav class="nav">
             <a class="logo" href="/">
@@ -11225,14 +11256,22 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderDbSql();
             },
 
+            // The SQL console's and wp-cli tab's history. During `cove demo`
+            // each demo keeps its own, so earlier commands naming hidden
+            // sites never show up on screen.
+            historyKey(name) {
+                const demo = document.body.dataset.demo;
+                return demo ? name + '.demo-' + demo : name;
+            },
+
             get dbHistory() {
-                try { return JSON.parse(localStorage.getItem('cove-sql-history') || '[]'); } catch (e) { return []; }
+                try { return JSON.parse(localStorage.getItem(this.historyKey('cove-sql-history')) || '[]'); } catch (e) { return []; }
             },
 
             pushDbHistory(sql) {
                 const h = this.dbHistory.filter(x => x !== sql);
                 h.unshift(sql);
-                try { localStorage.setItem('cove-sql-history', JSON.stringify(h.slice(0, 40))); } catch (e) {}
+                try { localStorage.setItem(this.historyKey('cove-sql-history'), JSON.stringify(h.slice(0, 40))); } catch (e) {}
             },
 
             // --- Rendering ---------------------------------------------------
@@ -13242,7 +13281,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 c.running = true; c.cmd = line;
                 c.history = [line].concat(c.history.filter(h => h !== line)).slice(0, 50);
                 c.histIdx = -1;
-                try { localStorage.setItem('cove.cli.history', JSON.stringify(c.history)); } catch (e) {}
+                try { localStorage.setItem(this.historyKey('cove.cli.history'), JSON.stringify(c.history)); } catch (e) {}
                 this.renderSiteCli();
                 const res = await this.apiPost('site_wp', { site_name: site.name, args: line }, { quiet: true, timeoutMs: 300000 });
                 c.running = false;
@@ -13458,7 +13497,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             bindSiteTabEvents() {
                 const p = this.sitePage;
-                try { p.cli.history = JSON.parse(localStorage.getItem('cove.cli.history') || '[]'); } catch (e) {}
+                try { p.cli.history = JSON.parse(localStorage.getItem(this.historyKey('cove.cli.history')) || '[]'); } catch (e) {}
                 $id('siteTabs').addEventListener('click', (e) => {
                     const b = e.target.closest('.mail-part');
                     if (b) this.setSiteTab(b.dataset.tab);

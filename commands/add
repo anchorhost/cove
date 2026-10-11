@@ -371,6 +371,7 @@ PHP
     # Made during `cove demo`: it joins the demo, or it would vanish on screen.
     if [ -f "$COVE_DIR/demo" ] && ! grep -qx "$site_name" "$COVE_DIR/demo"; then
         echo "$site_name" >> "$COVE_DIR/demo"
+        demo_db_sync
     fi
 
     echo "✅ Site '$full_hostname' created successfully!"

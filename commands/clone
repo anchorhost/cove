@@ -179,13 +179,15 @@ cove_clone() {
         inject_mu_plugin "$new_dir/public"
     fi
 
-    # --- Custom Caddy directives ---
-    # Carried over so the clone behaves like its source. Directives can hardcode
-    # the old hostname, so say so rather than letting it fail mysteriously.
     # Made during `cove demo`: it joins the demo, like a site from `cove add`.
     if [ -f "$COVE_DIR/demo" ] && ! grep -qx "$new_name" "$COVE_DIR/demo"; then
         echo "$new_name" >> "$COVE_DIR/demo"
+        demo_db_sync
     fi
+
+    # --- Custom Caddy directives ---
+    # Carried over so the clone behaves like its source. Directives can hardcode
+    # the old hostname, so say so rather than letting it fail mysteriously.
 
     local source_conf="$CUSTOM_CADDY_DIR/$source_name.localhost"
     if [ -f "$source_conf" ]; then

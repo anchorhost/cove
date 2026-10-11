@@ -10,6 +10,37 @@ demo_mailbox_open() {
     ps -eo args= 2>/dev/null | grep -E '(^|/)mailpit --database ' | grep -q 'mailpit-demo\.db'
 }
 
+# The database side of the demo: a MariaDB account that can open only the
+# demo sites' databases. The dashboard's database view and SQL console, and
+# Adminer, sign in as it while the demo is on, so `SHOW DATABASES`, a query
+# naming another database, or Adminer's ?db= find nothing else. Its password
+# is kept in ~/Cove/demo-db (600) and never goes on a command line. Run
+# whenever the demo's sites change; `cove demo off` drops the account.
+demo_db_sync() {
+    local demo_file="$COVE_DIR/demo" creds="$COVE_DIR/demo-db" pass site db sql
+    [ -f "$demo_file" ] || return 0
+    pass=$(sed -n 's/^DB_PASSWORD=//p' "$creds" 2>/dev/null)
+    [[ "$pass" =~ ^[0-9a-f]{32,}$ ]] || pass=$(openssl rand -hex 24 2>/dev/null)
+    [ -n "$pass" ] || pass=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    sql="CREATE USER IF NOT EXISTS 'cove_demo'@'localhost'; ALTER USER 'cove_demo'@'localhost' IDENTIFIED BY '$pass'; REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'cove_demo'@'localhost';"
+    while IFS= read -r site; do
+        [[ "$site" =~ ^[a-z0-9-]+$ ]] || continue
+        db=$(sed -nE "s/.*define\([[:space:]]*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]+)['\"].*/\1/p" "$SITES_DIR/$site.localhost/public/wp-config.php" 2>/dev/null | head -1)
+        # wp-config.php is the site's to write: a name that isn't plain goes.
+        [[ "$db" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+        # _ is a wildcard in a GRANT's database name.
+        db="${db//_/\\_}"
+        sql="$sql GRANT ALL PRIVILEGES ON \`$db\`.* TO 'cove_demo'@'localhost';"
+    done < "$demo_file"
+    ( umask 077; printf 'DB_USER=cove_demo\nDB_PASSWORD=%s\n' "$pass" > "$creds.tmp" ) && mv -f "$creds.tmp" "$creds"
+    printf '%s\n' "$sql" | MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" 2>/dev/null
+}
+
+demo_db_drop() {
+    printf '%s\n' "DROP USER IF EXISTS 'cove_demo'@'localhost';" | MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" 2>/dev/null
+    rm -f "$COVE_DIR/demo-db"
+}
+
 cove_demo() {
     local demo_file="$COVE_DIR/demo"
     case "${1:-}" in
@@ -36,9 +67,10 @@ cove_demo() {
                 return 0
             fi
             if [ -f "$demo_file" ]; then
-                rm -f "$demo_file"
+                rm -f "$demo_file" "$COVE_DIR/demo-started"
                 install_mailpit_service >/dev/null
             fi
+            [ -f "$COVE_DIR/demo-db" ] && demo_db_drop
             if [ "$held" -gt 0 ]; then
                 # Wait for Mailpit to answer on the real mailbox: replaying
                 # into the demo one (a restart that didn't happen) would
@@ -90,8 +122,13 @@ cove_demo() {
     # open while demo mode is off, so the demo one is free to go.
     [ "$was_on" = 1 ] || rm -f "$COVE_DIR/mailpit-demo.db" "$COVE_DIR/mailpit-demo.db-wal" "$COVE_DIR/mailpit-demo.db-shm"
     printf '%s\n' "${names[@]}" > "$demo_file"
+    # The dashboard keeps each demo's console history apart, by this stamp.
+    [ "$was_on" = 1 ] || date +%s > "$COVE_DIR/demo-started"
     # Mailpit picks its mailbox when it starts (see write_mailpit_run_script).
     [ "$was_on" = 1 ] || install_mailpit_service >/dev/null
+    if ! demo_db_sync; then
+        gum style --foreground yellow "⚠️  Couldn't set up the demo's database account, so the dashboard's database view and Adminer won't open until it works. Check MariaDB with 'cove status', then run this again."
+    fi
     echo "🎬 Demo mode is on, showing ${#names[@]} site$([ ${#names[@]} -eq 1 ] || echo s): ${names[*]}"
     echo "   The dashboard, Adminer and 'cove list' show only these, and mail goes to a"
     echo "   separate mailbox. Sites you create now join the demo. 'cove demo off' ends it."
