@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### ✨ New Features
+
+* **`cove mcp` lets an AI agent work with your sites:** a Model Context Protocol server on stdin and stdout, added to Claude Code with `claude mcp add cove -- cove mcp` (or to Cursor, Codex, or any MCP client as a stdio server running `cove mcp`). It offers fourteen tools, each running the `cove` command that already does the job:
+    * `list_sites` and `site_info` (URL, folders, database and table prefix, `WP_DEBUG`, the logs it writes, extra domains, twin), `create_site` (WordPress at any version, a multisite network, plain or Minn Engine, with the one-time admin link in the reply), `login_link`, and `wp`, which runs any WP-CLI command in a site.
+    * Ways for the agent to check its own work: `screenshot` opens any page of a site in a headless browser and returns the image, at any width (390 for a phone); `read_logs` reads PHP errors (just one site's out of the shared log), `debug.log`, or the access log for the last N minutes; and `read_mail` searches the mail a site sent and returns a message's text with every link in it, so a password reset or a form's confirmation can be followed.
+    * A way back: `snapshot_create`, `snapshot_list`, `snapshot_restore`, `history_list` and `history_rollback`. A restore and a rollback each save the current state first.
+    * `status` says whether the web server, MariaDB and Mailpit answer.
+    * It deletes nothing and reaches no remote host: there are no tools for `delete`, `pull`, `push`, `share`, `lan` or `tailscale`, and `wp` refuses the WP-CLI commands that wipe a whole database (`db reset`, `db drop`, `db clean`, `site empty`) and the interactive ones. During `cove demo` it sees only the demo's sites. A login link that points at a live domain, because the site's stored URLs were never rewritten, comes with a note saying so and the `search-replace` that fixes it.
+    * `cove mcp tools` lists the tools. The server is PHP run by FrankenPHP, so it needs nothing Cove doesn't already install.
+* **`cove screenshot --path`:** captures any page of a site, not only its front page, into the file `--out` names (the dashboard's preview stays the front page).
+
 ### 🔒 Security & Bug Fixes
 
 * **`cove demo` hides the other sites everywhere:** the dashboard left out hidden sites and refused actions on them, but a few ways in still answered. A hidden site's preview image, files, snapshot and backup downloads opened from their URLs; the SQL console ran any query, so `SHOW DATABASES` listed every site's database and a query could read any of them; Adminer showed only the demo's databases but opened any other from `?db=`; and the SQL console and wp-cli tab offered commands typed before the demo. Those URLs now answer 404 for a hidden site. While the demo is on, the database view, the SQL console and Adminer sign in as a MariaDB account of the demo's own that can open only the demo sites' databases, set up by `cove demo` (and by `cove add` and `cove clone` during one) and removed by `cove demo off`. Each demo keeps its own console history.

@@ -26,6 +26,7 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
   * **Instant Public Sharing**: `cove share` spins up a Cloudflare Tunnel so you can share a WIP site with a client in seconds.
   * **Hosts File Automation**: Cove manages `/etc/hosts` entries for you — no manual editing.
   * **Pretty Errors**: Whoops renders beautiful PHP error pages with stack traces and editor integration.
+  * **AI Agents (MCP)**: `claude mcp add cove -- cove mcp` gives Claude Code, Cursor, Codex, or any MCP client fourteen tools over your sites: list and create them, run WP-CLI, get a one-time login link, read PHP and access logs, read the mail a site sent (reset links lifted out), screenshot any page, and take or restore snapshots. Nothing it offers deletes a site or reaches a remote host.
   * **Demo Mode**: `cove demo mysite another` shows only those sites, with a mailbox of their own, across the dashboard, Adminer, and `cove list` while you record. `cove demo off` brings everything back.
   * **Health Check**: `cove health` diagnoses crashes, OPcache pressure, and on-disk hygiene, and recommends fixes without changing anything.
   * **Menu Bar App**: `cove menubar enable` adds a tiny companion showing service status at a glance — a native menu bar app on macOS, a system tray app on Linux desktops — with start/stop, one-click site open or admin login, and quick links.
@@ -152,6 +153,7 @@ For browsing and editing, the dashboard's **databases** view lists every databas
 | `cove trust` | Installs Cove's local root certificate into the system trust store and every browser certificate database it can find: Chrome/Chromium/Brave/Edge's shared `~/.pki/nssdb`, Firefox profiles, snap and Flatpak browsers. Fresh installs run it automatically; re-run any time the root rotates. |
 | `cove upgrade` | Upgrades Cove, FrankenPHP, and Adminer to the latest versions, and refreshes the managed bits (Whoops, the login helper, the watchdog) across every site. |
 | `cove version` | Displays the current version of Cove. |
+| `cove mcp` | Runs a Model Context Protocol server on stdin/stdout for AI agents (`claude mcp add cove -- cove mcp`). `cove mcp tools` lists its tools. |
 | `cove demo <site>… \| off` | Narrows Cove to the sites you name, for recording a demo: the dashboard, Adminer's database list, and `cove list` show only them, and mail goes to a mailbox of its own (other sites' mail is held and delivered by `cove demo off`). Nothing on disk changes. |
 
 *You can get help for any command by running `cove <command> --help`.*
@@ -294,7 +296,9 @@ Every command runs without a terminal. When stdin is not a TTY, confirmations de
 | Edit Caddy rules non-interactively | pipe them: `printf 'header X-Test 1\n' \| cove directive set <site>` |
 | Anything sudo needs on Linux | run that command with `sudo` (`sudo cove upgrade`); `/etc/hosts` lines are skipped and reported when nothing can ask for a password |
 
-The dashboard's API answers only from this machine, so agents run the CLI, not the API.
+For agents that speak the Model Context Protocol, `cove mcp` is a server on stdin/stdout that wraps the same commands as tools: `list_sites`, `site_info`, `create_site`, `login_link`, `wp`, `screenshot` (the page comes back as an image), `read_logs`, `read_mail` (a message's links come back as a list), `snapshot_create`, `snapshot_list`, `snapshot_restore`, `history_list`, `history_rollback` and `status`. Add it with `claude mcp add cove -- cove mcp`, or in any client as a stdio server running `cove` with the argument `mcp`. It leaves out deleting sites, pull, push and sharing, refuses the WP-CLI commands that wipe a whole database, and during `cove demo` sees only the demo's sites.
+
+The dashboard's API answers only from this machine, so agents run the CLI or `cove mcp`, not the API.
 
 ## 🛠️ Development
 
