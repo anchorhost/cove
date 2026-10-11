@@ -1720,6 +1720,20 @@ fi
 # refresh one stale site preview in the background (cove screenshot --sweep).
 sweep_stamp="$COVE_DIR/cache/screenshots/.sweep.stamp"
 now_s=\$(date +%s)
+
+# Log rotation, only when asked for (cove log rotate <MB>; off by default,
+# so every line is kept): every ~5 minutes, if a log in $LOGS_DIR has grown
+# past that size, cove moves it to <name>.log.1.
+rot_mb=\$(sed -n 's/^LOG_ROTATE_MB=//p' "$CONFIG_FILE" 2>/dev/null | tail -1 | tr -cd '0-9')
+if [ -n "\$rot_mb" ] && [ "\$rot_mb" -gt 0 ]; then
+    rot_stamp="$COVE_DIR/.logrotate.stamp"
+    if [ \$((now_s - \$(cat "\$rot_stamp" 2>/dev/null || echo 0))) -ge 300 ]; then
+        echo "\$now_s" > "\$rot_stamp"
+        if [ -n "\$(find "$LOGS_DIR" -maxdepth 1 -name '*.log' -size +"\${rot_mb}"M 2>/dev/null)" ]; then
+            "$watchdog_cove" log rotate --apply >/dev/null 2>&1
+        fi
+    fi
+fi
 last_s=\$(cat "\$sweep_stamp" 2>/dev/null || echo 0)
 if [ \$((now_s - last_s)) -ge 300 ]; then
     mkdir -p "$COVE_DIR/cache/screenshots"
@@ -16370,8 +16384,14 @@ display_command_help() {
             ;;
         log)
             echo "Usage: cove log [site] [--follow]"
+            echo "       cove log rotate [<MB>|off]"
             echo ""
             echo "View logs for a site or the global error log."
+            echo ""
+            echo "Cove keeps every line of its own logs (~/Cove/Logs) unless asked otherwise."
+            echo "'cove log rotate 50' turns rotation on: a log past 50 MB moves to <name>.log.1,"
+            echo "replacing the one before, and starts again empty. 'cove log rotate' shows the"
+            echo "setting and each log's size; 'cove log rotate off' keeps everything again."
             echo ""
             echo "Arguments:"
             echo "  [site]           The site name (optional). If omitted, shows global error log."

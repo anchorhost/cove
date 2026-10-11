@@ -1,4 +1,75 @@
+# Rotation of Cove's own logs (~/Cove/Logs/*.log) is off unless asked for:
+# Cove is for local development, where last month's error can be the clue,
+# so by default every line is kept. `cove log rotate <MB>` turns it on. The
+# watchdog then looks every five minutes, and a log past that size moves to
+# <name>.log.1 (replacing the one before) and starts again empty, so each
+# log keeps at most about twice the size. The copy is taken and the original
+# emptied in place, because FrankenPHP, Mailpit and the watchdog keep their
+# logs open. Sites' own debug.log and access logs are not Cove's to trim.
+log_rotate_limit() {
+    sed -n 's/^LOG_ROTATE_MB=//p' "$CONFIG_FILE" 2>/dev/null | tail -1 | tr -cd '0-9'
+}
+
+log_rotate_apply() {
+    local quiet="${1:-}" mb f size
+    mb=$(log_rotate_limit)
+    [ -n "$mb" ] && [ "$mb" -gt 0 ] || return 0
+    for f in "$LOGS_DIR"/*.log; do
+        [ -f "$f" ] || continue
+        size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+        [ "$size" -gt $((mb * 1048576)) ] || continue
+        rm -f "$f.1"
+        if cp -c "$f" "$f.1" 2>/dev/null || cp --reflink=auto "$f" "$f.1" 2>/dev/null || cp "$f" "$f.1"; then
+            : > "$f"
+            [ "$quiet" = quiet ] || echo "   ↻ $(basename "$f"): $((size / 1048576)) MB moved to $(basename "$f").1"
+        fi
+    done
+}
+
+cove_log_rotate() {
+    local mb f size
+    case "${1:-}" in
+        --apply)
+            log_rotate_apply quiet
+            ;;
+        ""|status)
+            mb=$(log_rotate_limit)
+            if [ -n "$mb" ] && [ "$mb" -gt 0 ]; then
+                echo "↻ Log rotation is on: a log in $LOGS_DIR past $mb MB moves to <name>.log.1."
+            else
+                echo "Log rotation is off: Cove keeps every log line. Turn it on with: cove log rotate <MB>"
+            fi
+            for f in "$LOGS_DIR"/*.log "$LOGS_DIR"/*.log.1; do
+                [ -f "$f" ] || continue
+                size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+                printf '   %-28s %s\n' "$(basename "$f")" "$(awk -v b="$size" 'BEGIN { if (b >= 1048576) printf "%.1f MB", b / 1048576; else printf "%d KB", (b + 1023) / 1024 }')"
+            done
+            ;;
+        off)
+            config_set LOG_ROTATE_MB 0
+            echo "✅ Log rotation is off: Cove keeps every log line from here on."
+            ls "$LOGS_DIR"/*.log.1 >/dev/null 2>&1 && echo "   The .log.1 files from earlier rotations stay in $LOGS_DIR."
+            ;;
+        *)
+            mb="$1"
+            if ! [[ "$mb" =~ ^[0-9]+$ ]] || [ "$mb" -lt 1 ] || [ "$mb" -gt 100000 ]; then
+                gum style --foreground red "❌ Error: Give a size in MB, such as 'cove log rotate 50', or 'off'."
+                exit 1
+            fi
+            config_set LOG_ROTATE_MB "$mb"
+            echo "✅ Log rotation is on: a log in $LOGS_DIR past $mb MB moves to <name>.log.1."
+            echo "   The watchdog checks every five minutes. 'cove log rotate off' keeps everything again."
+            log_rotate_apply
+            ;;
+    esac
+}
+
 cove_log() {
+    if [ "${1:-}" = "rotate" ]; then
+        shift
+        cove_log_rotate "$@"
+        return
+    fi
     local site_name=""
     local follow_flag=""
 

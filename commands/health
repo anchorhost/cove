@@ -238,7 +238,16 @@ cove_health() {
     for lf in "$LOGS_DIR/caddy-process.log" "$LOGS_DIR/errors.log" "$LOGS_DIR/mailpit.log"; do
         [ -f "$lf" ] || continue
         sz=$(stat -f%z "$lf" 2>/dev/null || stat -c%s "$lf" 2>/dev/null || echo 0)
-        if [ "$sz" -gt 52428800 ]; then
+        # PHP's error log is kept in full on purpose (rotation is opt-in), so
+        # its size is a note, not a problem.
+        if [ "$sz" -gt 52428800 ] && [ "$(basename "$lf")" = "errors.log" ]; then
+            if [ "$(log_rotate_limit)" -gt 0 ] 2>/dev/null; then
+                echo "  ℹ️  errors.log is $((sz/1048576)) MB (rotation is on at $(log_rotate_limit) MB)"
+            else
+                echo "  ℹ️  errors.log is $((sz/1048576)) MB, kept in full. To cap it: cove log rotate <MB>"
+            fi
+            biglog=$((biglog+1))
+        elif [ "$sz" -gt 52428800 ]; then
             echo "  ⚠️  $(basename "$lf") is $((sz/1048576)) MB"
             if [ "$(basename "$lf")" = "mailpit.log" ]; then
                 echo "     (bind-failure thrash? reinstall with: cove enable)"
