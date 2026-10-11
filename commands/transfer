@@ -953,6 +953,26 @@ cmd_backup() {
     echo "$archive"
 }
 
+# MariaDB's dump tools (11.x, and 10.x point releases since mid-2024) start
+# every dump with /*M!999999\- enable the sandbox mode */, which MySQL's
+# client and older MariaDB clients refuse ("Unknown command '\-'"), so a site
+# dumped by Cove's MariaDB failed to import on a MySQL host. Asks the client
+# WP-CLI imports with whether it takes the line; when it doesn't, writes a
+# copy without it to $3. Prints the dump to import. $1 = site dir.
+dump_for_this_client() {
+    local site_dir="$1" sql="$2" out="$3"
+    if [ "$DB_LOAD" != native ] || ! head -c 200 "$sql" | head -1 | grep -q 'enable the sandbox mode'; then
+        echo "$sql"; return 0
+    fi
+    if printf '%s\n' '/*M!999999\- enable the sandbox mode */' 'SELECT 1;' \
+        | $WP db query --path="$site_dir" --skip-plugins --skip-themes >/dev/null 2>&1; then
+        echo "$sql"; return 0
+    fi
+    log "  (this database client doesn't take MariaDB's sandbox line; importing without it)"
+    ( umask 077; tail -n +2 "$sql" > "$out" ) || return 1
+    echo "$out"
+}
+
 # Restore the unpacked site in $2 (dump $3) into tenant $TENANT of the install
 # at $1: the tenant's tables, and the one folder that is its own. Core, the
 # main site and the other tenants are shared and stay as they are. Everything
@@ -988,6 +1008,8 @@ restore_tenant() {
     [ -s "$held/dump-problem.txt" ] && die "$(cat "$held/dump-problem.txt") Nothing was changed."
     grep -qx "${dest_prefix}options" "$held/tables.txt" \
         || die "The dump has no ${dest_prefix}options table once renamed. Nothing was changed."
+    sql=$(dump_for_this_client "$site_dir" "$sql" "$held/client.sql") \
+        || die "Could not prepare the dump for this host's database client. Nothing was changed."
 
     # Files: the tenant's own folder is built beside the live one and swapped
     # in, so the site serves its old files right up until the swap.
@@ -1263,6 +1285,8 @@ cmd_restore() {
 
     log "Importing database..."
     if [ "$DB_LOAD" = native ]; then
+        sql=$(dump_for_this_client "$site_dir" "$sql" "$held/client.sql") \
+            || die "Could not prepare the dump for this host's database client."
         $WP db reset --yes --path="$site_dir" --skip-plugins --skip-themes >&2 \
             || die "Database reset failed."
         $WP db import "$sql" --path="$site_dir" --skip-plugins --skip-themes >&2 \
