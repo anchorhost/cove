@@ -57,6 +57,10 @@ cove_log_rotate() {
                 exit 1
             fi
             config_set LOG_ROTATE_MB "$mb"
+            # A watchdog written by an older Cove has no rotation check yet.
+            if [ -f "$COVE_DIR/watchdog.sh" ] && ! grep -q 'LOG_ROTATE_MB' "$COVE_DIR/watchdog.sh"; then
+                write_watchdog_script >/dev/null
+            fi
             echo "✅ Log rotation is on: a log in $LOGS_DIR past $mb MB moves to <name>.log.1."
             echo "   The watchdog checks every five minutes. 'cove log rotate off' keeps everything again."
             log_rotate_apply
