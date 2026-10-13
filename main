@@ -1714,7 +1714,7 @@ never_healthy_ticks=120   # ~10min (120 x 5s) stuck in startup -> retry once
 # default 50 MB, so a restart storm can't fill the disk). Past it, the last
 # tenth is kept.
 log_cap_mb=\$(sed -n 's/^SERVICE_LOG_CAP_MB=//p' "$CONFIG_FILE" 2>/dev/null | tail -1 | tr -cd '0-9')
-log_cap_bytes=\$(( \${log_cap_mb:-50} * 1048576 ))
+log_cap_bytes=\$(( 10#\${log_cap_mb:-50} * 1048576 ))
 
 [ -f "\$pidfile" ] || exit 0
 pid=\$(cat "\$pidfile" 2>/dev/null)
@@ -1726,12 +1726,15 @@ mkdir -p "$LOGS_DIR"
 
 # Cap the FrankenPHP process log. It grows unbounded (info-level auto-HTTPS
 # lines on every startup) and a restart storm can push it into the GBs, which
-# is itself a drag on the box. Keep the most recent tenth of the cap.
+# is itself a drag on the box. Keep the most recent tenth of the cap, written
+# back into the same file: FrankenPHP holds it open, and after a mv it would
+# go on writing into the replaced file, out of sight and never freed.
 if [ "\$log_cap_bytes" -gt 0 ] && [ -f "\$process_log" ]; then
     lsize=\$(stat -f%z "\$process_log" 2>/dev/null || stat -c%s "\$process_log" 2>/dev/null || echo 0)
     if [ "\$lsize" -gt "\$log_cap_bytes" ]; then
         tail -c \$((log_cap_bytes / 10)) "\$process_log" > "\$process_log.tmp" 2>/dev/null \\
-            && mv "\$process_log.tmp" "\$process_log" 2>/dev/null
+            && cat "\$process_log.tmp" > "\$process_log" 2>/dev/null
+        rm -f "\$process_log.tmp"
     fi
 fi
 
@@ -2212,18 +2215,21 @@ log_file="$LOGS_DIR/mailpit.log"
 # default 50 MB, so a restart storm can't fill the disk). Past it, the last
 # tenth is kept.
 log_cap_mb=\$(sed -n 's/^SERVICE_LOG_CAP_MB=//p' "$CONFIG_FILE" 2>/dev/null | tail -1 | tr -cd '0-9')
-log_cap_bytes=\$(( \${log_cap_mb:-50} * 1048576 ))
+log_cap_bytes=\$(( 10#\${log_cap_mb:-50} * 1048576 ))
 
 mkdir -p "$LOGS_DIR"
 
 # Cap the log. A bind-failure restart storm used to push this into the tens of
 # MBs with nothing useful but "address already in use" lines. Keep the most
-# recent tenth of the cap so a real error still has context.
+# recent tenth of the cap so a real error still has context. Written back
+# into the same file: the service manager opened it for this script's
+# output before it ran, so a mv would leave Mailpit writing to the old one.
 if [ "\$log_cap_bytes" -gt 0 ] && [ -f "\$log_file" ]; then
     lsize=\$(stat -f%z "\$log_file" 2>/dev/null || stat -c%s "\$log_file" 2>/dev/null || echo 0)
     if [ "\$lsize" -gt "\$log_cap_bytes" ]; then
         tail -c \$((log_cap_bytes / 10)) "\$log_file" > "\$log_file.tmp" 2>/dev/null \\
-            && mv "\$log_file.tmp" "\$log_file" 2>/dev/null
+            && cat "\$log_file.tmp" > "\$log_file" 2>/dev/null
+        rm -f "\$log_file.tmp"
     fi
 fi
 
@@ -2889,16 +2895,28 @@ emit_site_php_handler() {
 # the file by default (at 100 MB, the newest 10 rolled files kept, none older
 # than 90 days); `cove log rotate access` sets other numbers, or off, which
 # keeps one file growing for good.
+# Read without a subprocess (it runs for every log block of every site), and
+# in base 10, since bash takes a leading zero (08) as octal.
 site_log_output() {
-    local file="$1" mb keep days
-    mb=$(config_get ACCESS_LOG_ROLL_MB)
-    keep=$(config_get ACCESS_LOG_ROLL_KEEP | tr -cd '0-9')
-    days=$(config_get ACCESS_LOG_ROLL_DAYS | tr -cd '0-9')
+    local file="$1" k v mb="" keep="" days=""
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS='=' read -r k v || [ -n "$k" ]; do
+            v="${v//[\"\']/}"
+            case "$k" in
+                ACCESS_LOG_ROLL_MB) mb="$v" ;;
+                ACCESS_LOG_ROLL_KEEP) keep="${v//[!0-9]/}" ;;
+                ACCESS_LOG_ROLL_DAYS) days="${v//[!0-9]/}" ;;
+            esac
+        done < "$CONFIG_FILE"
+    fi
     if [ "$mb" = off ]; then
         printf '        output file "%s" {\n            roll_disabled\n        }\n' "$file"
         return
     fi
-    mb=$(printf '%s' "$mb" | tr -cd '0-9')
+    mb="${mb//[!0-9]/}"
+    [ -z "$mb" ] || mb=$((10#$mb))
+    [ -z "$keep" ] || keep=$((10#$keep))
+    [ -z "$days" ] || days=$((10#$days))
     if [ -z "$mb$keep$days" ]; then
         printf '        output file "%s"\n' "$file"
         return

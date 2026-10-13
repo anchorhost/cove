@@ -15,14 +15,17 @@
 #     [--days=N]` writes other numbers, or roll_disabled, into every site's
 #     log block (see site_log_output). (ACCESS_LOG_ROLL_MB/_KEEP/_DAYS)
 # Sites' own debug.log files are WordPress's, and left alone.
+# Read as base 10: bash takes a leading zero (08) as octal in arithmetic.
 log_rotate_limit() {
-    config_get LOG_ROTATE_MB | tr -cd '0-9'
+    local v
+    v=$(config_get LOG_ROTATE_MB | tr -cd '0-9')
+    [ -z "$v" ] || echo $((10#$v))
 }
 
 log_service_cap() {
     local v
     v=$(config_get SERVICE_LOG_CAP_MB | tr -cd '0-9')
-    echo "${v:-50}"
+    echo $((10#${v:-50}))
 }
 
 log_size_label() {
@@ -113,6 +116,7 @@ log_rotate_services() {
                 gum style --foreground red "❌ Error: Give a size in MB, such as 'cove log rotate services 200', or off, or default."
                 exit 1
             fi
+            v=$((10#$v))
             config_set SERVICE_LOG_CAP_MB "$v"
             echo "✅ The services' own output is trimmed to its last $(log_size_label $((v * 104858))) once past $v MB."
             ;;
@@ -152,6 +156,9 @@ log_rotate_access() {
         gum style --foreground red "❌ Error: Give a size in MB, 1 to 100000."
         exit 1
     fi
+    [[ "$mb" =~ ^[0-9]+$ ]] && mb=$((10#$mb))
+    [ -n "$keep" ] && keep=$((10#$keep))
+    [ -n "$days" ] && days=$((10#$days))
     case "$mb" in
         off)
             config_set ACCESS_LOG_ROLL_MB off
@@ -192,6 +199,7 @@ cove_log_rotate() {
                 gum style --foreground red "❌ Error: Give a size in MB, such as 'cove log rotate 50', or off." "'cove log rotate' shows every setting."
                 exit 1
             fi
+            mb=$((10#$mb))
             config_set LOG_ROTATE_MB "$mb"
             log_rotate_refresh_scripts
             echo "✅ Log rotation is on: a log in $LOGS_DIR past $mb MB moves to <name>.log.1."
