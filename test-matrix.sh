@@ -308,9 +308,12 @@ out=$(printf '%s\n' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_sites","arguments":{"filter":"alpha"}}}' \
     '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wp","arguments":{"site":"alpha","args":["option","get","siteurl"]}}}' \
     '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"wp","arguments":{"site":"alpha","args":["--path=/tmp","option","get","home"]}}}' \
-    | timeout 120 cove mcp)
+    '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wp_read","arguments":{"site":"alpha","args":["option","update","blogname","x"]}}}' \
+    '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"check_page","arguments":{"site":"alpha","body":"none"}}}' \
+    | timeout 180 cove mcp)
 echo "$out" | grep -q '"serverInfo"' && echo "$out" | grep -q 'https://alpha.localhost' && echo "$out" | grep -q 'exit 0' \
-    && echo "$out" | grep -q -- '--path is not offered'
+    && echo "$out" | grep -q -- '--path is not offered' && echo "$out" | grep -q 'wp_read runs only commands that read' \
+    && echo "$out" | grep -q '→ 200 in'
 MCPCHECK
         then
             res "$c" mcp PASS
