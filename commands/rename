@@ -146,6 +146,8 @@ cove_rename() {
     # dashboard would otherwise hide it and refuse every action on it.
     if [ -f "$COVE_DIR/demo" ] && grep -qx "$old_name" "$COVE_DIR/demo"; then
         sed "s/^$old_name\$/$new_name/" "$COVE_DIR/demo" > "$COVE_DIR/demo.tmp" && mv "$COVE_DIR/demo.tmp" "$COVE_DIR/demo"
+        # Its database was renamed too: grant the new name instead.
+        demo_db_sync || echo "⚠️  Couldn't update the demo's database account; run 'cove demo $(tr '\n' ' ' < "$COVE_DIR/demo")' again."
     fi
 
     # --- Reload Server Configuration ---

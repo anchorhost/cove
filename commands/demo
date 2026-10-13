@@ -15,10 +15,16 @@ demo_mailbox_open() {
 # Adminer, sign in as it while the demo is on, so `SHOW DATABASES`, a query
 # naming another database, or Adminer's ?db= find nothing else. Its password
 # is kept in ~/Cove/demo-db (600) and never goes on a command line. Run
-# whenever the demo's sites change; `cove demo off` drops the account.
+# whenever the demo's sites change; `cove demo off` drops the account. The
+# file is written only once MariaDB took every statement, and removed when it
+# didn't, so the dashboard and Adminer fail closed rather than sign in with
+# an account that may still hold the previous demo's grants.
 demo_db_sync() {
-    local demo_file="$COVE_DIR/demo" creds="$COVE_DIR/demo-db" pass site db sql
+    local demo_file="$COVE_DIR/demo" creds="$COVE_DIR/demo-db" pass site db sql user pw
     [ -f "$demo_file" ] || return 0
+    user=$(config_get DB_USER)
+    pw=$(config_get DB_PASSWORD)
+    if [ -z "$user" ]; then rm -f "$creds"; return 1; fi
     pass=$(sed -n 's/^DB_PASSWORD=//p' "$creds" 2>/dev/null)
     [[ "$pass" =~ ^[0-9a-f]{32,}$ ]] || pass=$(openssl rand -hex 24 2>/dev/null)
     [ -n "$pass" ] || pass=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
@@ -30,15 +36,28 @@ demo_db_sync() {
         [[ "$db" =~ ^[A-Za-z0-9_-]+$ ]] || continue
         # _ is a wildcard in a GRANT's database name.
         db="${db//_/\\_}"
+        # MariaDB refuses an escaped name past 64 characters, and the client
+        # stops at the first error, which would leave the later sites out.
+        if [ ${#db} -gt 64 ]; then
+            echo "⚠️  $site's database name is too long to grant on its own, so the demo's database view leaves it out." >&2
+            continue
+        fi
         sql="$sql GRANT ALL PRIVILEGES ON \`$db\`.* TO 'cove_demo'@'localhost';"
     done < "$demo_file"
+    if ! printf '%s\n' "$sql" | MYSQL_PWD="$pw" mysql -u "$user" 2>/dev/null; then
+        rm -f "$creds"
+        return 1
+    fi
     ( umask 077; printf 'DB_USER=cove_demo\nDB_PASSWORD=%s\n' "$pass" > "$creds.tmp" ) && mv -f "$creds.tmp" "$creds"
-    printf '%s\n' "$sql" | MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" 2>/dev/null
 }
 
 demo_db_drop() {
-    printf '%s\n' "DROP USER IF EXISTS 'cove_demo'@'localhost';" | MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" 2>/dev/null
+    local user pw
+    user=$(config_get DB_USER)
+    pw=$(config_get DB_PASSWORD)
     rm -f "$COVE_DIR/demo-db"
+    [ -n "$user" ] || return 0
+    printf '%s\n' "DROP USER IF EXISTS 'cove_demo'@'localhost';" | MYSQL_PWD="$pw" mysql -u "$user" 2>/dev/null
 }
 
 cove_demo() {
@@ -70,7 +89,7 @@ cove_demo() {
                 rm -f "$demo_file" "$COVE_DIR/demo-started"
                 install_mailpit_service >/dev/null
             fi
-            [ -f "$COVE_DIR/demo-db" ] && demo_db_drop
+            demo_db_drop
             if [ "$held" -gt 0 ]; then
                 # Wait for Mailpit to answer on the real mailbox: replaying
                 # into the demo one (a restart that didn't happen) would
