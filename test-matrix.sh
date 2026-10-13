@@ -237,12 +237,15 @@ lane_a() {
 fail() { echo "login_rewrite: $*" >&2; exit 1; }
 cove wp alpha option update home https://www.example.com >/dev/null 2>&1 || fail "setting home"
 cove wp alpha option update siteurl https://www.example.com >/dev/null 2>&1 || fail "setting siteurl"
+cove wp alpha option update cove_matrix_hosts 'https://www.example.com.au/x https://www.example.com/y' >/dev/null 2>&1 || fail "setting cove_matrix_hosts"
 link=$(cove login alpha --plain 2>/tmp/rewrite.err) || fail "cove login: $(cat /tmp/rewrite.err)"
 echo "$link" | grep -Eq '^https://alpha\.localhost(:[0-9]+)?/wp-login\.php\?' || fail "link is $link"
 grep -q 'Rewriting them to https://alpha.localhost' /tmp/rewrite.err || fail "no rewrite message: $(cat /tmp/rewrite.err)"
 cove wp alpha option get home 2>/dev/null | grep -Eqx 'https://alpha\.localhost(:[0-9]+)?' || fail "home not rewritten"
 cove wp alpha option get siteurl 2>/dev/null | grep -Eqx 'https://alpha\.localhost(:[0-9]+)?' || fail "siteurl not rewritten"
 ls /root/Cove/Sites/alpha.localhost/private/database-before-url-rewrite-*.sql >/dev/null 2>&1 || fail "no database copy in private/"
+hosts=$(cove wp alpha option get cove_matrix_hosts 2>/dev/null)
+echo "$hosts" | grep -Eqx 'https://www\.example\.com\.au/x https://alpha\.localhost(:[0-9]+)?/y' || fail "a longer host was rewritten too: $hosts"
 curl -skL --max-time 20 -c /tmp/jar-rewrite "$link" -o /dev/null || fail "link did not load"
 grep -q wordpress_logged_in /tmp/jar-rewrite || fail "link did not sign in"
 cove login alpha --plain >/dev/null 2>/tmp/rewrite2.err || fail "second login"
@@ -304,8 +307,10 @@ out=$(printf '%s\n' \
     '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_sites","arguments":{"filter":"alpha"}}}' \
     '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wp","arguments":{"site":"alpha","args":["option","get","siteurl"]}}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"wp","arguments":{"site":"alpha","args":["--path=/tmp","option","get","home"]}}}' \
     | timeout 120 cove mcp)
-echo "$out" | grep -q '"serverInfo"' && echo "$out" | grep -q 'https://alpha.localhost' && echo "$out" | grep -q 'exit 0'
+echo "$out" | grep -q '"serverInfo"' && echo "$out" | grep -q 'https://alpha.localhost' && echo "$out" | grep -q 'exit 0' \
+    && echo "$out" | grep -q -- '--path is not offered'
 MCPCHECK
         then
             res "$c" mcp PASS
