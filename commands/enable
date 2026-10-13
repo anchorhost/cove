@@ -65,7 +65,7 @@ RestartSec=2s
 # wedges the Go runtime. Give it generous headroom (matches the macOS plist).
 LimitNOFILE=65536
 User=$current_user
-Environment=HOME=/home/$current_user
+Environment=HOME=$HOME
 Environment=PHPRC=$PHP_INI_FILE
 
 [Install]

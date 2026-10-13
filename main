@@ -1920,6 +1920,22 @@ EOM
     echo "$script_path"
 }
 
+# Units written before 2.4 set HOME=/home/<user>: wrong for root (/root) and
+# for any home elsewhere. FrankenPHP's PHP reads ~/Cove/config through it
+# (the dashboard's port, Adminer's sign-in), and the watchdog's cove looked
+# for ~/Cove there. Rewrites cove.service's HOME line, with the same sudo tee
+# the unit was written with (SELinux-safe). Returns 0 when it changed.
+fix_cove_service_home() {
+    local unit=/etc/systemd/system/cove.service content
+    [ -f "$unit" ] || return 1
+    grep -q '^Environment=HOME=' "$unit" || return 1
+    grep -qxF "Environment=HOME=$HOME" "$unit" && return 1
+    content=$(sed "s|^Environment=HOME=.*|Environment=HOME=$HOME|" "$unit") || return 1
+    printf '%s\n' "$content" | $SUDO_CMD tee "$unit" >/dev/null || return 1
+    $SUDO_CMD systemctl daemon-reload
+    return 0
+}
+
 # Register the watchdog with the OS service manager (launchd on macOS, a
 # systemd timer on Linux) so it ticks every 5s. Extracted from cove_enable so
 # cove_upgrade can install it too: pre-1.11 upgraders would otherwise get the
@@ -1991,7 +2007,7 @@ After=cove.service
 Type=oneshot
 ExecStart=/bin/bash $watchdog_bin
 User=$current_user
-Environment=HOME=/home/$current_user
+Environment=HOME=$HOME
 # The tick hands off sweeps (previews, history) with nohup and exits; the
 # default control-group kill would take them down with it.
 KillMode=process
@@ -16766,6 +16782,11 @@ main() {
             if [ "$OS" = "macos" ] && write_caddy_plist; then
                 echo "   - Restarting FrankenPHP to apply its updated service definition..."
                 start_caddy_service
+                for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
+            fi
+            if [ "$OS" = "linux" ] && fix_cove_service_home; then
+                echo "   - Restarting FrankenPHP so it sees the right home folder..."
+                $SUDO_CMD systemctl restart cove.service
                 for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
             fi
             # Regenerate per-version php-fpm configs/units so pinned sites pick
