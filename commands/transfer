@@ -427,7 +427,7 @@ $problem = null;
 $created = array();
 $foreign = array();
 
-$check = function ( $sql ) use ( $prefix, $label, &$created, &$foreign, &$problem ) {
+$check = function ( $sql, $seen = array() ) use ( $prefix, $label, &$created, &$foreign, &$problem ) {
     preg_match_all( '/`(?:[^`]|``)*`|\'\'|@@?[A-Za-z0-9_.$]+|[A-Za-z0-9_$]+|\S/', $sql, $m );
     $t = $m[0];
     if ( ! $t ) { return; }
@@ -466,6 +466,14 @@ $check = function ( $sql ) use ( $prefix, $label, &$created, &$foreign, &$proble
     };
     $i     = 1;
     $first = strtoupper( $t[0] );
+    // A dump writes rows as values. A SELECT (or MySQL 8's TABLE) inside any
+    // other statement reads them from somewhere, possibly another tenant's
+    // tables, and SELECT … INTO keeps what it read for a later statement.
+    if ( ( isset( $seen['SELECT'] ) && 'SELECT' !== $first )
+        || ( isset( $seen['TABLE'] ) && in_array( $first, array( 'INSERT', 'REPLACE', 'UPDATE', 'DELETE', 'SET' ), true ) )
+        || ( isset( $seen['INTO'] ) && 'SELECT' === $first ) ) {
+        return $refuse();
+    }
     switch ( $first ) {
         case 'SET':
             foreach ( $t as $tok ) {
@@ -565,6 +573,7 @@ $state   = 'code'; // code | sq | dq | bt | comment
 $exec    = 0;      // executable comments open (/*! … */): their text is code
 $esc     = false;  // the last character in a string was a backslash
 $line_no = 0;
+$seen    = array(); // SELECT, TABLE, INTO in the statement's code, past the cap too
 $add     = function ( $s ) use ( &$head, $cap ) {
     if ( strlen( $head ) < $cap ) { $head .= $s; }
 };
@@ -602,8 +611,12 @@ while ( null === $problem && false !== ( $line = fgets( $fh ) ) ) {
             $add( ' ' );
             $i = $p + 2;
         } else {
-            $n = strcspn( $line, "'\"`;/-#*\\", $i );
-            $add( substr( $line, $i, $n ) );
+            $n     = strcspn( $line, "'\"`;/-#*\\", $i );
+            $chunk = substr( $line, $i, $n );
+            $add( $chunk );
+            if ( preg_match_all( '/(?<![A-Za-z0-9_$])(SELECT|TABLE|INTO)(?![A-Za-z0-9_$])/i', $chunk, $w ) ) {
+                foreach ( $w[1] as $word ) { $seen[ strtoupper( $word ) ] = true; }
+            }
             $i += $n;
             if ( $i >= $len ) { break; }
             $c    = $line[ $i ];
@@ -619,8 +632,9 @@ while ( null === $problem && false !== ( $line = fgets( $fh ) ) ) {
                 $add( '`' );
                 $i++;
             } elseif ( ';' === $c ) {
-                $check( $head );
+                $check( $head, $seen );
                 $head = '';
+                $seen = array();
                 $i++;
             } elseif ( '\\' === $c ) {
                 $problem = "The dump holds a mysql client command (\\$next on line $line_no), which a tenant restore refuses.";
@@ -648,7 +662,7 @@ while ( null === $problem && false !== ( $line = fgets( $fh ) ) ) {
     }
 }
 fclose( $fh );
-if ( null === $problem && '' !== trim( $head ) ) { $check( $head ); }
+if ( null === $problem && '' !== trim( $head ) ) { $check( $head, $seen ); }
 if ( null === $problem && $foreign ) {
     $problem = "The dump touches tables outside $label: " . implode( ' ', array_slice( array_keys( $foreign ), 0, 5 ) ) . '.';
 }
