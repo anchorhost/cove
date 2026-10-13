@@ -186,7 +186,7 @@ RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="2.3"
+COVE_VERSION="2.4"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -252,6 +252,21 @@ config_set() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
+# A value from ~/Cove/config (the last line that sets it, quotes stripped),
+# or nothing.
+config_get() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    grep "^${1}=" "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "'\""
+}
+
+config_unset() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    local tmp
+    tmp=$(mktemp)
+    grep -v "^${1}=" "$CONFIG_FILE" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$CONFIG_FILE"
+}
+
 # Emit a base64-encoded random password. Uses openssl when present, falls
 # back to /dev/urandom otherwise — Fedora Workstation doesn't ship openssl
 # in its base install, and a missing openssl used to yield an empty $db_pass
@@ -299,6 +314,26 @@ cove_ini_get() {
             | sed -E 's/[[:space:]]+$//')
     fi
     echo "${val:-$fallback}"
+}
+
+# Sets a directive in ~/Cove/php.ini: rewrites every line that sets it, or
+# appends it when none does. A file that doesn't end in a newline (one edited
+# by hand) gets one first, or the new line would be glued onto its last one
+# and both settings lost. Leaves the file alone when it already says so.
+cove_ini_set() {
+    local key="$1" line="$1 = $2"
+    mkdir -p "$(dirname "$PHP_INI_FILE")"
+    touch "$PHP_INI_FILE"
+    if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$PHP_INI_FILE"; then
+        [ "$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$PHP_INI_FILE" | tail -1)" = "$line" ] && return 0
+        COVE_INI_KEY="$key" COVE_INI_LINE="$line" awk '
+            { k = $0; sub(/^[[:space:]]*/, "", k); sub(/[[:space:]]*=.*/, "", k) }
+            /=/ && k == ENVIRON["COVE_INI_KEY"] { print ENVIRON["COVE_INI_LINE"]; next }
+            { print }' "$PHP_INI_FILE" > "$PHP_INI_FILE.tmp" && mv -f "$PHP_INI_FILE.tmp" "$PHP_INI_FILE"
+    else
+        [ -s "$PHP_INI_FILE" ] && [ -n "$(tail -c 1 "$PHP_INI_FILE")" ] && echo >> "$PHP_INI_FILE"
+        printf '%s\n' "$line" >> "$PHP_INI_FILE"
+    fi
 }
 
 # Default FrankenPHP worker-thread count: 4x CPU cores, floor of 16,
@@ -1364,66 +1399,69 @@ get_mariadb_service_name() {
     fi
 }
 
+# Every hostname Cove keeps in /etc/hosts, one per line: its own three, each
+# site, and each site's mappings and twin. Warnings go to stderr.
+cove_required_hosts() {
+    printf '%s\n' cove.localhost db.cove.localhost mail.cove.localhost
+    [ -d "$SITES_DIR" ] || return 0
+    local site_path host_site_name mapping twin_entry twin_domain twin_folder twin_as_site
+    for site_path in "$SITES_DIR"/*; do
+        [ -d "$site_path" ] || continue
+        host_site_name=$(basename "$site_path")
+
+        # Same skip as regenerate_caddyfile: a dir with no public/
+        # and no custom directive isn't a servable site (e.g. the
+        # logs/-only skeleton left by a reload racing a delete) —
+        # adding its hosts entry back would undo the delete's cleanup.
+        if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$host_site_name" ]; then
+            continue
+        fi
+        # A folder name is a hostname only if it looks like one; any
+        # process running as this user can create folders here.
+        if ! validate_hostname "$host_site_name"; then
+            echo "   - ⚠️  Skipping a folder in $SITES_DIR whose name isn't a hostname: $host_site_name" >&2
+            continue
+        fi
+        printf '%s\n' "$host_site_name"
+
+        # Check for additional mappings
+        if [ -f "$site_path/mappings" ]; then
+            while IFS= read -r mapping || [ -n "$mapping" ]; do
+                # Skip empty lines and wildcards: /etc/hosts has no
+                # wildcard syntax and *.localhost already resolves to
+                # loopback natively, so a "*.name" line would be inert
+                # — and would prompt for sudo on every reload.
+                if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]]; then
+                    # Checked again on the way to a root-written
+                    # file: the mappings file sits where a site's
+                    # own PHP can rewrite it, and a line holding
+                    # spaces would alias any domain to this machine.
+                    if validate_hostname "$mapping"; then
+                        printf '%s\n' "$mapping"
+                    else
+                        echo "   - ⚠️  Skipping invalid mapping in $site_path/mappings: $mapping" >&2
+                    fi
+                fi
+            done < "$site_path/mappings"
+        fi
+
+        # A twin's domains (site_twin checks them before they get here).
+        if twin_entry=$(site_twin "$site_path"); then
+            IFS=$'\t' read -r twin_domain twin_folder twin_as_site <<< "$twin_entry"
+            printf '%s\n' "$twin_domain"
+            [ -n "$twin_as_site" ] && printf '%s\n' "$twin_as_site"
+        fi
+    done
+}
+
 # Manage /etc/hosts file for local domains
 update_etc_hosts() {
     echo "🔎 Checking /etc/hosts for required entries..."
 
-    # An array of all hostnames Cove will manage
-    local required_hosts=("cove.localhost" "db.cove.localhost" "mail.cove.localhost")
-
-    # Also find all site-specific hostnames
-    if [ -d "$SITES_DIR" ]; then
-        for site_path in "$SITES_DIR"/*; do
-            if [ -d "$site_path" ]; then
-                local host_site_name
-                host_site_name=$(basename "$site_path")
-
-                # Same skip as regenerate_caddyfile: a dir with no public/
-                # and no custom directive isn't a servable site (e.g. the
-                # logs/-only skeleton left by a reload racing a delete) —
-                # adding its hosts entry back would undo the delete's cleanup.
-                if [ ! -d "$site_path/public" ] && [ ! -f "$CUSTOM_CADDY_DIR/$host_site_name" ]; then
-                    continue
-                fi
-                # A folder name is a hostname only if it looks like one; any
-                # process running as this user can create folders here.
-                if ! validate_hostname "$host_site_name"; then
-                    echo "   - ⚠️  Skipping a folder in $SITES_DIR whose name isn't a hostname: $host_site_name"
-                    continue
-                fi
-                required_hosts+=("$host_site_name")
-
-                # Check for additional mappings
-                if [ -f "$site_path/mappings" ]; then
-                    while IFS= read -r mapping || [ -n "$mapping" ]; do
-                        # Skip empty lines and wildcards: /etc/hosts has no
-                        # wildcard syntax and *.localhost already resolves to
-                        # loopback natively, so a "*.name" line would be inert
-                        # — and would prompt for sudo on every reload.
-                        if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]]; then
-                            # Checked again on the way to a root-written
-                            # file: the mappings file sits where a site's
-                            # own PHP can rewrite it, and a line holding
-                            # spaces would alias any domain to this machine.
-                            if validate_hostname "$mapping"; then
-                                required_hosts+=("$mapping")
-                            else
-                                echo "   - ⚠️  Skipping invalid mapping in $site_path/mappings: $mapping"
-                            fi
-                        fi
-                    done < "$site_path/mappings"
-                fi
-
-                # A twin's domains (site_twin checks them before they get here).
-                local twin_entry twin_domain twin_folder twin_as_site
-                if twin_entry=$(site_twin "$site_path"); then
-                    IFS=$'\t' read -r twin_domain twin_folder twin_as_site <<< "$twin_entry"
-                    required_hosts+=("$twin_domain")
-                    [ -n "$twin_as_site" ] && required_hosts+=("$twin_as_site")
-                fi
-            fi
-        done
-    fi
+    local required_hosts=() host
+    while IFS= read -r host; do
+        [ -n "$host" ] && required_hosts+=("$host")
+    done < <(cove_required_hosts)
 
     local missing_hosts=()
     for host in "${required_hosts[@]}"; do
@@ -1448,6 +1486,42 @@ update_etc_hosts() {
         echo "   - ✅ Done."
     else
         echo "   - ✅ All entries are present."
+    fi
+}
+
+# The other direction: takes out the lines for hostnames Cove stopped serving
+# (a deleted or renamed site, a removed mapping or twin). update_etc_hosts
+# only ever adds, so without this they stayed, and a real domain once used as
+# a mapping or twin kept resolving to this machine. A name something still
+# needs stays, and only exact "127.0.0.1 <host>" lines go. Each name is
+# checked again first: it is spliced into a sudo sed expression, and GNU
+# sed's `e` command runs a shell.
+prune_etc_hosts() {
+    local required host stale=() sed_args=()
+    required=$(cove_required_hosts 2>/dev/null)
+    for host in "$@"; do
+        [ -n "$host" ] && [[ "$host" != \*.* ]] && validate_hostname "$host" || continue
+        printf '%s\n' "$required" | grep -qxF "$host" && continue
+        grep -qE "^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$" /etc/hosts 2>/dev/null || continue
+        stale+=("$host")
+    done
+    [ ${#stale[@]} -gt 0 ] || return 0
+
+    echo "🧹 Removing /etc/hosts entries (requires sudo)..."
+    for host in "${stale[@]}"; do
+        sed_args+=(-e "/^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$/d")
+    done
+    # Use non-interactive sudo when we don't have a TTY (e.g., the dashboard's
+    # PHP shell_exec). In that context an interactive sudo prompt can hang
+    # the caller waiting for a password that will never arrive. From a real
+    # terminal the flag is empty, so sudo prompts as normal.
+    local sudo_flag=""
+    [ -t 0 ] || sudo_flag="-n"
+    if sudo $sudo_flag sed -i.bak -E "${sed_args[@]}" /etc/hosts 2>/dev/null; then
+        sudo $sudo_flag rm -f /etc/hosts.bak 2>/dev/null
+        echo "   - ✅ /etc/hosts cleaned."
+    else
+        gum style --foreground yellow "   - ⚠️ Couldn't edit /etc/hosts (sudo unavailable from this context). These lines are left in it: ${stale[*]}"
     fi
 }
 
@@ -1636,7 +1710,11 @@ warmup_ticks=60           # ~5min after a pid first answers a probe. Until then
                           # with nothing actually wedged.
 fail_threshold_warm=24    # ~2min of sustained failure inside that warmup window
 never_healthy_ticks=120   # ~10min (120 x 5s) stuck in startup -> retry once
-log_cap_bytes=52428800    # 50MB — a restart storm must not fill the disk
+# The cap on the services' own output (cove log rotate services <MB>|off;
+# default 50 MB, so a restart storm can't fill the disk). Past it, the last
+# tenth is kept.
+log_cap_mb=\$(sed -n 's/^SERVICE_LOG_CAP_MB=//p' "$CONFIG_FILE" 2>/dev/null | tail -1 | tr -cd '0-9')
+log_cap_bytes=\$(( 10#\${log_cap_mb:-50} * 1048576 ))
 
 [ -f "\$pidfile" ] || exit 0
 pid=\$(cat "\$pidfile" 2>/dev/null)
@@ -1648,12 +1726,15 @@ mkdir -p "$LOGS_DIR"
 
 # Cap the FrankenPHP process log. It grows unbounded (info-level auto-HTTPS
 # lines on every startup) and a restart storm can push it into the GBs, which
-# is itself a drag on the box. Keep the most recent 5MB.
-if [ -f "\$process_log" ]; then
+# is itself a drag on the box. Keep the most recent tenth of the cap, written
+# back into the same file: FrankenPHP holds it open, and after a mv it would
+# go on writing into the replaced file, out of sight and never freed.
+if [ "\$log_cap_bytes" -gt 0 ] && [ -f "\$process_log" ]; then
     lsize=\$(stat -f%z "\$process_log" 2>/dev/null || stat -c%s "\$process_log" 2>/dev/null || echo 0)
     if [ "\$lsize" -gt "\$log_cap_bytes" ]; then
-        tail -c 5242880 "\$process_log" > "\$process_log.tmp" 2>/dev/null \\
-            && mv "\$process_log.tmp" "\$process_log" 2>/dev/null
+        tail -c \$((log_cap_bytes / 10)) "\$process_log" > "\$process_log.tmp" 2>/dev/null \\
+            && cat "\$process_log.tmp" > "\$process_log" 2>/dev/null
+        rm -f "\$process_log.tmp"
     fi
 fi
 
@@ -1661,6 +1742,20 @@ fi
 # refresh one stale site preview in the background (cove screenshot --sweep).
 sweep_stamp="$COVE_DIR/cache/screenshots/.sweep.stamp"
 now_s=\$(date +%s)
+
+# Log rotation, only when asked for (cove log rotate <MB>; off by default,
+# so every line is kept): every ~5 minutes, if a log in $LOGS_DIR has grown
+# past that size, cove moves it to <name>.log.1.
+rot_mb=\$(sed -n 's/^LOG_ROTATE_MB=//p' "$CONFIG_FILE" 2>/dev/null | tail -1 | tr -cd '0-9')
+if [ -n "\$rot_mb" ] && [ "\$rot_mb" -gt 0 ]; then
+    rot_stamp="$COVE_DIR/.logrotate.stamp"
+    if [ \$((now_s - \$(cat "\$rot_stamp" 2>/dev/null || echo 0))) -ge 300 ]; then
+        echo "\$now_s" > "\$rot_stamp"
+        if [ -n "\$(find "$LOGS_DIR" -maxdepth 1 -name '*.log' -size +"\${rot_mb}"M 2>/dev/null)" ]; then
+            "$watchdog_cove" log rotate --apply >/dev/null 2>&1
+        fi
+    fi
+fi
 last_s=\$(cat "\$sweep_stamp" 2>/dev/null || echo 0)
 if [ \$((now_s - last_s)) -ge 300 ]; then
     mkdir -p "$COVE_DIR/cache/screenshots"
@@ -1828,6 +1923,22 @@ EOM
     echo "$script_path"
 }
 
+# Units written before 2.4 set HOME=/home/<user>: wrong for root (/root) and
+# for any home elsewhere. FrankenPHP's PHP reads ~/Cove/config through it
+# (the dashboard's port, Adminer's sign-in), and the watchdog's cove looked
+# for ~/Cove there. Rewrites cove.service's HOME line, with the same sudo tee
+# the unit was written with (SELinux-safe). Returns 0 when it changed.
+fix_cove_service_home() {
+    local unit=/etc/systemd/system/cove.service content
+    [ -f "$unit" ] || return 1
+    grep -q '^Environment=HOME=' "$unit" || return 1
+    grep -qxF "Environment=HOME=$HOME" "$unit" && return 1
+    content=$(sed "s|^Environment=HOME=.*|Environment=HOME=$HOME|" "$unit") || return 1
+    printf '%s\n' "$content" | $SUDO_CMD tee "$unit" >/dev/null || return 1
+    $SUDO_CMD systemctl daemon-reload
+    return 0
+}
+
 # Register the watchdog with the OS service manager (launchd on macOS, a
 # systemd timer on Linux) so it ticks every 5s. Extracted from cove_enable so
 # cove_upgrade can install it too: pre-1.11 upgraders would otherwise get the
@@ -1899,7 +2010,7 @@ After=cove.service
 Type=oneshot
 ExecStart=/bin/bash $watchdog_bin
 User=$current_user
-Environment=HOME=/home/$current_user
+Environment=HOME=$HOME
 # The tick hands off sweeps (previews, history) with nohup and exits; the
 # default control-group kill would take them down with it.
 KillMode=process
@@ -2039,13 +2150,6 @@ EOM
     echo "$wrapper"
 }
 
-# The CLI side of the same: $PHP_INI_FILE (~/Cove/php.ini, PHPRC for wp-cli
-# and every other PHP Cove runs from a terminal) sets no sendmail_path, so
-# wp_mail() from `cove wp` went to /usr/sbin/sendmail, which can deliver for
-# real where a mail server is set up, instead of Mailpit. Points it at the
-# wrapper, touching only that one line of a file `cove memory` and `cove
-# opcache` also edit. Called by install, post-upgrade and every Caddyfile
-# regeneration, so an existing install picks it up on its next reload.
 # FrankenPHP 1.13.0's `php-cli` puts its own binary at $argv[0] and shifts
 # the script to $argv[1] (php/frankenphp#2690, open as of 2026-10-09), so
 # WP-CLI, Minn's CLI and anything built on Symfony Console read their own
@@ -2055,8 +2159,8 @@ EOM
 # nothing otherwise. The web server and php-fpm pools set their own
 # auto_prepend_file (the Whoops bootstrap), which overrides this one.
 ensure_cli_argv_fix() {
-    local fix="$APP_DIR/cli-argv-fix.php" line
-    mkdir -p "$APP_DIR" "$(dirname "$PHP_INI_FILE")"
+    local fix="$APP_DIR/cli-argv-fix.php"
+    mkdir -p "$APP_DIR"
     cat > "$fix.tmp" << 'EOM'
 <?php
 // Generated by Cove (ensure_cli_argv_fix in main). See php/frankenphp#2690.
@@ -2070,28 +2174,20 @@ if ( PHP_SAPI === 'cli' && isset( $argv[1], $_SERVER['SCRIPT_FILENAME'] )
 }
 EOM
     mv -f "$fix.tmp" "$fix"
-    line="auto_prepend_file = \"$fix\""
-    touch "$PHP_INI_FILE"
-    grep -qxF "$line" "$PHP_INI_FILE" && return 0
-    if grep -qE '^[[:space:]]*auto_prepend_file[[:space:]]*=' "$PHP_INI_FILE"; then
-        grep -vE '^[[:space:]]*auto_prepend_file[[:space:]]*=' "$PHP_INI_FILE" > "$PHP_INI_FILE.tmp" && mv -f "$PHP_INI_FILE.tmp" "$PHP_INI_FILE"
-    fi
-    # A file without a trailing newline would glue this onto its last line.
-    [ -s "$PHP_INI_FILE" ] && [ -n "$(tail -c 1 "$PHP_INI_FILE")" ] && echo >> "$PHP_INI_FILE"
-    printf '%s\n' "$line" >> "$PHP_INI_FILE"
+    cove_ini_set auto_prepend_file "\"$fix\""
 }
 
+# The CLI side of the same: $PHP_INI_FILE (~/Cove/php.ini, PHPRC for wp-cli
+# and every other PHP Cove runs from a terminal) sets no sendmail_path, so
+# wp_mail() from `cove wp` went to /usr/sbin/sendmail, which can deliver for
+# real where a mail server is set up, instead of Mailpit. Points it at the
+# wrapper, touching only that one line of a file `cove memory` and `cove
+# opcache` also edit. Called by install, post-upgrade and every Caddyfile
+# regeneration, so an existing install picks it up on its next reload.
 ensure_cli_sendmail_path() {
-    local wrapper line
+    local wrapper
     wrapper=$(write_sendmail_wrapper "$1") || return 0
-    line="sendmail_path = \"$wrapper\""
-    mkdir -p "$(dirname "$PHP_INI_FILE")"
-    touch "$PHP_INI_FILE"
-    grep -qxF "$line" "$PHP_INI_FILE" && return 0
-    if grep -qE '^[[:space:]]*sendmail_path[[:space:]]*=' "$PHP_INI_FILE"; then
-        grep -vE '^[[:space:]]*sendmail_path[[:space:]]*=' "$PHP_INI_FILE" > "$PHP_INI_FILE.tmp" && mv -f "$PHP_INI_FILE.tmp" "$PHP_INI_FILE"
-    fi
-    printf '%s\n' "$line" >> "$PHP_INI_FILE"
+    cove_ini_set sendmail_path "\"$wrapper\""
 }
 
 write_mailpit_run_script() {
@@ -2115,18 +2211,25 @@ db_path="$COVE_DIR/mailpit.db"
 # \`cove demo\` keeps its own mailbox, so a recording shows only demo mail.
 [ -f "$COVE_DIR/demo" ] && db_path="$COVE_DIR/mailpit-demo.db"
 log_file="$LOGS_DIR/mailpit.log"
-log_cap_bytes=52428800    # 50MB — a restart storm must not fill the disk
+# The cap on the services' own output (cove log rotate services <MB>|off;
+# default 50 MB, so a restart storm can't fill the disk). Past it, the last
+# tenth is kept.
+log_cap_mb=\$(sed -n 's/^SERVICE_LOG_CAP_MB=//p' "$CONFIG_FILE" 2>/dev/null | tail -1 | tr -cd '0-9')
+log_cap_bytes=\$(( 10#\${log_cap_mb:-50} * 1048576 ))
 
 mkdir -p "$LOGS_DIR"
 
 # Cap the log. A bind-failure restart storm used to push this into the tens of
 # MBs with nothing useful but "address already in use" lines. Keep the most
-# recent 1MB so a real error still has context.
-if [ -f "\$log_file" ]; then
+# recent tenth of the cap so a real error still has context. Written back
+# into the same file: the service manager opened it for this script's
+# output before it ran, so a mv would leave Mailpit writing to the old one.
+if [ "\$log_cap_bytes" -gt 0 ] && [ -f "\$log_file" ]; then
     lsize=\$(stat -f%z "\$log_file" 2>/dev/null || stat -c%s "\$log_file" 2>/dev/null || echo 0)
     if [ "\$lsize" -gt "\$log_cap_bytes" ]; then
-        tail -c 1048576 "\$log_file" > "\$log_file.tmp" 2>/dev/null \\
-            && mv "\$log_file.tmp" "\$log_file" 2>/dev/null
+        tail -c \$((log_cap_bytes / 10)) "\$log_file" > "\$log_file.tmp" 2>/dev/null \\
+            && cat "\$log_file.tmp" > "\$log_file" 2>/dev/null
+        rm -f "\$log_file.tmp"
     fi
 fi
 
@@ -2512,6 +2615,14 @@ function adminer_object() {
         }
         function credentials() {
             $configFile = getenv('HOME') . '/Cove/config';
+            // `cove demo`: the demo's own account, which can open only the
+            // demo sites' databases, so ?db= reaches nothing else. Without it
+            // there is no automatic sign-in at all.
+            if (file_exists(getenv('HOME') . '/Cove/demo')) {
+                $demo = @parse_ini_file(getenv('HOME') . '/Cove/demo-db') ?: [];
+                if (empty($demo['DB_USER']) || empty($demo['DB_PASSWORD'])) return ['localhost', null, null];
+                return ['localhost', $demo['DB_USER'], $demo['DB_PASSWORD']];
+            }
             if (file_exists($configFile)) {
                 $config = parse_ini_file($configFile);
                 $db_user = $config['DB_USER'] ?? null;
@@ -2780,6 +2891,43 @@ emit_site_php_handler() {
 # ignores .htaccess, so without this they download to anyone who can reach
 # the site — a `cove share` visitor included. A `handle` block, not a bare
 # `respond`: php_server is ordered ahead of respond.
+# A site's access log, as the `output` line of its log block. Caddy rolls
+# the file by default (at 100 MB, the newest 10 rolled files kept, none older
+# than 90 days); `cove log rotate access` sets other numbers, or off, which
+# keeps one file growing for good.
+# Read without a subprocess (it runs for every log block of every site), and
+# in base 10, since bash takes a leading zero (08) as octal.
+site_log_output() {
+    local file="$1" k v mb="" keep="" days=""
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS='=' read -r k v || [ -n "$k" ]; do
+            v="${v//[\"\']/}"
+            case "$k" in
+                ACCESS_LOG_ROLL_MB) mb="$v" ;;
+                ACCESS_LOG_ROLL_KEEP) keep="${v//[!0-9]/}" ;;
+                ACCESS_LOG_ROLL_DAYS) days="${v//[!0-9]/}" ;;
+            esac
+        done < "$CONFIG_FILE"
+    fi
+    if [ "$mb" = off ]; then
+        printf '        output file "%s" {\n            roll_disabled\n        }\n' "$file"
+        return
+    fi
+    mb="${mb//[!0-9]/}"
+    [ -z "$mb" ] || mb=$((10#$mb))
+    [ -z "$keep" ] || keep=$((10#$keep))
+    [ -z "$days" ] || days=$((10#$days))
+    if [ -z "$mb$keep$days" ]; then
+        printf '        output file "%s"\n' "$file"
+        return
+    fi
+    printf '        output file "%s" {\n' "$file"
+    [ -n "$mb" ] && printf '            roll_size %sMiB\n' "$mb"
+    [ -n "$keep" ] && printf '            roll_keep %s\n' "$keep"
+    [ -n "$days" ] && printf '            roll_keep_for %sh\n' "$((days * 24))"
+    printf '        }\n'
+}
+
 emit_site_deny_rules() {
     cat >> "$CADDYFILE_PATH" <<'EOM'
     @cove_private {
@@ -2929,7 +3077,7 @@ emit_site_twin_block() {
     {
         echo "    tls internal"
         echo "    log {"
-        echo "        output file \"$site_path/logs/caddy-twin.log\""
+        site_log_output "$site_path/logs/caddy-twin.log"
         echo "    }"
         echo "    @cove_as_site header X-Cove-Twin as-site"
         echo "    request_header @cove_as_site Host $site_host"
@@ -3202,7 +3350,7 @@ EOM
                 echo "    tls internal" >> "$CADDYFILE_PATH"
                 
                 echo "    log {" >> "$CADDYFILE_PATH"
-                echo "        output file \"$site_path/logs/caddy.log\"" >> "$CADDYFILE_PATH"
+                site_log_output "$site_path/logs/caddy.log" >> "$CADDYFILE_PATH"
                 echo "    }" >> "$CADDYFILE_PATH"
                 
                 local custom_conf_file="$CUSTOM_CADDY_DIR/$site_name"
@@ -3244,7 +3392,7 @@ EOM
                         echo "    tls internal" >> "$CADDYFILE_PATH"
                         
                         echo "    log {" >> "$CADDYFILE_PATH"
-                        echo "        output file \"$site_path/logs/caddy-lan.log\"" >> "$CADDYFILE_PATH"
+                        site_log_output "$site_path/logs/caddy-lan.log" >> "$CADDYFILE_PATH"
                         echo "    }" >> "$CADDYFILE_PATH"
                         
                         if [ -f "$custom_conf_file" ]; then
@@ -3366,7 +3514,7 @@ EOM
                         emit_site_deny_rules
 
                         echo "    log {" >> "$CADDYFILE_PATH"
-                        echo "        output file \"$site_path/logs/caddy-tailscale.log\"" >> "$CADDYFILE_PATH"
+                        site_log_output "$site_path/logs/caddy-tailscale.log" >> "$CADDYFILE_PATH"
                         echo "    }" >> "$CADDYFILE_PATH"
                         
                         # Include custom directives if present
@@ -3903,6 +4051,18 @@ function cove_write_size_cache($path, array $sizes) {
 // Handle GET requests for listing sites
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $action = $_GET['action'] ?? '';
+    // `cove demo`: a hidden site's preview, files and downloads answer 404,
+    // the same as a site that doesn't exist (the POST actions refuse too).
+    if (cove_demo_sites($user_home) !== null) {
+        $__demo_get = $action === 'backup_download'
+            ? preg_replace('/-\d{8}-\d{6}\.zip$/', '', (string) ($_GET['name'] ?? ''))
+            : (string) ($_GET['site'] ?? '');
+        if ($__demo_get !== '' && cove_demo_hides($user_home, $__demo_get)) {
+            http_response_code(404);
+            echo json_encode(['success' => false, 'message' => 'Not found.']);
+            exit;
+        }
+    }
     if ($action === 'list_sites') {
         $sites_info = [];
         $size_cache = cove_read_size_cache($__cove_sizes_cache);
@@ -4965,6 +5125,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 if (!empty($login_url)) {
                     $response = ['success' => true, 'url' => $login_url];
+                    // A site whose stored URLs still named its live domain had
+                    // them rewritten first (or couldn't): say so.
+                    $note = [];
+                    foreach ($output_lines as $line) {
+                        $line = trim(preg_replace('/\x1b\[[0-9;]*m/', '', $line));
+                        if (preg_match('/^(🔧|⚠️|Done\. The database)/u', $line)) $note[] = preg_replace('/^(🔧|⚠️)\s*/u', '', $line);
+                    }
+                    if ($note) $response['note'] = implode(' ', $note);
                 } else {
                     $response = ['success' => false, 'message' => 'Failed to generate login link.', 'output' => $full_output];
                 }
@@ -5149,7 +5317,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // like every action here. This is a local dev box: the SQL console
             // is deliberately unrestricted, and every identifier is quoted
             // rather than allow-listed so any schema a site created works.
+            // During `cove demo` it signs in as the demo's own account, which
+            // can open only the demo sites' databases (see demo_db_sync).
             $__db_cfg = isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : [];
+            if (cove_demo_sites($user_home) !== null) {
+                $__db_cfg = @parse_ini_file($user_home . '/Cove/demo-db') ?: [];
+                if (empty($__db_cfg['DB_USER']) || empty($__db_cfg['DB_PASSWORD'])) {
+                    echo json_encode(['success' => false, 'message' => 'The demo\'s database account is missing. Run cove demo with the same sites again to set it up.']);
+                    exit;
+                }
+            }
             mysqli_report(MYSQLI_REPORT_OFF);
             $__db = @new mysqli('127.0.0.1', $__db_cfg['DB_USER'] ?? '', $__db_cfg['DB_PASSWORD'] ?? '', null, 3306);
             if ($__db->connect_error) {
@@ -5911,6 +6088,8 @@ $config_file = getenv('HOME') . '/Cove/config';
 $config_data = file_exists($config_file) ? parse_ini_file($config_file) : [];
 $__cove_https_port = isset($config_data['HTTPS_PORT']) ? (int) $config_data['HTTPS_PORT'] : 443;
 $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_port;
+// `cove demo`: each demo keeps console history of its own (see historyKey).
+$__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file_get_contents(getenv('HOME') . '/Cove/demo-started')) ?: '1') : '';
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -7115,7 +7294,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
         }
     </style>
 </head>
-<body>
+<body<?php if ($__cove_demo !== '') echo ' data-demo="' . htmlspecialchars($__cove_demo, ENT_QUOTES) . '"'; ?>>
     <div class="wrap">
         <nav class="nav">
             <a class="logo" href="/">
@@ -11181,14 +11360,22 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderDbSql();
             },
 
+            // The SQL console's and wp-cli tab's history. During `cove demo`
+            // each demo keeps its own, so earlier commands naming hidden
+            // sites never show up on screen.
+            historyKey(name) {
+                const demo = document.body.dataset.demo;
+                return demo ? name + '.demo-' + demo : name;
+            },
+
             get dbHistory() {
-                try { return JSON.parse(localStorage.getItem('cove-sql-history') || '[]'); } catch (e) { return []; }
+                try { return JSON.parse(localStorage.getItem(this.historyKey('cove-sql-history')) || '[]'); } catch (e) { return []; }
             },
 
             pushDbHistory(sql) {
                 const h = this.dbHistory.filter(x => x !== sql);
                 h.unshift(sql);
-                try { localStorage.setItem('cove-sql-history', JSON.stringify(h.slice(0, 40))); } catch (e) {}
+                try { localStorage.setItem(this.historyKey('cove-sql-history'), JSON.stringify(h.slice(0, 40))); } catch (e) {}
             },
 
             // --- Rendering ---------------------------------------------------
@@ -13185,7 +13372,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 this.renderSiteTab();
                 const res = await this.apiPost('get_login_link', url ? { site_name: site.name, user: login, url } : { site_name: site.name, user: login });
                 delete t.busy[login];
-                if (res.success && res.url) { this.openUrl(res.url); this.showSnack('Login link for ' + login + ' opened in a new tab.'); }
+                if (res.success && res.url) { this.openUrl(res.url); this.showSnack(res.note || 'Login link for ' + login + ' opened in a new tab.', false, res.note ? { duration: 12000 } : {}); }
                 if (this.sitePage.name === site.name) this.renderSiteTab();
             },
 
@@ -13198,7 +13385,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 c.running = true; c.cmd = line;
                 c.history = [line].concat(c.history.filter(h => h !== line)).slice(0, 50);
                 c.histIdx = -1;
-                try { localStorage.setItem('cove.cli.history', JSON.stringify(c.history)); } catch (e) {}
+                try { localStorage.setItem(this.historyKey('cove.cli.history'), JSON.stringify(c.history)); } catch (e) {}
                 this.renderSiteCli();
                 const res = await this.apiPost('site_wp', { site_name: site.name, args: line }, { quiet: true, timeoutMs: 300000 });
                 c.running = false;
@@ -13414,7 +13601,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
 
             bindSiteTabEvents() {
                 const p = this.sitePage;
-                try { p.cli.history = JSON.parse(localStorage.getItem('cove.cli.history') || '[]'); } catch (e) {}
+                try { p.cli.history = JSON.parse(localStorage.getItem(this.historyKey('cove.cli.history')) || '[]'); } catch (e) {}
                 $id('siteTabs').addEventListener('click', (e) => {
                     const b = e.target.closest('.mail-part');
                     if (b) this.setSiteTab(b.dataset.tab);
@@ -15633,7 +15820,7 @@ $__cove_port_suffix = ($__cove_https_port === 443) ? '' : ':' . $__cove_https_po
                 const res = await this.apiPost('get_login_link', { site_name: name });
                 if (res.success && res.url) {
                     this.openUrl(res.url);
-                    this.showSnack('Login link opened in a new tab.');
+                    this.showSnack(res.note || 'Login link opened in a new tab.', false, res.note ? { duration: 12000 } : {});
                 }
                 site.isLoggingIn = false;
                 this.renderList();
@@ -15746,8 +15933,8 @@ show_general_help() {
     help_cmd transfer "Inspect the backup/restore engine used by pull and push."
     echo ""
     help_section "Inspect"
-    help_cmd log "View logs for a site or the global error log."
-    help_cmd screenshot "Capture a site's front page with a headless browser."
+    help_cmd log "View logs for a site or the global error log; 'rotate' sets retention."
+    help_cmd screenshot "Capture any page of a site with a headless browser."
     help_cmd health "Diagnose crashes, OPcache pressure, and on-disk hygiene."
     help_cmd status "Check the status of all background services."
     echo ""
@@ -15778,6 +15965,7 @@ show_general_help() {
     help_cmd upgrade "Upgrades Cove to the latest available version."
     help_cmd version "Displays the current version of Cove."
     help_cmd demo "Show only a few sites (and a mailbox of their own) for recording a demo."
+    help_cmd mcp "Let an AI agent work with your sites: claude mcp add cove -- cove mcp"
     if [ "$OS" == "macos" ]; then
         help_cmd menubar "Manage the macOS menu bar companion app."
     elif [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; then
@@ -16123,6 +16311,25 @@ display_command_help() {
             echo "  cove demo                            Is it on, and for which sites?"
             echo "  cove demo off                        Everything back, your mail included."
             ;;
+        mcp)
+            local mcp_self
+            mcp_self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+            command -v cove >/dev/null 2>&1 && mcp_self="$(command -v cove)"
+            echo "Usage: cove mcp [tools]"
+            echo ""
+            echo "Runs a Model Context Protocol server on stdin and stdout, so an AI agent can"
+            echo "work with your sites: list and create them, run WP-CLI, get a one-time login"
+            echo "link, read the logs and the mail a site sent, look at a page, and take or"
+            echo "restore a snapshot. Nothing it offers deletes a site or reaches a remote host,"
+            echo "and during 'cove demo' it sees only the demo's sites."
+            echo ""
+            echo "Add it to your agent:"
+            echo "  Claude Code   claude mcp add cove -- cove mcp"
+            echo "  Others        a stdio server with the command \"$mcp_self\" and the argument \"mcp\":"
+            echo "                {\"mcpServers\": {\"cove\": {\"command\": \"$mcp_self\", \"args\": [\"mcp\"]}}}"
+            echo ""
+            echo "  cove mcp tools   List the tools it offers."
+            ;;
         twin)
             echo "Usage: cove twin <site> [add|remove] [--domain=<domain>] [--root=<folder>] [--as-site=<domain>] [--format=json]"
             echo ""
@@ -16259,8 +16466,19 @@ display_command_help() {
             ;;
         log)
             echo "Usage: cove log [site] [--follow]"
+            echo "       cove log rotate                     How long each log is kept, and sizes"
+            echo "       cove log rotate <MB> | off           Cove's own logs (~/Cove/Logs)"
+            echo "       cove log rotate services <MB> | off | default"
+            echo "       cove log rotate access <MB> | off | default [--keep=<files>] [--days=<days>]"
             echo ""
             echo "View logs for a site or the global error log."
+            echo ""
+            echo "Cove keeps every line of its own logs unless asked otherwise: 'cove log rotate 50'"
+            echo "moves a log past 50 MB to <name>.log.1, replacing the one before. The services'"
+            echo "own output (caddy-process.log, mailpit.log) is trimmed to its last tenth past"
+            echo "50 MB, so a restart storm can't fill the disk; 'services' changes that size or"
+            echo "turns it off. Caddy rolls each site's access log at 100 MB and keeps 10 rolled"
+            echo "files for up to 90 days; 'access' sets other numbers, or off to keep one file."
             echo ""
             echo "Arguments:"
             echo "  [site]           The site name (optional). If omitted, shows global error log."
@@ -16584,6 +16802,11 @@ main() {
                 start_caddy_service
                 for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
             fi
+            if [ "$OS" = "linux" ] && fix_cove_service_home; then
+                echo "   - Restarting FrankenPHP so it sees the right home folder..."
+                $SUDO_CMD systemctl restart cove.service
+                for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
+            fi
             # Regenerate per-version php-fpm configs/units so pinned sites pick
             # up pool-template changes. Restart-shy: unchanged configs with a
             # live master are left alone.
@@ -16672,6 +16895,10 @@ main() {
             ;;
         demo)
             cove_demo "$@"
+            ;;
+        mcp)
+            # No dependency check: stdout is the protocol, and it prints.
+            cove_mcp "$@"
             ;;
         lan)
             check_dependencies
@@ -17100,6 +17327,7 @@ PHP
     # Made during `cove demo`: it joins the demo, or it would vanish on screen.
     if [ -f "$COVE_DIR/demo" ] && ! grep -qx "$site_name" "$COVE_DIR/demo"; then
         echo "$site_name" >> "$COVE_DIR/demo"
+        demo_db_sync
     fi
 
     echo "✅ Site '$full_hostname' created successfully!"
@@ -17423,13 +17651,15 @@ cove_clone() {
         inject_mu_plugin "$new_dir/public"
     fi
 
-    # --- Custom Caddy directives ---
-    # Carried over so the clone behaves like its source. Directives can hardcode
-    # the old hostname, so say so rather than letting it fail mysteriously.
     # Made during `cove demo`: it joins the demo, like a site from `cove add`.
     if [ -f "$COVE_DIR/demo" ] && ! grep -qx "$new_name" "$COVE_DIR/demo"; then
         echo "$new_name" >> "$COVE_DIR/demo"
+        demo_db_sync
     fi
+
+    # --- Custom Caddy directives ---
+    # Carried over so the clone behaves like its source. Directives can hardcode
+    # the old hostname, so say so rather than letting it fail mysteriously.
 
     local source_conf="$CUSTOM_CADDY_DIR/$source_name.localhost"
     if [ -f "$source_conf" ]; then
@@ -18193,13 +18423,7 @@ cove_delete() {
     local hosts_to_remove=("$site_name.localhost")
     if [ -f "$site_dir/mappings" ]; then
         while IFS= read -r mapping || [ -n "$mapping" ]; do
-            # Re-validated here, not just when `cove mappings add` wrote it:
-            # each name is spliced into a `sudo sed` expression below, and the
-            # file sits where any of the site's own PHP can rewrite it. GNU
-            # sed's `e` command runs a shell. Wildcards never get a hosts line.
-            if [ -n "$mapping" ] && [[ "$mapping" != \*.* ]] && validate_hostname "$mapping"; then
-                hosts_to_remove+=("$mapping")
-            fi
+            hosts_to_remove+=("$mapping")
         done < "$site_dir/mappings"
     fi
     local twin_entry twin_domain twin_folder twin_as_site
@@ -18274,34 +18498,7 @@ cove_delete() {
     fi
 
     # --- Clean /etc/hosts entries ---
-    local entries_exist=false
-    local host
-    for host in "${hosts_to_remove[@]}"; do
-        if grep -qE "^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$" /etc/hosts 2>/dev/null; then
-            entries_exist=true
-            break
-        fi
-    done
-
-    if $entries_exist; then
-        echo "🧹 Removing /etc/hosts entries (requires sudo)..."
-        local sed_args=()
-        for host in "${hosts_to_remove[@]}"; do
-            sed_args+=(-e "/^127\.0\.0\.1[[:space:]]+${host//./\\.}[[:space:]]*$/d")
-        done
-        # Use non-interactive sudo when we don't have a TTY (e.g., the dashboard's
-        # PHP shell_exec). In that context an interactive sudo prompt can hang
-        # the caller waiting for a password that will never arrive. From a real
-        # terminal the flag is empty, so sudo prompts as normal.
-        local sudo_flag=""
-        [ -t 0 ] || sudo_flag="-n"
-        if sudo $sudo_flag sed -i.bak -E "${sed_args[@]}" /etc/hosts 2>/dev/null; then
-            sudo $sudo_flag rm -f /etc/hosts.bak 2>/dev/null
-            echo "   - ✅ /etc/hosts cleaned."
-        else
-            gum style --foreground yellow "   - ⚠️ Skipped /etc/hosts cleanup (sudo unavailable from this context). Run 'cove reload' from a terminal to sync."
-        fi
-    fi
+    prune_etc_hosts "${hosts_to_remove[@]}"
 
     # Regenerate the Caddyfile so Caddy stops holding log file handles for
     # this site. Without this, a later Caddy restart would re-create the
@@ -18324,6 +18521,56 @@ cove_delete() {
 # database it opened (see write_mailpit_run_script).
 demo_mailbox_open() {
     ps -eo args= 2>/dev/null | grep -E '(^|/)mailpit --database ' | grep -q 'mailpit-demo\.db'
+}
+
+# The database side of the demo: a MariaDB account that can open only the
+# demo sites' databases. The dashboard's database view and SQL console, and
+# Adminer, sign in as it while the demo is on, so `SHOW DATABASES`, a query
+# naming another database, or Adminer's ?db= find nothing else. Its password
+# is kept in ~/Cove/demo-db (600) and never goes on a command line. Run
+# whenever the demo's sites change; `cove demo off` drops the account. The
+# file is written only once MariaDB took every statement, and removed when it
+# didn't, so the dashboard and Adminer fail closed rather than sign in with
+# an account that may still hold the previous demo's grants.
+demo_db_sync() {
+    local demo_file="$COVE_DIR/demo" creds="$COVE_DIR/demo-db" pass site db sql user pw
+    [ -f "$demo_file" ] || return 0
+    user=$(config_get DB_USER)
+    pw=$(config_get DB_PASSWORD)
+    if [ -z "$user" ]; then rm -f "$creds"; return 1; fi
+    pass=$(sed -n 's/^DB_PASSWORD=//p' "$creds" 2>/dev/null)
+    [[ "$pass" =~ ^[0-9a-f]{32,}$ ]] || pass=$(openssl rand -hex 24 2>/dev/null)
+    [ -n "$pass" ] || pass=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    sql="CREATE USER IF NOT EXISTS 'cove_demo'@'localhost'; ALTER USER 'cove_demo'@'localhost' IDENTIFIED BY '$pass'; REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'cove_demo'@'localhost';"
+    while IFS= read -r site; do
+        [[ "$site" =~ ^[a-z0-9-]+$ ]] || continue
+        db=$(sed -nE "s/.*define\([[:space:]]*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]+)['\"].*/\1/p" "$SITES_DIR/$site.localhost/public/wp-config.php" 2>/dev/null | head -1)
+        # wp-config.php is the site's to write: a name that isn't plain goes.
+        [[ "$db" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+        # _ is a wildcard in a GRANT's database name.
+        db="${db//_/\\_}"
+        # MariaDB refuses an escaped name past 64 characters, and the client
+        # stops at the first error, which would leave the later sites out.
+        if [ ${#db} -gt 64 ]; then
+            echo "⚠️  $site's database name is too long to grant on its own, so the demo's database view leaves it out." >&2
+            continue
+        fi
+        sql="$sql GRANT ALL PRIVILEGES ON \`$db\`.* TO 'cove_demo'@'localhost';"
+    done < "$demo_file"
+    if ! printf '%s\n' "$sql" | MYSQL_PWD="$pw" mysql -u "$user" 2>/dev/null; then
+        rm -f "$creds"
+        return 1
+    fi
+    ( umask 077; printf 'DB_USER=cove_demo\nDB_PASSWORD=%s\n' "$pass" > "$creds.tmp" ) && mv -f "$creds.tmp" "$creds"
+}
+
+demo_db_drop() {
+    local user pw
+    user=$(config_get DB_USER)
+    pw=$(config_get DB_PASSWORD)
+    rm -f "$COVE_DIR/demo-db"
+    [ -n "$user" ] || return 0
+    printf '%s\n' "DROP USER IF EXISTS 'cove_demo'@'localhost';" | MYSQL_PWD="$pw" mysql -u "$user" 2>/dev/null
 }
 
 cove_demo() {
@@ -18352,9 +18599,10 @@ cove_demo() {
                 return 0
             fi
             if [ -f "$demo_file" ]; then
-                rm -f "$demo_file"
+                rm -f "$demo_file" "$COVE_DIR/demo-started"
                 install_mailpit_service >/dev/null
             fi
+            demo_db_drop
             if [ "$held" -gt 0 ]; then
                 # Wait for Mailpit to answer on the real mailbox: replaying
                 # into the demo one (a restart that didn't happen) would
@@ -18406,8 +18654,13 @@ cove_demo() {
     # open while demo mode is off, so the demo one is free to go.
     [ "$was_on" = 1 ] || rm -f "$COVE_DIR/mailpit-demo.db" "$COVE_DIR/mailpit-demo.db-wal" "$COVE_DIR/mailpit-demo.db-shm"
     printf '%s\n' "${names[@]}" > "$demo_file"
+    # The dashboard keeps each demo's console history apart, by this stamp.
+    [ "$was_on" = 1 ] || date +%s > "$COVE_DIR/demo-started"
     # Mailpit picks its mailbox when it starts (see write_mailpit_run_script).
     [ "$was_on" = 1 ] || install_mailpit_service >/dev/null
+    if ! demo_db_sync; then
+        gum style --foreground yellow "⚠️  Couldn't set up the demo's database account, so the dashboard's database view and Adminer won't open until it works. Check MariaDB with 'cove status', then run this again."
+    fi
     echo "🎬 Demo mode is on, showing ${#names[@]} site$([ ${#names[@]} -eq 1 ] || echo s): ${names[*]}"
     echo "   The dashboard, Adminer and 'cove list' show only these, and mail goes to a"
     echo "   separate mailbox. Sites you create now join the demo. 'cove demo off' ends it."
@@ -18698,7 +18951,7 @@ RestartSec=2s
 # wedges the Go runtime. Give it generous headroom (matches the macOS plist).
 LimitNOFILE=65536
 User=$current_user
-Environment=HOME=/home/$current_user
+Environment=HOME=$HOME
 Environment=PHPRC=$PHP_INI_FILE
 
 [Install]
@@ -19006,7 +19259,19 @@ cove_health() {
     for lf in "$LOGS_DIR/caddy-process.log" "$LOGS_DIR/errors.log" "$LOGS_DIR/mailpit.log"; do
         [ -f "$lf" ] || continue
         sz=$(stat -f%z "$lf" 2>/dev/null || stat -c%s "$lf" 2>/dev/null || echo 0)
-        if [ "$sz" -gt 52428800 ]; then
+        # PHP's error log is kept in full on purpose (rotation is opt-in), so
+        # its size is a note, not a problem.
+        if [ "$sz" -gt 52428800 ] && [ "$(basename "$lf")" = "errors.log" ]; then
+            if [ "$(log_rotate_limit)" -gt 0 ] 2>/dev/null; then
+                echo "  ℹ️  errors.log is $((sz/1048576)) MB (rotation is on at $(log_rotate_limit) MB)"
+            else
+                echo "  ℹ️  errors.log is $((sz/1048576)) MB, kept in full. To cap it: cove log rotate <MB>"
+            fi
+            biglog=$((biglog+1))
+        elif [ "$(log_service_cap)" -eq 0 ]; then
+            # Kept in full on purpose (cove log rotate services off).
+            [ "$sz" -gt 52428800 ] && echo "  ℹ️  $(basename "$lf") is $((sz/1048576)) MB, kept in full (cove log rotate services off)" && biglog=$((biglog+1))
+        elif [ "$sz" -gt $(( $(log_service_cap) > 50 ? $(log_service_cap) * 1048576 : 52428800 )) ]; then
             echo "  ⚠️  $(basename "$lf") is $((sz/1048576)) MB"
             if [ "$(basename "$lf")" = "mailpit.log" ]; then
                 echo "     (bind-failure thrash? reinstall with: cove enable)"
@@ -21474,7 +21739,223 @@ cove_list() {
         echo "$php_output"
     fi
 }
+# How long Cove keeps each log. Three settings, in ~/Cove/config:
+#   - Cove's own logs (~/Cove/Logs/*.log): kept in full unless asked for.
+#     Cove is for local development, where last month's error can be the
+#     clue. `cove log rotate <MB>` turns rotation on: the watchdog looks every
+#     five minutes, and a log past that size moves to <name>.log.1 (replacing
+#     the one before) and starts again empty. The copy is taken and the
+#     original emptied in place, because FrankenPHP, Mailpit and the watchdog
+#     keep their logs open. (LOG_ROTATE_MB)
+#   - The services' own output (caddy-process.log, mailpit.log): a guard
+#     against restart storms, on by default. Past 50 MB the last tenth is
+#     kept; the watchdog trims FrankenPHP's, Mailpit's start script its own.
+#     `cove log rotate services <MB>|off|default`. (SERVICE_LOG_CAP_MB)
+#   - Sites' access logs: Caddy rolls them by default (100 MB, 10 rolled
+#     files, 90 days). `cove log rotate access <MB>|off|default [--keep=N]
+#     [--days=N]` writes other numbers, or roll_disabled, into every site's
+#     log block (see site_log_output). (ACCESS_LOG_ROLL_MB/_KEEP/_DAYS)
+# Sites' own debug.log files are WordPress's, and left alone.
+# Read as base 10: bash takes a leading zero (08) as octal in arithmetic.
+log_rotate_limit() {
+    local v
+    v=$(config_get LOG_ROTATE_MB | tr -cd '0-9')
+    [ -z "$v" ] || echo $((10#$v))
+}
+
+log_service_cap() {
+    local v
+    v=$(config_get SERVICE_LOG_CAP_MB | tr -cd '0-9')
+    echo $((10#${v:-50}))
+}
+
+log_size_label() {
+    awk -v b="$1" 'BEGIN { if (b >= 1073741824) printf "%.1f GB", b / 1073741824; else if (b >= 1048576) printf "%.1f MB", b / 1048576; else printf "%d KB", (b + 1023) / 1024 }'
+}
+
+# Scripts written by an older Cove read none of these settings yet.
+log_rotate_refresh_scripts() {
+    if [ -f "$COVE_DIR/watchdog.sh" ] && ! grep -q 'SERVICE_LOG_CAP_MB' "$COVE_DIR/watchdog.sh"; then
+        write_watchdog_script >/dev/null
+    fi
+    if [ -f "$COVE_DIR/mailpit-run.sh" ] && ! grep -q 'SERVICE_LOG_CAP_MB' "$COVE_DIR/mailpit-run.sh"; then
+        write_mailpit_run_script >/dev/null
+    fi
+}
+
+log_rotate_apply() {
+    local quiet="${1:-}" mb f size
+    mb=$(log_rotate_limit)
+    [ -n "$mb" ] && [ "$mb" -gt 0 ] || return 0
+    for f in "$LOGS_DIR"/*.log; do
+        [ -f "$f" ] || continue
+        size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+        [ "$size" -gt $((mb * 1048576)) ] || continue
+        rm -f "$f.1"
+        if cp -c "$f" "$f.1" 2>/dev/null || cp --reflink=auto "$f" "$f.1" 2>/dev/null || cp "$f" "$f.1"; then
+            : > "$f"
+            [ "$quiet" = quiet ] || echo "   ↻ $(basename "$f"): $((size / 1048576)) MB moved to $(basename "$f").1"
+        fi
+    done
+}
+
+log_rotate_status() {
+    local mb cap roll keep days f size total sites
+    mb=$(log_rotate_limit)
+    echo "📜 Cove's own logs ($LOGS_DIR)"
+    if [ -n "$mb" ] && [ "$mb" -gt 0 ]; then
+        echo "   Rotated: a log past $mb MB moves to <name>.log.1, replacing the one before."
+    else
+        echo "   Kept in full (the default)."
+    fi
+    for f in "$LOGS_DIR"/*.log "$LOGS_DIR"/*.log.1; do
+        [ -f "$f" ] || continue
+        size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+        printf '     %-28s %s\n' "$(basename "$f")" "$(log_size_label "$size")"
+    done
+    echo "   Change: cove log rotate <MB> | off"
+    echo ""
+    cap=$(log_service_cap)
+    echo "🛟 The services' own output (caddy-process.log, mailpit.log)"
+    if [ "$cap" -gt 0 ]; then
+        echo "   Trimmed to the last $(log_size_label $((cap * 104858))) once past $cap MB$([ "$cap" = 50 ] && echo " (the default)"), so a restart storm can't fill the disk."
+    else
+        echo "   Kept in full: the restart-storm cap is off."
+    fi
+    echo "   Change: cove log rotate services <MB> | off | default"
+    echo ""
+    roll=$(config_get ACCESS_LOG_ROLL_MB)
+    keep=$(config_get ACCESS_LOG_ROLL_KEEP | tr -cd '0-9')
+    days=$(config_get ACCESS_LOG_ROLL_DAYS | tr -cd '0-9')
+    echo "🌐 Sites' access logs (<site>/logs/caddy*.log)"
+    if [ "$roll" = off ]; then
+        echo "   Kept in full: Caddy doesn't roll them."
+    else
+        roll=$(printf '%s' "$roll" | tr -cd '0-9')
+        echo "   Caddy rolls each at ${roll:-100} MB and keeps the newest ${keep:-10} rolled files, none older than ${days:-90} days$([ -z "$roll$keep$days" ] && echo " (Caddy's default)")."
+    fi
+    total=$(find "$SITES_DIR" -mindepth 3 -maxdepth 3 -path '*/logs/*' -name 'caddy*' -type f -exec stat -f%z {} + 2>/dev/null || find "$SITES_DIR" -mindepth 3 -maxdepth 3 -path '*/logs/*' -name 'caddy*' -type f -exec stat -c%s {} + 2>/dev/null)
+    total=$(printf '%s\n' "$total" | awk '{ s += $1 } END { print s + 0 }')
+    sites=$(find "$SITES_DIR" -mindepth 3 -maxdepth 3 -path '*/logs/*' -name 'caddy.log' -type f 2>/dev/null | wc -l | tr -d ' ')
+    echo "     $(log_size_label "$total") across $sites sites, rolled files included"
+    echo "   Change: cove log rotate access <MB> | off | default [--keep=<files>] [--days=<days>]"
+}
+
+log_rotate_services() {
+    local v="${1:-}"
+    case "$v" in
+        off)
+            config_set SERVICE_LOG_CAP_MB 0
+            echo "✅ The services' own output is kept in full from here on."
+            ;;
+        default)
+            config_unset SERVICE_LOG_CAP_MB
+            echo "✅ The services' own output is trimmed to its last 5 MB once past 50 MB (the default)."
+            ;;
+        *)
+            if ! [[ "$v" =~ ^[0-9]+$ ]] || [ "$v" -lt 1 ] || [ "$v" -gt 100000 ]; then
+                gum style --foreground red "❌ Error: Give a size in MB, such as 'cove log rotate services 200', or off, or default."
+                exit 1
+            fi
+            v=$((10#$v))
+            config_set SERVICE_LOG_CAP_MB "$v"
+            echo "✅ The services' own output is trimmed to its last $(log_size_label $((v * 104858))) once past $v MB."
+            ;;
+    esac
+    log_rotate_refresh_scripts
+    echo "   The watchdog applies it to caddy-process.log; Mailpit's start script to mailpit.log."
+}
+
+log_rotate_access() {
+    local mb="" keep="" days="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --keep=*) keep="${arg#*=}" ;;
+            --days=*) days="${arg#*=}" ;;
+            off|default) mb="$arg" ;;
+            *)
+                if [[ "$arg" =~ ^[0-9]+$ ]]; then mb="$arg"; else
+                    gum style --foreground red "❌ Error: Unknown '$arg'." "Usage: cove log rotate access <MB> | off | default [--keep=<files>] [--days=<days>]"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+    if [ -z "$mb$keep$days" ]; then
+        gum style --foreground red "❌ Error: Give a size in MB, off, default, --keep or --days." "Usage: cove log rotate access <MB> | off | default [--keep=<files>] [--days=<days>]"
+        exit 1
+    fi
+    if [ -n "$keep" ] && { ! [[ "$keep" =~ ^[0-9]+$ ]] || [ "$keep" -lt 1 ] || [ "$keep" -gt 1000 ]; }; then
+        gum style --foreground red "❌ Error: --keep takes a number of rolled files, 1 to 1000."
+        exit 1
+    fi
+    if [ -n "$days" ] && { ! [[ "$days" =~ ^[0-9]+$ ]] || [ "$days" -lt 1 ] || [ "$days" -gt 36500 ]; }; then
+        gum style --foreground red "❌ Error: --days takes a number of days, 1 to 36500."
+        exit 1
+    fi
+    if [[ "$mb" =~ ^[0-9]+$ ]] && { [ "$mb" -lt 1 ] || [ "$mb" -gt 100000 ]; }; then
+        gum style --foreground red "❌ Error: Give a size in MB, 1 to 100000."
+        exit 1
+    fi
+    [[ "$mb" =~ ^[0-9]+$ ]] && mb=$((10#$mb))
+    [ -n "$keep" ] && keep=$((10#$keep))
+    [ -n "$days" ] && days=$((10#$days))
+    case "$mb" in
+        off)
+            config_set ACCESS_LOG_ROLL_MB off
+            echo "✅ Sites' access logs are kept in full from here on: Caddy won't roll them."
+            ;;
+        default)
+            config_unset ACCESS_LOG_ROLL_MB; config_unset ACCESS_LOG_ROLL_KEEP; config_unset ACCESS_LOG_ROLL_DAYS
+            echo "✅ Sites' access logs are back on Caddy's default: rolled at 100 MB, 10 rolled files kept, none older than 90 days."
+            ;;
+        *)
+            if [ -n "$mb" ]; then config_set ACCESS_LOG_ROLL_MB "$mb"
+            elif [ "$(config_get ACCESS_LOG_ROLL_MB)" = off ]; then config_unset ACCESS_LOG_ROLL_MB
+            fi
+            [ -n "$keep" ] && config_set ACCESS_LOG_ROLL_KEEP "$keep"
+            [ -n "$days" ] && config_set ACCESS_LOG_ROLL_DAYS "$days"
+            local r k d
+            r=$(config_get ACCESS_LOG_ROLL_MB); k=$(config_get ACCESS_LOG_ROLL_KEEP); d=$(config_get ACCESS_LOG_ROLL_DAYS)
+            echo "✅ Caddy rolls each site's access log at ${r:-100} MB and keeps the newest ${k:-10} rolled files, none older than ${d:-90} days."
+            ;;
+    esac
+    regenerate_caddyfile
+}
+
+cove_log_rotate() {
+    case "${1:-}" in
+        --apply) log_rotate_apply quiet ;;
+        ""|status) log_rotate_status ;;
+        services) shift; log_rotate_services "$@" ;;
+        access) shift; log_rotate_access "$@" ;;
+        off)
+            config_set LOG_ROTATE_MB 0
+            echo "✅ Log rotation is off: Cove keeps every log line from here on."
+            ls "$LOGS_DIR"/*.log.1 >/dev/null 2>&1 && echo "   The .log.1 files from earlier rotations stay in $LOGS_DIR."
+            ;;
+        *)
+            local mb="$1"
+            if ! [[ "$mb" =~ ^[0-9]+$ ]] || [ "$mb" -lt 1 ] || [ "$mb" -gt 100000 ]; then
+                gum style --foreground red "❌ Error: Give a size in MB, such as 'cove log rotate 50', or off." "'cove log rotate' shows every setting."
+                exit 1
+            fi
+            mb=$((10#$mb))
+            config_set LOG_ROTATE_MB "$mb"
+            log_rotate_refresh_scripts
+            echo "✅ Log rotation is on: a log in $LOGS_DIR past $mb MB moves to <name>.log.1."
+            echo "   The watchdog checks every five minutes. 'cove log rotate off' keeps everything again."
+            log_rotate_apply
+            ;;
+    esac
+}
+
 cove_log() {
+    if [ "${1:-}" = "rotate" ]; then
+        shift
+        cove_log_rotate "$@"
+        return
+    fi
     local site_name=""
     local follow_flag=""
 
@@ -21558,6 +22039,157 @@ cove_log() {
     fi
 }
 
+# A site restored or copied in by hand keeps the address it had where it
+# came from: its home and siteurl options still name the live domain (or
+# Local's localhost:10003). WordPress builds the login link from them, so the
+# link opened that address, and so did every redirect after signing in.
+# Rewrite them to this site's own address, as `cove import` and `cove pull`
+# do, after saving the database to the site's private/ folder. Only a plain
+# single site: a multisite network keeps its domains in tables of its own, a
+# Minn Engine site has no WordPress to run search-replace, and WP_HOME or
+# WP_SITEURL win over the database anyway; those get a warning instead, as
+# does a copy of another Cove site still sharing that site's database. An
+# address the site answers on here (a mapping, its twin) is left alone.
+# Messages go to stderr with --plain, where stdout is the link.
+login_localize_urls() {
+    local site_name="$1" site_dir="$2" wp_cmd="$3" plain="$4"
+    local public_dir="$site_dir/public"
+    local fd=1 tmp_php facts tag multisite defined db_name home_url siteurl_url
+    local key url origin host m entry twin_domain twin_folder twin_as_site
+    local other_cfg backup local_url from to found v n path
+    local -a wpa=(--skip-plugins --skip-themes) foreign=() keys=() longer=()
+    [ "$plain" = true ] && fd=2
+    site_is_minn "$public_dir" && return 0
+    local_url=$(url_for "$site_name.localhost")
+    tmp_php=$(mktemp "${TMPDIR:-/tmp}/cove-login-XXXXXX") || return 0
+    # What WordPress itself sees, so a WP_HOME set in an included file or a
+    # MULTISITE spelled TRUE counts as much as one in wp-config.php.
+    login_facts_php > "$tmp_php"
+    facts=$( (cd "$public_dir" && $wp_cmd eval-file "$tmp_php" "${wpa[@]}" 2>/dev/null) | grep "^COVE"$'\t' | tail -n 1)
+    if [ -z "$facts" ]; then rm -f "$tmp_php"; return 0; fi
+    IFS=$'\t' read -r tag multisite defined db_name home_url siteurl_url <<< "$facts"
+    for key in home siteurl; do
+        url="$home_url"; [ "$key" = siteurl ] && url="$siteurl_url"
+        origin=$(printf '%s' "$url" | sed -nE 's~^([A-Za-z]+://[^/?#]+).*~\1~p')
+        host=$(printf '%s' "$origin" | sed -E 's~^[A-Za-z]+://~~; s~:[0-9]+$~~' | tr '[:upper:]' '[:lower:]')
+        [ -n "$host" ] || continue
+        [ "$host" = "$site_name.localhost" ] && continue
+        if [ -f "$site_dir/mappings" ]; then
+            grep -Fixq "$host" "$site_dir/mappings" && continue
+            while IFS= read -r m || [ -n "$m" ]; do
+                case "$m" in \*.*) [[ "$host" == *".${m#\*.}" ]] && continue 2 ;; esac
+            done < "$site_dir/mappings"
+        fi
+        if entry=$(site_twin "$site_dir"); then
+            IFS=$'\t' read -r twin_domain twin_folder twin_as_site <<< "$entry"
+            [ "$host" = "$twin_domain" ] || [ "$host" = "$twin_as_site" ] && continue
+        fi
+        keys+=("$key")
+        [[ " ${foreign[*]} " == *" $origin "* ]] || foreign+=("$origin")
+    done
+    if [ ${#foreign[@]} -eq 0 ]; then rm -f "$tmp_php"; return 0; fi
+
+    if [ "$multisite" = 1 ] || [ "$defined" = 1 ]; then
+        echo "⚠️  $site_name's URLs name ${foreign[*]}, so signing in can land on that address. Its configuration sets them (multisite, WP_HOME or WP_SITEURL), so Cove left them alone." >&"$fd"
+        rm -f "$tmp_php"; return 0
+    fi
+    # A folder copied from another Cove site still uses that site's database:
+    # rewriting it would move the original to this address.
+    for origin in "${foreign[@]}"; do
+        host=$(printf '%s' "${origin#*://}" | sed -E 's~:[0-9]+$~~' | tr '[:upper:]' '[:lower:]')
+        other_cfg="$SITES_DIR/$host/public/wp-config.php"
+        case "$host" in *.localhost) ;; *) continue ;; esac
+        [ -f "$other_cfg" ] || continue
+        if grep -Fq "'$db_name'" "$other_cfg" || grep -Fq "\"$db_name\"" "$other_cfg"; then
+            echo "⚠️  $site_name's stored URLs name $origin, and it shares that site's database ($db_name), so Cove left them alone: a rewrite would break ${host%.localhost}. 'cove clone ${host%.localhost} <name>' makes a copy with a database of its own." >&"$fd"
+            rm -f "$tmp_php"; return 0
+        fi
+    done
+
+    backup="$site_dir/private/database-before-url-rewrite-$(date +%Y%m%d-%H%M%S).sql"
+    mkdir -p "$site_dir/private"
+    echo "🔧 $site_name's stored URLs still name ${foreign[*]}, so the login link would open that address, not this site. Rewriting them to $local_url..." >&"$fd"
+    if ! (umask 077; cd "$public_dir" && $wp_cmd db export "$backup" "${wpa[@]}" >/dev/null 2>&1); then
+        rm -f "$backup" "$tmp_php"
+        echo "⚠️  Couldn't save the database first, so the URLs were left alone." >&"$fd"
+        return 0
+    fi
+    to="//${local_url#*://}"
+    for origin in "${foreign[@]}"; do
+        from="//${origin#*://}"
+        # A plain search for //example.com also matches //example.com.au.
+        # Park every longer host that starts with it, replace, put them back.
+        login_longer_hosts_php > "$tmp_php"
+        found=$( (cd "$public_dir" && $wp_cmd eval-file "$tmp_php" "$from" "${wpa[@]}" 2>/dev/null) | grep '^//')
+        longer=()
+        while IFS= read -r v; do [ -n "$v" ] && longer+=("$v"); done <<< "$found"
+        n=0
+        for v in ${longer[@]+"${longer[@]}"}; do
+            n=$((n + 1))
+            login_search_replace "$public_dir" "$wp_cmd" "$v" "//cove-keep-$n.invalid"
+        done
+        login_search_replace "$public_dir" "$wp_cmd" "$from" "$to"
+        n=0
+        for v in ${longer[@]+"${longer[@]}"}; do
+            n=$((n + 1))
+            login_search_replace "$public_dir" "$wp_cmd" "//cove-keep-$n.invalid" "$v"
+        done
+    done
+    rm -f "$tmp_php"
+    # Set outright too (search-replace keeps an http:// scheme, and Cove
+    # serves https), but only the ones that named another address.
+    for key in "${keys[@]}"; do
+        url=$( (cd "$public_dir" && $wp_cmd option get "$key" "${wpa[@]}" 2>/dev/null) )
+        path=$(printf '%s' "$url" | sed -nE 's~^[A-Za-z]+://[^/?#]+(/[^?#]*)?.*$~\1~p')
+        (cd "$public_dir" && $wp_cmd option update "$key" "$local_url${path%/}" "${wpa[@]}" >/dev/null 2>&1)
+    done
+    (cd "$public_dir" && $wp_cmd cache flush "${wpa[@]}" >/dev/null 2>&1)
+    echo "   Done. The database from before is in $site_name.localhost/private/$(basename "$backup")." >&"$fd"
+}
+
+login_search_replace() {
+    (cd "$1" && $2 search-replace "$3" "$4" --all-tables-with-prefix --skip-columns=guid --skip-plugins --skip-themes --quiet >/dev/null 2>&1)
+}
+
+login_facts_php() {
+cat << 'PHPFACTS'
+<?php
+echo "COVE\t", is_multisite() ? 1 : 0, "\t", ( defined( 'WP_HOME' ) || defined( 'WP_SITEURL' ) ) ? 1 : 0, "\t", DB_NAME, "\t", get_option( 'home' ), "\t", get_option( 'siteurl' ), "\n";
+PHPFACTS
+}
+
+# $args[0] = "//host". Every longer host in the site's tables that starts with
+# it (//example.com.au and //example.community for //example.com), longest
+# first, so a search-replace of the shorter one can leave them as they are.
+login_longer_hosts_php() {
+cat << 'PHPHOSTS'
+<?php
+global $wpdb;
+$needle = $args[0];
+$like   = '%' . $wpdb->esc_like( $needle ) . '%';
+$re     = '~' . preg_quote( $needle, '~' ) . '(?:[A-Za-z0-9-]|\.[A-Za-z0-9])[A-Za-z0-9.-]*~';
+$found  = array();
+foreach ( $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->prefix ) . '%' ) ) as $table ) {
+    $table = str_replace( '`', '``', $table );
+    foreach ( (array) $wpdb->get_results( "SHOW COLUMNS FROM `$table`" ) as $col ) {
+        if ( 'guid' === $col->Field || ! preg_match( '/char|text|blob|json/i', $col->Type ) ) { continue; }
+        $field = str_replace( '`', '``', $col->Field );
+        foreach ( (array) $wpdb->get_col( $wpdb->prepare( "SELECT `$field` FROM `$table` WHERE `$field` LIKE %s", $like ) ) as $value ) {
+            if ( preg_match_all( $re, (string) $value, $m ) ) {
+                foreach ( $m[0] as $host ) {
+                    $host = rtrim( $host, '.-' );
+                    if ( $host !== $needle ) { $found[ $host ] = true; }
+                }
+            }
+        }
+    }
+}
+$hosts = array_keys( $found );
+usort( $hosts, function ( $a, $b ) { return strlen( $b ) - strlen( $a ); } );
+foreach ( $hosts as $host ) { echo $host, "\n"; }
+PHPHOSTS
+}
+
 cove_login() {
     local site_name=""
     local user_identifier="" # Optional: the user to log in as
@@ -21629,6 +22261,8 @@ cove_login() {
         url_flag=(--url="$wanted")
         label="$wanted"
     fi
+
+    [ -z "$subsite_url" ] && login_localize_urls "$site_name" "$site_dir" "$wp_cmd" "$plain"
 
     local admin_to_login
     if [ -n "$user_identifier" ]; then
@@ -21772,7 +22406,7 @@ cove_mappings() {
                 echo "✅ Removed mapping: $domain"
                 
                 regenerate_caddyfile
-                update_etc_hosts
+                prune_etc_hosts "$domain"
             else
                 gum style --foreground red "❌ Error: Mapping '$domain' not found."
             fi
@@ -21787,6 +22421,1161 @@ cove_mappings() {
     echo "Usage: cove mappings <site> [add|remove] [domain]"
     exit 1
 }
+# `cove mcp`: a Model Context Protocol server on stdin/stdout, so an AI agent
+# (Claude Code, Cursor, Codex, anything that speaks MCP) can work with the
+# sites here: list and create them, run WP-CLI, get a login link, read the
+# logs and the mail a site sent, look at a page, and take or restore a
+# snapshot. Every tool runs the `cove` command that already does the job, one
+# escaped argument at a time and with no terminal, so what a command checks
+# still holds. Nothing here deletes a site or reaches a remote host, and
+# during `cove demo` the hidden sites are refused.
+#
+# The server is PHP, run by FrankenPHP's php-cli (the same PHP `cove list`
+# uses), because the protocol is JSON and bash has no parser. Its input
+# comes from the environment, never $argv (see ensure_cli_argv_fix).
+
+mcp_server_source() {
+cat << 'COVE_MCP_PHP'
+<?php
+// Generated by Cove (commands/mcp). Rewritten every time `cove mcp` starts.
+ini_set('display_errors', 'stderr');
+error_reporting(E_ALL & ~E_DEPRECATED);
+set_time_limit(0);
+
+const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+define('COVE_BIN', (string) getenv('COVE_MCP_BIN'));
+define('COVE_VERSION', (string) getenv('COVE_MCP_VERSION'));
+define('COVE_DIR', (string) getenv('COVE_MCP_DIR'));
+define('SITES', (string) getenv('COVE_MCP_SITES'));
+define('PORT_SUFFIX', (string) getenv('COVE_MCP_PORT_SUFFIX'));
+
+class ToolError extends Exception {}
+
+// --- Running cove ----------------------------------------------------------
+
+// Runs `cove <args…>` with no terminal and nothing on stdin (stdin here is
+// the protocol stream). Returns [stdout, stderr, exit code]; with $merge,
+// stderr joins stdout as it would in a terminal. The server answers one call
+// at a time, so a command that hangs (an editor, a prompt) would hang every
+// later call: no editor is offered, and after $timeout seconds it is stopped.
+// Reading ends when the command exits, not at EOF, because a background job
+// it leaves behind (a reload's delayed signal check) keeps the pipe open.
+function cove(array $args, bool $merge = false, int $timeout = 1800): array {
+    $cmd = escapeshellarg(COVE_BIN);
+    foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string) $a);
+    $err = tempnam(sys_get_temp_dir(), 'cove-mcp-');
+    $spec = [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => $merge ? ['redirect', 1] : ['file', $err, 'w']];
+    $env = getenv();
+    $env['EDITOR'] = $env['VISUAL'] = 'false';
+    $proc = proc_open($cmd, $spec, $pipes, null, $env);
+    if (!is_resource($proc)) { @unlink($err); throw new ToolError('Could not run cove.'); }
+    stream_set_blocking($pipes[1], false);
+    $out = '';
+    $code = -1;
+    $deadline = microtime(true) + $timeout;
+    while (true) {
+        $r = [$pipes[1]]; $w = $x = null;
+        if (@stream_select($r, $w, $x, 0, 200000) > 0) {
+            $chunk = (string) fread($pipes[1], 65536);
+            if ($chunk !== '') { $out .= $chunk; continue; }
+            usleep(20000); // EOF: the command is on its way out
+        }
+        $st = proc_get_status($proc);
+        if (!$st['running']) {
+            $code = $st['exitcode'];
+            while (($chunk = (string) fread($pipes[1], 65536)) !== '') $out .= $chunk;
+            break;
+        }
+        if (microtime(true) > $deadline) {
+            proc_terminate($proc, 15);
+            usleep(500000);
+            if (proc_get_status($proc)['running']) proc_terminate($proc, 9);
+            $out .= "\n(stopped after {$timeout} s with no end in sight)";
+            $code = 124;
+            break;
+        }
+    }
+    fclose($pipes[1]);
+    proc_close($proc);
+    $stderr = (string) @file_get_contents($err);
+    @unlink($err);
+    return [$out, $stderr, (int) $code];
+}
+
+// The last line of a command's output that parses as JSON.
+function last_json(string $out) {
+    foreach (array_reverse(explode("\n", trim($out))) as $line) {
+        $data = json_decode(trim($line), true);
+        if (is_array($data)) return $data;
+    }
+    return null;
+}
+
+// Terminal output made readable as text: colours, gum's boxes and the
+// blank lines around them go.
+function clean(string $s): string {
+    $s = preg_replace('/\x1b\[[0-9;?]*[ -\/]*[@-~]/', '', $s);
+    $s = preg_replace('/[┌┐└┘├┤┬┴┼│─╭╮╰╯]/u', ' ', (string) $s);
+    $out = [];
+    foreach (explode("\n", str_replace("\r", '', (string) $s)) as $line) {
+        $line = trim($line);
+        if ($line === '' && (!$out || end($out) === '')) continue;
+        $out[] = $line;
+    }
+    return trim(implode("\n", $out));
+}
+
+function cut(string $s, int $max = 60000): string {
+    return strlen($s) > $max ? substr($s, 0, $max) . "\n… (" . (strlen($s) - $max) . ' more bytes cut)' : $s;
+}
+
+// --- Arguments ---------------------------------------------------------------
+
+function demo_sites(): ?array {
+    $lines = @file(COVE_DIR . '/demo', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    return $lines === false ? null : array_map('trim', $lines);
+}
+
+// A site the agent named: "anchor", "anchor.localhost" or a URL on it. It
+// must exist, and during `cove demo` it must be one of the demo's.
+function site_arg(array $a, bool $wordpress = false): string {
+    $s = strtolower(trim((string) ($a['site'] ?? '')));
+    if (strpos($s, '://') !== false) $s = (string) parse_url($s, PHP_URL_HOST);
+    $s = preg_replace('/\.localhost$/', '', $s);
+    if ($s === '') throw new ToolError('Name a site. list_sites shows them.');
+    if (!preg_match('/^[a-z0-9-]+$/', $s)) throw new ToolError("'$s' is not a site name.");
+    if (!is_dir(SITES . "/$s.localhost/public")) throw new ToolError("There is no site named '$s'. list_sites shows them.");
+    $demo = demo_sites();
+    if ($demo !== null && !in_array($s, $demo, true)) throw new ToolError("'$s' is not part of the demo (cove demo is on).");
+    if ($wordpress && !is_file(SITES . "/$s.localhost/public/wp-config.php")) throw new ToolError("'$s' is not a WordPress site.");
+    return $s;
+}
+
+function int_arg(array $a, string $key, int $default, int $min, int $max): int {
+    $v = isset($a[$key]) && is_numeric($a[$key]) ? (int) $a[$key] : $default;
+    return max($min, min($max, $v));
+}
+
+function url_of(string $site): string { return "https://$site.localhost" . PORT_SUFFIX; }
+
+function text(string $s, bool $error = false): array {
+    return ['content' => [['type' => 'text', 'text' => $s]], 'isError' => $error];
+}
+function json_result($data): array {
+    return text(json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PRETTY_PRINT));
+}
+
+// A value out of wp-config.php without running it.
+function wp_config_value(string $site, string $name): ?string {
+    $cfg = @file_get_contents(SITES . "/$site.localhost/public/wp-config.php", false, null, 0, 65536);
+    if ($cfg === false) return null;
+    if (preg_match('/define\s*\(\s*[\'"]' . preg_quote($name, '/') . '[\'"]\s*,\s*([^)]+)\)/', $cfg, $m)) return trim($m[1], " \t'\"");
+    return null;
+}
+
+// --- Logs --------------------------------------------------------------------
+
+// The end of a file (up to $bytes), without its first, partial line.
+function tail_of(string $file, int $bytes = 4194304): string {
+    $size = @filesize($file);
+    if (!$size) return '';
+    $fh = @fopen($file, 'rb');
+    if (!$fh) return '';
+    $start = max(0, $size - $bytes);
+    fseek($fh, $start);
+    $data = (string) stream_get_contents($fh);
+    fclose($fh);
+    if ($start > 0 && ($nl = strpos($data, "\n")) !== false) $data = substr($data, $nl + 1);
+    return $data;
+}
+
+// PHP's log format: an entry starts with "[10-Oct-2026 22:18:01 UTC]", and
+// the lines after it (a stack trace) belong to it.
+function php_entries(string $data, int $since, ?string $must_contain): array {
+    $entries = [];
+    $cur = null;
+    foreach (explode("\n", $data) as $line) {
+        if (preg_match('/^\[([^\]]+)\]/', $line, $m) && ($t = strtotime($m[1])) !== false) {
+            if ($cur !== null) $entries[] = $cur;
+            $cur = ['t' => $t, 'text' => $line];
+        } elseif ($cur !== null && $line !== '') {
+            $cur['text'] .= "\n" . $line;
+        }
+    }
+    if ($cur !== null) $entries[] = $cur;
+    return array_values(array_filter($entries, function ($e) use ($since, $must_contain) {
+        return $e['t'] >= $since && ($must_contain === null || strpos($e['text'], $must_contain) !== false);
+    }));
+}
+
+// Everything a log file gained since it was $from bytes long (a log that
+// shrank meanwhile was cleared, so all of it), up to its last 4 MB.
+function log_since(string $file, int $from): string {
+    clearstatcache(true, $file);
+    $size = is_file($file) ? (int) filesize($file) : 0;
+    if ($size <= 0) return '';
+    if ($size < $from) $from = 0;
+    $from = max($from, $size - 4194304);
+    $fh = @fopen($file, 'rb');
+    if (!$fh) return '';
+    fseek($fh, $from);
+    $data = (string) stream_get_contents($fh);
+    fclose($fh);
+    return $data;
+}
+
+// --- WP-CLI ------------------------------------------------------------------
+
+// What wp_read runs: WP-CLI commands that only read. Matched on the first
+// one, two or three words, so `option get` allows `option get home` but
+// `post meta` alone allows nothing.
+const WP_READ = [
+    'help',
+    'option get', 'option list', 'option pluck',
+    'plugin list', 'plugin get', 'plugin status', 'plugin is-active', 'plugin is-installed', 'plugin path',
+    'theme list', 'theme get', 'theme status', 'theme is-active', 'theme is-installed', 'theme path', 'theme mod get', 'theme mod list',
+    'post list', 'post get', 'post exists', 'post meta get', 'post meta list', 'post meta pluck', 'post-type list', 'post-type get',
+    'taxonomy list', 'taxonomy get', 'term list', 'term get', 'term meta get', 'term meta list',
+    'user list', 'user get', 'user list-caps', 'user meta get', 'user meta list',
+    'comment list', 'comment get', 'comment count', 'comment exists', 'comment meta get', 'comment meta list',
+    'core version', 'core is-installed',
+    'config get', 'config list', 'config has', 'config path',
+    'cron event list', 'cron schedule list',
+    'transient get', 'transient type', 'cache get', 'cache type',
+    'rewrite list', 'menu list', 'menu item list', 'menu location list', 'widget list', 'sidebar list',
+    'role list', 'role exists', 'cap list', 'site list',
+    'db size', 'db tables', 'db prefix', 'db columns',
+    'language core list', 'language plugin list', 'language theme list', 'media image-size',
+];
+
+// The WP-CLI command an agent gave, as args (["plugin", "list"]) or as one
+// line. WP-CLI's global flags that would run it somewhere else (another
+// site's folder, an SSH or HTTP host, an alias) or load other code first
+// are refused: it runs in the site that was named, on this machine.
+function wp_tokens(array $a): array {
+    $tokens = !empty($a['args']) && is_array($a['args']) ? array_map('strval', array_values($a['args'])) : split_line((string) ($a['command'] ?? ''));
+    if ($tokens && $tokens[0] === 'wp') array_shift($tokens);
+    if (!$tokens) throw new ToolError('Give the WP-CLI command as args (["plugin", "list"]) or command ("plugin list").');
+    foreach ($tokens as $t) {
+        if ($t !== '' && $t[0] === '@') throw new ToolError('WP-CLI aliases (@name) are not offered here: this runs in the site you name.');
+        if (preg_match('/^--(path|ssh|http|require|exec)(=|$)/i', $t, $f)) throw new ToolError("--{$f[1]} is not offered here: wp runs in the site you name, on this machine, with nothing loaded first.");
+    }
+    // --help anywhere would get Cove's own help for `cove wp`.
+    if (($h = array_search('--help', $tokens, true)) !== false) { array_splice($tokens, $h, 1); array_unshift($tokens, 'help'); }
+    return $tokens;
+}
+
+// The command's words: lowercased, flags left out.
+function wp_words(array $tokens): array {
+    return array_values(array_filter(array_map('strtolower', $tokens), function ($t) { return $t === '' || $t[0] !== '-'; }));
+}
+
+function run_wp(string $site, array $tokens): array {
+    $tokens[] = '--no-color';
+    $t0 = microtime(true);
+    [$out, , $code] = cove(array_merge(['wp', $site], $tokens), true, 900);
+    $ms = (int) round((microtime(true) - $t0) * 1000);
+    $out = preg_replace('/\x1b\[[0-9;]*m/', '', $out);
+    // PHP's own notices end "in <file> on line <n>"; WP-CLI's
+    // "Warning: …" lines don't, and they are the command's answer.
+    $kept = []; $notices = 0;
+    foreach (explode("\n", (string) $out) as $line) {
+        if (preg_match('/^(?:PHP )?(?:Deprecated|Warning|Notice|Strict Standards):\s.* on line \d+\s*$/', $line)) { $notices++; continue; }
+        $kept[] = $line;
+    }
+    $body = trim(implode("\n", $kept));
+    $meta = "exit $code · {$ms} ms" . ($notices ? " · $notices PHP notice line" . ($notices === 1 ? '' : 's') . ' left out' : '');
+    return text(cut($body === '' ? '(no output)' : $body) . "\n\n[$meta]", $code !== 0);
+}
+
+// --- HTTP --------------------------------------------------------------------
+
+// One request to Cove's own web server on this machine (whose certificate
+// is Cove's local CA, so it isn't checked here), no redirects followed.
+function http_request(string $url, string $method): array {
+    $host = (string) parse_url($url, PHP_URL_HOST);
+    $port = (int) (parse_url($url, PHP_URL_PORT) ?: 443);
+    $headers = [];
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_FOLLOWLOCATION => false, CURLOPT_TIMEOUT => 120, CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_RESOLVE => ["$host:$port:127.0.0.1"], CURLOPT_SSL_VERIFYPEER => false, CURLOPT_SSL_VERIFYHOST => 0,
+        CURLOPT_NOBODY => $method === 'HEAD', CURLOPT_ENCODING => '', CURLOPT_USERAGENT => 'Cove-MCP-check_page',
+        CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$headers) {
+            if (preg_match('/^HTTP\//', $line)) $headers = [];
+            elseif (strpos($line, ':') !== false) {
+                [$k, $v] = explode(':', $line, 2);
+                $k = strtolower(trim($k));
+                $headers[$k] = isset($headers[$k]) ? $headers[$k] . ', ' . trim($v) : trim($v);
+            }
+            return strlen($line);
+        },
+    ]);
+    $body = curl_exec($ch);
+    $r = ['url' => $url, 'status' => (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE), 'ms' => (int) round(curl_getinfo($ch, CURLINFO_TOTAL_TIME) * 1000), 'headers' => $headers, 'body' => is_string($body) ? $body : '', 'error' => $body === false ? curl_error($ch) : ''];
+    curl_close($ch);
+    return $r;
+}
+
+// A Location header made absolute against the URL that sent it.
+function absolute_url(string $base, string $loc): string {
+    if (preg_match('~^https?://~i', $loc)) return $loc;
+    $b = parse_url($base);
+    $origin = $b['scheme'] . '://' . $b['host'] . (isset($b['port']) ? ':' . $b['port'] : '');
+    if (strpos($loc, '//') === 0) return $b['scheme'] . ':' . $loc;
+    if ($loc !== '' && $loc[0] === '/') return $origin . $loc;
+    $dir = preg_replace('~/[^/]*$~', '/', $b['path'] ?? '/');
+    return $origin . $dir . $loc;
+}
+
+// An HTML page as its title and visible text.
+function page_text(string $html): array {
+    $title = preg_match('~<title[^>]*>(.*?)</title>~is', $html, $m) ? trim(html_entity_decode(strip_tags($m[1]), ENT_QUOTES | ENT_HTML5)) : '';
+    if (!class_exists('DOMDocument')) return [$title, trim(preg_replace('/\s+/', ' ', strip_tags($html)))];
+    $doc = new DOMDocument();
+    $prev = libxml_use_internal_errors(true);
+    $doc->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING);
+    libxml_clear_errors();
+    libxml_use_internal_errors($prev);
+    foreach (['script', 'style', 'noscript', 'template', 'svg', 'head'] as $tag) {
+        foreach (iterator_to_array($doc->getElementsByTagName($tag)) as $el) $el->parentNode->removeChild($el);
+    }
+    $body = $doc->getElementsByTagName('body')->item(0);
+    $text = $body ? $body->textContent : $doc->textContent;
+    $text = preg_replace("/[ \t\x{00A0}]+/u", ' ', (string) $text);
+    $text = trim(preg_replace("/\s*\n\s*/", "\n", (string) $text));
+    return [$title, $text];
+}
+
+// Cove's error page for a local request is Whoops, which handles an
+// uncaught error itself, so PHP never logs it: read it off the page.
+function whoops_error(string $html): ?string {
+    if (strpos($html, 'Whoops! There was an error.') === false || !class_exists('DOMDocument')) return null;
+    $doc = new DOMDocument();
+    $prev = libxml_use_internal_errors(true);
+    $doc->loadHTML($html, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING);
+    libxml_clear_errors();
+    libxml_use_internal_errors($prev);
+    $x = new DOMXPath($doc);
+    $q = function ($path) use ($x) { $n = $x->query($path); return $n && $n->length ? trim(preg_replace('/\s+/', ' ', $n->item(0)->textContent)) : ''; };
+    $class = $q('//*[contains(concat(" ", @class, " "), " exc-title-primary ")]');
+    $message = $q('//div[contains(concat(" ", @class, " "), " exc-message ")]/span');
+    $file = $q('//div[@id="frame-code-0"]//div[contains(concat(" ", @class, " "), " frame-file ")]//strong');
+    $line = $q('(//span[contains(concat(" ", @class, " "), " frame-line ")])[1]');
+    if ($class === '' && $message === '') return null;
+    return 'Uncaught ' . ($class ?: 'error') . ': ' . $message . ($file !== '' ? " in $file" . ($line !== '' ? ":$line" : '') : '') . ' (from Cove\'s error page, which shows the stack trace in a browser)';
+}
+
+// --- Mailpit -----------------------------------------------------------------
+
+function mailpit(string $path) {
+    $cfg = @parse_ini_file(COVE_DIR . '/config') ?: [];
+    $headers = ['Accept: application/json'];
+    if (!empty($cfg['MAILPIT_UI_PASSWORD'])) $headers[] = 'Authorization: Basic ' . base64_encode('cove:' . $cfg['MAILPIT_UI_PASSWORD']);
+    $url = 'http://127.0.0.1:8025/api/v1' . $path;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HTTPHEADER => $headers, CURLOPT_TIMEOUT => 15]);
+        $body = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    } else {
+        $body = @file_get_contents($url, false, stream_context_create(['http' => ['header' => implode("\r\n", $headers), 'timeout' => 15, 'ignore_errors' => true]]));
+        $code = $body === false ? 0 : 200;
+    }
+    if ($body === false || $code === 0) throw new ToolError('Mailpit is not answering on 127.0.0.1:8025. Is Cove running? (status)');
+    if ($code === 404) throw new ToolError('No such message.');
+    if ($code >= 400) throw new ToolError("Mailpit answered HTTP $code.");
+    $data = json_decode((string) $body, true);
+    if (!is_array($data)) throw new ToolError('Mailpit sent something that is not JSON.');
+    return $data;
+}
+
+function address_list($list): string {
+    $out = [];
+    foreach ((array) $list as $p) {
+        if (!is_array($p)) continue;
+        $out[] = ($p['Name'] ?? '') !== '' ? "{$p['Name']} <{$p['Address']}>" : (string) ($p['Address'] ?? '');
+    }
+    return implode(', ', $out);
+}
+
+// --- The tools ---------------------------------------------------------------
+
+function tools(): array {
+    $site = ['type' => 'string', 'description' => 'The site: its name (anchor), its domain (anchor.localhost), or a URL on it.'];
+    $ro = ['readOnlyHint' => true, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false];
+    $rw = ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => false, 'openWorldHint' => false];
+    $over = ['readOnlyHint' => false, 'destructiveHint' => true, 'idempotentHint' => false, 'openWorldHint' => false];
+    $obj = function (array $props, array $required = []) {
+        $s = ['type' => 'object', 'properties' => $props ?: new stdClass(), 'additionalProperties' => false];
+        if ($required) $s['required'] = $required;
+        return $s;
+    };
+    return [
+        'list_sites' => [
+            'title' => 'List sites',
+            'description' => "Every site in Cove: name, URL (https://<name>.localhost), type (WordPress, Minn, Plain), WordPress and PHP version, multisite, and its folder. A site's files are in <folder>/public.",
+            'inputSchema' => $obj(['filter' => ['type' => 'string', 'description' => 'Only sites whose name, type or WordPress version contains this.']]),
+            'annotations' => $ro,
+        ],
+        'site_info' => [
+            'title' => 'Site details',
+            'description' => "One site in detail: its URL and folders, database name and table prefix, WP_DEBUG, the logs it writes, extra domains, and its twin if it has one.",
+            'inputSchema' => $obj(['site' => $site], ['site']),
+            'annotations' => $ro,
+        ],
+        'create_site' => [
+            'title' => 'Create a site',
+            'description' => "Creates a new local site at https://<name>.localhost with its own database: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a plain static site, or a Minn Engine site. Takes up to a minute.",
+            'inputSchema' => $obj([
+                'name' => ['type' => 'string', 'description' => 'Lowercase letters, numbers and hyphens, e.g. client-demo.'],
+                'type' => ['type' => 'string', 'enum' => ['wordpress', 'plain', 'minn'], 'description' => 'Default wordpress.'],
+                'wp_version' => ['type' => 'string', 'description' => 'A WordPress version such as 6.8.3, or nightly. Default latest.'],
+                'php' => ['type' => 'string', 'description' => 'Pin an older PHP, e.g. 8.2. Default: the bundled PHP.'],
+                'multisite' => ['type' => 'string', 'enum' => ['subdirectory', 'subdomain'], 'description' => 'Install a multisite network instead of a single site.'],
+            ], ['name']),
+            'annotations' => $rw,
+        ],
+        'clone_site' => [
+            'title' => 'Clone a site',
+            'description' => "Copies a site, files and database, to a new site at https://<name>.localhost with its URLs rewritten. A safe place to try a risky change: the original is left alone.",
+            'inputSchema' => $obj(['site' => $site, 'name' => ['type' => 'string', 'description' => 'The new site\'s name: lowercase letters, numbers and hyphens.']], ['site', 'name']),
+            'annotations' => $rw,
+        ],
+        'set_php' => [
+            'title' => 'Set a site\'s PHP version',
+            'description' => "Pins a site to an older PHP (e.g. 8.2), served by a native php-fpm behind the same web server, or puts it back on Cove's bundled PHP with version default. For checking a plugin or theme on another PHP. macOS with Homebrew only; the first pin to a version installs php@<version>, which can take a few minutes.",
+            'inputSchema' => $obj(['site' => $site, 'version' => ['type' => 'string', 'description' => 'A PHP version such as 8.2 or 8.3, or default.']], ['site', 'version']),
+            'annotations' => ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false],
+        ],
+        'login_link' => [
+            'title' => 'One-time login link',
+            'description' => "A one-time link that signs into a WordPress site's admin as an administrator (or the user named), for a browser or a browser-automation tool. Each link works once.",
+            'inputSchema' => $obj(['site' => $site, 'user' => ['type' => 'string', 'description' => 'A user login, email or ID. Default: the first administrator.'], 'url' => ['type' => 'string', 'description' => 'On a multisite network, the subsite to sign into.']], ['site']),
+            'annotations' => $rw,
+        ],
+        'wp_read' => [
+            'title' => 'Read with WP-CLI',
+            'description' => "Runs a WP-CLI command that only reads, inside a WordPress site: option get/list, plugin and theme list/get/status, post, term, user and comment list/get and their meta, config get/list, cron event list, transient get, rewrite list, menus, roles, db size/tables, core version, help. Pass the words after `wp` as args, e.g. [\"option\", \"get\", \"home\"]. Anything else is refused: use wp for that.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'args' => ['type' => 'array', 'items' => ['type' => 'string'], 'description' => 'The arguments after `wp`, one per item.'],
+                'command' => ['type' => 'string', 'description' => 'Or the same as one line, quotes honoured, e.g. post list --post_type=page.'],
+            ], ['site']),
+            'annotations' => $ro,
+        ],
+        'wp' => [
+            'title' => 'Run WP-CLI',
+            'description' => "Runs any WP-CLI command inside a WordPress site, e.g. [\"plugin\", \"deactivate\", \"akismet\"] or [\"eval\", \"echo home_url();\"]; for commands that only read, wp_read needs no approval. Pass the words after `wp` as args. It runs in the named site only: --path, --ssh, --http, --require, --exec and @aliases are refused, as are commands that wipe a whole database (db reset, db drop, db clean, site empty, DROP DATABASE) and interactive ones (shell, db cli, server). Take a snapshot first (snapshot_create) before anything you might want to undo.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'args' => ['type' => 'array', 'items' => ['type' => 'string'], 'description' => 'The arguments after `wp`, one per item.'],
+                'command' => ['type' => 'string', 'description' => 'Or the same as one line, quotes honoured, e.g. post list --post_type=page. No shell: | ; $( ) are literal.'],
+            ], ['site']),
+            'annotations' => $over,
+        ],
+        'screenshot' => [
+            'title' => 'Screenshot a page',
+            'description' => "Opens a page of a site in a headless browser (Chrome, Brave, Edge…) as a logged-out visitor and returns the image, to check how it looks. Takes a few seconds.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'path' => ['type' => 'string', 'description' => 'The page, e.g. /shop/ or /?p=12. Default: the front page.'],
+                'width' => ['type' => 'integer', 'description' => 'Viewport width in pixels (320–2560). Default 1280; 390 for a phone.'],
+                'height' => ['type' => 'integer', 'description' => 'Viewport height in pixels (320–4000). Default 800.'],
+            ], ['site']),
+            'annotations' => $ro,
+        ],
+        'check_page' => [
+            'title' => 'Check a page',
+            'description' => "Requests a page or REST route of a site as a logged-out visitor and reports what came back: status, time, the redirects it followed on the site (one to another host is shown, not followed), headers, the page's title and visible text (or the raw body), and the PHP errors it raised: an uncaught error or exception, with its file and line, and anything the site logged meanwhile. Cove keeps warnings and notices from page requests out of the logs, so they don't show here. For checking that a change didn't break a page, or what an endpoint returns.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'path' => ['type' => 'string', 'description' => 'The page or route, e.g. /shop/, /?p=12 or /wp-json/wp/v2/posts. Default: the front page.'],
+                'method' => ['type' => 'string', 'enum' => ['GET', 'HEAD'], 'description' => 'Default GET.'],
+                'body' => ['type' => 'string', 'enum' => ['text', 'raw', 'none'], 'description' => 'text (default): an HTML page\'s visible text, JSON pretty-printed; raw: the body as sent; none: status, headers and PHP errors only.'],
+                'max_chars' => ['type' => 'integer', 'description' => 'Cut the body at this many characters (200–100000). Default 4000.'],
+            ], ['site']),
+            'annotations' => $ro,
+        ],
+        'read_logs' => [
+            'title' => 'Read logs',
+            'description' => "Recent log entries: php = PHP errors from Cove's shared error log (just this site's when a site is named), debug = the site's wp-content/debug.log, access = the site's requests (status, method, path, time).",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'source' => ['type' => 'string', 'enum' => ['php', 'debug', 'access'], 'description' => 'Default php.'],
+                'minutes' => ['type' => 'integer', 'description' => 'How far back, in minutes (up to a week). Default 60.'],
+                'limit' => ['type' => 'integer', 'description' => 'At most this many entries, newest last (up to 500). Default 50.'],
+                'errors_only' => ['type' => 'boolean', 'description' => 'For access: only responses of 400 and up.'],
+            ]),
+            'annotations' => $ro,
+        ],
+        'read_mail' => [
+            'title' => 'Read caught mail',
+            'description' => "Mail the sites sent, which Cove's Mailpit catches instead of delivering. Without an id: the newest messages (only those to addresses at the site's own domain, such as admin@<name>.localhost, when a site is named; leave site out to see mail to other addresses). With an id: that message's text and every link in it, such as a password-reset or confirmation link.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'query' => ['type' => 'string', 'description' => 'A Mailpit search, e.g. subject:"Password Reset" or from:wordpress@.'],
+                'id' => ['type' => 'string', 'description' => 'A message id from the list, to read it.'],
+                'limit' => ['type' => 'integer', 'description' => 'How many messages to list (up to 50). Default 10.'],
+            ]),
+            'annotations' => $ro,
+        ],
+        'snapshot_create' => [
+            'title' => 'Take a snapshot',
+            'description' => "Saves a site's files and database as they are now, so they can be put back with snapshot_restore. Take one before changes you might want to undo.",
+            'inputSchema' => $obj(['site' => $site, 'note' => ['type' => 'string', 'description' => 'What it is for, e.g. before updating WooCommerce.']], ['site']),
+            'annotations' => $rw,
+        ],
+        'snapshot_list' => [
+            'title' => 'List snapshots',
+            'description' => "A site's snapshots, newest first, with their ids, notes and sizes.",
+            'inputSchema' => $obj(['site' => $site], ['site']),
+            'annotations' => $ro,
+        ],
+        'snapshot_restore' => [
+            'title' => 'Restore a snapshot',
+            'description' => "Puts a site's files and database back as a snapshot saved them. The current state is saved as a new snapshot first, so a restore can itself be undone.",
+            'inputSchema' => $obj(['site' => $site, 'id' => ['type' => 'string', 'description' => 'The snapshot id from snapshot_list.']], ['site', 'id']),
+            'annotations' => $over,
+        ],
+        'history_list' => [
+            'title' => 'Plugin and theme history',
+            'description' => "A site's saved versions of its plugins, themes and mu-plugins (saved nightly and before each rollback): what changed in each save, with versions.",
+            'inputSchema' => $obj(['site' => $site, 'limit' => ['type' => 'integer', 'description' => 'How many saves (up to 100). Default 20.']], ['site']),
+            'annotations' => $ro,
+        ],
+        'history_diff' => [
+            'title' => 'What a save changed',
+            'description' => "The code diff of one history save against the save before it: what a plugin or theme update actually changed. Name a plugin, theme, mu-plugin or file to narrow it, or ask for stat_only for the list of files.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'id' => ['type' => 'string', 'description' => 'The save id from history_list (or latest).'],
+                'plugin' => ['type' => 'string', 'description' => 'Only this plugin (slug).'],
+                'theme' => ['type' => 'string', 'description' => 'Only this theme (slug).'],
+                'mu_plugin' => ['type' => 'string', 'description' => 'Only this mu-plugin.'],
+                'file' => ['type' => 'string', 'description' => 'Only this file, relative to wp-content (plugins/akismet/akismet.php).'],
+                'stat_only' => ['type' => 'boolean', 'description' => 'Just the files and line counts.'],
+            ], ['site', 'id']),
+            'annotations' => $ro,
+        ],
+        'history_save' => [
+            'title' => 'Save plugins and themes',
+            'description' => "Saves a site's plugins, themes and mu-plugins as they are now, as a history save (seconds; an identical state is not saved twice). Save before editing plugin or theme code, and again after: history_diff with id latest then shows exactly what the edit changed, and history_rollback with the first save's id puts a plugin or theme back. Files only, not the database (snapshot_create covers both).",
+            'inputSchema' => $obj(['site' => $site, 'note' => ['type' => 'string', 'description' => 'What it is for, e.g. before editing the checkout template.']], ['site']),
+            'annotations' => $rw,
+        ],
+        'history_rollback' => [
+            'title' => 'Roll back a plugin or theme',
+            'description' => "Puts one plugin, theme or mu-plugin (or all of them) back as a history save had it. The current state is saved first, so it can be undone. Files only: the database is left as it is.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'id' => ['type' => 'string', 'description' => 'The save id from history_list (or latest, HEAD~1).'],
+                'plugin' => ['type' => 'string', 'description' => 'A plugin slug.'],
+                'theme' => ['type' => 'string', 'description' => 'A theme slug.'],
+                'mu_plugin' => ['type' => 'string', 'description' => 'An mu-plugin file or folder name.'],
+                'all' => ['type' => 'boolean', 'description' => 'Every plugin, theme and mu-plugin.'],
+            ], ['site', 'id']),
+            'annotations' => $over,
+        ],
+        'health' => [
+            'title' => 'Cove health check',
+            'description' => "Cove's own diagnosis, for when sites are slow or crashing: the web server process and its recent crashes, OPcache pressure (one cache shared by every site), leftover files and logs, and what the network can reach. Reads only.",
+            'inputSchema' => $obj([]),
+            'annotations' => $ro,
+        ],
+        'status' => [
+            'title' => 'Cove status',
+            'description' => "Whether Cove's web server, MariaDB and Mailpit are answering, and where the dashboard, Adminer and Mailpit are.",
+            'inputSchema' => $obj([]),
+            'annotations' => $ro,
+        ],
+    ];
+}
+
+function call_tool(string $name, array $a): array {
+    switch ($name) {
+        case 'list_sites':
+            [$out, $err, $code] = cove(['list', '--json']);
+            $sites = json_decode(trim($out), true);
+            if ($code !== 0 || !is_array($sites)) throw new ToolError(clean($out . "\n" . $err) ?: 'cove list failed.');
+            $demo = demo_sites();
+            if ($demo !== null) $sites = array_values(array_filter($sites, function ($s) use ($demo) { return in_array($s['name'], $demo, true); }));
+            $f = strtolower(trim((string) ($a['filter'] ?? '')));
+            if ($f !== '') {
+                $sites = array_values(array_filter($sites, function ($s) use ($f) {
+                    return strpos(strtolower($s['name'] . ' ' . $s['type'] . ' ' . ($s['wp_version'] ?? '')), $f) !== false;
+                }));
+            }
+            foreach ($sites as &$s) {
+                $s = ['name' => $s['name'], 'url' => $s['domain'], 'type' => $s['type'], 'wp_version' => $s['wp_version'], 'minn_version' => $s['minn_version'], 'multisite' => $s['multisite'], 'php' => $s['php'] . ($s['php_pinned'] ? ' (pinned)' : ''), 'folder' => $s['path']];
+                $s = array_filter($s, function ($v) { return $v !== null; });
+            }
+            unset($s);
+            return json_result(['count' => count($sites), 'sites' => $sites]);
+
+        case 'site_info':
+            $site = site_arg($a);
+            $dir = SITES . "/$site.localhost";
+            $info = ['name' => $site, 'url' => url_of($site), 'folder' => $dir, 'files' => "$dir/public"];
+            if (is_file("$dir/public/wp-config.php")) {
+                $info['type'] = is_file("$dir/public/.minn-install.php") ? 'Minn Engine' : 'WordPress';
+                $ver = @file_get_contents("$dir/public/wp-includes/version.php", false, null, 0, 4096);
+                if ($ver && preg_match('/\$wp_version\s*=\s*\'([^\']+)\'/', $ver, $m)) $info['wp_version'] = $m[1];
+                $info['database'] = wp_config_value($site, 'DB_NAME');
+                $cfg = (string) @file_get_contents("$dir/public/wp-config.php", false, null, 0, 65536);
+                if (preg_match('/\$table_prefix\s*=\s*[\'"]([^\'"]+)/', $cfg, $m)) $info['table_prefix'] = $m[1];
+                $info['wp_debug'] = in_array(strtolower((string) wp_config_value($site, 'WP_DEBUG')), ['true', '1'], true);
+                $info['multisite'] = in_array(strtolower((string) wp_config_value($site, 'MULTISITE')), ['true', '1'], true);
+                $info['login'] = 'login_link gives a one-time admin link.';
+            } else {
+                $info['type'] = 'Plain (static files)';
+            }
+            $pin = trim((string) @file_get_contents("$dir/php_version"));
+            if ($pin !== '') $info['php_pinned'] = $pin;
+            $info['logs'] = ['php errors' => COVE_DIR . '/Logs/errors.log (shared by every site)', 'debug' => "$dir/public/wp-content/debug.log", 'access' => "$dir/logs/caddy.log"];
+            $maps = @file("$dir/mappings", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            if ($maps) $info['extra_domains'] = array_values(array_map('trim', $maps));
+            $twin = @file_get_contents("$dir/twin");
+            if ($twin && preg_match('/^domain=(.+)$/m', $twin, $d) && preg_match('/^root=(.+)$/m', $twin, $r)) $info['twin'] = ['url' => 'https://' . trim($d[1]) . PORT_SUFFIX, 'folder' => "$dir/" . trim($r[1])];
+            $info['mail'] = "read_mail with site=$site shows the mail it sent.";
+            return json_result($info);
+
+        case 'create_site':
+            $name = strtolower(trim((string) ($a['name'] ?? '')));
+            if (!preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/', $name)) throw new ToolError('A site name takes lowercase letters, numbers and hyphens, and cannot start or end with a hyphen.');
+            if (is_dir(SITES . "/$name.localhost")) throw new ToolError("There is already a site named '$name'.");
+            $args = ['add', $name];
+            $type = (string) ($a['type'] ?? 'wordpress');
+            if ($type === 'plain') $args[] = '--plain';
+            elseif ($type === 'minn') $args[] = '--minn';
+            elseif ($type !== 'wordpress') throw new ToolError("type is wordpress, plain or minn.");
+            if (!empty($a['wp_version'])) {
+                if (!preg_match('/^(latest|nightly|\d+\.\d+(\.\d+)?([-.][a-zA-Z0-9.]+)?)$/', (string) $a['wp_version'])) throw new ToolError('wp_version is a version such as 6.8.3, or latest or nightly.');
+                $args[] = '--wp-version=' . $a['wp_version'];
+            }
+            if (!empty($a['php'])) {
+                if (!preg_match('/^(php@)?\d+\.\d+$/', (string) $a['php'])) throw new ToolError('php is a version such as 8.2.');
+                $args[] = '--php=' . $a['php'];
+            }
+            if (!empty($a['multisite'])) {
+                if (!in_array($a['multisite'], ['subdirectory', 'subdomain'], true)) throw new ToolError('multisite is subdirectory or subdomain.');
+                $args[] = '--multisite=' . $a['multisite'];
+            }
+            [$out, , $code] = cove($args, true);
+            $out = clean($out);
+            if ($code !== 0 || !is_dir(SITES . "/$name.localhost/public")) throw new ToolError(cut($out) ?: 'cove add failed.');
+            $reply = 'Created ' . url_of($name) . "\nFiles: " . SITES . "/$name.localhost/public";
+            if (preg_match('~https://\S*wp-login\.php\S*~', $out, $m)) $reply .= "\nOne-time admin login: " . $m[0];
+            $lines = explode("\n", $out);
+            return text($reply . "\n\n" . implode("\n", array_slice($lines, -25)));
+
+        case 'clone_site':
+            $site = site_arg($a);
+            $name = strtolower(trim((string) ($a['name'] ?? '')));
+            if (!preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/', $name)) throw new ToolError('A site name takes lowercase letters, numbers and hyphens, and cannot start or end with a hyphen.');
+            if (is_dir(SITES . "/$name.localhost")) throw new ToolError("There is already a site named '$name'.");
+            [$out, , $code] = cove(['clone', $site, $name], true);
+            $out = clean($out);
+            if ($code !== 0 || !is_dir(SITES . "/$name.localhost/public")) throw new ToolError(cut($out) ?: 'cove clone failed.');
+            $lines = explode("\n", $out);
+            return text("Cloned $site to " . url_of($name) . "\nFiles: " . SITES . "/$name.localhost/public\n\n" . implode("\n", array_slice($lines, -15)));
+
+        case 'set_php':
+            $site = site_arg($a);
+            $ver = strtolower(trim((string) ($a['version'] ?? '')));
+            if ($ver !== 'default' && !preg_match('/^(php@)?\d+\.\d+$/', $ver)) throw new ToolError('version is a PHP version such as 8.2, or default.');
+            [$out, , $code] = cove(['php', $site, $ver], true);
+            $out = clean($out);
+            if ($code !== 0) throw new ToolError(cut($out) ?: 'cove php failed.');
+            return text($out);
+
+        case 'login_link':
+            $site = site_arg($a, true);
+            $args = ['login', $site];
+            if (!empty($a['user'])) $args[] = (string) $a['user'];
+            if (!empty($a['url'])) $args[] = '--url=' . $a['url'];
+            $args[] = '--plain';
+            [$out, $err, $code] = cove($args, true);
+            $out = clean($out);
+            if ($code !== 0 || !preg_match('~https?://\S+wp-login\.php\S*~', $out, $m)) throw new ToolError($out ?: 'cove login failed.');
+            // Anything cove login said first: it rewrote the site's stored URLs, or couldn't.
+            $said = trim(preg_replace('~^.*wp-login\.php.*$~m', '', $out));
+            // WordPress builds the link from the home URL in the database. A
+            // site imported without its URLs rewritten still names its live
+            // domain, and signing in there would leave this machine.
+            $host = strtolower((string) parse_url($m[0], PHP_URL_HOST));
+            $maps = array_map('strtolower', array_map('trim', @file(SITES . "/$site.localhost/mappings", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []));
+            $here = $host === '' || substr($host, -10) === '.localhost' || $host === 'localhost' || in_array($host, $maps, true);
+            foreach ($maps as $map) { if (strpos($map, '*.') === 0 && substr($host, -strlen($map) + 1) === substr($map, 1)) $here = true; }
+            $reply = $m[0] . ($said !== '' ? "\n\n" . $said : '');
+            if (!$here) {
+                $reply .= "\n\nThis link points at $host, not " . url_of($site) . ": the site's home URL is still that address, so signing in would leave this machine. To use the site locally, rewrite its URLs first (take a snapshot first): wp with args [\"search-replace\", \"//$host\", \"//$site.localhost\", \"--all-tables-with-prefix\", \"--skip-columns=guid\"], and remove any WP_HOME or WP_SITEURL define.";
+            }
+            return text($reply);
+
+        case 'wp_read':
+            $site = site_arg($a, true);
+            $tokens = wp_tokens($a);
+            $words = wp_words($tokens);
+            $ok = false;
+            for ($n = min(3, count($words)); $n > 0 && !$ok; $n--) $ok = in_array(implode(' ', array_slice($words, 0, $n)), WP_READ, true);
+            if (!$ok) throw new ToolError('wp_read runs only commands that read (option get, plugin list, post get…). `wp ' . implode(' ', array_slice($words, 0, 2)) . '` is not one of them: use wp.');
+            return run_wp($site, $tokens);
+
+        case 'wp':
+            $site = site_arg($a, true);
+            $tokens = wp_tokens($a);
+            $words = wp_words($tokens);
+            $pair = implode(' ', array_slice($words, 0, 2));
+            if (in_array($words[0] ?? '', ['shell', 'server'], true) || in_array($pair, ['db cli', 'db shell'], true)) throw new ToolError('Interactive commands (wp shell, wp db cli, wp server) have no terminal here.');
+            if (in_array($pair, ['db reset', 'db drop', 'db clean', 'site empty'], true)
+                || ($pair === 'db query' && preg_match('/\bdrop\s+(database|schema)\b/i', implode(' ', $tokens)))) {
+                throw new ToolError("`wp $pair` can wipe a whole database, which this server leaves to a terminal. Take a snapshot first (snapshot_create) and run it yourself with: cove wp $site …");
+            }
+            return run_wp($site, $tokens);
+
+        case 'check_page':
+            $site = site_arg($a);
+            $path = (string) ($a['path'] ?? '/');
+            if ($path === '') $path = '/';
+            if ($path[0] !== '/') $path = '/' . $path;
+            if (!preg_match('~^/[A-Za-z0-9._\~/?=&%:+,@!;\[\]-]*$~', $path)) throw new ToolError('path is a path on the site, such as /shop/ or /wp-json/wp/v2/posts.');
+            $method = strtoupper((string) ($a['method'] ?? 'GET'));
+            if (!in_array($method, ['GET', 'HEAD'], true)) throw new ToolError('method is GET or HEAD.');
+            $show = (string) ($a['body'] ?? 'text');
+            if (!in_array($show, ['text', 'raw', 'none'], true)) throw new ToolError('body is text, raw or none.');
+            $max = int_arg($a, 'max_chars', 4000, 200, 100000);
+            if (!function_exists('curl_init')) throw new ToolError("This PHP has no curl, so check_page can't make requests.");
+            // The site's PHP errors go to Cove's shared log (or to debug.log
+            // when WP_DEBUG_LOG is on): what each gained during the request.
+            $logs = [COVE_DIR . '/Logs/errors.log' => "/Sites/$site.localhost/", SITES . "/$site.localhost/public/wp-content/debug.log" => null];
+            $from = [];
+            foreach (array_keys($logs) as $f) { clearstatcache(true, $f); $from[$f] = is_file($f) ? (int) filesize($f) : 0; }
+            $host = "$site.localhost";
+            $url = url_of($site) . $path;
+            $chain = [];
+            for ($hop = 0; ; $hop++) {
+                $r = http_request($url, $method);
+                if ($r['error'] !== '') throw new ToolError("No answer from $url: {$r['error']}. Is Cove running? (status)");
+                $loc = $r['headers']['location'] ?? '';
+                if ($r['status'] < 300 || $r['status'] >= 400 || $loc === '') break;
+                $next = absolute_url($url, $loc);
+                $chain[] = "{$r['status']} $url → $next";
+                if (strtolower((string) parse_url($next, PHP_URL_HOST)) !== $host) { $chain[] = '(another host: not followed)'; break; }
+                if ($hop >= 5) { $chain[] = '(more than 5 redirects: stopped)'; break; }
+                $url = $next;
+            }
+            usleep(150000);
+            $errors = [];
+            $bytes = strlen($r['body']);
+            if ($r['status'] >= 500 && ($w = whoops_error($r['body'])) !== null) { $errors[] = $w; $r['body'] = ''; }
+            foreach ($logs as $f => $must) foreach (php_entries(log_since($f, $from[$f]), 0, $must) as $e) $errors[] = $e['text'];
+            $type = $r['headers']['content-type'] ?? '';
+            $out = "$method $url → {$r['status']} in {$r['ms']} ms, $bytes bytes" . ($type !== '' ? ", $type" : '');
+            if ($chain) $out .= "\nRedirects:\n  " . implode("\n  ", $chain);
+            $hdr = $r['headers'];
+            if (isset($hdr['set-cookie'])) $hdr['set-cookie'] = '(' . substr_count($hdr['set-cookie'], '=') . ' cookie values left out)';
+            $out .= "\nHeaders:\n  " . implode("\n  ", array_map(function ($k, $v) { return "$k: " . (strlen($v) > 200 ? substr($v, 0, 200) . '…' : $v); }, array_keys($hdr), $hdr));
+            $out .= "\n\nPHP errors: " . ($errors ? count($errors) . "\n" . cut(implode("\n", $errors), 20000) : 'none');
+            if ($show !== 'none' && $method === 'GET' && $r['body'] !== '') {
+                $body = $r['body'];
+                if ($show === 'text' && stripos($type, 'html') !== false) {
+                    [$title, $body] = page_text($body);
+                    if ($title !== '') $out .= "\n\nTitle: $title";
+                    $label = 'Visible text';
+                } elseif ($show === 'text' && stripos($type, 'json') !== false && ($j = json_decode($body)) !== null) {
+                    $body = json_encode($j, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+                    $label = 'Body';
+                } elseif (preg_match('~^(text/|application/(json|xml|javascript|ld\+json|rss|atom))~i', $type) || $type === '') {
+                    $label = 'Body';
+                } else {
+                    $body = '';
+                    $out .= "\n\n(" . $type . ' body, not shown)';
+                }
+                if ($body !== '') {
+                    $more = mb_strlen($body) > $max ? ' (first ' . $max . ' of ' . mb_strlen($body) . ' characters)' : '';
+                    $out .= "\n\n$label$more:\n" . mb_substr($body, 0, $max);
+                }
+            }
+            return text($out, $r['status'] >= 500);
+
+        case 'screenshot':
+            $site = site_arg($a);
+            $path = (string) ($a['path'] ?? '/');
+            if ($path === '') $path = '/';
+            if ($path[0] !== '/') $path = '/' . $path;
+            if (!preg_match('~^/[A-Za-z0-9._\~/?=&%:+,@!;#-]*$~', $path)) throw new ToolError('path is a path on the site, such as /shop/ or /?p=12.');
+            $w = int_arg($a, 'width', 1280, 320, 2560);
+            $h = int_arg($a, 'height', 800, 320, 4000);
+            $file = sys_get_temp_dir() . '/cove-mcp-shot-' . bin2hex(random_bytes(6)) . '.png';
+            $args = ['screenshot', $site, "--out=$file", "--width=$w", "--height=$h"];
+            if ($path !== '/') $args[] = "--path=$path";
+            [$out, $err, $code] = cove($args, true);
+            $png = is_file($file) ? (string) file_get_contents($file) : '';
+            @unlink($file);
+            if ($code !== 0 || $png === '') throw new ToolError(clean($out) ?: 'The capture failed.');
+            [$data, $mime] = shrink_image($png);
+            return ['content' => [
+                ['type' => 'image', 'data' => base64_encode($data), 'mimeType' => $mime],
+                ['type' => 'text', 'text' => url_of($site) . ($path === '/' ? '/' : $path) . " at {$w}×{$h}"],
+            ], 'isError' => false];
+
+        case 'read_logs':
+            $source = (string) ($a['source'] ?? 'php');
+            $since = time() - 60 * int_arg($a, 'minutes', 60, 1, 10080);
+            $limit = int_arg($a, 'limit', 50, 1, 500);
+            $site = isset($a['site']) && $a['site'] !== '' ? site_arg($a) : null;
+            if ($source === 'php') {
+                if ($site === null && demo_sites() !== null) throw new ToolError('During cove demo, name a site.');
+                $file = COVE_DIR . '/Logs/errors.log';
+                $entries = php_entries(tail_of($file, $site ? 12582912 : 4194304), $since, $site ? "/Sites/$site.localhost/" : null);
+            } elseif ($source === 'debug') {
+                if ($site === null) throw new ToolError('Name a site for its debug.log.');
+                $file = SITES . "/$site.localhost/public/wp-content/debug.log";
+                $entries = php_entries(tail_of($file), $since, null);
+            } elseif ($source === 'access') {
+                if ($site === null) throw new ToolError('Name a site for its access log.');
+                $file = SITES . "/$site.localhost/logs/caddy.log";
+                $entries = [];
+                foreach (explode("\n", tail_of($file)) as $line) {
+                    $e = json_decode($line, true);
+                    if (!is_array($e) || !isset($e['ts']) || $e['ts'] < $since) continue;
+                    $status = (int) ($e['status'] ?? 0);
+                    if (!empty($a['errors_only']) && $status < 400) continue;
+                    $r = $e['request'] ?? [];
+                    $entries[] = ['t' => (int) $e['ts'], 'text' => sprintf('%s  %d  %s %s  %.3fs', date('Y-m-d H:i:s T', (int) $e['ts']), $status, $r['method'] ?? '?', $r['uri'] ?? '?', (float) ($e['duration'] ?? 0))];
+                }
+            } else {
+                throw new ToolError('source is php, debug or access.');
+            }
+            if (!is_file($file)) return text("No log yet at $file.");
+            $total = count($entries);
+            $entries = array_slice($entries, -$limit);
+            if (!$entries) return text("Nothing in $file in that time.");
+            $head = "$file: " . ($total > $limit ? "the newest $limit of $total entries" : "$total entr" . ($total === 1 ? 'y' : 'ies')) . "\n\n";
+            return text(cut($head . implode("\n", array_column($entries, 'text'))));
+
+        case 'read_mail':
+            $site = isset($a['site']) && $a['site'] !== '' ? site_arg($a) : null;
+            if (!empty($a['id'])) {
+                $id = (string) $a['id'];
+                if (!preg_match('/^[A-Za-z0-9_-]+$/', $id)) throw new ToolError('That is not a message id.');
+                $m = mailpit('/message/' . rawurlencode($id));
+                if ($site !== null) {
+                    $to = array_merge((array) ($m['To'] ?? []), (array) ($m['Cc'] ?? []), (array) ($m['Bcc'] ?? []));
+                    $ours = array_filter($to, function ($p) use ($site) { return is_array($p) && preg_match('/[@.]' . preg_quote("$site.localhost", '/') . '$/i', (string) ($p['Address'] ?? '')); });
+                    if (!$ours) throw new ToolError("That message was not sent to $site.");
+                }
+                $body = trim((string) ($m['Text'] ?? ''));
+                if ($body === '' && !empty($m['HTML'])) $body = trim(html_entity_decode(strip_tags(preg_replace('~<(br|/p|/div|/tr|/h\d)[^>]*>~i', "\n", (string) $m['HTML'])), ENT_QUOTES | ENT_HTML5));
+                $links = [];
+                if (!empty($m['HTML']) && preg_match_all('~href\s*=\s*["\']([^"\']+)~i', (string) $m['HTML'], $mm)) $links = $mm[1];
+                if (preg_match_all('~https?://[^\s<>"\'\]\)]+~', (string) ($m['Text'] ?? ''), $mm)) $links = array_merge($links, $mm[0]);
+                $links = array_values(array_unique(array_filter(array_map(function ($l) { return html_entity_decode(trim($l), ENT_QUOTES | ENT_HTML5); }, $links), function ($l) { return preg_match('~^https?://~', $l); })));
+                return json_result([
+                    'id' => $m['ID'] ?? $id, 'date' => $m['Date'] ?? null, 'from' => address_list([$m['From'] ?? []]), 'to' => address_list($m['To'] ?? []),
+                    'subject' => $m['Subject'] ?? '', 'links' => $links, 'text' => cut($body, 20000),
+                ]);
+            }
+            $limit = int_arg($a, 'limit', 10, 1, 50);
+            $query = trim(($site !== null ? "to:@$site.localhost " : '') . (string) ($a['query'] ?? ''));
+            $data = $query === '' ? mailpit("/messages?limit=$limit") : mailpit('/search?query=' . rawurlencode($query) . "&limit=$limit");
+            $list = [];
+            foreach ($data['messages'] ?? [] as $m) {
+                $list[] = ['id' => $m['ID'], 'date' => $m['Created'] ?? null, 'from' => address_list([$m['From'] ?? []]), 'to' => address_list($m['To'] ?? []), 'subject' => $m['Subject'] ?? '', 'snippet' => $m['Snippet'] ?? ''];
+            }
+            return json_result(['total' => $data['messages_count'] ?? ($data['total'] ?? count($list)), 'messages' => $list, 'hint' => $list ? 'read_mail with an id shows a message and its links.' : 'No mail matches.']);
+
+        case 'snapshot_create':
+            $site = site_arg($a);
+            $args = ['snapshot', $site, 'create', '--format=json'];
+            if (!empty($a['note'])) $args[] = '--note=' . $a['note'];
+            [$out, $err, $code] = cove($args);
+            $data = last_json($out);
+            if ($code !== 0 || $data === null) throw new ToolError(clean($out . "\n" . $err) ?: 'The snapshot failed.');
+            return json_result($data);
+
+        case 'snapshot_list':
+            $site = site_arg($a);
+            [$out, $err, $code] = cove(['snapshot', $site, 'list', '--format=json']);
+            $data = last_json($out);
+            if ($code !== 0 || $data === null) throw new ToolError(clean($out . "\n" . $err) ?: 'Could not list snapshots.');
+            return json_result($data ?: ['snapshots' => [], 'hint' => 'No snapshots yet. snapshot_create takes one.']);
+
+        case 'snapshot_restore':
+            $site = site_arg($a);
+            $id = (string) ($a['id'] ?? '');
+            if (!preg_match('/^\d{8}-\d{6}(-\d+)?$/', $id)) throw new ToolError('id is a snapshot id from snapshot_list, such as 20261010-222053.');
+            [$out, $err, $code] = cove(['snapshot', $site, 'restore', $id, '--format=json']);
+            $data = last_json($out);
+            if ($code !== 0 || $data === null) throw new ToolError(clean($out . "\n" . $err) ?: 'The restore failed.');
+            $data['undo'] = "snapshot_restore with id {$data['safety']} puts back what was there before.";
+            return json_result($data);
+
+        case 'history_list':
+            $site = site_arg($a);
+            [$out, $err, $code] = cove(['history', $site, '--format=json', '--limit=' . int_arg($a, 'limit', 20, 1, 100)]);
+            $data = last_json($out);
+            if ($code !== 0 || $data === null) throw new ToolError(clean($out . "\n" . $err) ?: 'Could not read the history.');
+            if (!array_is_list($data)) throw new ToolError((string) ($data['error'] ?? $data['message'] ?? clean($out . "\n" . $err)) ?: 'Could not read the history.');
+            $saves = [];
+            foreach ($data as $s) {
+                $changes = [];
+                foreach ($s['summary']['components'] ?? [] as $c) {
+                    $v = ($c['version_from'] ?? '') !== '' && ($c['version_from'] ?? '') !== ($c['version'] ?? '') ? "{$c['version_from']} → {$c['version']}" : ($c['version'] ?? '');
+                    $changes[] = trim($c['type'] === 'file' ? "file {$c['path']} {$c['change']}" : "{$c['type']} {$c['slug']} {$c['change']} $v");
+                }
+                $saves[] = ['id' => $s['id'], 'date' => date('Y-m-d H:i T', (int) $s['created']), 'note' => $s['note'] ?? '', 'auto' => !empty($s['auto']), 'wordpress' => $s['wp'] ?? null, 'changes' => $changes];
+            }
+            return json_result(['saves' => $saves, 'hint' => $saves ? 'history_rollback puts a plugin or theme back as one of these saves had it.' : 'No saves yet.']);
+
+        case 'history_diff':
+            $site = site_arg($a);
+            $id = (string) ($a['id'] ?? '');
+            if (!preg_match('/^([0-9a-f]{4,40}|latest|HEAD(~\d+)?)$/', $id)) throw new ToolError('id is a save id from history_list, or latest, or HEAD~1.');
+            $targets = [];
+            foreach (['plugin' => '--plugin=', 'theme' => '--theme=', 'mu_plugin' => '--mu-plugin='] as $k => $flag) {
+                if (!empty($a[$k])) {
+                    if (!preg_match('/^[A-Za-z0-9._-]+$/', (string) $a[$k])) throw new ToolError("$k is a slug or file name.");
+                    $targets[] = $flag . $a[$k];
+                }
+            }
+            if (!empty($a['file'])) {
+                $f = (string) $a['file'];
+                if (!preg_match('~^[A-Za-z0-9._/-]+$~', $f) || preg_match('~(^|/)\.\.(/|$)~', $f)) throw new ToolError('file is a path relative to wp-content.');
+                $targets[] = '--file=' . $f;
+            }
+            if (count($targets) > 1) throw new ToolError('Name at most one of plugin, theme, mu_plugin, or file.');
+            $base = array_merge(['history', $site, 'diff', $id], $targets);
+            [$stat, $err, $code] = cove(array_merge($base, ['--stat']));
+            if ($code !== 0) throw new ToolError(clean($stat . "\n" . $err) ?: 'Could not read that save.');
+            if (trim($stat) === '') return text('That save changed nothing' . ($targets ? ' there.' : '.'));
+            if (!empty($a['stat_only'])) return text(cut(trim($stat)));
+            [$diff] = cove($base);
+            if (strlen($diff) > 60000) {
+                return text(cut(trim($stat), 10000) . "\n\nThe full diff is " . strlen($diff) . " bytes, so here is its start. Name a plugin, theme or file to see one part whole.\n\n" . substr($diff, 0, 50000));
+            }
+            return text(trim($diff));
+
+        case 'history_save':
+            $site = site_arg($a);
+            $args = ['history', $site, 'save', '--format=json'];
+            if (!empty($a['note'])) $args[] = '--note=' . $a['note'];
+            [$out, $err, $code] = cove($args);
+            $data = last_json($out);
+            if ($code !== 0 || $data === null || !isset($data['state'])) throw new ToolError((string) ($data['message'] ?? '') ?: (clean($out . "\n" . $err) ?: 'The save failed.'));
+            return json_result([
+                'id' => $data['id'] ?? null,
+                'saved' => $data['state'] === 'new' ? 'yes' : 'no: nothing changed since save ' . ($data['id'] ?? '?'),
+                'summary' => $data['summary'] ?? null,
+                'next' => 'After editing, history_save again: history_diff with id latest then shows the edit, and history_rollback with id ' . ($data['id'] ?? '<this id>') . ' puts a plugin or theme back as it is now.',
+            ]);
+
+        case 'history_rollback':
+            $site = site_arg($a);
+            $id = (string) ($a['id'] ?? '');
+            if (!preg_match('/^([0-9a-f]{4,40}|latest|HEAD(~\d+)?)$/', $id)) throw new ToolError('id is a save id from history_list, or latest, or HEAD~1.');
+            $targets = [];
+            foreach (['plugin' => '--plugin=', 'theme' => '--theme=', 'mu_plugin' => '--mu-plugin='] as $k => $flag) {
+                if (!empty($a[$k])) {
+                    if (!preg_match('/^[A-Za-z0-9._-]+$/', (string) $a[$k])) throw new ToolError("$k is a slug or file name.");
+                    $targets[] = $flag . $a[$k];
+                }
+            }
+            if (!empty($a['all'])) $targets[] = '--all';
+            if (count($targets) !== 1) throw new ToolError('Name exactly one of plugin, theme, mu_plugin, or all.');
+            [$out, $err, $code] = cove(['history', $site, 'rollback', $id, $targets[0], '--format=json']);
+            $data = last_json($out);
+            if ($code !== 0 || $data === null) throw new ToolError(clean($out . "\n" . $err) ?: 'The rollback failed.');
+            return json_result($data);
+
+        case 'health':
+            if (demo_sites() !== null) throw new ToolError('The health check names sites outside the demo, so it is off while cove demo is on.');
+            [$out] = cove(['health'], true);
+            $out = clean($out);
+            if ($out === '') throw new ToolError('cove health printed nothing.');
+            return text(cut($out));
+
+        case 'status':
+            $cfg = @parse_ini_file(COVE_DIR . '/config') ?: [];
+            $https = (int) ($cfg['HTTPS_PORT'] ?? 443) ?: 443;
+            $probe = function ($port) { $s = @fsockopen('127.0.0.1', $port, $errno, $errstr, 1); if ($s) { fclose($s); return 'answering'; } return 'NOT answering'; };
+            $lines = [
+                'Cove ' . COVE_VERSION,
+                "Web server (FrankenPHP) on :$https: " . $probe($https),
+                'MariaDB on :3306: ' . $probe(3306),
+                'Mailpit on :8025: ' . $probe(8025),
+                '',
+                'Dashboard: https://cove.localhost' . PORT_SUFFIX,
+                'Adminer: https://db.cove.localhost' . PORT_SUFFIX,
+                'Mailpit: https://mail.cove.localhost' . PORT_SUFFIX,
+            ];
+            if (demo_sites() !== null) $lines[] = "\ncove demo is on: only " . implode(', ', demo_sites()) . ' can be used.';
+            return text(implode("\n", $lines));
+    }
+    throw new ToolError("Unknown tool '$name'.");
+}
+
+// A command line split into words, quotes honoured; no shell is involved.
+function split_line(string $line): array {
+    $line = trim($line);
+    $tokens = []; $cur = ''; $q = null; $has = false;
+    for ($i = 0, $n = strlen($line); $i < $n; $i++) {
+        $ch = $line[$i];
+        if ($q !== null) {
+            if ($ch === $q) { $q = null; continue; }
+            if ($ch === '\\' && $q === '"' && $i + 1 < $n) { $cur .= $line[++$i]; continue; }
+            $cur .= $ch;
+            continue;
+        }
+        if ($ch === '"' || $ch === "'") { $q = $ch; $has = true; continue; }
+        if ($ch === '\\' && $i + 1 < $n) { $cur .= $line[++$i]; $has = true; continue; }
+        if (ctype_space($ch)) { if ($cur !== '' || $has) { $tokens[] = $cur; $cur = ''; $has = false; } continue; }
+        $cur .= $ch;
+        $has = true;
+    }
+    if ($q !== null) throw new ToolError('Unbalanced quote in command.');
+    if ($cur !== '' || $has) $tokens[] = $cur;
+    return $tokens;
+}
+
+// Screenshots go back as JPEG when PHP can make one: a fraction of the PNG.
+function shrink_image(string $png): array {
+    try {
+        if (class_exists('Imagick')) {
+            $im = new Imagick();
+            $im->readImageBlob($png);
+            $im->setImageBackgroundColor('white');
+            $im = $im->mergeImageLayers(Imagick::LAYERMETHOD_FLATTEN);
+            $im->setImageFormat('jpeg');
+            $im->setImageCompressionQuality(82);
+            $jpg = $im->getImageBlob();
+            if ($jpg !== '') return [$jpg, 'image/jpeg'];
+        }
+        if (function_exists('imagecreatefromstring') && function_exists('imagejpeg') && ($img = @imagecreatefromstring($png))) {
+            ob_start();
+            imagejpeg($img, null, 82);
+            $jpg = (string) ob_get_clean();
+            if ($jpg !== '') return [$jpg, 'image/jpeg'];
+        }
+    } catch (Throwable $e) {
+    }
+    return [$png, 'image/png'];
+}
+
+// --- JSON-RPC over stdio -----------------------------------------------------
+
+function send($msg): void {
+    fwrite(STDOUT, json_encode($msg, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE) . "\n");
+    fflush(STDOUT);
+}
+
+function rpc_error($id, int $code, string $message): array {
+    return ['jsonrpc' => '2.0', 'id' => $id, 'error' => ['code' => $code, 'message' => $message]];
+}
+
+const INSTRUCTIONS = "Cove runs local WordPress sites on this machine, each at https://<name>.localhost with its files in ~/Cove/Sites/<name>.localhost/public and a database of its own. Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin, screenshot to see a page, check_page for a page's status and the PHP errors it caused, and read_logs for older errors. wp_read runs WP-CLI commands that only read; wp runs any. Take a snapshot (snapshot_create) before a change you might want to undo, or try it on a copy (clone_site); before editing plugin or theme code, history_save, so history_diff shows the edit and history_rollback can undo it. snapshot_restore and history_rollback each save the current state first. No tool here deletes a site, pulls or pushes one to a remote host, or changes Cove's own settings.";
+
+function handle(array $msg): ?array {
+    $id = $msg['id'] ?? null;
+    $method = $msg['method'] ?? null;
+    $is_request = array_key_exists('id', $msg);
+    if (!is_string($method)) {             // a response to us, or a malformed request
+        return $is_request && !isset($msg['result']) && !isset($msg['error']) ? rpc_error($id, -32600, 'Invalid request') : null;
+    }
+    if (!$is_request) return null;        // notifications: initialized, cancelled
+    $p = is_array($msg['params'] ?? null) ? $msg['params'] : [];
+    switch ($method) {
+        case 'initialize':
+            $want = (string) ($p['protocolVersion'] ?? '');
+            return ['jsonrpc' => '2.0', 'id' => $id, 'result' => [
+                'protocolVersion' => in_array($want, PROTOCOLS, true) ? $want : PROTOCOLS[0],
+                'capabilities' => ['tools' => ['listChanged' => false]],
+                'serverInfo' => ['name' => 'cove', 'title' => 'Cove', 'version' => COVE_VERSION],
+                'instructions' => INSTRUCTIONS,
+            ]];
+        case 'ping':
+            return ['jsonrpc' => '2.0', 'id' => $id, 'result' => new stdClass()];
+        case 'tools/list':
+            $list = [];
+            foreach (tools() as $name => $t) $list[] = ['name' => $name] + $t;
+            return ['jsonrpc' => '2.0', 'id' => $id, 'result' => ['tools' => $list]];
+        case 'tools/call':
+            $name = (string) ($p['name'] ?? '');
+            $args = is_array($p['arguments'] ?? null) ? $p['arguments'] : [];
+            $tools = tools();
+            if (!isset($tools[$name])) return rpc_error($id, -32602, "Unknown tool: $name");
+            foreach ($tools[$name]['inputSchema']['required'] ?? [] as $req) {
+                if (!isset($args[$req]) || $args[$req] === '') return ['jsonrpc' => '2.0', 'id' => $id, 'result' => text("Missing required argument: $req", true)];
+            }
+            try {
+                $result = call_tool($name, $args);
+            } catch (ToolError $e) {
+                $result = text($e->getMessage(), true);
+            } catch (Throwable $e) {
+                fwrite(STDERR, "cove mcp: $name: " . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine() . "\n");
+                $result = text("$name failed: " . $e->getMessage(), true);
+            }
+            return ['jsonrpc' => '2.0', 'id' => $id, 'result' => $result];
+    }
+    return rpc_error($id, -32601, "Method not found: $method");
+}
+
+// `cove mcp tools`: the list, for people.
+if (getenv('COVE_MCP_LIST') === '1') {
+    foreach (tools() as $name => $t) {
+        $kind = $t['annotations']['readOnlyHint'] ? 'reads' : ($t['annotations']['destructiveHint'] ? 'changes' : ($t['annotations']['idempotentHint'] ? 'sets' : 'adds'));
+        printf("  %-18s %-30s %s\n", $name, $t['title'], $kind);
+    }
+    exit(0);
+}
+
+while (($line = fgets(STDIN)) !== false) {
+    $line = trim($line);
+    if ($line === '') continue;
+    $msg = json_decode($line, true);
+    if (!is_array($msg)) { send(rpc_error(null, -32700, 'Parse error')); continue; }
+    if (array_is_list($msg)) {
+        $replies = [];
+        foreach ($msg as $m) { if (is_array($m) && ($r = handle($m)) !== null) $replies[] = $r; }
+        if ($replies) send($replies);
+        continue;
+    }
+    $reply = handle($msg);
+    if ($reply !== null) send($reply);
+}
+COVE_MCP_PHP
+}
+
+cove_mcp() {
+    case "${1:-}" in
+        ""|serve|tools) ;;
+        *)
+            echo "Usage: cove mcp [tools]" >&2
+            exit 1
+            ;;
+    esac
+    local self server
+    self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    server="$APP_DIR/mcp-server.php"
+    mkdir -p "$APP_DIR"
+    mcp_server_source > "$server.tmp.$$" && mv -f "$server.tmp.$$" "$server" || {
+        echo "cove mcp: could not write $server" >&2
+        exit 1
+    }
+    if ! command -v frankenphp >/dev/null 2>&1; then
+        echo "cove mcp: FrankenPHP is not installed. Run 'cove install' first." >&2
+        exit 1
+    fi
+    local list=0
+    [ "${1:-}" = "tools" ] && list=1
+    [ "$list" = 1 ] && echo "Tools 'cove mcp' offers an agent:"
+    # stdout is the protocol from here on: nothing else may write to it.
+    COVE_MCP_BIN="$self" COVE_MCP_VERSION="$COVE_VERSION" COVE_MCP_DIR="$COVE_DIR" \
+        COVE_MCP_SITES="$SITES_DIR" COVE_MCP_PORT_SUFFIX="$(https_port_suffix)" COVE_MCP_LIST="$list" \
+        exec frankenphp php-cli "$server"
+}
+
 cove_memory() {
     # -----------------------------------------------------------------
     #  cove memory [set <value>]
@@ -21967,19 +23756,12 @@ cove_memory_set() {
     echo ""
 
     # 1) Cove CLI ini — source of truth for Cove
-    mkdir -p "$(dirname "$PHP_INI_FILE")"
-    touch "$PHP_INI_FILE"
     echo "📁 Updating $PHP_INI_FILE"
     local k
     for k in memory_limit upload_max_filesize post_max_size; do
-        if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
-            sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${value}|" "$PHP_INI_FILE"
-        else
-            echo "${k} = ${value}" >> "$PHP_INI_FILE"
-        fi
+        cove_ini_set "$k" "$value"
         echo "   ✓ ${k} = ${value}"
     done
-    rm -f "${PHP_INI_FILE}.bak"
 
     # 2) Regenerate Caddyfile so FrankenPHP web server picks up the new values
     echo ""
@@ -22626,21 +24408,14 @@ cove_opcache() {
     fi
     echo ""
     gum style --foreground "212" --bold "Setting opcache.memory_consumption = ${mem} MB"
-    mkdir -p "$(dirname "$PHP_INI_FILE")"
-    touch "$PHP_INI_FILE"
     echo "📁 Updating $PHP_INI_FILE"
     local k v
     for pair in "opcache.memory_consumption=$mem" "opcache.interned_strings_buffer=$interned" "opcache.max_accelerated_files=$files"; do
         k="${pair%%=*}"; v="${pair#*=}"
         [ -z "$v" ] && continue
-        if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
-            sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${v}|" "$PHP_INI_FILE"
-        else
-            echo "${k} = ${v}" >> "$PHP_INI_FILE"
-        fi
+        cove_ini_set "$k" "$v"
         echo "   ✓ ${k} = ${v}"
     done
-    rm -f "${PHP_INI_FILE}.bak"
     echo ""
     regenerate_caddyfile
     echo ""
@@ -24236,10 +26011,13 @@ cove_rename() {
     # dashboard would otherwise hide it and refuse every action on it.
     if [ -f "$COVE_DIR/demo" ] && grep -qx "$old_name" "$COVE_DIR/demo"; then
         sed "s/^$old_name\$/$new_name/" "$COVE_DIR/demo" > "$COVE_DIR/demo.tmp" && mv "$COVE_DIR/demo.tmp" "$COVE_DIR/demo"
+        # Its database was renamed too: grant the new name instead.
+        demo_db_sync || echo "⚠️  Couldn't update the demo's database account; run 'cove demo $(tr '\n' ' ' < "$COVE_DIR/demo")' again."
     fi
 
     # --- Reload Server Configuration ---
     regenerate_caddyfile
+    prune_etc_hosts "$old_name.localhost"
 
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: $(url_for "$new_name.localhost")"
 }
@@ -24401,11 +26179,12 @@ cove_screenshot_sweep() {
 }
 
 cove_screenshot() {
-    local site_name="" out="" width=1280 height=800 quiet=0 sweep=0 max=3 idle_only=0 check=0
+    local site_name="" out="" path="" width=1280 height=800 quiet=0 sweep=0 max=3 idle_only=0 check=0
     local arg
     for arg in "$@"; do
         case "$arg" in
             --out=*)    out="${arg#*=}" ;;
+            --path=*)   path="${arg#*=}" ;;
             --width=*)  width="${arg#*=}" ;;
             --height=*) height="${arg#*=}" ;;
             --quiet)    quiet=1 ;;
@@ -24414,11 +26193,12 @@ cove_screenshot() {
             --max=*)    max="${arg#*=}" ;;
             --idle-only) idle_only=1 ;;
             -h|--help)
-                echo "Usage: cove screenshot <site> [--out=<file.png>] [--width=1280] [--height=800]"
+                echo "Usage: cove screenshot <site> [--out=<file.png>] [--path=/<page>] [--width=1280] [--height=800]"
                 echo ""
                 echo "Captures the site's front page with a headless Chromium-family browser"
                 echo "(Chrome, Chromium, Brave, Edge, Arc, Vivaldi). Without --out the image"
                 echo "goes to ~/Cove/cache/screenshots/<site>.png, where the dashboard shows it."
+                echo "--path captures another page of the site instead, and needs --out."
                 echo ""
                 echo "  --check       Print the browser that would be used; exit 2 when there is none."
                 echo "  --sweep [--max=N] [--idle-only]"
@@ -24461,6 +26241,21 @@ cove_screenshot() {
         gum style --foreground red "❌ Error: --width and --height take a number of pixels."
         exit 1
     fi
+    # Another page of the site. The preview the dashboard shows is always the
+    # front page, so this one goes to a file of the caller's choosing.
+    if [ -n "$path" ] && [ "$path" != "/" ]; then
+        local path_re='^/[A-Za-z0-9._~/?=&%:+,@!;#-]*$'
+        if [[ ! "$path" =~ $path_re ]]; then
+            gum style --foreground red "❌ Error: --path takes a path on the site, such as /shop/ or /?p=12."
+            exit 1
+        fi
+        if [ -z "$out" ]; then
+            gum style --foreground red "❌ Error: --path needs --out=<file.png>; the site's preview is always its front page."
+            exit 1
+        fi
+    else
+        path=""
+    fi
 
     local browser
     if ! browser=$(find_headless_browser); then
@@ -24471,7 +26266,7 @@ cove_screenshot() {
     [ -z "$out" ] && { mkdir -p "$SCREENSHOTS_DIR"; out="$SCREENSHOTS_DIR/$site_name.png"; }
     cove_screenshot_reap
     local url
-    url=$(url_for "$site_name.localhost")
+    url=$(url_for "$site_name.localhost")$path
     local tmp_profile tmp_out
     tmp_profile=$(mktemp -d "$SHOT_TMP/cove-shot-profile.XXXXXX")
     tmp_out="$out.tmp.png"
@@ -26225,6 +28020,274 @@ WP_CLI::log( "Renamed {$from}user_roles and {$from}* user meta to $to." );
 PHPKEYS
 }
 
+php_dump_check_script() {
+cat << 'PHPCHECK'
+<?php
+// $args: 0=dump, 1=the tenant's prefix, 2=file to list the tables the dump
+// creates, 3=file to write the first problem to, 4="tenant <id>".
+// Reads the dump statement by statement, with strings, comments and MySQL's
+// executable /*! */ comments taken into account, and accepts only what a
+// table dump is made of: session SET, LOCK/UNLOCK, and DROP/CREATE/ALTER/
+// INSERT/REPLACE/TRUNCATE/RENAME/DELETE/UPDATE on tables under the prefix.
+// Triggers, views, routines, events, users, global settings, another
+// database, or a mysql client command could all reach past the tenant.
+$file   = $args[0];
+$prefix = $args[1];
+$label  = $args[4];
+$fh     = fopen( $file, 'rb' );
+if ( ! $fh ) { WP_CLI::error( "Cannot read $file" ); }
+
+$problem = null;
+$created = array();
+$foreign = array();
+
+$check = function ( $sql, $seen = array() ) use ( $prefix, $label, &$created, &$foreign, &$problem ) {
+    preg_match_all( '/`(?:[^`]|``)*`|\'\'|@@?[A-Za-z0-9_.$]+|[A-Za-z0-9_$]+|\S/', $sql, $m );
+    $t = $m[0];
+    if ( ! $t ) { return; }
+    $kw = function ( $i, $words ) use ( &$t ) {
+        return isset( $t[ $i ] ) && '`' !== $t[ $i ][0] && in_array( strtoupper( $t[ $i ] ), (array) $words, true );
+    };
+    $name = function ( &$i ) use ( &$t, &$problem ) {
+        if ( ! isset( $t[ $i ] ) ) { return null; }
+        $tok = $t[ $i ];
+        if ( '`' === $tok[0] ) {
+            $n = str_replace( '``', '`', substr( $tok, 1, -1 ) );
+        } elseif ( preg_match( '/^[A-Za-z0-9_$]+$/', $tok ) ) {
+            $n = $tok;
+        } else {
+            return null;
+        }
+        $i++;
+        if ( isset( $t[ $i ] ) && '.' === $t[ $i ] ) {
+            $problem = "The dump names a table in another database ($n." . ( isset( $t[ $i + 1 ] ) ? $t[ $i + 1 ] : '' ) . ').';
+            return null;
+        }
+        return $n;
+    };
+    $own = function ( $n ) use ( $prefix, &$foreign ) {
+        if ( null !== $n && 0 !== strpos( $n, $prefix ) ) { $foreign[ $n ] = true; }
+        return null !== $n;
+    };
+    $refuse = function () use ( &$t, &$problem, $label ) {
+        $text = '';
+        foreach ( $t as $tok ) {
+            $glue  = '' === $text || in_array( $tok, array( ',', ')', '.', '@', '/' ), true ) || in_array( substr( $text, -1 ), array( '(', '.', '@', '/' ), true );
+            $text .= $glue ? $tok : ' ' . $tok;
+            if ( strlen( $text ) > 70 ) { $text = substr( $text, 0, 70 ) . '…'; break; }
+        }
+        $problem = "The dump holds a statement that can reach past $label's tables, which a tenant restore refuses: $text.";
+    };
+    $i     = 1;
+    $first = strtoupper( $t[0] );
+    // A dump writes rows as values. A SELECT (or MySQL 8's TABLE) inside any
+    // other statement reads them from somewhere, possibly another tenant's
+    // tables, and SELECT … INTO keeps what it read for a later statement.
+    if ( ( isset( $seen['SELECT'] ) && 'SELECT' !== $first )
+        || ( isset( $seen['TABLE'] ) && in_array( $first, array( 'INSERT', 'REPLACE', 'UPDATE', 'DELETE', 'SET' ), true ) )
+        || ( isset( $seen['INTO'] ) && 'SELECT' === $first ) ) {
+        return $refuse();
+    }
+    switch ( $first ) {
+        case 'SET':
+            foreach ( $t as $tok ) {
+                $u = strtoupper( $tok );
+                if ( in_array( $u, array( 'GLOBAL', 'PERSIST', 'PERSIST_ONLY', 'PASSWORD', 'ROLE', 'STATEMENT' ), true )
+                    || 0 === strpos( $u, '@@GLOBAL.' ) || 0 === strpos( $u, '@@PERSIST' ) ) {
+                    return $refuse();
+                }
+            }
+            return;
+        case 'UNLOCK': case 'START': case 'BEGIN': case 'COMMIT': case 'ROLLBACK':
+            return;
+        case 'SELECT':
+            foreach ( $t as $tok ) {
+                if ( in_array( strtoupper( $tok ), array( 'OUTFILE', 'DUMPFILE' ), true ) ) { return $refuse(); }
+            }
+            return;
+        case 'USE':
+            $problem = 'The dump switches or creates databases.';
+            return;
+        case 'LOCK':
+            if ( ! $kw( $i++, array( 'TABLE', 'TABLES' ) ) ) { return $refuse(); }
+            do {
+                if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+                while ( isset( $t[ $i ] ) && ',' !== $t[ $i ] ) { $i++; }
+            } while ( isset( $t[ $i ] ) && ',' === $t[ $i++ ] );
+            return;
+        case 'DROP':
+            if ( $kw( $i, 'TEMPORARY' ) ) { $i++; }
+            if ( $kw( $i, array( 'DATABASE', 'SCHEMA' ) ) ) { $problem = 'The dump switches or creates databases.'; return; }
+            if ( ! $kw( $i++, array( 'TABLE', 'TABLES' ) ) ) { return $refuse(); }
+            if ( $kw( $i, 'IF' ) && $kw( $i + 1, 'EXISTS' ) ) { $i += 2; }
+            do {
+                if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            } while ( isset( $t[ $i ] ) && ',' === $t[ $i++ ] );
+            return;
+        case 'CREATE':
+            if ( $kw( $i, 'OR' ) && $kw( $i + 1, 'REPLACE' ) ) { $i += 2; }
+            if ( $kw( $i, 'TEMPORARY' ) ) { $i++; }
+            if ( $kw( $i, array( 'DATABASE', 'SCHEMA' ) ) ) { $problem = 'The dump switches or creates databases.'; return; }
+            if ( ! $kw( $i++, 'TABLE' ) ) { return $refuse(); }
+            if ( $kw( $i, 'IF' ) && $kw( $i + 1, 'NOT' ) && $kw( $i + 2, 'EXISTS' ) ) { $i += 3; }
+            $n = $name( $i );
+            if ( ! $own( $n ) ) { return $problem ? null : $refuse(); }
+            $created[ $n ] = true;
+            break;
+        case 'ALTER':
+            while ( $kw( $i, array( 'ONLINE', 'IGNORE' ) ) ) { $i++; }
+            if ( $kw( $i, array( 'DATABASE', 'SCHEMA' ) ) ) { $problem = 'The dump switches or creates databases.'; return; }
+            if ( ! $kw( $i++, 'TABLE' ) ) { return $refuse(); }
+            if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            break;
+        case 'INSERT': case 'REPLACE':
+            while ( $kw( $i, array( 'LOW_PRIORITY', 'DELAYED', 'HIGH_PRIORITY', 'IGNORE' ) ) ) { $i++; }
+            if ( $kw( $i, 'INTO' ) ) { $i++; }
+            if ( ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            return;
+        case 'TRUNCATE':
+            if ( $kw( $i, 'TABLE' ) ) { $i++; }
+            if ( ! $own( $name( $i ) ) || isset( $t[ $i ] ) ) { return $problem ? null : $refuse(); }
+            return;
+        case 'RENAME':
+            if ( ! $kw( $i++, array( 'TABLE', 'TABLES' ) ) ) { return $refuse(); }
+            do {
+                if ( ! $own( $name( $i ) ) || ! $kw( $i++, 'TO' ) || ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            } while ( isset( $t[ $i ] ) && ',' === $t[ $i++ ] );
+            return;
+        case 'DELETE':
+            while ( $kw( $i, array( 'LOW_PRIORITY', 'QUICK', 'IGNORE' ) ) ) { $i++; }
+            if ( ! $kw( $i++, 'FROM' ) || ! $own( $name( $i ) ) ) { return $problem ? null : $refuse(); }
+            if ( isset( $t[ $i ] ) && ! $kw( $i, array( 'WHERE', 'ORDER', 'LIMIT', 'RETURNING' ) ) ) { return $refuse(); }
+            return;
+        case 'UPDATE':
+            while ( $kw( $i, array( 'LOW_PRIORITY', 'IGNORE' ) ) ) { $i++; }
+            if ( ! $own( $name( $i ) ) || ! $kw( $i, 'SET' ) ) { return $problem ? null : $refuse(); }
+            return;
+        default:
+            return $refuse();
+    }
+    // CREATE TABLE and ALTER TABLE: the other tables they name.
+    for ( $n = count( $t ); $i < $n; $i++ ) {
+        if ( $kw( $i, 'WITH' ) && $kw( $i + 1, 'TABLE' ) ) {
+            $i++;
+        } elseif ( $kw( $i, 'RENAME' ) && ! $kw( $i + 1, array( 'COLUMN', 'INDEX', 'KEY', 'CONSTRAINT' ) ) ) {
+            if ( $kw( $i + 1, array( 'TO', 'AS' ) ) ) { $i++; }
+        } elseif ( ! $kw( $i, array( 'REFERENCES', 'LIKE' ) ) ) {
+            continue;
+        }
+        $j = $i + 1;
+        if ( ! $own( $name( $j ) ) && $problem ) { return; }
+    }
+};
+
+$head    = '';     // the statement so far: code only, strings as ''
+$cap     = 65536;  // a CREATE TABLE fits; an INSERT's rows don't matter
+$state   = 'code'; // code | sq | dq | bt | comment
+$exec    = 0;      // executable comments open (/*! … */): their text is code
+$esc     = false;  // the last character in a string was a backslash
+$line_no = 0;
+$seen    = array(); // SELECT, TABLE, INTO in the statement's code, past the cap too
+$add     = function ( $s ) use ( &$head, $cap ) {
+    if ( strlen( $head ) < $cap ) { $head .= $s; }
+};
+while ( null === $problem && false !== ( $line = fgets( $fh ) ) ) {
+    $line_no++;
+    // MariaDB's dump tools put this first. It is a client command, but the
+    // one that turns the client's other commands off.
+    if ( 1 === $line_no && '/*M!999999\- enable the sandbox mode */' === rtrim( $line ) ) { continue; }
+    $len = strlen( $line );
+    $i   = 0;
+    while ( $i < $len && null === $problem ) {
+        if ( 'sq' === $state || 'dq' === $state ) {
+            if ( $esc ) { $esc = false; $i++; continue; }
+            $q  = 'sq' === $state ? "'" : '"';
+            $i += strcspn( $line, $q . '\\', $i );
+            if ( $i >= $len ) { break; }
+            if ( '\\' === $line[ $i ] ) { $esc = true; $i++; continue; }
+            if ( $i + 1 < $len && $q === $line[ $i + 1 ] ) { $i += 2; continue; }
+            $state = 'code';
+            $add( "''" );
+            $i++;
+        } elseif ( 'bt' === $state ) {
+            $n = strcspn( $line, '`', $i );
+            $add( substr( $line, $i, $n ) );
+            $i += $n;
+            if ( $i >= $len ) { break; }
+            if ( $i + 1 < $len && '`' === $line[ $i + 1 ] ) { $add( '``' ); $i += 2; continue; }
+            $add( '`' );
+            $state = 'code';
+            $i++;
+        } elseif ( 'comment' === $state ) {
+            $p = strpos( $line, '*/', $i );
+            if ( false === $p ) { break; }
+            $state = 'code';
+            $add( ' ' );
+            $i = $p + 2;
+        } else {
+            $n     = strcspn( $line, "'\"`;/-#*\\", $i );
+            $chunk = substr( $line, $i, $n );
+            $add( $chunk );
+            if ( preg_match_all( '/(?<![A-Za-z0-9_$])(SELECT|TABLE|INTO)(?![A-Za-z0-9_$])/i', $chunk, $w ) ) {
+                foreach ( $w[1] as $word ) { $seen[ strtoupper( $word ) ] = true; }
+            }
+            $i += $n;
+            if ( $i >= $len ) { break; }
+            $c    = $line[ $i ];
+            $next = $i + 1 < $len ? $line[ $i + 1 ] : '';
+            if ( "'" === $c ) {
+                $state = 'sq';
+                $i++;
+            } elseif ( '"' === $c ) {
+                $state = 'dq';
+                $i++;
+            } elseif ( '`' === $c ) {
+                $state = 'bt';
+                $add( '`' );
+                $i++;
+            } elseif ( ';' === $c ) {
+                $check( $head, $seen );
+                $head = '';
+                $seen = array();
+                $i++;
+            } elseif ( '\\' === $c ) {
+                $problem = "The dump holds a mysql client command (\\$next on line $line_no), which a tenant restore refuses.";
+            } elseif ( '#' === $c || ( '-' === $c && '-' === $next && ( $i + 2 >= $len || ctype_space( $line[ $i + 2 ] ) ) ) ) {
+                $add( ' ' );
+                break;
+            } elseif ( '/' === $c && '*' === $next ) {
+                if ( preg_match( '/\G\/\*M?!\d*/', $line, $m, 0, $i ) ) {
+                    $exec++;
+                    $i += strlen( $m[0] );
+                } else {
+                    $state = 'comment';
+                    $i += 2;
+                }
+                $add( ' ' );
+            } elseif ( '*' === $c && '/' === $next && $exec > 0 ) {
+                $exec--;
+                $add( ' ' );
+                $i += 2;
+            } else {
+                $add( $c );
+                $i++;
+            }
+        }
+    }
+}
+fclose( $fh );
+if ( null === $problem && '' !== trim( $head ) ) { $check( $head, $seen ); }
+if ( null === $problem && $foreign ) {
+    $problem = "The dump touches tables outside $label: " . implode( ' ', array_slice( array_keys( $foreign ), 0, 5 ) ) . '.';
+}
+if ( null !== $problem ) {
+    file_put_contents( $args[3], $problem );
+    return;
+}
+file_put_contents( $args[2], implode( "\n", array_keys( $created ) ) . "\n" );
+PHPCHECK
+}
+
 # Does the install at $1 run WP Freighter? Read from the files, not through
 # PHP, so the answer holds when WordPress fails to boot: push uses it to
 # refuse a whole-install restore that would take every tenant with it.
@@ -26288,12 +28351,6 @@ tenant_check() {
                 return 1 ;;
         esac
     fi
-}
-
-# Every table a dump drops, creates or writes to, one per line.
-dump_tables_touched() {
-    grep -oE '^(DROP TABLE( IF EXISTS)?|CREATE TABLE( IF NOT EXISTS)?|INSERT( IGNORE)? INTO|REPLACE INTO|LOCK TABLES|ALTER TABLE|TRUNCATE( TABLE)?|RENAME TABLE|DELETE FROM|UPDATE) `[^`]+`' "$1" \
-        | sed -E 's/.*`([^`]+)`$/\1/' | sort -u
 }
 
 # Copy dump $1 to $4 with every table renamed from prefix $2 to $3. Only the
@@ -26524,6 +28581,77 @@ cmd_backup() {
     echo "$archive"
 }
 
+# Import dump $2 into the site at $1, with the mysql client or through $wpdb.
+# WP-CLI's import carries on past a statement that fails and still reports
+# success, so IMPORT_ERRORS counts the statements the database refused.
+IMPORT_ERRORS=0
+db_load() {
+    local err rc=0
+    err=$(mktemp "${TMPDIR:-/tmp}/cove-import-XXXXXX") || return 1
+    if [ "$DB_LOAD" = native ]; then
+        $WP db import "$2" --path="$1" --skip-plugins --skip-themes >&2 2>"$err" || rc=$?
+    else
+        wp_eval "$1" php_load_script "$2" 2>"$err" || rc=$?
+    fi
+    cat "$err" >&2
+    IMPORT_ERRORS=$(grep -cE '^(ERROR [0-9]|WordPress database error)' "$err")
+    rm -f "$err"
+    return $rc
+}
+
+# MariaDB's dump tools (11.x, and 10.x point releases since mid-2024) start
+# every dump with /*M!999999\- enable the sandbox mode */, which MySQL's
+# client and older MariaDB clients refuse ("Unknown command '\-'"), so a site
+# dumped by Cove's MariaDB failed to import on a MySQL host. Asks the client
+# WP-CLI imports with whether it takes the line; when it doesn't, writes a
+# copy without it to $3. Prints the dump to import. $1 = site dir.
+dump_for_this_client() {
+    local site_dir="$1" sql="$2" out="$3"
+    if [ "$DB_LOAD" != native ] || ! head -c 200 "$sql" | head -1 | grep -q 'enable the sandbox mode'; then
+        echo "$sql"; return 0
+    fi
+    if printf '%s\n' '/*M!999999\- enable the sandbox mode */' 'SELECT 1;' \
+        | $WP db query --path="$site_dir" --skip-plugins --skip-themes >/dev/null 2>&1; then
+        echo "$sql"; return 0
+    fi
+    log "  (this database client doesn't take MariaDB's sandbox line; importing without it)"
+    ( umask 077; tail -n +2 "$sql" > "$out" ) || return 1
+    echo "$out"
+}
+
+# What a tenant restore needs to undo itself once it has changed anything:
+# the tenant's folder and where its previous files wait, whether the folder
+# is new, and a dump of its previous tables with their names.
+UNDO_SITE="" UNDO_DIR="" UNDO_OLD="" UNDO_CREATED=false UNDO_SQL="" UNDO_TABLES=""
+
+# Put tenant $TENANT back the way restore_tenant found it, then stop with $1.
+tenant_undo() {
+    local why="$1" ok=true sql keep
+    trap '' HUP INT TERM PIPE
+    log "$why Putting tenant $TENANT back as it was..."
+    if [ -n "$UNDO_OLD" ] && [ -e "$UNDO_OLD" ]; then
+        if [ -e "$UNDO_DIR" ]; then
+            mv "$UNDO_DIR" "$UNDO_OLD.failed" && rm -rf "$UNDO_OLD.failed"
+        fi
+        mv "$UNDO_OLD" "$UNDO_DIR" || { ok=false; log "  Could not put its files back. The previous ones are in $UNDO_OLD."; }
+    elif $UNDO_CREATED && [ -n "$UNDO_DIR" ]; then
+        rm -rf "$UNDO_DIR"
+    fi
+    if [ -n "$UNDO_SQL" ]; then
+        if sql=$(dump_for_this_client "$UNDO_SITE" "$UNDO_SQL" "$UNDO_SQL.client") \
+            && db_load "$UNDO_SITE" "$sql" && [ "$IMPORT_ERRORS" = 0 ] \
+            && wp_eval "$UNDO_SITE" php_drop_leftovers_script "$UNDO_TABLES" "stacked_${TENANT}_"; then
+            :
+        else
+            ok=false
+            keep="$HOME/cove-tenant-$TENANT-before-$(date +%Y%m%d-%H%M%S).sql"
+            ( umask 077; cp "$UNDO_SQL" "$keep" ) && log "  Could not put its tables back. They are saved in $keep."
+        fi
+    fi
+    $ok && die "$why Tenant $TENANT is back as it was."
+    die "$why Tenant $TENANT could not be put back completely (see above)."
+}
+
 # Restore the unpacked site in $2 (dump $3) into tenant $TENANT of the install
 # at $1: the tenant's tables, and the one folder that is its own. Core, the
 # main site and the other tenants are shared and stay as they are. Everything
@@ -26553,17 +28681,30 @@ restore_tenant() {
             || die "Could not rewrite the dump's table names. Nothing was changed."
         sql="$held/tenant.sql"
     fi
-    if grep -qiE '^(USE|CREATE DATABASE|DROP DATABASE|CREATE SCHEMA|DROP SCHEMA)[[:space:]]' "$sql"; then
-        die "The dump switches or creates databases. Nothing was changed."
-    fi
-    local foreign
-    foreign=$(dump_tables_touched "$sql" | grep -v "^${dest_prefix}" | head -5 | tr '\n' ' ')
-    if [ -n "$foreign" ]; then
-        die "The dump touches tables outside tenant $TENANT: ${foreign% }. Nothing was changed."
-    fi
-    grep -oE '^CREATE TABLE( IF NOT EXISTS)? `[^`]+`' "$sql" | sed -E 's/.*`([^`]+)`$/\1/' > "$held/tables.txt"
+    log "Checking the dump..."
+    wp_eval "$site_dir" php_dump_check_script "$sql" "$dest_prefix" "$held/tables.txt" "$held/dump-problem.txt" "tenant $TENANT" \
+        || die "Could not check the dump. Nothing was changed."
+    [ -s "$held/dump-problem.txt" ] && die "$(cat "$held/dump-problem.txt") Nothing was changed."
     grep -qx "${dest_prefix}options" "$held/tables.txt" \
         || die "The dump has no ${dest_prefix}options table once renamed. Nothing was changed."
+    sql=$(dump_for_this_client "$site_dir" "$sql" "$held/client.sql") \
+        || die "Could not prepare the dump for this host's database client. Nothing was changed."
+
+    # The tenant's tables as they are, dumped the way a backup dumps them, so
+    # a failed import can be undone.
+    log "Saving tenant $TENANT's current tables, in case the import fails..."
+    local before_tables
+    before_tables=$($WP db tables --all-tables-with-prefix --format=csv --path="$site_dir" --skip-plugins --skip-themes 2>/dev/null)
+    [ -n "$before_tables" ] || die "Could not list tenant $TENANT's tables. Nothing was changed."
+    printf '%s\n' "$before_tables" | tr ',' '\n' > "$held/before-tables.txt"
+    if [ "$DB_DUMP" = native ]; then
+        ( umask 077; $WP db export "$held/before.sql" --path="$site_dir" --add-drop-table \
+            --default-character-set=utf8mb4 --tables="$before_tables" --skip-plugins --skip-themes >&2 )
+    else
+        ( umask 077; wp_eval "$site_dir" php_dump_script "$held/before.sql" prefix )
+    fi || die "Could not save tenant $TENANT's current tables. Nothing was changed."
+    UNDO_SITE="$site_dir"
+    UNDO_TABLES="$held/before-tables.txt"
 
     # Files: the tenant's own folder is built beside the live one and swapped
     # in, so the site serves its old files right up until the swap.
@@ -26597,39 +28738,48 @@ restore_tenant() {
                 cp -Rp "$target/$inner" "$incoming/$inner"
             fi
         done
+        # From here on a failure, or the connection dropping, puts the
+        # tenant's previous files (kept aside until the end) back in place.
+        UNDO_DIR="$target"
+        trap 'tenant_undo "The restore was interrupted."' HUP INT TERM PIPE
         if [ -e "$target" ]; then
             mv "$target" "$old" || { rm -rf "$incoming"; die "Could not move $target aside. Nothing was changed."; }
+            UNDO_OLD="$old"
+        else
+            UNDO_CREATED=true
         fi
         if ! mv "$incoming" "$target"; then
-            [ -e "$old" ] && mv "$old" "$target"
             rm -rf "$incoming"
-            die "Could not move the new files into $target. Nothing was changed."
+            tenant_undo "Could not move the new files into $target."
         fi
-        rm -rf "$old"
     fi
+    # (Again for the files modes that leave the folder alone.)
+    trap 'tenant_undo "The restore was interrupted."' HUP INT TERM PIPE
 
     # Database: import, then drop the tenant's tables the archive doesn't
     # have. Never `wp db reset` here: that empties the whole shared database.
     log "Importing database..."
-    if [ "$DB_LOAD" = native ]; then
-        $WP db import "$sql" --path="$site_dir" --skip-plugins --skip-themes >&2 \
-            || die "Database import failed."
-    else
-        log "  (no mysql client — importing through WordPress)"
-        wp_eval "$site_dir" php_load_script "$sql" || die "Database import failed."
-    fi
+    [ "$DB_LOAD" = native ] || log "  (no mysql client — importing through WordPress)"
+    UNDO_SQL="$held/before.sql"
+    db_load "$site_dir" "$sql" || tenant_undo "Database import failed."
+    [ "$IMPORT_ERRORS" = 0 ] || tenant_undo "The database refused $IMPORT_ERRORS statement(s) from the dump (above)."
     wp_eval "$site_dir" php_drop_leftovers_script "$held/tables.txt" "$dest_prefix" \
-        || die "Could not remove the tenant's old tables."
+        || tenant_undo "Could not remove the tenant's old tables."
     if [ "$src_prefix" != "$dest_prefix" ]; then
         wp_eval "$site_dir" php_prefix_keys_script "$src_prefix" \
-            || die "Could not rename the prefix-keyed role option and user meta."
+            || tenant_undo "Could not rename the prefix-keyed role option and user meta."
     fi
+    load_facts "$site_dir" || tenant_undo "WordPress did not boot as tenant $TENANT after the import."
+
+    # The tenant is in: nothing below fails the restore, so the way back goes.
+    trap - HUP INT TERM PIPE
+    [ -n "$UNDO_OLD" ] && rm -rf "$UNDO_OLD"
+    UNDO_OLD="" UNDO_SQL="" UNDO_CREATED=false
 
     # URLs, in this tenant's tables only: wp-content links move to the
     # tenant's own folder first, then the address changes over. Scheme-less,
     # so http, https and protocol-relative links all follow.
     if [ -n "$url_to" ]; then
-        load_facts "$site_dir" || die "WordPress did not boot as tenant $TENANT after the import."
         local url_from from_content
         url_from=$(fact raw_home)
         if [ -n "$url_from" ]; then
@@ -26839,16 +28989,19 @@ cmd_restore() {
 
     log "Importing database..."
     if [ "$DB_LOAD" = native ]; then
+        sql=$(dump_for_this_client "$site_dir" "$sql" "$held/client.sql") \
+            || die "Could not prepare the dump for this host's database client."
         $WP db reset --yes --path="$site_dir" --skip-plugins --skip-themes >&2 \
             || die "Database reset failed."
-        $WP db import "$sql" --path="$site_dir" --skip-plugins --skip-themes >&2 \
-            || die "Database import failed."
     else
         log "  (no mysql client — importing through WordPress)"
         # The dump's DROP TABLE statements make a separate reset unnecessary,
         # which matters here because `wp db reset` also needs the native client.
-        wp_eval "$site_dir" php_load_script "$sql" || die "Database import failed."
     fi
+    db_load "$site_dir" "$sql" || die "Database import failed."
+    # Not fatal: a dump from a MySQL server with GTIDs sets @@GLOBAL.GTID_PURGED,
+    # which MariaDB refuses while everything else imports fine.
+    [ "$IMPORT_ERRORS" = 0 ] || log "⚠️  The database refused $IMPORT_ERRORS statement(s) from the dump (above). Check that the site's tables all arrived."
 
     if [ -n "$url_to" ]; then
         local url_from
@@ -27314,25 +29467,38 @@ cove_twin() {
             elif [[ "$twin_engine" == WordPress* ]] && [ ! -f "$site_dir/$folder/wp-config.php" ] && [ ! -f "$(dirname "$site_dir/$folder")/wp-config.php" ]; then
                 gum style --foreground yellow "⚠️  $folder/ has no wp-config.php, so WordPress there will offer to install itself. Copy public/wp-config.php into it to share the site's database."
             fi
-            {
+            local old_twin old_domain old_folder old_as_site
+            old_twin=$(site_twin "$site_dir") && IFS=$'\t' read -r old_domain old_folder old_as_site <<< "$old_twin"
+            # An if, not `[ … ] && printf`: that ends the group with status 1
+            # when there is no as-site, and the twin file was never moved in.
+            if ! {
                 printf 'domain=%s\nroot=%s\n' "$domain" "$folder"
-                [ -n "$as_site" ] && printf 'as_site=%s\n' "$as_site"
-            } > "$site_dir/twin.tmp" && mv "$site_dir/twin.tmp" "$site_dir/twin"
+                if [ -n "$as_site" ]; then printf 'as_site=%s\n' "$as_site"; fi
+            } > "$site_dir/twin.tmp" || ! mv "$site_dir/twin.tmp" "$site_dir/twin"; then
+                rm -f "$site_dir/twin.tmp"
+                gum style --foreground red "❌ Error: Couldn't write $site_dir/twin."
+                exit 1
+            fi
             echo "✅ $(url_for "$domain") now serves $folder/ ($twin_engine), the same site at its own domain."
             if [ -n "$as_site" ]; then
                 echo "   $(url_for "$as_site") serves it too, answering as $site_host."
             fi
             regenerate_caddyfile
             update_etc_hosts
+            # The domains a twin it replaced answered on.
+            if [ -n "$old_twin" ]; then prune_etc_hosts "$old_domain" "$old_as_site"; fi
             ;;
         remove)
             if [ ! -f "$site_dir/twin" ]; then
                 echo "ℹ️  $site_host has no twin."
                 return 0
             fi
+            local old_twin old_domain old_folder old_as_site
+            old_twin=$(site_twin "$site_dir") && IFS=$'\t' read -r old_domain old_folder old_as_site <<< "$old_twin"
             rm -f "$site_dir/twin"
             echo "✅ Removed the twin of $site_host."
             regenerate_caddyfile
+            if [ -n "$old_twin" ]; then prune_etc_hosts "$old_domain" "$old_as_site"; fi
             ;;
         *)
             gum style --foreground red "❌ Error: Unknown action '$action'."
@@ -27723,14 +29889,7 @@ cove_upgrade() {
         if [ "$current" = "-1" ]; then
             echo "   ✓ ${k}: -1 (unlimited)"
         elif [ -z "$current" ] || [ "$current_bytes" -lt "$floor_bytes" ]; then
-            mkdir -p "$(dirname "$PHP_INI_FILE")"
-            touch "$PHP_INI_FILE"
-            if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$PHP_INI_FILE"; then
-                sed -i.bak -E "s|^[[:space:]]*${k}[[:space:]]*=.*|${k} = ${install_default_memory}|" "$PHP_INI_FILE"
-            else
-                echo "${k} = ${install_default_memory}" >> "$PHP_INI_FILE"
-            fi
-            rm -f "${PHP_INI_FILE}.bak"
+            cove_ini_set "$k" "$install_default_memory"
             echo "   ↑ ${k}: ${current:-unset} → ${install_default_memory}"
             bumped_any=true
         else
