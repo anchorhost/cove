@@ -185,6 +185,164 @@ function php_entries(string $data, int $since, ?string $must_contain): array {
     }));
 }
 
+// Everything a log file gained since it was $from bytes long (a log that
+// shrank meanwhile was cleared, so all of it), up to its last 4 MB.
+function log_since(string $file, int $from): string {
+    clearstatcache(true, $file);
+    $size = is_file($file) ? (int) filesize($file) : 0;
+    if ($size <= 0) return '';
+    if ($size < $from) $from = 0;
+    $from = max($from, $size - 4194304);
+    $fh = @fopen($file, 'rb');
+    if (!$fh) return '';
+    fseek($fh, $from);
+    $data = (string) stream_get_contents($fh);
+    fclose($fh);
+    return $data;
+}
+
+// --- WP-CLI ------------------------------------------------------------------
+
+// What wp_read runs: WP-CLI commands that only read. Matched on the first
+// one, two or three words, so `option get` allows `option get home` but
+// `post meta` alone allows nothing.
+const WP_READ = [
+    'help',
+    'option get', 'option list', 'option pluck',
+    'plugin list', 'plugin get', 'plugin status', 'plugin is-active', 'plugin is-installed', 'plugin path',
+    'theme list', 'theme get', 'theme status', 'theme is-active', 'theme is-installed', 'theme path', 'theme mod get', 'theme mod list',
+    'post list', 'post get', 'post exists', 'post meta get', 'post meta list', 'post meta pluck', 'post-type list', 'post-type get',
+    'taxonomy list', 'taxonomy get', 'term list', 'term get', 'term meta get', 'term meta list',
+    'user list', 'user get', 'user list-caps', 'user meta get', 'user meta list',
+    'comment list', 'comment get', 'comment count', 'comment exists', 'comment meta get', 'comment meta list',
+    'core version', 'core is-installed',
+    'config get', 'config list', 'config has', 'config path',
+    'cron event list', 'cron schedule list',
+    'transient get', 'transient type', 'cache get', 'cache type',
+    'rewrite list', 'menu list', 'menu item list', 'menu location list', 'widget list', 'sidebar list',
+    'role list', 'role exists', 'cap list', 'site list',
+    'db size', 'db tables', 'db prefix', 'db columns',
+    'language core list', 'language plugin list', 'language theme list', 'media image-size',
+];
+
+// The WP-CLI command an agent gave, as args (["plugin", "list"]) or as one
+// line. WP-CLI's global flags that would run it somewhere else (another
+// site's folder, an SSH or HTTP host, an alias) or load other code first
+// are refused: it runs in the site that was named, on this machine.
+function wp_tokens(array $a): array {
+    $tokens = !empty($a['args']) && is_array($a['args']) ? array_map('strval', array_values($a['args'])) : split_line((string) ($a['command'] ?? ''));
+    if ($tokens && $tokens[0] === 'wp') array_shift($tokens);
+    if (!$tokens) throw new ToolError('Give the WP-CLI command as args (["plugin", "list"]) or command ("plugin list").');
+    foreach ($tokens as $t) {
+        if ($t !== '' && $t[0] === '@') throw new ToolError('WP-CLI aliases (@name) are not offered here: this runs in the site you name.');
+        if (preg_match('/^--(path|ssh|http|require|exec)(=|$)/i', $t, $f)) throw new ToolError("--{$f[1]} is not offered here: wp runs in the site you name, on this machine, with nothing loaded first.");
+    }
+    // --help anywhere would get Cove's own help for `cove wp`.
+    if (($h = array_search('--help', $tokens, true)) !== false) { array_splice($tokens, $h, 1); array_unshift($tokens, 'help'); }
+    return $tokens;
+}
+
+// The command's words: lowercased, flags left out.
+function wp_words(array $tokens): array {
+    return array_values(array_filter(array_map('strtolower', $tokens), function ($t) { return $t === '' || $t[0] !== '-'; }));
+}
+
+function run_wp(string $site, array $tokens): array {
+    $tokens[] = '--no-color';
+    $t0 = microtime(true);
+    [$out, , $code] = cove(array_merge(['wp', $site], $tokens), true, 900);
+    $ms = (int) round((microtime(true) - $t0) * 1000);
+    $out = preg_replace('/\x1b\[[0-9;]*m/', '', $out);
+    // PHP's own notices end "in <file> on line <n>"; WP-CLI's
+    // "Warning: …" lines don't, and they are the command's answer.
+    $kept = []; $notices = 0;
+    foreach (explode("\n", (string) $out) as $line) {
+        if (preg_match('/^(?:PHP )?(?:Deprecated|Warning|Notice|Strict Standards):\s.* on line \d+\s*$/', $line)) { $notices++; continue; }
+        $kept[] = $line;
+    }
+    $body = trim(implode("\n", $kept));
+    $meta = "exit $code · {$ms} ms" . ($notices ? " · $notices PHP notice line" . ($notices === 1 ? '' : 's') . ' left out' : '');
+    return text(cut($body === '' ? '(no output)' : $body) . "\n\n[$meta]", $code !== 0);
+}
+
+// --- HTTP --------------------------------------------------------------------
+
+// One request to Cove's own web server on this machine (whose certificate
+// is Cove's local CA, so it isn't checked here), no redirects followed.
+function http_request(string $url, string $method): array {
+    $host = (string) parse_url($url, PHP_URL_HOST);
+    $port = (int) (parse_url($url, PHP_URL_PORT) ?: 443);
+    $headers = [];
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_FOLLOWLOCATION => false, CURLOPT_TIMEOUT => 120, CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_RESOLVE => ["$host:$port:127.0.0.1"], CURLOPT_SSL_VERIFYPEER => false, CURLOPT_SSL_VERIFYHOST => 0,
+        CURLOPT_NOBODY => $method === 'HEAD', CURLOPT_ENCODING => '', CURLOPT_USERAGENT => 'Cove-MCP-check_page',
+        CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$headers) {
+            if (preg_match('/^HTTP\//', $line)) $headers = [];
+            elseif (strpos($line, ':') !== false) {
+                [$k, $v] = explode(':', $line, 2);
+                $k = strtolower(trim($k));
+                $headers[$k] = isset($headers[$k]) ? $headers[$k] . ', ' . trim($v) : trim($v);
+            }
+            return strlen($line);
+        },
+    ]);
+    $body = curl_exec($ch);
+    $r = ['url' => $url, 'status' => (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE), 'ms' => (int) round(curl_getinfo($ch, CURLINFO_TOTAL_TIME) * 1000), 'headers' => $headers, 'body' => is_string($body) ? $body : '', 'error' => $body === false ? curl_error($ch) : ''];
+    curl_close($ch);
+    return $r;
+}
+
+// A Location header made absolute against the URL that sent it.
+function absolute_url(string $base, string $loc): string {
+    if (preg_match('~^https?://~i', $loc)) return $loc;
+    $b = parse_url($base);
+    $origin = $b['scheme'] . '://' . $b['host'] . (isset($b['port']) ? ':' . $b['port'] : '');
+    if (strpos($loc, '//') === 0) return $b['scheme'] . ':' . $loc;
+    if ($loc !== '' && $loc[0] === '/') return $origin . $loc;
+    $dir = preg_replace('~/[^/]*$~', '/', $b['path'] ?? '/');
+    return $origin . $dir . $loc;
+}
+
+// An HTML page as its title and visible text.
+function page_text(string $html): array {
+    $title = preg_match('~<title[^>]*>(.*?)</title>~is', $html, $m) ? trim(html_entity_decode(strip_tags($m[1]), ENT_QUOTES | ENT_HTML5)) : '';
+    if (!class_exists('DOMDocument')) return [$title, trim(preg_replace('/\s+/', ' ', strip_tags($html)))];
+    $doc = new DOMDocument();
+    $prev = libxml_use_internal_errors(true);
+    $doc->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING);
+    libxml_clear_errors();
+    libxml_use_internal_errors($prev);
+    foreach (['script', 'style', 'noscript', 'template', 'svg', 'head'] as $tag) {
+        foreach (iterator_to_array($doc->getElementsByTagName($tag)) as $el) $el->parentNode->removeChild($el);
+    }
+    $body = $doc->getElementsByTagName('body')->item(0);
+    $text = $body ? $body->textContent : $doc->textContent;
+    $text = preg_replace("/[ \t\x{00A0}]+/u", ' ', (string) $text);
+    $text = trim(preg_replace("/\s*\n\s*/", "\n", (string) $text));
+    return [$title, $text];
+}
+
+// Cove's error page for a local request is Whoops, which handles an
+// uncaught error itself, so PHP never logs it: read it off the page.
+function whoops_error(string $html): ?string {
+    if (strpos($html, 'Whoops! There was an error.') === false || !class_exists('DOMDocument')) return null;
+    $doc = new DOMDocument();
+    $prev = libxml_use_internal_errors(true);
+    $doc->loadHTML($html, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING);
+    libxml_clear_errors();
+    libxml_use_internal_errors($prev);
+    $x = new DOMXPath($doc);
+    $q = function ($path) use ($x) { $n = $x->query($path); return $n && $n->length ? trim(preg_replace('/\s+/', ' ', $n->item(0)->textContent)) : ''; };
+    $class = $q('//*[contains(concat(" ", @class, " "), " exc-title-primary ")]');
+    $message = $q('//div[contains(concat(" ", @class, " "), " exc-message ")]/span');
+    $file = $q('//div[@id="frame-code-0"]//div[contains(concat(" ", @class, " "), " frame-file ")]//strong');
+    $line = $q('(//span[contains(concat(" ", @class, " "), " frame-line ")])[1]');
+    if ($class === '' && $message === '') return null;
+    return 'Uncaught ' . ($class ?: 'error') . ': ' . $message . ($file !== '' ? " in $file" . ($line !== '' ? ":$line" : '') : '') . ' (from Cove\'s error page, which shows the stack trace in a browser)';
+}
+
 // --- Mailpit -----------------------------------------------------------------
 
 function mailpit(string $path) {
@@ -273,9 +431,19 @@ function tools(): array {
             'inputSchema' => $obj(['site' => $site, 'user' => ['type' => 'string', 'description' => 'A user login, email or ID. Default: the first administrator.'], 'url' => ['type' => 'string', 'description' => 'On a multisite network, the subsite to sign into.']], ['site']),
             'annotations' => $rw,
         ],
+        'wp_read' => [
+            'title' => 'Read with WP-CLI',
+            'description' => "Runs a WP-CLI command that only reads, inside a WordPress site: option get/list, plugin and theme list/get/status, post, term, user and comment list/get and their meta, config get/list, cron event list, transient get, rewrite list, menus, roles, db size/tables, core version, help. Pass the words after `wp` as args, e.g. [\"option\", \"get\", \"home\"]. Anything else is refused: use wp for that.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'args' => ['type' => 'array', 'items' => ['type' => 'string'], 'description' => 'The arguments after `wp`, one per item.'],
+                'command' => ['type' => 'string', 'description' => 'Or the same as one line, quotes honoured, e.g. post list --post_type=page.'],
+            ], ['site']),
+            'annotations' => $ro,
+        ],
         'wp' => [
             'title' => 'Run WP-CLI',
-            'description' => "Runs a WP-CLI command inside a WordPress site, e.g. [\"plugin\", \"list\"] or [\"option\", \"get\", \"home\"]. Pass the words after `wp` as args. It runs in the named site only: --path, --ssh, --http, --require, --exec and @aliases are refused, as are commands that wipe a whole database (db reset, db drop, db clean, site empty, DROP DATABASE) and interactive ones (shell, db cli, server). Take a snapshot first (snapshot_create) before anything you might want to undo.",
+            'description' => "Runs any WP-CLI command inside a WordPress site, e.g. [\"plugin\", \"deactivate\", \"akismet\"] or [\"eval\", \"echo home_url();\"]; for commands that only read, wp_read needs no approval. Pass the words after `wp` as args. It runs in the named site only: --path, --ssh, --http, --require, --exec and @aliases are refused, as are commands that wipe a whole database (db reset, db drop, db clean, site empty, DROP DATABASE) and interactive ones (shell, db cli, server). Take a snapshot first (snapshot_create) before anything you might want to undo.",
             'inputSchema' => $obj([
                 'site' => $site,
                 'args' => ['type' => 'array', 'items' => ['type' => 'string'], 'description' => 'The arguments after `wp`, one per item.'],
@@ -291,6 +459,18 @@ function tools(): array {
                 'path' => ['type' => 'string', 'description' => 'The page, e.g. /shop/ or /?p=12. Default: the front page.'],
                 'width' => ['type' => 'integer', 'description' => 'Viewport width in pixels (320–2560). Default 1280; 390 for a phone.'],
                 'height' => ['type' => 'integer', 'description' => 'Viewport height in pixels (320–4000). Default 800.'],
+            ], ['site']),
+            'annotations' => $ro,
+        ],
+        'check_page' => [
+            'title' => 'Check a page',
+            'description' => "Requests a page or REST route of a site as a logged-out visitor and reports what came back: status, time, the redirects it followed on the site (one to another host is shown, not followed), headers, the page's title and visible text (or the raw body), and the PHP errors it raised: an uncaught error or exception, with its file and line, and anything the site logged meanwhile. Cove keeps warnings and notices from page requests out of the logs, so they don't show here. For checking that a change didn't break a page, or what an endpoint returns.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'path' => ['type' => 'string', 'description' => 'The page or route, e.g. /shop/, /?p=12 or /wp-json/wp/v2/posts. Default: the front page.'],
+                'method' => ['type' => 'string', 'enum' => ['GET', 'HEAD'], 'description' => 'Default GET.'],
+                'body' => ['type' => 'string', 'enum' => ['text', 'raw', 'none'], 'description' => 'text (default): an HTML page\'s visible text, JSON pretty-printed; raw: the body as sent; none: status, headers and PHP errors only.'],
+                'max_chars' => ['type' => 'integer', 'description' => 'Cut the body at this many characters (200–100000). Default 4000.'],
             ], ['site']),
             'annotations' => $ro,
         ],
@@ -354,6 +534,12 @@ function tools(): array {
                 'stat_only' => ['type' => 'boolean', 'description' => 'Just the files and line counts.'],
             ], ['site', 'id']),
             'annotations' => $ro,
+        ],
+        'history_save' => [
+            'title' => 'Save plugins and themes',
+            'description' => "Saves a site's plugins, themes and mu-plugins as they are now, as a history save (seconds; an identical state is not saved twice). Save before editing plugin or theme code, and again after: history_diff with id latest then shows exactly what the edit changed, and history_rollback with the first save's id puts a plugin or theme back. Files only, not the database (snapshot_create covers both).",
+            'inputSchema' => $obj(['site' => $site, 'note' => ['type' => 'string', 'description' => 'What it is for, e.g. before editing the checkout template.']], ['site']),
+            'annotations' => $rw,
         ],
         'history_rollback' => [
             'title' => 'Roll back a plugin or theme',
@@ -504,41 +690,91 @@ function call_tool(string $name, array $a): array {
             }
             return text($reply);
 
+        case 'wp_read':
+            $site = site_arg($a, true);
+            $tokens = wp_tokens($a);
+            $words = wp_words($tokens);
+            $ok = false;
+            for ($n = min(3, count($words)); $n > 0 && !$ok; $n--) $ok = in_array(implode(' ', array_slice($words, 0, $n)), WP_READ, true);
+            if (!$ok) throw new ToolError('wp_read runs only commands that read (option get, plugin list, post get…). `wp ' . implode(' ', array_slice($words, 0, 2)) . '` is not one of them: use wp.');
+            return run_wp($site, $tokens);
+
         case 'wp':
             $site = site_arg($a, true);
-            $tokens = !empty($a['args']) && is_array($a['args']) ? array_map('strval', array_values($a['args'])) : split_line((string) ($a['command'] ?? ''));
-            if ($tokens && $tokens[0] === 'wp') array_shift($tokens);
-            if (!$tokens) throw new ToolError('Give the WP-CLI command as args (["plugin", "list"]) or command ("plugin list").');
-            // WP-CLI's global flags that run it somewhere else (another site's
-            // folder, an SSH or HTTP host, an alias) or load other code first.
-            foreach ($tokens as $t) {
-                if ($t !== '' && $t[0] === '@') throw new ToolError('WP-CLI aliases (@name) are not offered here: this runs in the site you name.');
-                if (preg_match('/^--(path|ssh|http|require|exec)(=|$)/i', $t, $f)) throw new ToolError("--{$f[1]} is not offered here: wp runs in the site you name, on this machine, with nothing loaded first.");
-            }
-            // --help anywhere would get Cove's own help for `cove wp`.
-            if (($h = array_search('--help', $tokens, true)) !== false) { array_splice($tokens, $h, 1); array_unshift($tokens, 'help'); }
-            $words = array_values(array_filter(array_map('strtolower', $tokens), function ($t) { return $t === '' || $t[0] !== '-'; }));
+            $tokens = wp_tokens($a);
+            $words = wp_words($tokens);
             $pair = implode(' ', array_slice($words, 0, 2));
             if (in_array($words[0] ?? '', ['shell', 'server'], true) || in_array($pair, ['db cli', 'db shell'], true)) throw new ToolError('Interactive commands (wp shell, wp db cli, wp server) have no terminal here.');
             if (in_array($pair, ['db reset', 'db drop', 'db clean', 'site empty'], true)
                 || ($pair === 'db query' && preg_match('/\bdrop\s+(database|schema)\b/i', implode(' ', $tokens)))) {
                 throw new ToolError("`wp $pair` can wipe a whole database, which this server leaves to a terminal. Take a snapshot first (snapshot_create) and run it yourself with: cove wp $site …");
             }
-            $tokens[] = '--no-color';
-            $t0 = microtime(true);
-            [$out, , $code] = cove(array_merge(['wp', $site], $tokens), true, 900);
-            $ms = (int) round((microtime(true) - $t0) * 1000);
-            $out = preg_replace('/\x1b\[[0-9;]*m/', '', $out);
-            // PHP's own notices end "in <file> on line <n>"; WP-CLI's
-            // "Warning: …" lines don't, and they are the command's answer.
-            $kept = []; $notices = 0;
-            foreach (explode("\n", (string) $out) as $line) {
-                if (preg_match('/^(?:PHP )?(?:Deprecated|Warning|Notice|Strict Standards):\s.* on line \d+\s*$/', $line)) { $notices++; continue; }
-                $kept[] = $line;
+            return run_wp($site, $tokens);
+
+        case 'check_page':
+            $site = site_arg($a);
+            $path = (string) ($a['path'] ?? '/');
+            if ($path === '') $path = '/';
+            if ($path[0] !== '/') $path = '/' . $path;
+            if (!preg_match('~^/[A-Za-z0-9._\~/?=&%:+,@!;\[\]-]*$~', $path)) throw new ToolError('path is a path on the site, such as /shop/ or /wp-json/wp/v2/posts.');
+            $method = strtoupper((string) ($a['method'] ?? 'GET'));
+            if (!in_array($method, ['GET', 'HEAD'], true)) throw new ToolError('method is GET or HEAD.');
+            $show = (string) ($a['body'] ?? 'text');
+            if (!in_array($show, ['text', 'raw', 'none'], true)) throw new ToolError('body is text, raw or none.');
+            $max = int_arg($a, 'max_chars', 4000, 200, 100000);
+            if (!function_exists('curl_init')) throw new ToolError("This PHP has no curl, so check_page can't make requests.");
+            // The site's PHP errors go to Cove's shared log (or to debug.log
+            // when WP_DEBUG_LOG is on): what each gained during the request.
+            $logs = [COVE_DIR . '/Logs/errors.log' => "/Sites/$site.localhost/", SITES . "/$site.localhost/public/wp-content/debug.log" => null];
+            $from = [];
+            foreach (array_keys($logs) as $f) { clearstatcache(true, $f); $from[$f] = is_file($f) ? (int) filesize($f) : 0; }
+            $host = "$site.localhost";
+            $url = url_of($site) . $path;
+            $chain = [];
+            for ($hop = 0; ; $hop++) {
+                $r = http_request($url, $method);
+                if ($r['error'] !== '') throw new ToolError("No answer from $url: {$r['error']}. Is Cove running? (status)");
+                $loc = $r['headers']['location'] ?? '';
+                if ($r['status'] < 300 || $r['status'] >= 400 || $loc === '') break;
+                $next = absolute_url($url, $loc);
+                $chain[] = "{$r['status']} $url → $next";
+                if (strtolower((string) parse_url($next, PHP_URL_HOST)) !== $host) { $chain[] = '(another host: not followed)'; break; }
+                if ($hop >= 5) { $chain[] = '(more than 5 redirects: stopped)'; break; }
+                $url = $next;
             }
-            $body = trim(implode("\n", $kept));
-            $meta = "exit $code · {$ms} ms" . ($notices ? " · $notices PHP notice line" . ($notices === 1 ? '' : 's') . ' left out' : '');
-            return text(cut($body === '' ? '(no output)' : $body) . "\n\n[$meta]", $code !== 0);
+            usleep(150000);
+            $errors = [];
+            $bytes = strlen($r['body']);
+            if ($r['status'] >= 500 && ($w = whoops_error($r['body'])) !== null) { $errors[] = $w; $r['body'] = ''; }
+            foreach ($logs as $f => $must) foreach (php_entries(log_since($f, $from[$f]), 0, $must) as $e) $errors[] = $e['text'];
+            $type = $r['headers']['content-type'] ?? '';
+            $out = "$method $url → {$r['status']} in {$r['ms']} ms, $bytes bytes" . ($type !== '' ? ", $type" : '');
+            if ($chain) $out .= "\nRedirects:\n  " . implode("\n  ", $chain);
+            $hdr = $r['headers'];
+            if (isset($hdr['set-cookie'])) $hdr['set-cookie'] = '(' . substr_count($hdr['set-cookie'], '=') . ' cookie values left out)';
+            $out .= "\nHeaders:\n  " . implode("\n  ", array_map(function ($k, $v) { return "$k: " . (strlen($v) > 200 ? substr($v, 0, 200) . '…' : $v); }, array_keys($hdr), $hdr));
+            $out .= "\n\nPHP errors: " . ($errors ? count($errors) . "\n" . cut(implode("\n", $errors), 20000) : 'none');
+            if ($show !== 'none' && $method === 'GET' && $r['body'] !== '') {
+                $body = $r['body'];
+                if ($show === 'text' && stripos($type, 'html') !== false) {
+                    [$title, $body] = page_text($body);
+                    if ($title !== '') $out .= "\n\nTitle: $title";
+                    $label = 'Visible text';
+                } elseif ($show === 'text' && stripos($type, 'json') !== false && ($j = json_decode($body)) !== null) {
+                    $body = json_encode($j, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+                    $label = 'Body';
+                } elseif (preg_match('~^(text/|application/(json|xml|javascript|ld\+json|rss|atom))~i', $type) || $type === '') {
+                    $label = 'Body';
+                } else {
+                    $body = '';
+                    $out .= "\n\n(" . $type . ' body, not shown)';
+                }
+                if ($body !== '') {
+                    $more = mb_strlen($body) > $max ? ' (first ' . $max . ' of ' . mb_strlen($body) . ' characters)' : '';
+                    $out .= "\n\n$label$more:\n" . mb_substr($body, 0, $max);
+                }
+            }
+            return text($out, $r['status'] >= 500);
 
         case 'screenshot':
             $site = site_arg($a);
@@ -698,6 +934,20 @@ function call_tool(string $name, array $a): array {
             }
             return text(trim($diff));
 
+        case 'history_save':
+            $site = site_arg($a);
+            $args = ['history', $site, 'save', '--format=json'];
+            if (!empty($a['note'])) $args[] = '--note=' . $a['note'];
+            [$out, $err, $code] = cove($args);
+            $data = last_json($out);
+            if ($code !== 0 || $data === null || !isset($data['state'])) throw new ToolError((string) ($data['message'] ?? '') ?: (clean($out . "\n" . $err) ?: 'The save failed.'));
+            return json_result([
+                'id' => $data['id'] ?? null,
+                'saved' => $data['state'] === 'new' ? 'yes' : 'no: nothing changed since save ' . ($data['id'] ?? '?'),
+                'summary' => $data['summary'] ?? null,
+                'next' => 'After editing, history_save again: history_diff with id latest then shows the edit, and history_rollback with id ' . ($data['id'] ?? '<this id>') . ' puts a plugin or theme back as it is now.',
+            ]);
+
         case 'history_rollback':
             $site = site_arg($a);
             $id = (string) ($a['id'] ?? '');
@@ -801,7 +1051,7 @@ function rpc_error($id, int $code, string $message): array {
     return ['jsonrpc' => '2.0', 'id' => $id, 'error' => ['code' => $code, 'message' => $message]];
 }
 
-const INSTRUCTIONS = "Cove runs local WordPress sites on this machine, each at https://<name>.localhost with its files in ~/Cove/Sites/<name>.localhost/public and a database of its own. Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin, screenshot to see a page, and read_logs for PHP errors. Take a snapshot (snapshot_create) before a change you might want to undo, or try it on a copy (clone_site); snapshot_restore and history_rollback each save the current state first. No tool here deletes a site, pulls or pushes one to a remote host, or changes Cove's own settings.";
+const INSTRUCTIONS = "Cove runs local WordPress sites on this machine, each at https://<name>.localhost with its files in ~/Cove/Sites/<name>.localhost/public and a database of its own. Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin, screenshot to see a page, check_page for a page's status and the PHP errors it caused, and read_logs for older errors. wp_read runs WP-CLI commands that only read; wp runs any. Take a snapshot (snapshot_create) before a change you might want to undo, or try it on a copy (clone_site); before editing plugin or theme code, history_save, so history_diff shows the edit and history_rollback can undo it. snapshot_restore and history_rollback each save the current state first. No tool here deletes a site, pulls or pushes one to a remote host, or changes Cove's own settings.";
 
 function handle(array $msg): ?array {
     $id = $msg['id'] ?? null;
