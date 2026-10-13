@@ -14,8 +14,10 @@
 #  The box (override with COVE_TEST_BOX) hosts six Incus containers, each with
 #  a "baseline" snapshot (clean OS + curl). Lanes:
 #    A (all six):      fresh --dev install → add/clone/rename/login/delete →
+#                      a login link rewriting a live-domain home →
 #                      status/health/mailpit → mail from a page and WP-CLI →
-#                      `cove mcp` over stdio → container reboot survival
+#                      `cove mcp` over stdio → log rotation settings →
+#                      container reboot survival
 #    B (one apt/dnf):  previous GitHub release → candidate + post-upgrade
 #    C (one apt/dnf):  install + add as a non-root sudo user
 # ====================================================
@@ -188,7 +190,7 @@ lane_a() {
             res "$c" install PASS
         else
             res "$c" install FAIL
-            for k in add_latest add_pinned add_plain clone rename login delete status health mailpit mail mcp reboot; do res "$c" "$k" SKIP; done
+            for k in add_latest add_pinned add_plain clone rename login login_rewrite delete status health mailpit mail mcp logrotate reboot; do res "$c" "$k" SKIP; done
             return
         fi
 
@@ -226,6 +228,31 @@ lane_a() {
             res "$c" login PASS
         else
             res "$c" login FAIL
+        fi
+
+        # A site whose stored URLs still name a live domain: asking for a
+        # login link rewrites them first (database saved to private/), and
+        # the link signs in here. A second link has nothing to rewrite.
+        if cx "$c" bash -s <<'LOGINREWRITE'
+fail() { echo "login_rewrite: $*" >&2; exit 1; }
+cove wp alpha option update home https://www.example.com >/dev/null 2>&1 || fail "setting home"
+cove wp alpha option update siteurl https://www.example.com >/dev/null 2>&1 || fail "setting siteurl"
+link=$(cove login alpha --plain 2>/tmp/rewrite.err) || fail "cove login: $(cat /tmp/rewrite.err)"
+echo "$link" | grep -Eq '^https://alpha\.localhost(:[0-9]+)?/wp-login\.php\?' || fail "link is $link"
+grep -q 'Rewriting them to https://alpha.localhost' /tmp/rewrite.err || fail "no rewrite message: $(cat /tmp/rewrite.err)"
+cove wp alpha option get home 2>/dev/null | grep -Eqx 'https://alpha\.localhost(:[0-9]+)?' || fail "home not rewritten"
+cove wp alpha option get siteurl 2>/dev/null | grep -Eqx 'https://alpha\.localhost(:[0-9]+)?' || fail "siteurl not rewritten"
+ls /root/Cove/Sites/alpha.localhost/private/database-before-url-rewrite-*.sql >/dev/null 2>&1 || fail "no database copy in private/"
+curl -skL --max-time 20 -c /tmp/jar-rewrite "$link" -o /dev/null || fail "link did not load"
+grep -q wordpress_logged_in /tmp/jar-rewrite || fail "link did not sign in"
+cove login alpha --plain >/dev/null 2>/tmp/rewrite2.err || fail "second login"
+if grep -q Rewriting /tmp/rewrite2.err; then fail "second login rewrote again"; fi
+exit 0
+LOGINREWRITE
+        then
+            res "$c" login_rewrite PASS
+        else
+            res "$c" login_rewrite FAIL
         fi
 
         if cx "$c" cove delete alpha2 && ! cx "$c" test -d /root/Cove/Sites/alpha2.localhost; then
@@ -286,6 +313,47 @@ MCPCHECK
             res "$c" mcp FAIL
         fi
 
+        # `cove log rotate`: Cove's own logs rotate when asked (by the command
+        # and by a real watchdog tick), the services cap trims FrankenPHP's
+        # output, and the access-log settings land in a Caddyfile that loads.
+        if cx "$c" bash -s <<'LOGROTATE'
+fail() { echo "logrotate: $*" >&2; exit 1; }
+L=/root/Cove/Logs; CF=/root/Cove/Caddyfile
+size() { stat -c%s "$1" 2>/dev/null || echo 0; }
+up() { [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://alpha.localhost/)" = 200 ] || fail "alpha not answering after $1"; }
+waitfor() { local i; for i in $(seq 1 24); do eval "$1" && return 0; sleep 5; done; return 1; }
+cove log rotate | grep -q "Cove's own logs" || fail "status"
+head -c 2000000 /dev/urandom | base64 > "$L/errors.log"
+cove log rotate 1 >/dev/null || fail "cove log rotate 1"
+[ -s "$L/errors.log.1" ] || fail "no errors.log.1 after cove log rotate 1"
+[ "$(size "$L/errors.log")" -lt 1048576 ] || fail "errors.log not emptied"
+rm -f /root/Cove/.logrotate.stamp "$L/errors.log.1"
+head -c 2000000 /dev/urandom | base64 >> "$L/errors.log"
+waitfor '[ -s "$L/errors.log.1" ]' || fail "the watchdog did not rotate errors.log"
+cove log rotate off >/dev/null || fail "cove log rotate off"
+cove log rotate services 1 >/dev/null || fail "services 1"
+head -c 2000000 /dev/urandom | base64 >> "$L/caddy-process.log"
+waitfor '[ "$(size "$L/caddy-process.log")" -lt 1048576 ]' || fail "the watchdog did not trim caddy-process.log"
+cove log rotate services default >/dev/null || fail "services default"
+cove log rotate access 5 --keep=2 --days=3 >/dev/null || fail "access 5"
+grep -q 'roll_size 5MiB' "$CF" || fail "no roll_size"
+grep -q 'roll_keep 2' "$CF" || fail "no roll_keep"
+grep -q 'roll_keep_for 72h' "$CF" || fail "no roll_keep_for"
+up "access 5"
+cove log rotate access off >/dev/null || fail "access off"
+grep -q roll_disabled "$CF" || fail "no roll_disabled"
+up "access off"
+cove log rotate access default >/dev/null || fail "access default"
+if grep -q 'roll_' "$CF"; then fail "roll settings left after access default"; fi
+up "access default"
+exit 0
+LOGROTATE
+        then
+            res "$c" logrotate PASS
+        else
+            res "$c" logrotate FAIL
+        fi
+
         incus restart "$c"; sleep 25
         if site_has "$c" alpha "Welcome to alpha"; then
             res "$c" reboot PASS
@@ -321,7 +389,11 @@ lane_b() { # previous release -> candidate + post-upgrade
         # Drop the candidate in place and run its post-upgrade hook —
         # the same sequence cove upgrade performs after downloading.
         incus file push "$SRC/cove.sh" "$c/usr/local/bin/cove"
-        if cx "$c" chmod +x /usr/local/bin/cove && cx "$c" cove post-upgrade; then
+        # post-upgrade also points cove.service and the watchdog at root's real
+        # home (/root): units before 2.4 said /home/root.
+        if cx "$c" chmod +x /usr/local/bin/cove && cx "$c" cove post-upgrade \
+            && cx "$c" systemctl show cove.service -p Environment | grep -q 'HOME=/root' \
+            && cx "$c" systemctl show cove-watchdog.service -p Environment | grep -q 'HOME=/root'; then
             res "$c" upgrade_post PASS
         else
             res "$c" upgrade_post FAIL
