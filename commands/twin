@@ -146,10 +146,16 @@ cove_twin() {
             fi
             local old_twin old_domain old_folder old_as_site
             old_twin=$(site_twin "$site_dir") && IFS=$'\t' read -r old_domain old_folder old_as_site <<< "$old_twin"
-            {
+            # An if, not `[ … ] && printf`: that ends the group with status 1
+            # when there is no as-site, and the twin file was never moved in.
+            if ! {
                 printf 'domain=%s\nroot=%s\n' "$domain" "$folder"
-                [ -n "$as_site" ] && printf 'as_site=%s\n' "$as_site"
-            } > "$site_dir/twin.tmp" && mv "$site_dir/twin.tmp" "$site_dir/twin"
+                if [ -n "$as_site" ]; then printf 'as_site=%s\n' "$as_site"; fi
+            } > "$site_dir/twin.tmp" || ! mv "$site_dir/twin.tmp" "$site_dir/twin"; then
+                rm -f "$site_dir/twin.tmp"
+                gum style --foreground red "❌ Error: Couldn't write $site_dir/twin."
+                exit 1
+            fi
             echo "✅ $(url_for "$domain") now serves $folder/ ($twin_engine), the same site at its own domain."
             if [ -n "$as_site" ]; then
                 echo "   $(url_for "$as_site") serves it too, answering as $site_host."
@@ -157,7 +163,7 @@ cove_twin() {
             regenerate_caddyfile
             update_etc_hosts
             # The domains a twin it replaced answered on.
-            [ -n "$old_twin" ] && prune_etc_hosts "$old_domain" "$old_as_site"
+            if [ -n "$old_twin" ]; then prune_etc_hosts "$old_domain" "$old_as_site"; fi
             ;;
         remove)
             if [ ! -f "$site_dir/twin" ]; then
@@ -169,7 +175,7 @@ cove_twin() {
             rm -f "$site_dir/twin"
             echo "✅ Removed the twin of $site_host."
             regenerate_caddyfile
-            [ -n "$old_twin" ] && prune_etc_hosts "$old_domain" "$old_as_site"
+            if [ -n "$old_twin" ]; then prune_etc_hosts "$old_domain" "$old_as_site"; fi
             ;;
         *)
             gum style --foreground red "❌ Error: Unknown action '$action'."
