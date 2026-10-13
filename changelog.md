@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [2.4] - 2026-10-12
+
+Cove now speaks MCP: `claude mcp add cove -- cove mcp` gives Claude Code, Cursor, or Codex twenty-one tools to create and clone sites, run WP-CLI, check and screenshot pages, read logs and caught mail, and save or snapshot before a risky change, with no tool that deletes a site or pushes one anywhere. `cove log rotate` shows and sets how long every log is kept, login links no longer send you to a live domain for a site copied in by hand, and Linux installs running as root get working nightly sweeps and Adminer sign-in. `cove demo` now hides other sites everywhere, Adminer and the SQL console included, and a failed push into a WP Freighter tenant puts the tenant back.
 
 ### ✨ New Features
 
