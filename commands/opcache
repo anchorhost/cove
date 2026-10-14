@@ -67,26 +67,517 @@ cove_opcache_restart() {
     fi
 }
 
+# --- Usage by site ----------------------------------------------------------
+#
+# The arena is shared, but OPcache keys every script by its real path, so
+# grouping paths by the ~/Cove/Sites/<name>.localhost folder they sit in says
+# which site holds what. Like cove_opcache_probe, the probe asks the running
+# server from Cove's own docroot.
+#
+# A file that changes while the server runs is compiled again on its next
+# request, and the copy before it stays in the arena as dead weight
+# ("wasted") until FrankenPHP restarts. When the arena fills, OPcache
+# restarts it if the dead weight passes opcache.max_wasted_percentage, but
+# under ZTS that check divides by a memory_consumption that reads 0 in
+# request threads, so any dead weight at all triggers it. That restart runs
+# while other threads still use the memory and aborts the process with
+# "zend_mm_heap corrupted" (php/php-src#22281). So what fills the arena, and
+# which site keeps recompiling, is worth seeing: `sites` and `--watch`.
+cove_opcache_sites_probe_source() {
+    cat <<'PHP'
+<?php
+// Written by `cove opcache sites` and removed when it finishes.
+header('Content-Type: text/plain; charset=utf-8');
+if (!function_exists('opcache_get_status')) { echo "noopcache\n"; exit; }
+$s = @opcache_get_status(true);
+$c = @opcache_get_configuration();
+if (!$s || !$c) { echo "disabled\n"; exit; }
+$cove = dirname(__DIR__, 2);            // this file is in ~/Cove/App/gui
+$sites = $cove . '/Sites/';
+$app = $cove . '/App/';
+$site_of = function (string $path) use ($sites, $app): string {
+    if (strncmp($path, $sites, strlen($sites)) === 0) {
+        $rest = substr($path, strlen($sites));
+        $dir = strstr($rest, '/', true);
+        return preg_replace('/\.localhost$/', '', $dir === false ? $rest : $dir);
+    }
+    return strncmp($path, $app, strlen($app)) === 0 ? '(cove)' : '(other)';
+};
+$st = $s['opcache_statistics'];
+$m = $s['memory_usage'];
+$is = $s['interned_strings_usage'];
+$started = max((int) $st['start_time'], (int) $st['last_restart_time']);
+$summary = [
+    'free' => max(0, (int) $m['free_memory']),
+    'wasted' => max(0, (int) $m['wasted_memory']),
+    'scripts' => (int) $st['num_cached_scripts'],
+    'full' => !empty($s['cache_full']) ? 1 : 0,
+    'started' => $started,
+    'interned_used' => (int) $is['used_memory'],
+    'interned_total' => (int) $is['used_memory'] + (int) $is['free_memory'],
+    'restarts_oom' => (int) $st['oom_restarts'],
+    'restarts_hash' => (int) $st['hash_restarts'],
+    'excluded_compiles' => (int) $st['blacklist_misses'],
+];
+$tsv = fn(array $row) => implode("\t", $row) . "\n";
+$summary_row = array_merge(['summary'], array_values($summary));
+if (($_GET['mode'] ?? '') === 'scripts') {
+    // One line per cached script, for --watch to compare two samples.
+    echo $tsv($summary_row);
+    foreach ($s['scripts'] as $path => $sc) {
+        if (strpbrk($path, "\t\n\r") !== false) continue;
+        echo $tsv([$site_of($path), (int) $sc['timestamp'], (int) $sc['memory_consumption'], $path]);
+    }
+    exit;
+}
+$by = [];
+foreach ($s['scripts'] as $path => $sc) {
+    $name = $site_of($path);
+    $by[$name] ??= ['site' => $name, 'files' => 0, 'bytes' => 0, 'changed_files' => 0, 'changed_bytes' => 0];
+    $by[$name]['files']++;
+    $by[$name]['bytes'] += (int) $sc['memory_consumption'];
+    // Edited or added since the cache started. An edited file was compiled
+    // again, so the copy before it is dead weight now.
+    if ((int) $sc['timestamp'] > $started) {
+        $by[$name]['changed_files']++;
+        $by[$name]['changed_bytes'] += (int) $sc['memory_consumption'];
+    }
+}
+usort($by, fn($a, $b) => $b['bytes'] <=> $a['bytes']);
+$excluded = array_values($c['blacklist'] ?? []);
+if (($_GET['format'] ?? '') === 'json') {
+    echo json_encode(['summary' => $summary, 'sites' => $by, 'excluded' => $excluded], JSON_UNESCAPED_SLASHES), "\n";
+    exit;
+}
+echo $tsv($summary_row);
+foreach ($by as $row) echo $tsv(['site', $row['site'], $row['files'], $row['bytes'], $row['changed_files'], $row['changed_bytes']]);
+foreach ($excluded as $e) echo $tsv(['excluded', $e]);
+PHP
+}
+
+# Writes the probe into Cove's docroot and prints its path. The caller
+# removes it.
+cove_opcache_sites_install_probe() {
+    local probe="$GUI_DIR/_cove_opcache_sites_$$.php"
+    cove_opcache_sites_probe_source > "$probe" 2>/dev/null || return 1
+    echo "$probe"
+}
+
+# cove_opcache_sites_get <probe> <query> <out file>: one answer from the
+# running server, retried like cove_opcache_probe (a request landing during a
+# config reload can hang).
+cove_opcache_sites_get() {
+    local probe="$1" query="$2" out="$3" attempt
+    for attempt in 1 2 3; do
+        if curl -sk --max-time 30 -o "$out" "https://cove.localhost:${HTTPS_PORT}/${probe##*/}?$query" 2>/dev/null \
+            && head -c 8 "$out" | grep -q -E '^(summary|\{)'; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+# Seconds since the epoch as HH:MM:SS (BSD date takes -r, GNU date -d @).
+cove_opcache_hms() {
+    date -r "$1" +%H:%M:%S 2>/dev/null || date -d "@$1" +%H:%M:%S
+}
+
+cove_opcache_sites() {
+    local format="$1" top="$2" probe tmp
+    probe=$(cove_opcache_sites_install_probe) || { gum style --foreground red "❌ Could not write a probe into $GUI_DIR."; exit 1; }
+    tmp=$(mktemp "${TMPDIR:-/tmp}/cove-opcache.XXXXXX") || { rm -f "$probe"; exit 1; }
+    local query="mode=sites"
+    [ "$format" = "json" ] && query="mode=sites&format=json"
+    if ! cove_opcache_sites_get "$probe" "$query" "$tmp"; then
+        rm -f "$probe" "$tmp"
+        gum style --foreground red "❌ The running server did not answer. Is Caddy up?"
+        exit 1
+    fi
+    rm -f "$probe"
+    if [ "$format" = "json" ]; then
+        cat "$tmp"; rm -f "$tmp"; return 0
+    fi
+    local listed
+    listed=$(cove_opcache_exclude_entries | grep -c .)
+    echo ""
+    awk -F'\t' -v now="$(date +%s)" -v arena="$(cove_ini_get opcache.memory_consumption 512)" -v top="$top" -v listed="$listed" '
+        function mb(b) { return sprintf("%.1f", b / 1048576) }
+        function changed(n, b) { return n ? sprintf("%d files · %s MB", n, mb(b)) : "-" }
+        function up(s,  h, m) { h = int(s / 3600); m = int((s % 3600) / 60); return (h ? h "h " : "") m "m" }
+        $1 == "summary" { free = $2; wasted = $3; full = $5; started = $6; iu = $7; it = $8; skipped = $11 }
+        $1 == "site" { n++; name[n] = $2; files[n] = $3; bytes[n] = $4; cf[n] = $5; cb[n] = $6 }
+        $1 == "excluded" { live++ }
+        END {
+            printf "OPcache by site  (%s MB arena · %d MB free · %d MB dead weight · server up %s)\n", arena, free / 1048576, wasted / 1048576, up(now - started)
+            if (full) print "  ❌ FULL: files not cached yet compile on every request"
+            printf "  %-28s %7s %9s   %s\n", "SITE", "FILES", "MB", "CHANGED SINCE START"
+            for (i = 1; i <= n; i++) {
+                if (i > top) { rn++; rf += files[i]; rb += bytes[i]; rcf += cf[i]; rcb += cb[i]; continue }
+                printf "  %-28s %7d %9s   %s\n", substr(name[i], 1, 28), files[i], mb(bytes[i]), changed(cf[i], cb[i])
+            }
+            if (rn) printf "  %-28s %7d %9s   %s\n", rn " more", rf, mb(rb), changed(rcf, rcb)
+            printf "  interned strings: %d of %d MB\n", iu / 1048576, it / 1048576
+            if (live || listed) {
+                printf "  excluded paths: %d in use, %d listed · %d compiles skipped the cache\n", live, listed, skipped
+                if (live != listed) print "  ⚠️  the list changed since the server started: cove opcache exclude apply"
+            }
+        }' "$tmp"
+    rm -f "$tmp"
+    echo ""
+    echo "  Changed = edited or added since the server started. An edited file is"
+    echo "  compiled again and its old copy stays as dead weight until a restart."
+    echo "  See what a run does: cove opcache sites --watch"
+    echo "  Keep a folder out:   cove opcache exclude add <site> <folder>"
+}
+
+# --watch: compare the running server's cache every N seconds and say which
+# site added files and which recompiled them (each recompile leaves the old
+# copy as dead weight). Append-only output, so it can be left running into a
+# log during a test run.
+cove_opcache_watch() {
+    local every="$1" top="$2" probe tmp q_probe q_tmp
+    probe=$(cove_opcache_sites_install_probe) || { gum style --foreground red "❌ Could not write a probe into $GUI_DIR."; exit 1; }
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/cove-opcache-watch.XXXXXX") || { rm -f "$probe"; exit 1; }
+    # Baked in now: by the time EXIT fires these locals are gone.
+    printf -v q_probe '%q' "$probe"
+    printf -v q_tmp '%q' "$tmp"
+    trap "cove_opcache_watch_totals $q_tmp; rm -f $q_probe; rm -rf $q_tmp" EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    : > "$tmp/totals"
+    date +%s > "$tmp/began"
+    echo "Watching OPcache every ${every}s. Ctrl-C stops and prints the totals."
+    local have_prev=false
+    while :; do
+        if cove_opcache_sites_get "$probe" "mode=scripts" "$tmp/cur"; then
+            if $have_prev; then
+                cove_opcache_watch_tick "$tmp" "$top"
+            else
+                awk -F'\t' -v hms="$(date +%H:%M:%S)" 'NR == 1 { printf "%s  %d MB free · dead weight %d MB · %d files%s\n", hms, $2 / 1048576, $3 / 1048576, $4, ($5 ? " · FULL" : ""); exit }' "$tmp/cur"
+            fi
+            mv "$tmp/cur" "$tmp/prev"
+            have_prev=true
+        else
+            echo "$(date +%H:%M:%S)  no answer from the server"
+        fi
+        sleep "$every"
+    done
+}
+
+# One sample against the one before: per site, files new to the cache and
+# files compiled again (whose earlier copy is now dead weight).
+cove_opcache_watch_tick() {
+    local tmp="$1" top="$2"
+    awk -F'\t' -v hms="$(date +%H:%M:%S)" -v top="$top" -v totals="$tmp/totals" '
+        function mb(b) { return sprintf("%.1f", b / 1048576) }
+        function signed(b) { return sprintf("%+.1f", b / 1048576) }
+        NR == FNR {
+            if ($1 == "summary") { pfree = $2; pwasted = $3; pscripts = $4; pstart = $6; next }
+            pts[$4] = $2; pb[$4] = $3; next
+        }
+        $1 == "summary" { free = $2; wasted = $3; scripts = $4; full = $5; start = $6; next }
+        start != pstart { next }
+        !($4 in pts) { addb[$1] += $3; addn[$1]++; seen[$1] = 1; next }
+        pts[$4] != $2 { recb[$1] += pb[$4]; recn[$1]++; seen[$1] = 1 }
+        END {
+            if (start != pstart) {
+                printf "%s  ⚠️  the server restarted, and the cache started again empty (%d MB free)\n", hms, free / 1048576
+                exit
+            }
+            printf "%s  %d MB free (%s) · dead weight %d MB (%s) · %d files (%+d)%s\n", hms, free / 1048576, signed(free - pfree), wasted / 1048576, signed(wasted - pwasted), scripts, scripts - pscripts, (full ? " · FULL" : "")
+            k = 0
+            for (s in seen) {
+                k++; key[k] = s; w[k] = addb[s] + recb[s]
+                printf "%s\t%.0f\t%d\t%.0f\t%d\n", s, addb[s], addn[s], recb[s], recn[s] >> totals
+            }
+            for (i = 1; i <= k; i++) for (j = i + 1; j <= k; j++) if (w[j] > w[i]) { t = w[i]; w[i] = w[j]; w[j] = t; t = key[i]; key[i] = key[j]; key[j] = t }
+            for (i = 1; i <= k && i <= top; i++) {
+                s = key[i]; line = ""
+                if (recn[s]) line = sprintf("%s MB dead weight (%d recompiled)", mb(recb[s]), recn[s])
+                if (addn[s]) line = line (line ? " · " : "") sprintf("+%s MB new (%d files)", mb(addb[s]), addn[s])
+                printf "            %-26s %s\n", substr(s, 1, 26), line
+            }
+            if (k > top) printf "            %d more sites\n", k - top
+        }' "$tmp/prev" "$tmp/cur"
+}
+
+# Called on exit: the whole watch per site, biggest dead weight first.
+cove_opcache_watch_totals() {
+    local tmp="$1" began
+    [ -s "$tmp/totals" ] || return 0
+    began=$(cat "$tmp/began" 2>/dev/null)
+    echo ""
+    echo "Since $(cove_opcache_hms "$began"), by site:"
+    awk -F'\t' '{ ab[$1] += $2; an[$1] += $3; rb[$1] += $4; rn[$1] += $5 }
+        END { for (s in ab) printf "%s\t%.0f\t%d\t%.0f\t%d\n", s, ab[s], an[s], rb[s], rn[s] }' "$tmp/totals" \
+        | sort -t "$(printf '\t')" -k4,4nr -k2,2nr \
+        | awk -F'\t' '{ printf "  %-28s %8.1f MB dead weight (%d recompiled) · %8.1f MB new (%d files)\n", substr($1, 1, 28), $4 / 1048576, $5, $2 / 1048576, $3 }'
+}
+
+# --- Paths OPcache never caches ---------------------------------------------
+#
+# ~/Cove/opcache-exclude.txt becomes opcache.blacklist_filename in the
+# frankenphp{} block (regenerate_caddyfile) whenever it lists anything. PHP
+# reads it once, when the server starts. Each line is a path prefix; * matches
+# within one folder name and ** across folders. A file under an excluded path
+# compiles on every request instead of taking room in the arena: right for
+# code that keeps changing (a suite's scratch plugins, cache folders that hold
+# PHP, a test site that is reset all the time), too slow for a big site's
+# plugins. Sites pinned to an older PHP run on php-fpm, whose OPcache is its
+# own, and ignore the list.
+cove_opcache_exclude_entries() {
+    [ -f "$OPCACHE_EXCLUDE_FILE" ] || return 0
+    grep -v -E '^[[:space:]]*(;|$)' "$OPCACHE_EXCLUDE_FILE"
+}
+
+# cove_opcache_exclude_entry <site> [<folder inside public/>] | <absolute path>
+# Prints the line for the file. A folder is written as folder/* so it can't
+# also catch a sibling whose name starts the same (cache/ and cache-enabler/).
+cove_opcache_exclude_entry() {
+    local first="$1" second="$2" entry
+    if [ -z "$first" ]; then
+        echo "❌ Name a site (and a folder inside its public/ if you like), or give an absolute path." >&2
+        return 1
+    fi
+    case "$first$second" in
+        *$'\n'*|*$'\r'*|*$'\t'*|*\"*)
+            echo "❌ Paths can't contain quotes, tabs or line breaks." >&2
+            return 1 ;;
+    esac
+    if [ "${first:0:1}" = "/" ]; then
+        if [ -n "$second" ]; then
+            echo "❌ Give either an absolute path or <site> <folder>, not both." >&2
+            return 1
+        fi
+        entry="$first"
+    else
+        first="${first%.localhost}"
+        if [ "$first" != "*" ] && [ ! -d "$SITES_DIR/$first.localhost" ]; then
+            echo "❌ No site named '$first'." >&2
+            return 1
+        fi
+        if [ -z "$second" ]; then
+            entry="$SITES_DIR/$first.localhost/"
+        else
+            second="${second#./}"
+            case "/$second/" in
+                //*|*/../*|*/./*)
+                    echo "❌ The folder goes inside the site's public/ folder: no leading /, no '..'." >&2
+                    return 1 ;;
+            esac
+            entry="$SITES_DIR/$first.localhost/public/$second"
+        fi
+    fi
+    # A folder gets /*: one that exists, one written with a trailing /, or a
+    # last name with no dot in it (PHP files have an extension), which covers
+    # paths behind a * that can't be looked at.
+    case "$entry" in
+        */) entry="${entry}*" ;;
+        *[*?]) ;;
+        *) if [ -d "$entry" ]; then
+               entry="$entry/*"
+           elif [ ! -e "$entry" ]; then
+               case "${entry##*/}" in *.*) ;; *) entry="$entry/*" ;; esac
+           fi ;;
+    esac
+    # Refuse what would take every site's code out of the cache: an entry
+    # whose fixed part (up to its first wildcard) stops at or above the Sites
+    # folder, unless the wildcard only stands for the site's name and a
+    # specific folder follows (every site's public/wp-content/cache/).
+    local fixed="${entry%%[*?]*}"
+    case "$SITES_DIR/" in
+        "$fixed"*)
+            local refuse=true rest rest_fixed
+            case "$entry" in
+                "$SITES_DIR"/*/*)
+                    rest="${entry#"$SITES_DIR"/}"
+                    rest="${rest#*/}"
+                    rest_fixed="${rest%%[*?]*}"
+                    case "$rest_fixed" in
+                        ""|public|public/) ;;
+                        *) refuse=false ;;
+                    esac ;;
+            esac
+            if $refuse; then
+                echo "❌ '$entry' would take every site out of the cache." >&2
+                return 1
+            fi ;;
+    esac
+    echo "$entry"
+}
+
+# Offer the restart an exclusion list needs (PHP reads it once, at start).
+cove_opcache_exclude_restart() {
+    local auto_yes="$1" no_restart="$2"
+    if ! [ -t 0 ] && ! $auto_yes; then no_restart=true; fi
+    if $no_restart; then
+        echo "ℹ️  Not restarting. The list applies on the next full restart: cove opcache exclude apply --yes"
+        return 0
+    fi
+    echo "PHP reads the list once, when it starts, so this needs a full restart of"
+    echo "FrankenPHP (every local site is served by that one process; requests in"
+    echo "flight are dropped, a few seconds of downtime)."
+    if $auto_yes || gum confirm "Restart FrankenPHP now?"; then
+        cove_opcache_restart
+        echo "✅ FrankenPHP restarted with the new list."
+    else
+        echo "⏭️  Skipped. Apply it later with: cove opcache exclude apply --yes"
+    fi
+}
+
+cove_opcache_exclude() {
+    local action="$1" auto_yes="$2" no_restart="$3" entry
+    shift 3
+    case "$action" in
+        list)
+            echo ""
+            gum style --foreground "212" --bold "OPcache exclusions"
+            echo "  $OPCACHE_EXCLUDE_FILE"
+            local listed
+            listed=$(cove_opcache_exclude_entries)
+            if [ -z "$listed" ]; then
+                echo "  (none) Add one: cove opcache exclude add <site> [<folder>]"
+            else
+                printf '%s\n' "$listed" | sed 's/^/    /'
+            fi
+            local probe tmp
+            probe=$(cove_opcache_sites_install_probe) || return 0
+            tmp=$(mktemp "${TMPDIR:-/tmp}/cove-opcache.XXXXXX") || { rm -f "$probe"; return 0; }
+            if cove_opcache_sites_get "$probe" "mode=sites" "$tmp"; then
+                local live skipped
+                live=$(awk -F'\t' '$1 == "excluded" { print $2 }' "$tmp" | sort)
+                skipped=$(awk -F'\t' '$1 == "summary" { print $11 }' "$tmp")
+                if [ "$live" = "$(printf '%s\n' "$listed" | sed 's:/$::' | grep . | sort)" ]; then
+                    [ -n "$listed" ] && echo "  ✅ in use by the running server · ${skipped:-0} compiles skipped the cache since it started"
+                else
+                    echo "  ⚠️  the running server uses a different list. Apply this one: cove opcache exclude apply"
+                fi
+            else
+                echo "  (could not read the running server)"
+            fi
+            rm -f "$probe" "$tmp"
+            ;;
+        add)
+            entry=$(cove_opcache_exclude_entry "$@") || exit 1
+            if cove_opcache_exclude_entries | grep -q -x -F -- "$entry"; then
+                echo "ℹ️  Already excluded: $entry"
+                return 0
+            fi
+            if [ ! -f "$OPCACHE_EXCLUDE_FILE" ]; then
+                cat > "$OPCACHE_EXCLUDE_FILE" <<'EOF'
+; Paths FrankenPHP's OPcache never caches (opcache.blacklist_filename).
+; One per line, each a path prefix: a folder is written as folder/* so it
+; covers everything inside it. * matches within one folder name, ** across
+; folders. Lines starting with ; are comments. Managed by
+; `cove opcache exclude`; after editing by hand, run `cove opcache exclude apply`.
+EOF
+            elif [ -n "$(tail -c 1 "$OPCACHE_EXCLUDE_FILE")" ]; then
+                echo >> "$OPCACHE_EXCLUDE_FILE"
+            fi
+            printf '%s\n' "$entry" >> "$OPCACHE_EXCLUDE_FILE"
+            echo "✅ Excluded: $entry"
+            echo "   Files under it compile on every request instead of taking room in the cache."
+            regenerate_caddyfile
+            cove_opcache_exclude_restart "$auto_yes" "$no_restart"
+            ;;
+        remove)
+            local candidate found=""
+            entry=$(cove_opcache_exclude_entry "$@" 2>/dev/null) || entry="$1"
+            for candidate in "$entry" "$entry/*" "${entry%/\*}" "$1"; do
+                if cove_opcache_exclude_entries | grep -q -x -F -- "$candidate"; then
+                    found="$candidate"; break
+                fi
+            done
+            if [ -z "$found" ]; then
+                echo "❌ Not in the list: $entry" >&2
+                cove_opcache_exclude list "$auto_yes" "$no_restart" >&2
+                exit 1
+            fi
+            local tmp
+            tmp=$(mktemp "$OPCACHE_EXCLUDE_FILE.XXXXXX") || exit 1
+            grep -v -x -F -- "$found" "$OPCACHE_EXCLUDE_FILE" > "$tmp"
+            mv "$tmp" "$OPCACHE_EXCLUDE_FILE"
+            echo "✅ No longer excluded: $found"
+            regenerate_caddyfile
+            cove_opcache_exclude_restart "$auto_yes" "$no_restart"
+            ;;
+        apply)
+            regenerate_caddyfile
+            cove_opcache_exclude_restart "$auto_yes" "$no_restart"
+            ;;
+    esac
+}
+
 cove_opcache() {
     local action="show" mem="" interned="" files="" auto_yes=false no_restart=false
+    local watch="" top=15 format="table" ex_action="" ex_args=()
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) display_command_help opcache; exit 0 ;;
-            show) action="show"; shift ;;
+            show) [ "$action" = "exclude" ] && ex_args+=("$1") || action="show"; shift ;;
             set)
                 action="set"
                 mem="$2"
                 shift 2 || { gum style --foreground red "❌ 'set' needs a size in MB (e.g. cove opcache set 2048)"; exit 1; }
                 ;;
+            sites) [ "$action" = "exclude" ] && ex_args+=("$1") || action="sites"; shift ;;
+            exclude)
+                action="exclude"; shift
+                case "${1:-}" in
+                    list|add|remove|apply) ex_action="$1"; shift ;;
+                    ""|-*) ex_action="list" ;;
+                    *) gum style --foreground red "❌ Unknown exclude action: $1 (list, add, remove or apply)"; exit 1 ;;
+                esac
+                ;;
+            --watch) watch=60; shift ;;
+            --watch=*) watch="${1#*=}"; shift ;;
+            --top=*) top="${1#*=}"; shift ;;
+            --format=*) format="${1#*=}"; shift ;;
             --interned) interned="$2"; shift 2 ;;
             --interned=*) interned="${1#*=}"; shift ;;
             --files) files="$2"; shift 2 ;;
             --files=*) files="${1#*=}"; shift ;;
             --no-restart) no_restart=true; shift ;;
             -y|--yes) auto_yes=true; shift ;;
-            *) gum style --foreground red "❌ Unknown option: $1"; echo "Usage: cove opcache [show | set <mb> [--interned <mb>] [--files <n>] [--no-restart] [--yes]]"; exit 1 ;;
+            -*) gum style --foreground red "❌ Unknown option: $1"; echo "Usage: cove opcache [show | sites [--watch[=<seconds>]] | exclude [list | add | remove | apply] | set <mb> …]  (cove opcache --help)"; exit 1 ;;
+            *)
+                if [ "$action" = "exclude" ]; then
+                    ex_args+=("$1"); shift
+                else
+                    gum style --foreground red "❌ Unknown option: $1"; echo "Usage: cove opcache [show | sites [--watch[=<seconds>]] | exclude [list | add | remove | apply] | set <mb> …]  (cove opcache --help)"; exit 1
+                fi
+                ;;
         esac
     done
+
+    if [ "$action" = "sites" ]; then
+        if [[ ! "$top" =~ ^[0-9]+$ ]] || [ "$top" -lt 1 ]; then
+            gum style --foreground red "❌ --top must be a whole number, 1 or more."; exit 1
+        fi
+        if [ -n "$watch" ]; then
+            if [[ ! "$watch" =~ ^[0-9]+$ ]] || [ "$watch" -lt 5 ]; then
+                gum style --foreground red "❌ --watch takes a number of seconds, 5 or more (default 60)."; exit 1
+            fi
+            cove_opcache_watch "$watch" "$top"
+            return
+        fi
+        case "$format" in table|json) ;; *) gum style --foreground red "❌ --format is table or json."; exit 1 ;; esac
+        cove_opcache_sites "$format" "$top"
+        return
+    fi
+
+    if [ "$action" = "exclude" ]; then
+        if [ "$ex_action" = "list" ] || [ "$ex_action" = "apply" ]; then
+            [ ${#ex_args[@]} -gt 0 ] && { gum style --foreground red "❌ '$ex_action' takes no arguments."; exit 1; }
+        fi
+        if [ ${#ex_args[@]} -gt 2 ]; then
+            gum style --foreground red "❌ Too many arguments. Quote a path with * in it: cove opcache exclude add '*' wp-content/cache"
+            exit 1
+        fi
+        cove_opcache_exclude "$ex_action" "$auto_yes" "$no_restart" ${ex_args[@]+"${ex_args[@]}"}
+        return
+    fi
 
     if [ "$action" = "show" ]; then
         local cfg mem_c int_c files_c
@@ -117,6 +608,10 @@ cove_opcache() {
         fi
         echo "    scripts ${cached}/${maxf} · hits ${hits} · misses ${misses} · hit rate ${hit}%"
         echo "    interned strings ${ipct}% of ${imb} MB"
+        local excluded_n
+        excluded_n=$(cove_opcache_exclude_entries | grep -c .)
+        [ "$excluded_n" -gt 0 ] && echo "    excluded paths: ${excluded_n} (cove opcache exclude)"
+        echo "  by site: cove opcache sites"
         if [ "$full" = "1" ]; then
             echo ""
             echo "  Raise it: cove opcache set $(( mem_c * 2 )) --interned $(( int_c * 2 ))"

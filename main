@@ -184,6 +184,7 @@ CUSTOM_CADDY_DIR="$APP_DIR/directives"
 # Per-site PHP version switching (native php-fpm behind FrankenPHP).
 RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
+OPCACHE_EXCLUDE_FILE="$COVE_DIR/opcache-exclude.txt"  # cove opcache exclude
 
 PROTECTED_NAMES="cove"
 COVE_VERSION="2.4"
@@ -3151,6 +3152,13 @@ regenerate_caddyfile() {
         *) disabled_fns="${disabled_fns:+$disabled_fns,}opcache_reset" ;;
     esac
 
+    # Paths OPcache never caches (cove opcache exclude), only while the list
+    # has something in it.
+    local opcache_exclude_directive=""
+    if [ -f "$OPCACHE_EXCLUDE_FILE" ] && grep -q -v -E '^[[:space:]]*(;|$)' "$OPCACHE_EXCLUDE_FILE"; then
+        opcache_exclude_directive="        php_ini opcache.blacklist_filename \"$OPCACHE_EXCLUDE_FILE\""$'\n'
+    fi
+
     # Write the static header of the Caddyfile
     # Who may reach the dashboard, Adminer, and Mailpit: this machine. Under
     # WSL2's default NAT networking the Windows browser arrives from the
@@ -3213,7 +3221,12 @@ ${port_directives}    frankenphp {
         php_ini opcache.interned_strings_buffer $(cove_ini_get opcache.interned_strings_buffer 64)
         php_ini opcache.max_accelerated_files $(cove_ini_get opcache.max_accelerated_files 100000)
         php_ini opcache.optimization_level $(cove_ini_get opcache.optimization_level 0)
-        # See the disabled_fns note above: opcache_reset under ZTS aborts
+        # opcache.max_wasted_percentage is no help under ZTS: request threads
+        # see memory_consumption as 0, so a full arena with any dead weight
+        # restarts, and that restart aborts the process (php/php-src#22281).
+        # What is left is room and less churn: cove opcache sites --watch
+        # shows which site recompiles, cove opcache exclude keeps it out.
+${opcache_exclude_directive}        # See the disabled_fns note above: opcache_reset under ZTS aborts
         # the process. disable_functions leaves opcache_get_status intact
         # so the health command can still read the arena.
         php_ini disable_functions $disabled_fns
@@ -15957,7 +15970,7 @@ show_general_help() {
     help_cmd disable "Stops all background services managed by Cove."
     help_cmd reload "Regenerates the Caddyfile and reloads the Caddy server."
     help_cmd memory "Show or raise PHP memory_limit across Cove + Homebrew PHPs."
-    help_cmd opcache "Show or resize FrankenPHP's shared OPcache (all sites share it)."
+    help_cmd opcache "Show, split by site, trim or resize FrankenPHP's shared OPcache."
     help_cmd signals "Check or repair FrankenPHP's SIGSEGV handler (parallel extension crash guard)."
     echo ""
     help_section "Cove itself"
@@ -16404,18 +16417,45 @@ display_command_help() {
             echo "Upstream: krakjoe/parallel#406, php/frankenphp#2650."
             ;;
         opcache)
-            echo "Usage: cove opcache [show | set <mb> [--interned <mb>] [--files <n>] [--no-restart] [--yes]]"
+            echo "Usage: cove opcache [show]"
+            echo "       cove opcache sites [--top=<n>] [--format=json]"
+            echo "       cove opcache sites --watch[=<seconds>] [--top=<n>]"
+            echo "       cove opcache exclude [list | add <site> [<folder>] | add <path> | remove … | apply] [--no-restart] [--yes]"
+            echo "       cove opcache set <mb> [--interned <mb>] [--files <n>] [--no-restart] [--yes]"
             echo ""
             echo "Every local site is served by one FrankenPHP, so its OPcache holds"
             echo "every site's PHP at once and fills as the fleet grows. Once it is"
             echo "full, files that are not already cached compile on every request:"
             echo "the plugin-heavy site you are working on crawls while others stay"
             echo "fast. 'show' reports the configured limits and the running server's"
-            echo "live state (full or not, hits and misses). 'set' writes"
-            echo "opcache.memory_consumption (MB) to ~/Cove/php.ini, optionally the"
-            echo "interned-strings buffer and the file cap, regenerates the Caddyfile"
-            echo "and restarts FrankenPHP, which the resize needs (a reload is not"
-            echo "enough). --no-restart writes without restarting; --yes skips the"
+            echo "live state (full or not, hits and misses)."
+            echo ""
+            echo "'sites' splits the cache by site: files, MB, and how much changed"
+            echo "since the server started. A file edited while the server runs is"
+            echo "compiled again and its old copy stays as dead weight until the next"
+            echo "restart. When the cache fills with any dead weight, OPcache empties"
+            echo "it while other threads still use it, which crashes FrankenPHP"
+            echo "(php/php-src#22281), so the sites that keep recompiling matter."
+            echo "--watch compares the cache every <seconds> (default 60) and prints,"
+            echo "per site, what was new and what was compiled again; Ctrl-C prints"
+            echo "the totals. Leave it running into a file during a test run."
+            echo ""
+            echo "'exclude' keeps paths out of the cache (opcache.blacklist_filename,"
+            echo "listed in ~/Cove/opcache-exclude.txt): their files compile on every"
+            echo "request instead of taking room. Name a site and a folder inside its"
+            echo "public/ (or no folder for the whole site), '*' for every site, or an"
+            echo "absolute path; * matches within one folder name, ** across folders."
+            echo "PHP reads the list when it starts, so add, remove and apply restart"
+            echo "FrankenPHP. Sites pinned to an older PHP have their own OPcache."
+            echo "  cove opcache exclude add mysite wp-content/cache"
+            echo "  cove opcache exclude add '*' wp-content/cache"
+            echo ""
+            echo "'set' writes opcache.memory_consumption (MB) to ~/Cove/php.ini,"
+            echo "optionally the interned-strings buffer and the file cap, regenerates"
+            echo "the Caddyfile and restarts FrankenPHP, which the resize needs (a"
+            echo "reload is not enough)."
+            echo ""
+            echo "--no-restart writes without restarting; --yes skips the"
             echo "confirmation. Without a terminal (a script, the dashboard) nothing"
             echo "is restarted unless --yes is given."
             ;;
