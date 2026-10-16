@@ -6586,6 +6586,35 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .sl-tdot.static { background: var(--panel-border-strong); }
 
         .sl-state { margin-top: 1.6rem; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); border: 1px dashed var(--panel-border); border-radius: 12px; }
+        /* Waiting on list_sites. With a saved listing on screen, one quiet
+           line under the summary; with nothing saved yet, the page's own
+           shapes shimmer until the list lands. */
+        .sl-sync { display: flex; width: fit-content; align-items: center; gap: 0.45rem; margin: 0.6rem 0 0; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-faint); animation: cove-fade 200ms 600ms both; }
+        .sl-sync i { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--accent); animation: dot-pulse 1.4s ease-in-out infinite; }
+        .sl-sync.is-failed { animation: none; }
+        .sl-sync.is-failed i { background: var(--warn); animation: none; }
+        .sl-sync .sl-link, .sl-loading-note .sl-link { font-family: var(--font-mono); font-size: inherit; padding: 0; }
+        @keyframes sl-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+        .sl-bone, .sl-harbor.is-loading .sl-stack, .sl-loading .sl-thumb, .sl-loading .sl-shot { background: linear-gradient(90deg, var(--hairline) 30%, color-mix(in srgb, var(--hairline) 45%, var(--panel-border)) 50%, var(--hairline) 70%); background-size: 200% 100%; animation: sl-shimmer 1.5s ease-in-out infinite; }
+        .sl-bone { display: inline-block; max-width: 100%; height: 0.75rem; border-radius: 4px; vertical-align: middle; }
+        .sl-bone.is-small { height: 0.6rem; }
+        .sl-bone.is-bar { height: 4px; border-radius: 999px; }
+        .sl-tags .sl-bone, .sl-chips .sl-bone { height: 1.45rem; border-radius: 999px; }
+        .sl-bone.is-pill { height: 1.1rem; border-radius: 999px; }
+        .sl-sub .sl-bone { height: 0.95rem; }
+        .sl-legend .sl-bone { height: 0.65rem; }
+        .sites-view.is-stalled :is(.sl-bone, .sl-stack, .sl-thumb, .sl-shot) { animation: none; }
+        .sl-loading { margin-top: 1.6rem; }
+        .sl-loading .sl-group { margin-top: 0; }
+        .sl-loading-rows { pointer-events: none; -webkit-mask-image: linear-gradient(#000 30%, transparent); mask-image: linear-gradient(#000 30%, transparent); }
+        .sl-row.is-skel { cursor: default; }
+        .sl-row.is-skel:hover { background: none; }
+        .sl-card.is-skel { cursor: default; }
+        .sl-loading-note { margin: 0.4rem 0 0; text-align: center; font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); }
+        .sl-loading-note small { display: block; margin-top: 0.3rem; font-family: var(--font-sans); font-size: 0.78rem; color: var(--text-faint); }
+        @media (prefers-reduced-motion: reduce) {
+            .sl-bone, .sl-harbor.is-loading .sl-stack, .sl-loading .sl-thumb, .sl-loading .sl-shot, .sl-sync i { animation: none; }
+        }
         .sl-foot { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; margin-top: 1.75rem; padding-top: 1rem; border-top: 1px solid var(--hairline); font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-faint); }
         .sl-foot .totals { display: inline-flex; align-items: center; gap: 0.45rem; }
         .sl-keys { display: flex; gap: 0.35rem 0.85rem; flex-wrap: wrap; align-items: center; }
@@ -7348,6 +7377,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <p class="sl-eyebrow">~/Cove/Sites</p>
                     <h1 class="sl-title" id="slTitle">Sites</h1>
                     <p class="sl-sub" id="slSub"></p>
+                    <p class="sl-sync" id="slSync" style="display: none;"></p>
                     <div class="sl-insight" id="slInsight">
                         <div class="sl-insight-row"><h2>plugins</h2><div class="sl-tags" id="slTopPlugins"></div></div>
                         <div class="sl-insight-row"><h2>themes</h2><div class="sl-tags" id="slTopThemes"></div></div>
@@ -7465,7 +7495,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             </section>
 
             <div id="siteGroups"></div>
-            <div class="sl-state" id="siteLoading">Loading sites…</div>
+            <div class="sl-loading" id="siteLoading">
+                <div class="sl-loading-rows" id="siteSkeleton" aria-hidden="true"></div>
+                <p class="sl-loading-note" id="siteLoadingNote" role="status">Reading ~/Cove/Sites…</p>
+            </div>
             <div class="sl-state empty" id="emptyNone" style="display: none;">
                         <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path class="art-fill" d="M52 12 L68 38 H52 Z"/>
@@ -8435,6 +8468,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             theme: (['light', 'dark'].includes(localStorage.getItem('theme')) ? localStorage.getItem('theme') : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')),
             sites: [],
             isLoading: true,
+            // When the sites on screen are this browser's saved listing
+            // (restoreSites) rather than the server's answer: its time, else 0.
+            sitesSavedAt: 0,
+            sitesFailed: false,
+            loadStarted: 0,
             adding: false,
             showDbModal: false,
             isRefreshingSizes: false,
@@ -8708,6 +8746,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.bindSiteEvents();
                 this.bindSiteTabEvents();
                 this.bindTips();
+                this.restoreSites();
                 this.render();
                 this.sweepPoll();
 
@@ -9257,6 +9296,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
                 // Snackbar action (undo etc.)
                 $id('snackAction').addEventListener('click', () => { if (this.snackbar.action) this.snackbar.action(); });
+
+                // "try again" when a listing never came back.
+                ['slSync', 'siteLoadingNote'].forEach(id => $id(id).addEventListener('click', (e) => { if (e.target.closest('[data-retry-sites]')) this.getSites(); }));
             },
 
             // --- Rendering -------------------------------------------------
@@ -9291,7 +9333,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // match something, or is the one in use.
                 show($id('filterKbd'), !this.filter);
                 show($id('btnFilterClear'), !!this.filter || this.chip !== 'all');
-                $id('slChips').innerHTML = this.chips.map(c => {
+                if (!this.sites.length && (this.isLoading || this.sitesFailed)) $id('slChips').innerHTML = ['3rem', '4.2rem', '4.6rem', '3.8rem'].map(w => '<span class="sl-bone" style="width:' + w + '"></span>').join('');
+                else $id('slChips').innerHTML = this.chips.map(c => {
                     const n = this.sites.filter(c.test).length;
                     if (!n && c.id !== this.chip && c.id !== 'all') return '';
                     return '<button type="button" class="sl-chip" data-chip="' + c.id + '" aria-pressed="' + (this.chip === c.id) + '">'
@@ -9380,7 +9423,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // while filtering, where the results should be all there is.
                 const byName = (names) => names.map(n => this.sites.find(s => s.name === n)).filter(Boolean);
                 let shelf = null;
-                if (!filtering && !this.isLoading) {
+                if (!filtering) {
                     const pinned = byName(this.pinned);
                     if (pinned.length) shelf = { label: 'pinned', sites: pinned.slice(0, 8), hint: 'right-click any site to pin it' };
                     else if (this.sites.length > 8) { const opened = byName(this.recent).slice(0, 4); if (opened.length) shelf = { label: 'recently opened', sites: opened, hint: 'pin a site to keep it here' }; }
@@ -9416,9 +9459,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 box.classList.toggle('has-checked', this.checked.size > 0);
 
                 const visible = order.length;
-                show($id('siteLoading'), this.isLoading && !this.sites.length);
-                show($id('emptyNone'), !this.isLoading && this.sites.length === 0);
-                const emptyFilter = !this.isLoading && this.sites.length > 0 && visible === 0;
+                const waiting = !this.sites.length && (this.isLoading || this.sitesFailed);
+                show($id('siteLoading'), waiting);
+                if (waiting) this.renderSkeleton();
+                this.renderLoadState();
+                show($id('emptyNone'), !waiting && this.sites.length === 0);
+                const emptyFilter = this.sites.length > 0 && visible === 0;
                 show($id('emptyFilter'), emptyFilter);
                 if (emptyFilter) $id('emptyFilterQuery').textContent = this.filter || this.chipLabel;
 
@@ -9618,8 +9664,31 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this._maxBytes = Math.max(1, ...sites.map(s => s.size_bytes || 0));
                 const words = ['No', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
                 const title = $id('slTitle');
-                if (this.isLoading && !sites.length) title.textContent = 'Sites';
-                else if (!sites.length) title.innerHTML = 'An empty <em>cove</em>.';
+
+                // Nothing to count yet: placeholders where the numbers go,
+                // rather than zeros that read as an empty cove.
+                const waiting = !sites.length && (this.isLoading || this.sitesFailed);
+                $id('slHarbor').classList.toggle('is-loading', waiting);
+                if (waiting) {
+                    const bone = (w) => '<span class="sl-bone" style="width:' + w + '"></span>';
+                    const bones = (ws) => ws.map(bone).join('');
+                    title.textContent = 'Sites';
+                    $id('slSub').innerHTML = bone('min(19rem, 100%)');
+                    show($id('slInsight'), true);
+                    $id('slTopPlugins').innerHTML = bones(['6.5rem', '8rem', '5rem', '7rem', '5.5rem', '6rem']);
+                    $id('slTopThemes').innerHTML = bones(['8.5rem', '6rem', '7rem']);
+                    $id('slTypeStack').innerHTML = '';
+                    $id('slTypeLegend').innerHTML = ['5.5rem', '3.5rem', '4.5rem'].map(w => '<li>' + bone(w) + '</li>').join('');
+                    show($id('slTypeExtra'), false);
+                    $id('slWpVersions').innerHTML = bones(['4.5rem', '4.5rem', '4rem']);
+                    $id('slPhpLine').innerHTML = bone('9rem');
+                    $id('slDiskStack').innerHTML = '';
+                    $id('slDiskLegend').innerHTML = ['4rem', '6rem', '5rem'].map(w => '<li>' + bone(w) + '</li>').join('');
+                    show($id('slTidyText'), false);
+                    this.drawHarbor();
+                    return;
+                }
+                if (!sites.length) title.innerHTML = 'An empty <em>cove</em>.';
                 else title.innerHTML = (sites.length <= 10 ? words[sites.length] : sites.length) + ' site' + (sites.length === 1 ? '' : 's') + ' in the <em>cove</em>.';
 
                 const now = Date.now() / 1000;
@@ -9878,7 +9947,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             },
 
             renderFooter() {
-                $id('siteCount').textContent = this.siteCountLabel;
+                $id('siteCount').textContent = this.sites.length || !(this.isLoading || this.sitesFailed) ? this.siteCountLabel : this.isLoading ? 'reading sites…' : 'no listing';
                 const totalEl = $id('totalSize');
                 show(totalEl, this.totalBytes > 0);
                 totalEl.textContent = '· ' + this.formatSize(this.totalBytes);
@@ -15476,8 +15545,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             },
 
             async getSites(opts = {}) {
-                this.requestShotSweep();
-                if (!opts.quiet) { this.isLoading = true; this.render(); }
+                if (!opts.quiet) {
+                    this.isLoading = true;
+                    this.sitesFailed = false;
+                    this.startLoadClock();
+                    this.render();
+                }
                 try {
                     const r = await fetch('/api.php?action=list_sites');
                     const data = await r.json();
@@ -15490,8 +15563,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.sites = data
                         .map(s => ({ ...s, isLoggingIn: false }))
                         .filter(s => !staged.has(s.name));
+                    this.sitesSavedAt = 0;
+                    this.sitesFailed = false;
+                    this.saveSites(data);
                 } catch (e) {
-                    if (!opts.quiet) this.showSnack('Could not fetch sites.', true);
+                    if (!opts.quiet) {
+                        this.sitesFailed = true;
+                        if (this.sites.length) this.showSnack('Could not refresh sites.', true);
+                    }
                 } finally {
                     this.isLoading = false;
                     this.render();
@@ -15499,11 +15578,96 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.afterSitesLoaded(opts.round || 0);
             },
 
+            // The last listing, kept in this browser so a reload paints at
+            // once while list_sites runs again (seconds on a loaded machine).
+            // Keyed like the console histories: a demo only ever saves and
+            // paints its own sites.
+            restoreSites() {
+                try {
+                    const saved = JSON.parse(localStorage.getItem(this.historyKey('cove.sites')) || 'null');
+                    if (!saved || !Array.isArray(saved.sites) || !saved.sites.length) return;
+                    this.sites = saved.sites.map(s => ({ ...s, isLoggingIn: false }));
+                    this.sitesSavedAt = saved.at || 1;
+                } catch (e) { /* storage blocked or unreadable: wait for the server */ }
+            },
+
+            saveSites(data) {
+                try {
+                    const key = this.historyKey('cove.sites');
+                    for (let i = localStorage.length - 1; i >= 0; i--) {
+                        const k = localStorage.key(i);
+                        if (k && k !== key && k.startsWith('cove.sites.demo-')) localStorage.removeItem(k);
+                    }
+                    localStorage.setItem(key, JSON.stringify({ at: Date.now(), sites: data }));
+                } catch (e) { /* full or blocked: the next load waits, as before */ }
+            },
+
+            // Ticks the waiting line once a second while a listing is out.
+            startLoadClock() {
+                this.loadStarted = Date.now();
+                clearInterval(this._loadClock);
+                this._loadClock = setInterval(() => {
+                    if (!this.isLoading) { clearInterval(this._loadClock); this._loadClock = null; }
+                    this.renderLoadState();
+                }, 1000);
+            },
+
+            renderLoadState() {
+                const secs = this.isLoading && this.loadStarted ? Math.floor((Date.now() - this.loadStarted) / 1000) : 0;
+                const clock = secs >= 3 ? ' · <span aria-hidden="true">' + secs + ' s</span>' : '';
+                const retry = '<button type="button" class="sl-link" data-retry-sites>try again</button>';
+
+                // A listing on screen: say how old it is while a fresh one
+                // is out, or that the fresh one never came.
+                const sync = $id('slSync');
+                const syncing = this.sites.length > 0 && (this.isLoading || this.sitesFailed);
+                show(sync, syncing);
+                if (syncing) {
+                    const ago = this.sitesSavedAt ? this.formatRelative(this.sitesSavedAt / 1000) : '';
+                    const from = ago ? 'showing the list from ' + (ago === 'now' ? 'a moment' : ago) + ' ago' : '';
+                    sync.classList.toggle('is-failed', !this.isLoading);
+                    sync.innerHTML = '<i aria-hidden="true"></i><span>' + (this.isLoading
+                        ? (from ? from + ' · ' : '') + 'refreshing' + clock
+                        : "couldn't refresh" + (from ? ' · ' + from : '') + ' · ' + retry) + '</span>';
+                }
+
+                // Nothing on screen yet: the skeleton's caption.
+                const waiting = !this.sites.length && (this.isLoading || this.sitesFailed);
+                $id('sitesCard').classList.toggle('is-stalled', waiting && !this.isLoading);
+                if (!waiting) return;
+                $id('siteLoadingNote').innerHTML = this.isLoading
+                    ? 'Reading ~/Cove/Sites' + (clock || '…') + (secs >= 8 ? '<small>A busy machine slows the first read. After this one, the last listing shows at once while it refreshes.</small>' : '')
+                    : "Couldn't read ~/Cove/Sites. " + retry;
+            },
+
+            // The page's own shapes, drawn once per layout while the first
+            // listing is out.
+            renderSkeleton() {
+                const box = $id('siteSkeleton');
+                if (box.dataset.layout === this.layout) return;
+                box.dataset.layout = this.layout;
+                const bone = (w, cls) => '<span class="sl-bone' + (cls ? ' ' + cls : '') + '" style="width:' + w + '"></span>';
+                const widths = [58, 44, 66, 50, 62, 40];
+                const body = this.layout === 'grid'
+                    ? '<div class="sl-cards">' + widths.concat(widths.slice(0, 2)).map(w => '<div class="sl-card is-skel"><div class="sl-shot"></div><div class="sl-card-body">' + bone(w + '%') + bone((w + 20) + '%', 'is-small') + '</div></div>').join('') + '</div>'
+                    : '<div class="sl-rows">' + widths.map(w => '<div class="sl-row is-skel"><span class="sl-check"></span><span class="sl-thumb"></span>'
+                        + '<span class="sl-who">' + bone(w + '%') + '</span>'
+                        + '<span class="sl-inside">' + bone((w + 18) + '%') + bone((w - 6) + '%', 'is-small') + '</span>'
+                        + '<span class="sl-kind">' + bone('2.4rem', 'is-pill') + bone('2.4rem') + '</span>'
+                        + '<span class="sl-seen">' + bone('2.2rem') + '</span>'
+                        + '<span class="sl-size">' + bone('100%', 'is-bar') + bone('2.6rem') + '</span>'
+                        + '<span class="sl-acts"></span></div>').join('') + '</div>';
+                box.innerHTML = '<section class="sl-group"><header class="sl-group-head">' + bone('3.6rem', 'is-small') + '<span class="sl-rule"></span></header>' + body + '</section>';
+            },
+
             // Follow-ups to a listing, none of them blocking it: history
             // cards the server had no time for this round, sizes never
             // measured, unread mail per site, and wordpress.org's verdict on
-            // each WordPress version (refetched once it is in).
+            // each WordPress version (refetched once it is in). Preview
+            // captures wait for the listing too, so on a loaded machine
+            // headless Chrome isn't competing with the first paint.
             afterSitesLoaded(round) {
+                this.requestShotSweep();
                 if (round < 6 && this.sites.some(s => s.card && s.card.pending)) {
                     clearTimeout(this._cardTimer);
                     this._cardTimer = setTimeout(() => this.getSites({ quiet: true, round: round + 1 }), 700);
