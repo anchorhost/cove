@@ -128,6 +128,28 @@ function site_arg(array $a, bool $wordpress = false): string {
     return $s;
 }
 
+// A Laravel site: its folder is the project, with artisan beside public/.
+function laravel_site(string $s): bool {
+    $dir = SITES . "/$s.localhost";
+    return is_file("$dir/artisan") && is_file("$dir/bootstrap/app.php") && is_file("$dir/public/index.php");
+}
+
+function laravel_arg(array $a): string {
+    $s = site_arg($a);
+    if (!laravel_site($s)) throw new ToolError("'$s' is not a Laravel site.");
+    return $s;
+}
+
+// A .env value, quotes removed: enough for the keys this server reads.
+function env_value(string $s, string $key): ?string {
+    $v = null;
+    foreach (@file(SITES . "/$s.localhost/.env", FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+        if (preg_match('/^\s*' . preg_quote($key, '/') . '\s*=\s*(.*)$/', $line, $m)) $v = trim($m[1]);
+    }
+    if ($v !== null && strlen($v) >= 2 && ($v[0] === '"' || $v[0] === "'") && substr($v, -1) === $v[0]) $v = substr($v, 1, -1);
+    return $v;
+}
+
 function int_arg(array $a, string $key, int $default, int $min, int $max): int {
     $v = isset($a[$key]) && is_numeric($a[$key]) ? (int) $a[$key] : $default;
     return max($min, min($max, $v));
@@ -166,6 +188,23 @@ function tail_of(string $file, int $bytes = 4194304): string {
     return $data;
 }
 
+// Laravel's log format: an entry starts with "[2026-10-17 06:04:48] local.ERROR:"
+// (the app's timezone, UTC by default), and its stack trace follows.
+function laravel_entries(string $data, int $since): array {
+    $entries = [];
+    $cur = null;
+    foreach (explode("\n", $data) as $line) {
+        if (preg_match('/^\[(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})[^\]]*\]/', $line, $m) && ($t = strtotime(str_replace('T', ' ', $m[1]) . ' UTC')) !== false) {
+            if ($cur !== null) $entries[] = $cur;
+            $cur = ['t' => $t, 'text' => $line];
+        } elseif ($cur !== null && $line !== '') {
+            $cur['text'] .= "\n" . $line;
+        }
+    }
+    if ($cur !== null) $entries[] = $cur;
+    return array_values(array_filter($entries, function ($e) use ($since) { return $e['t'] >= $since; }));
+}
+
 // PHP's log format: an entry starts with "[10-Oct-2026 22:18:01 UTC]", and
 // the lines after it (a stack trace) belong to it.
 function php_entries(string $data, int $since, ?string $must_contain): array {
@@ -199,6 +238,38 @@ function log_since(string $file, int $from): string {
     $data = (string) stream_get_contents($fh);
     fclose($fh);
     return $data;
+}
+
+// --- artisan -----------------------------------------------------------------
+
+// What artisan_read runs: artisan commands that only read.
+const ARTISAN_READ = [
+    'about', 'list', 'help', 'env', 'inspire',
+    'route:list', 'migrate:status', 'schedule:list', 'event:list', 'channel:list',
+    'db:show', 'db:table', 'model:show', 'config:show', 'queue:failed',
+];
+
+// Commands that wait on a terminal or run until stopped, and ones that wipe
+// the whole database.
+const ARTISAN_LONG = ['tinker', 'db', 'serve', 'dev', 'pail', 'queue:work', 'queue:listen', 'schedule:work', 'horizon', 'reverb:start', 'octane:start', 'octane:frankenphp'];
+const ARTISAN_WIPE = ['db:wipe', 'migrate:fresh', 'migrate:reset', 'migrate:refresh'];
+
+function artisan_tokens(array $a): array {
+    $tokens = !empty($a['args']) && is_array($a['args']) ? array_map('strval', array_values($a['args'])) : split_line((string) ($a['command'] ?? ''));
+    if ($tokens && $tokens[0] === 'php') array_shift($tokens);
+    if ($tokens && $tokens[0] === 'artisan') array_shift($tokens);
+    if (!$tokens || $tokens[0] === '' || $tokens[0][0] === '-') throw new ToolError('Give the artisan command as args (["route:list"]) or command ("route:list --json").');
+    // --help anywhere would get Cove's own help for `cove artisan`.
+    if (($h = array_search('--help', $tokens, true)) !== false) { array_splice($tokens, $h, 1); array_unshift($tokens, 'help'); }
+    return $tokens;
+}
+
+function run_artisan(string $site, array $tokens): array {
+    $t0 = microtime(true);
+    [$out, $err, $code] = cove(array_merge(['artisan', $site], $tokens, ['--no-ansi', '--no-interaction']), true, 900);
+    $ms = (int) round((microtime(true) - $t0) * 1000);
+    $out = trim(preg_replace('/\x1b\[[0-9;]*m/', '', (string) $out . ($err !== '' ? "\n" . $err : '')));
+    return text(cut(($out !== '' ? $out : '(no output)') . "\n\n[exit $code · {$ms} ms]"));
 }
 
 // --- WP-CLI ------------------------------------------------------------------
@@ -397,16 +468,17 @@ function tools(): array {
         ],
         'site_info' => [
             'title' => 'Site details',
-            'description' => "One site in detail: its URL and folders, database name and table prefix, WP_DEBUG, the logs it writes, extra domains, and its twin if it has one.",
+            'description' => "One site in detail: its URL and folders, the database (name and table prefix, or a Laravel app's connection), WP_DEBUG or APP_DEBUG, the logs it writes, a Laravel app's workers, extra domains, and its twin if it has one.",
             'inputSchema' => $obj(['site' => $site], ['site']),
             'annotations' => $ro,
         ],
         'create_site' => [
             'title' => 'Create a site',
-            'description' => "Creates a new local site at https://<name>.localhost with its own database: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a plain static site, or a Minn Engine site. Takes up to a minute.",
+            'description' => "Creates a new local site at https://<name>.localhost: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a Laravel application (as `laravel new` makes it, on SQLite unless database says mysql), a plain static site, or a Minn Engine site. Takes up to a minute.",
             'inputSchema' => $obj([
                 'name' => ['type' => 'string', 'description' => 'Lowercase letters, numbers and hyphens, e.g. client-demo.'],
-                'type' => ['type' => 'string', 'enum' => ['wordpress', 'plain', 'minn'], 'description' => 'Default wordpress.'],
+                'type' => ['type' => 'string', 'enum' => ['wordpress', 'laravel', 'plain', 'minn'], 'description' => 'Default wordpress.'],
+                'database' => ['type' => 'string', 'enum' => ['sqlite', 'mysql', 'mariadb'], 'description' => 'Laravel only: sqlite (the default) or a database on Cove\'s MariaDB.'],
                 'wp_version' => ['type' => 'string', 'description' => 'A WordPress version such as 6.8.3, or nightly. Default latest.'],
                 'php' => ['type' => 'string', 'description' => 'Pin an older PHP, e.g. 8.2. Default: the bundled PHP.'],
                 'multisite' => ['type' => 'string', 'enum' => ['subdirectory', 'subdomain'], 'description' => 'Install a multisite network instead of a single site.'],
@@ -474,9 +546,39 @@ function tools(): array {
             ], ['site']),
             'annotations' => $ro,
         ],
+        'artisan_read' => [
+            'title' => 'Read with artisan',
+            'description' => "Runs an artisan command that only reads, inside a Laravel site: about, route:list, migrate:status, schedule:list, event:list, db:show, db:table, model:show, config:show, queue:failed, list, help. Pass the words after `artisan` as args, e.g. [\"route:list\", \"--json\"]. Anything else is refused: use artisan for that.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'args' => ['type' => 'array', 'items' => ['type' => 'string'], 'description' => 'The arguments after `artisan`, one per item.'],
+                'command' => ['type' => 'string', 'description' => 'Or the same as one line, quotes honoured, e.g. route:list --path=api.'],
+            ], ['site']),
+            'annotations' => $ro,
+        ],
+        'artisan' => [
+            'title' => 'Run artisan',
+            'description' => "Runs any artisan command inside a Laravel site, on the PHP it serves with, e.g. [\"make:model\", \"Post\", \"-m\"] or [\"migrate\"]; for commands that only read, artisan_read needs no approval. Commands that wait on a terminal or run until stopped (tinker, serve, queue:work, schedule:work…) are refused: laravel_workers keeps a queue worker and the scheduler running. So are db:wipe and migrate:fresh/reset/refresh, which wipe the database: take a snapshot first (snapshot_create) and run those in a terminal.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'args' => ['type' => 'array', 'items' => ['type' => 'string'], 'description' => 'The arguments after `artisan`, one per item.'],
+                'command' => ['type' => 'string', 'description' => 'Or the same as one line, quotes honoured. No shell: | ; $( ) are literal.'],
+            ], ['site']),
+            'annotations' => ['readOnlyHint' => false, 'destructiveHint' => true, 'idempotentHint' => false, 'openWorldHint' => false],
+        ],
+        'laravel_workers' => [
+            'title' => 'Laravel workers',
+            'description' => "A Laravel site's queue worker (artisan queue:listen, so queued jobs run) and scheduler (artisan schedule:work, so scheduled tasks run each minute): shows them, or turns one on or off. One that is on keeps running, after a crash or a reboot too. Their output is in the site's logs/laravel-queue.log and logs/laravel-schedule.log.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'worker' => ['type' => 'string', 'enum' => ['queue', 'schedule'], 'description' => 'Which one to turn on or off. Leave out to see both.'],
+                'state' => ['type' => 'string', 'enum' => ['on', 'off']],
+            ], ['site']),
+            'annotations' => ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false],
+        ],
         'read_logs' => [
             'title' => 'Read logs',
-            'description' => "Recent log entries: php = PHP errors from Cove's shared error log (just this site's when a site is named), debug = the site's wp-content/debug.log, access = the site's requests (status, method, path, time).",
+            'description' => "Recent log entries: php = PHP errors from Cove's shared error log (just this site's when a site is named), debug = the site's own log (wp-content/debug.log, or a Laravel app's storage/logs), access = the site's requests (status, method, path, time).",
             'inputSchema' => $obj([
                 'site' => $site,
                 'source' => ['type' => 'string', 'enum' => ['php', 'debug', 'access'], 'description' => 'Default php.'],
@@ -584,7 +686,7 @@ function call_tool(string $name, array $a): array {
                 }));
             }
             foreach ($sites as &$s) {
-                $s = ['name' => $s['name'], 'url' => $s['domain'], 'type' => $s['type'], 'wp_version' => $s['wp_version'], 'minn_version' => $s['minn_version'], 'multisite' => $s['multisite'], 'php' => $s['php'] . ($s['php_pinned'] ? ' (pinned)' : ''), 'folder' => $s['path']];
+                $s = ['name' => $s['name'], 'url' => $s['domain'], 'type' => $s['type'], 'wp_version' => $s['wp_version'], 'minn_version' => $s['minn_version'], 'laravel_version' => $s['laravel_version'] ?? null, 'multisite' => $s['multisite'], 'php' => $s['php'] . ($s['php_pinned'] ? ' (pinned)' : ''), 'folder' => $s['path']];
                 $s = array_filter($s, function ($v) { return $v !== null; });
             }
             unset($s);
@@ -604,12 +706,25 @@ function call_tool(string $name, array $a): array {
                 $info['wp_debug'] = in_array(strtolower((string) wp_config_value($site, 'WP_DEBUG')), ['true', '1'], true);
                 $info['multisite'] = in_array(strtolower((string) wp_config_value($site, 'MULTISITE')), ['true', '1'], true);
                 $info['login'] = 'login_link gives a one-time admin link.';
+            } elseif (laravel_site($site)) {
+                $info['type'] = 'Laravel';
+                $info['files'] = $dir;
+                $app = @file_get_contents("$dir/vendor/laravel/framework/src/Illuminate/Foundation/Application.php", false, null, 0, 16384);
+                if ($app && preg_match("/const VERSION = '([^']+)'/", $app, $m)) $info['laravel_version'] = $m[1];
+                $conn = env_value($site, 'DB_CONNECTION') ?? 'sqlite';
+                $db = env_value($site, 'DB_DATABASE');
+                $info['database'] = $conn === 'sqlite' ? 'SQLite: ' . ($db ? ($db[0] === '/' ? $db : "$dir/$db") : "$dir/database/database.sqlite") : "$conn: " . ($db ?? '?') . ' on ' . (env_value($site, 'DB_HOST') ?? '127.0.0.1');
+                $info['app_debug'] = in_array(strtolower((string) env_value($site, 'APP_DEBUG')), ['true', '1'], true);
+                [$wout] = cove(['laravel', $site, '--format=json']);
+                $workers = json_decode(trim((string) $wout), true);
+                if (is_array($workers)) $info['workers'] = ['queue' => $workers['queue']['running'] ? 'running' : ($workers['queue']['on'] ? 'starting' : 'off'), 'schedule' => $workers['schedule']['running'] ? 'running' : ($workers['schedule']['on'] ? 'starting' : 'off')];
+                $info['commands'] = 'artisan_read and artisan run artisan; laravel_workers runs queued jobs and scheduled tasks.';
             } else {
                 $info['type'] = 'Plain (static files)';
             }
             $pin = trim((string) @file_get_contents("$dir/php_version"));
             if ($pin !== '') $info['php_pinned'] = $pin;
-            $info['logs'] = ['php errors' => COVE_DIR . '/Logs/errors.log (shared by every site)', 'debug' => "$dir/public/wp-content/debug.log", 'access' => "$dir/logs/caddy.log"];
+            $info['logs'] = ['php errors' => COVE_DIR . '/Logs/errors.log (shared by every site)', 'debug' => ($info['type'] === 'Laravel' ? "$dir/storage/logs/laravel.log" : "$dir/public/wp-content/debug.log"), 'access' => "$dir/logs/caddy.log"];
             $maps = @file("$dir/mappings", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
             if ($maps) $info['extra_domains'] = array_values(array_map('trim', $maps));
             $twin = @file_get_contents("$dir/twin");
@@ -625,7 +740,16 @@ function call_tool(string $name, array $a): array {
             $type = (string) ($a['type'] ?? 'wordpress');
             if ($type === 'plain') $args[] = '--plain';
             elseif ($type === 'minn') $args[] = '--minn';
-            elseif ($type !== 'wordpress') throw new ToolError("type is wordpress, plain or minn.");
+            elseif ($type === 'laravel') {
+                $args[] = 'laravel';
+                if (!empty($a['wp_version']) || !empty($a['multisite'])) throw new ToolError('wp_version and multisite are for WordPress sites.');
+                if (!empty($a['database'])) {
+                    if (!in_array($a['database'], ['sqlite', 'mysql', 'mariadb'], true)) throw new ToolError('database is sqlite, mysql or mariadb.');
+                    $args[] = '--database=' . $a['database'];
+                }
+            }
+            elseif ($type !== 'wordpress') throw new ToolError("type is wordpress, laravel, plain or minn.");
+            if ($type !== 'laravel' && !empty($a['database'])) throw new ToolError('database is for Laravel sites; WordPress always gets MariaDB.');
             if (!empty($a['wp_version'])) {
                 if (!preg_match('/^(latest|nightly|\d+\.\d+(\.\d+)?([-.][a-zA-Z0-9.]+)?)$/', (string) $a['wp_version'])) throw new ToolError('wp_version is a version such as 6.8.3, or latest or nightly.');
                 $args[] = '--wp-version=' . $a['wp_version'];
@@ -641,7 +765,7 @@ function call_tool(string $name, array $a): array {
             [$out, , $code] = cove($args, true);
             $out = clean($out);
             if ($code !== 0 || !is_dir(SITES . "/$name.localhost/public")) throw new ToolError(cut($out) ?: 'cove add failed.');
-            $reply = 'Created ' . url_of($name) . "\nFiles: " . SITES . "/$name.localhost/public";
+            $reply = 'Created ' . url_of($name) . "\nFiles: " . SITES . "/$name.localhost" . ($type === 'laravel' ? ' (the Laravel project; public/ is the webroot)' : '/public');
             if (preg_match('~https://\S*wp-login\.php\S*~', $out, $m)) $reply .= "\nOne-time admin login: " . $m[0];
             $lines = explode("\n", $out);
             return text($reply . "\n\n" . implode("\n", array_slice($lines, -25)));
@@ -710,6 +834,34 @@ function call_tool(string $name, array $a): array {
                 throw new ToolError("`wp $pair` can wipe a whole database, which this server leaves to a terminal. Take a snapshot first (snapshot_create) and run it yourself with: cove wp $site …");
             }
             return run_wp($site, $tokens);
+
+        case 'artisan_read':
+            $site = laravel_arg($a);
+            $tokens = artisan_tokens($a);
+            if (!in_array(strtolower($tokens[0]), ARTISAN_READ, true)) throw new ToolError('artisan_read runs only commands that read (route:list, migrate:status, about…). `artisan ' . $tokens[0] . '` is not one of them: use artisan.');
+            return run_artisan($site, $tokens);
+
+        case 'artisan':
+            $site = laravel_arg($a);
+            $tokens = artisan_tokens($a);
+            $cmd = strtolower($tokens[0]);
+            if (in_array($cmd, ARTISAN_LONG, true)) throw new ToolError("artisan $cmd waits on a terminal or runs until stopped, so it can't run here." . (in_array($cmd, ['queue:work', 'queue:listen', 'schedule:work'], true) ? ' laravel_workers keeps a queue worker and the scheduler running.' : ''));
+            if (in_array($cmd, ARTISAN_WIPE, true)) throw new ToolError("`artisan $cmd` wipes the whole database, which this server leaves to a terminal. Take a snapshot first (snapshot_create) and run it yourself with: cove artisan $site $cmd");
+            return run_artisan($site, $tokens);
+
+        case 'laravel_workers':
+            $site = laravel_arg($a);
+            $args = ['laravel', $site];
+            if (!empty($a['worker'])) {
+                if (!in_array($a['worker'], ['queue', 'schedule'], true) || !in_array($a['state'] ?? '', ['on', 'off'], true)) throw new ToolError('worker is queue or schedule, and state is on or off.');
+                array_push($args, $a['worker'], $a['state']);
+            }
+            $args[] = '--format=json';
+            [$out, $err, $code] = cove($args);
+            $w = json_decode(trim((string) $out), true);
+            if ($code !== 0 || !is_array($w)) throw new ToolError(clean($out . "\n" . $err) ?: 'cove laravel failed.');
+            $say = function ($x) { return $x['running'] ? 'running (pid ' . $x['pid'] . ')' : ($x['on'] ? 'on, starting' : 'off'); };
+            return text("queue worker: " . $say($w['queue']) . "\nscheduler: " . $say($w['schedule']) . "\nOutput: " . SITES . "/$site.localhost/logs/laravel-<worker>.log");
 
         case 'check_page':
             $site = site_arg($a);
@@ -806,6 +958,12 @@ function call_tool(string $name, array $a): array {
                 if ($site === null && demo_sites() !== null) throw new ToolError('During cove demo, name a site.');
                 $file = COVE_DIR . '/Logs/errors.log';
                 $entries = php_entries(tail_of($file, $site ? 12582912 : 4194304), $since, $site ? "/Sites/$site.localhost/" : null);
+            } elseif ($source === 'debug' && $site !== null && laravel_site($site)) {
+                // A Laravel app's own log: its newest file in storage/logs.
+                $logs = glob(SITES . "/$site.localhost/storage/logs/*.log") ?: [];
+                usort($logs, function ($x, $y) { return filemtime($y) <=> filemtime($x); });
+                $file = $logs[0] ?? SITES . "/$site.localhost/storage/logs/laravel.log";
+                $entries = laravel_entries(tail_of($file), $since);
             } elseif ($source === 'debug') {
                 if ($site === null) throw new ToolError('Name a site for its debug.log.');
                 $file = SITES . "/$site.localhost/public/wp-content/debug.log";
@@ -1051,7 +1209,7 @@ function rpc_error($id, int $code, string $message): array {
     return ['jsonrpc' => '2.0', 'id' => $id, 'error' => ['code' => $code, 'message' => $message]];
 }
 
-const INSTRUCTIONS = "Cove runs local WordPress sites on this machine, each at https://<name>.localhost with its files in ~/Cove/Sites/<name>.localhost/public and a database of its own. Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin, screenshot to see a page, check_page for a page's status and the PHP errors it caused, and read_logs for older errors. wp_read runs WP-CLI commands that only read; wp runs any. Take a snapshot (snapshot_create) before a change you might want to undo, or try it on a copy (clone_site); before editing plugin or theme code, history_save, so history_diff shows the edit and history_rollback can undo it. snapshot_restore and history_rollback each save the current state first. No tool here deletes a site, pulls or pushes one to a remote host, or changes Cove's own settings.";
+const INSTRUCTIONS = "Cove runs local WordPress and Laravel sites on this machine, each at https://<name>.localhost: a WordPress site's files are in ~/Cove/Sites/<name>.localhost/public with a database of its own, and a Laravel site's folder ~/Cove/Sites/<name>.localhost is the project (artisan_read and artisan run artisan, laravel_workers runs its queue and scheduler). Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin, screenshot to see a page, check_page for a page's status and the PHP errors it caused, and read_logs for older errors. wp_read runs WP-CLI commands that only read; wp runs any. Take a snapshot (snapshot_create) before a change you might want to undo, or try it on a copy (clone_site); before editing plugin or theme code, history_save, so history_diff shows the edit and history_rollback can undo it. snapshot_restore and history_rollback each save the current state first. No tool here deletes a site, pulls or pushes one to a remote host, or changes Cove's own settings.";
 
 function handle(array $msg): ?array {
     $id = $msg['id'] ?? null;
