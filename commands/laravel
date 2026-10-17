@@ -187,7 +187,7 @@ cove_laravel() {
     for k in $LARAVEL_WORKER_KINDS; do
         pid=$(laravel_worker_pid "$site_name" "$k") || pid=""
         if [ -n "$pid" ]; then line="running (pid $pid)"
-        elif laravel_worker_wanted "$site_name" "$k"; then line="on, not running yet (the watchdog starts it within five minutes)"
+        elif laravel_worker_wanted "$site_name" "$k"; then line="on, not running yet (the watchdog starts it within a minute)"
         else line="off"
         fi
         printf '  %-9s %s\n' "$k" "$line"

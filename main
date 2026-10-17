@@ -2007,10 +2007,12 @@ if [ -n "\$rot_mb" ] && [ "\$rot_mb" -gt 0 ]; then
         fi
     fi
 fi
-# Laravel sites' workers (cove laravel <site> queue|schedule on): any that
-# should run and doesn't is started again, so they come back after a crash
-# or a reboot.
-if ls "$SITES_DIR"/*.localhost/laravel_workers >/dev/null 2>&1; then
+# Laravel sites' workers (cove laravel <site> queue|schedule on): once a
+# minute, any that should run and doesn't is started again, so they come
+# back after a crash or a reboot.
+lv_stamp="$COVE_DIR/.laravel-workers.stamp"
+if [ \$((now_s - \$(cat "\$lv_stamp" 2>/dev/null || echo 0))) -ge 60 ] && ls "$SITES_DIR"/*.localhost/laravel_workers >/dev/null 2>&1; then
+    echo "\$now_s" > "\$lv_stamp"
     "$watchdog_cove" laravel --ensure >/dev/null 2>&1
 fi
 last_s=\$(cat "\$sweep_stamp" 2>/dev/null || echo 0)
