@@ -16,7 +16,9 @@
 #    A (all six):      fresh --dev install → add/clone/rename/login/delete →
 #                      a login link rewriting a live-domain home →
 #                      status/health/mailpit → mail from a page and WP-CLI →
-#                      `cove mcp` over stdio → log rotation settings →
+#                      `cove mcp` over stdio → Laravel sites (SQLite and
+#                      MariaDB, artisan, one-time login, clone, delete) →
+#                      log rotation settings →
 #                      container reboot survival
 #    B (one apt/dnf):  previous GitHub release → candidate + post-upgrade
 #    C (one apt/dnf):  install + add as a non-root sudo user
@@ -190,7 +192,7 @@ lane_a() {
             res "$c" install PASS
         else
             res "$c" install FAIL
-            for k in add_latest add_pinned add_plain clone rename login login_rewrite delete status health mailpit mail mcp logrotate reboot; do res "$c" "$k" SKIP; done
+            for k in add_latest add_pinned add_plain clone rename login login_rewrite delete status health mailpit mail mcp laravel logrotate reboot; do res "$c" "$k" SKIP; done
             return
         fi
 
@@ -319,6 +321,39 @@ MCPCHECK
             res "$c" mcp PASS
         else
             res "$c" mcp FAIL
+        fi
+
+        # Laravel: a new app on SQLite and one on MariaDB, served and migrated,
+        # artisan, a one-time login that signs in, and a clone and delete that
+        # take the MariaDB database along. Linux's packaged FrankenPHP has
+        # shipped without PDO, which Laravel needs; cove add says so.
+        if cx "$c" bash -s <<'LARAVELCHECK'
+fail() { echo "laravel: $*" >&2; exit 1; }
+up() { curl -sk -o /dev/null -w '%{http_code}' --max-time 60 "https://$1.localhost/up"; }
+set -a; . /root/Cove/config; set +a
+dbs() { MYSQL_PWD="$DB_PASSWORD" mariadb -u "$DB_USER" -N -e 'SHOW DATABASES' 2>/dev/null; }
+cove add lvl laravel >/tmp/lv-add.log 2>&1 || fail "cove add (sqlite): $(tail -n 6 /tmp/lv-add.log)"
+[ "$(up lvl)" = 200 ] || fail "/up on the SQLite app answered $(up lvl)"
+cove artisan lvl migrate:status 2>&1 | grep -q 'create_users_table.*Ran' || fail "migrate:status"
+cove artisan lvl tinker --execute='\App\Models\User::factory()->create(["email" => "m@matrix.test"]);' >/tmp/lv-user.log 2>&1 || fail "creating a user: $(tail -n 3 /tmp/lv-user.log)"
+printf '%s\n' "Route::get('/me', fn () => auth()->user()?->email ?? 'guest')->middleware('web');" >> /root/Cove/Sites/lvl.localhost/routes/web.php
+link=$(cove login lvl --plain) || fail "cove login"
+curl -sk --max-time 60 -c /tmp/lv-jar -b /tmp/lv-jar "$link" -o /dev/null
+curl -sk --max-time 60 -b /tmp/lv-jar https://lvl.localhost/me | grep -q 'm@matrix.test' || fail "the login link did not sign in"
+cove add lvm laravel --database=mysql >/tmp/lv-addm.log 2>&1 || fail "cove add (mysql): $(tail -n 6 /tmp/lv-addm.log)"
+[ "$(up lvm)" = 200 ] || fail "/up on the MariaDB app answered $(up lvm)"
+cove clone lvm lvm2 >/tmp/lv-clone.log 2>&1 || fail "clone: $(tail -n 4 /tmp/lv-clone.log)"
+[ "$(up lvm2)" = 200 ] || fail "/up on the clone answered $(up lvm2)"
+grep -q '^DB_DATABASE=cove_lvm2$' /root/Cove/Sites/lvm2.localhost/.env || fail "the clone's .env names $(grep ^DB_DATABASE= /root/Cove/Sites/lvm2.localhost/.env)"
+dbs | grep -qx cove_lvm2 || fail "no cove_lvm2 database"
+cove delete lvm2 --force >/dev/null 2>&1 || fail "delete"
+if dbs | grep -qx cove_lvm2; then fail "delete left cove_lvm2"; fi
+exit 0
+LARAVELCHECK
+        then
+            res "$c" laravel PASS
+        else
+            res "$c" laravel FAIL
         fi
 
         # `cove log rotate`: Cove's own logs rotate when asked (by the command
