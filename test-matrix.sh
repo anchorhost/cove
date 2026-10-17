@@ -338,7 +338,9 @@ cove add lvl laravel >/tmp/lv-add.log 2>&1 || fail "cove add (sqlite): $(tail -n
 # couple of seconds (opcache.revalidate_freq).
 printf '%s\n' "Route::get('/me', fn () => auth()->user()?->email ?? 'guest')->middleware('web');" >> /root/Cove/Sites/lvl.localhost/routes/web.php
 cove artisan lvl migrate:status 2>&1 | grep -q 'create_users_table.*Ran' || fail "migrate:status"
-cove artisan lvl tinker --execute='\App\Models\User::factory()->create(["email" => "m@matrix.test"]);' >/tmp/lv-user.log 2>&1 || fail "creating a user: $(tail -n 3 /tmp/lv-user.log)"
+cove artisan lvl test >/tmp/lv-test.log 2>&1 || fail "artisan test: $(tail -n 4 /tmp/lv-test.log)"
+cove laravel lvl user add m@matrix.test >/tmp/lv-user.log 2>&1 || fail "cove laravel user add: $(tail -n 3 /tmp/lv-user.log)"
+cove laravel lvl users | grep -q 'm@matrix.test' || fail "cove laravel users does not list m@matrix.test"
 link=$(cove login lvl --plain) || fail "cove login"
 code=$(curl -sk --max-time 60 -c /tmp/lv-jar -b /tmp/lv-jar "$link" -o /dev/null -w '%{http_code}')
 [ "$code" = 302 ] || fail "the login link answered $code"
@@ -347,6 +349,7 @@ for i in 1 2 3 4 5; do me=$(curl -sk --max-time 60 -b /tmp/lv-jar https://lvl.lo
 [ "$me" = m@matrix.test ] || fail "the login link did not sign in: /me said $(echo "$me" | head -c 80)"
 cove add lvm laravel --database=mysql >/tmp/lv-addm.log 2>&1 || fail "cove add (mysql): $(tail -n 6 /tmp/lv-addm.log)"
 [ "$(up lvm)" = 200 ] || fail "/up on the MariaDB app answered $(up lvm)"
+if cove login lvm --plain >/dev/null 2>&1; then fail "cove login made a link for an app with no users"; fi
 cove clone lvm lvm2 >/tmp/lv-clone.log 2>&1 || fail "clone: $(tail -n 4 /tmp/lv-clone.log)"
 [ "$(up lvm2)" = 200 ] || fail "/up on the clone answered $(up lvm2)"
 grep -q '^DB_DATABASE=cove_lvm2$' /root/Cove/Sites/lvm2.localhost/.env || fail "the clone's .env names $(grep ^DB_DATABASE= /root/Cove/Sites/lvm2.localhost/.env)"
