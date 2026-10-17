@@ -4053,12 +4053,14 @@ function cove_laravel_env($site_path) {
     return $out;
 }
 
-// The SQLite file a Laravel site uses: DB_DATABASE when it is an absolute
-// path, else Laravel's own default, database/database.sqlite.
+// The SQLite file a Laravel site uses: DB_DATABASE, or Laravel's own
+// default, database/database.sqlite.
 function cove_laravel_sqlite_path($site_path, $env = null) {
     $env = $env ?? cove_laravel_env($site_path);
     $db = $env['DB_DATABASE'] ?? '';
-    return ($db !== '' && $db[0] === '/') ? $db : $site_path . '/database/database.sqlite';
+    if ($db === '') return $site_path . '/database/database.sqlite';
+    // A relative path is the project's, as Laravel resolves it (base_path).
+    return $db[0] === '/' ? $db : $site_path . '/' . $db;
 }
 
 // What the sites list says about a Laravel site: the framework's version
@@ -4117,7 +4119,14 @@ function cove_db_sqlite($action, $input, $file) {
     $cap = 500;
     try {
         if (!class_exists('PDO') || !in_array('sqlite', PDO::getAvailableDrivers(), true)) throw new RuntimeException('This PHP has no pdo_sqlite.');
-        $pdo = new PDO('sqlite:' . $file, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5]);
+        // Pdo\Sqlite (PHP 8.4+) is the class with setAuthorizer; new PDO()
+        // returns the generic one even for an sqlite: DSN.
+        $opts = [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5];
+        $pdo = class_exists('Pdo\Sqlite') ? new Pdo\Sqlite('sqlite:' . $file, null, null, $opts) : new PDO('sqlite:' . $file, null, null, $opts);
+        // No ATTACH: the console works on the site's own file, and an
+        // attached one could be another site's (past a demo's limits) or a
+        // new file anywhere. SQLite's action code for it is 24.
+        if (method_exists($pdo, 'setAuthorizer')) $pdo->setAuthorizer(fn($action) => $action === 24 ? Pdo\Sqlite::DENY : Pdo\Sqlite::OK);
         $q = fn($id) => '"' . str_replace('"', '""', (string) $id) . '"';
         $names = $pdo->query("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name")->fetchAll(PDO::FETCH_COLUMN);
         $table = (string) ($input['table'] ?? '');
@@ -4244,6 +4253,7 @@ function cove_db_sqlite($action, $input, $file) {
             $t0 = microtime(true);
             foreach (cove_sqlite_statements($sql) as $stmt) {
                 try {
+                    if (!method_exists($pdo, 'setAuthorizer') && preg_match('/\bATTACH\b/i', preg_replace("~'[^']*'|\"[^\"]*\"~", '', $stmt))) throw new RuntimeException('ATTACH is not allowed here.');
                     $st = $pdo->prepare($stmt);
                     $st->execute();
                     if ($st->columnCount() > 0) {
@@ -4269,10 +4279,12 @@ function cove_db_sqlite($action, $input, $file) {
 }
 
 // The console's SQL split into statements for SQLite, which runs one at a
-// time: semicolons inside quotes, identifiers and comments don't count, nor
-// those inside a CREATE TRIGGER until its END. Comment-only pieces go.
+// time: semicolons inside quotes, identifiers and comments don't count. In a
+// CREATE TRIGGER they count only once its BEGIN … END closes, where CASE …
+// END inside the body nests. Comment-only pieces go.
 function cove_sqlite_statements($sql) {
     $out = []; $cur = ''; $n = strlen($sql); $i = 0;
+    $words = []; $depth = 0;
     while ($i < $n) {
         $c = $sql[$i];
         if ($c === "'" || $c === '"' || $c === '`' || $c === '[') {
@@ -4291,8 +4303,20 @@ function cove_sqlite_statements($sql) {
         }
         if ($c === '-' && substr($sql, $i, 2) === '--') { $j = strpos($sql, "\n", $i); $j = $j === false ? $n : $j; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
         if ($c === '/' && substr($sql, $i, 2) === '/*') { $j = strpos($sql, '*/', $i + 2); $j = $j === false ? $n : $j + 2; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
-        if ($c === ';' && (!preg_match('/^\s*CREATE\s+(TEMP\w*\s+)?TRIGGER\b/i', $cur) || preg_match('/\bEND\s*$/i', $cur))) {
-            $out[] = $cur; $cur = ''; $i++;
+        if (ctype_alpha($c) || $c === '_') {
+            $j = $i;
+            while ($j < $n && (ctype_alnum($sql[$j]) || $sql[$j] === '_' || $sql[$j] === '$')) $j++;
+            $w = strtoupper(substr($sql, $i, $j - $i));
+            if (count($words) < 3) $words[] = $w;
+            $trigger = $words && $words[0] === 'CREATE' && (($words[1] ?? '') === 'TRIGGER' || (in_array($words[1] ?? '', ['TEMP', 'TEMPORARY'], true) && ($words[2] ?? '') === 'TRIGGER'));
+            if ($trigger && ($w === 'BEGIN' || $w === 'CASE')) $depth++;
+            if ($trigger && $w === 'END') $depth = max(0, $depth - 1);
+            $cur .= substr($sql, $i, $j - $i);
+            $i = $j;
+            continue;
+        }
+        if ($c === ';' && $depth === 0) {
+            $out[] = $cur; $cur = ''; $words = []; $i++;
             continue;
         }
         $cur .= $c; $i++;
