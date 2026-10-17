@@ -6902,7 +6902,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .add-drop-text u { text-decoration-color: var(--text-faint); }
         .add-drop-file { display: inline-flex; align-items: center; gap: 0.2rem; padding: 0.15rem 0.25rem 0.15rem 0.6rem; border-radius: var(--radius-pill); background: var(--pill-wp-bg); color: var(--pill-wp-fg); font-size: 0.72rem; white-space: nowrap; }
         .add-progress { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); padding: 0 0 0.6rem; }
-        .add-row.is-importing .plain-toggle, .add-row.is-importing .wp-version, .add-row.has-import .plain-toggle, .add-row.has-import .wp-version { display: none; }
+        .add-row.is-importing .add-type, .add-row.is-importing .wp-version, .add-row.has-import .add-type, .add-row.has-import .wp-version { display: none; }
         /* Indeterminate progress stripe across the top while cove add is
            running — site creation takes 5-10s so we need a clear "working"
            cue beyond just the button text swap. Solid accent block slides
@@ -6929,8 +6929,17 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .add-row form { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
         .add-row input[type="text"] { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.9rem; padding: 0.5rem 0.8rem; border-radius: var(--radius-md); min-width: 200px; flex: 1; }
         .add-row input[type="text"]:focus { outline: 0; border-color: var(--accent); }
-        .add-row .plain-toggle { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--text-dim); font-size: 0.85rem; cursor: pointer; }
-        .add-row .plain-toggle input { accent-color: var(--accent); }
+        /* The site type: a field that completes from the kinds cove add
+           makes, with its list (the sort menu's look) underneath. */
+        .add-type { position: relative; flex: none; }
+        .add-row .add-type input[type="text"] { flex: none; min-width: 0; width: 11rem; padding-right: 2rem; cursor: pointer; }
+        .add-row .add-type input[type="text"]:focus { cursor: text; }
+        .add-type-chev { position: absolute; right: 0.7rem; top: 50%; width: 12px; height: 12px; margin-top: -6px; color: var(--text-faint); pointer-events: none; transition: transform 140ms; }
+        .add-type.is-open .add-type-chev { transform: rotate(180deg); }
+        .add-type .sl-menu { left: 0; right: auto; min-width: 18rem; }
+        .add-type .sl-menu button.is-active { background: var(--panel-hover); }
+        .add-type .sl-menu button:disabled { cursor: default; opacity: 0.5; }
+        .add-type-empty { padding: 0.45rem 0.65rem; font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-faint); }
         .add-row select.wp-version { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.85rem; padding: 0.5rem 0.7rem; border-radius: var(--radius-md); flex: none; cursor: pointer; }
         .add-row select.wp-version:focus { outline: 0; border-color: var(--accent); }
 
@@ -8036,14 +8045,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 <div class="add-progress" id="addProgress" style="display: none;"><span id="addProgressText"></span></div>
                 <form id="addForm">
                     <input type="text" id="newSiteName" placeholder="site-name" required>
-                    <label class="plain-toggle">
-                        <input type="checkbox" id="newSitePlain">
-                        plain (no WordPress)
-                    </label>
-                    <select class="wp-version" id="wpVersionSelect" title="What to install: a WordPress version, or Minn Engine once it has a release" aria-label="What to install">
+                    <div class="add-type" id="addType">
+                        <input type="text" id="addTypeInput" role="combobox" aria-label="Site type" aria-autocomplete="list" aria-expanded="false" aria-controls="addTypeList" autocomplete="off" spellcheck="false" value="WordPress" title="What the site is: type a few letters, ↑↓ to choose, ↵ to pick">
+                        <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                        <div class="sl-menu" id="addTypeList" role="listbox" aria-label="Site types" style="display: none;"></div>
+                    </div>
+                    <select class="wp-version" id="wpVersionSelect" title="Which WordPress: the latest release, nightly, or a version" aria-label="WordPress version">
                         <option value="latest">latest</option>
                         <option value="nightly">nightly</option>
-                        <option value="laravel">laravel</option>
                     </select>
                     <select class="wp-version" id="laravelDbSelect" title="Laravel's database: SQLite, Laravel's own default, or MySQL on Cove's MariaDB" aria-label="Laravel's database" style="display: none;">
                         <option value="sqlite">sqlite</option>
@@ -9090,7 +9099,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // from the site objects because getSites() rebuilds those from the
             // server and would drop a flag stored on them mid-install.
             phpApplying: {},
-            newSite: { name: '', isPlain: false, wpVersion: 'latest', database: 'sqlite', isLoading: false },
+            // kind: wordpress | plain | minn | laravel (the add form's type field).
+            newSite: { name: '', kind: 'wordpress', wpVersion: 'latest', database: 'sqlite', isLoading: false },
+            addType: { open: false, q: '', index: 0 },
+            minnRelease: null,
             // Populated lazily the first time the add row opens — no reason
             // to hit wp.org on a page load that never creates a site. Stays
             // empty when offline, leaving 'latest' and 'nightly' available.
@@ -9669,10 +9681,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.newSite.name = clean;
                     this.render();
                 });
-                $id('newSitePlain').addEventListener('change', (e) => {
-                    this.newSite.isPlain = e.target.checked;
-                    this.render();
-                });
+                this.bindAddType();
                 $id('wpVersionSelect').addEventListener('change', (e) => { this.newSite.wpVersion = e.target.value; this.renderChrome(); });
                 $id('laravelDbSelect').addEventListener('change', (e) => { this.newSite.database = e.target.value; this.renderChrome(); });
                 $id('addForm').addEventListener('submit', (e) => { e.preventDefault(); this.addSite(); });
@@ -9917,12 +9926,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 show(addRow, this.adding);
                 addRow.classList.toggle('is-creating', this.newSite.isLoading);
                 $id('newSiteName').disabled = this.newSite.isLoading;
-                $id('newSitePlain').disabled = this.newSite.isLoading;
+                $id('addTypeInput').disabled = this.newSite.isLoading;
+                this.renderAddType();
+                // WordPress asks which version; Laravel, which database.
+                const kind = this.newSite.kind;
                 const sel = $id('wpVersionSelect');
-                show(sel, !this.newSite.isPlain);
-                sel.disabled = this.newSite.isLoading || this.newSite.isPlain;
-                // Laravel asks one more thing: its database.
-                const isLaravel = !this.newSite.isPlain && this.newSite.wpVersion === 'laravel';
+                show(sel, kind === 'wordpress');
+                sel.disabled = this.newSite.isLoading;
+                const isLaravel = kind === 'laravel';
                 show($id('laravelDbSelect'), isLaravel);
                 $id('laravelDbSelect').disabled = this.newSite.isLoading;
                 $id('btnCreate').disabled = !this.newSite.name || this.newSite.isLoading;
@@ -9931,7 +9942,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.renderImportProgress();
                 // The same, from a terminal.
                 const nm = this.newSite.name || 'mysite';
-                const fl = this.newSite.isPlain ? ' plain' : (this.newSite.wpVersion && this.newSite.wpVersion !== 'latest' ? ' ' + this.newSite.wpVersion : '') + (isLaravel && this.newSite.database !== 'sqlite' ? ' --database=' + this.newSite.database : '');
+                const fl = kind === 'wordpress' ? (this.newSite.wpVersion && this.newSite.wpVersion !== 'latest' ? ' ' + this.newSite.wpVersion : '') : ' ' + kind + (isLaravel && this.newSite.database !== 'sqlite' ? ' --database=' + this.newSite.database : '');
                 $id('addEcho').textContent = this.importFile ? 'cove import ' + nm + ' ' + this.importFile.name : 'cove add ' + nm + fl;
 
                 // Theme button tooltip tracks the mode it would switch to.
@@ -10803,14 +10814,136 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 try {
                     const res = await fetch('/api.php?action=minn_release');
                     const data = await res.json();
-                    if (!data || !data.available) return;
-                    const sel = $id('wpVersionSelect');
-                    if (sel.querySelector('option[value="minn"]')) return;
-                    const opt = document.createElement('option');
-                    opt.value = 'minn';
-                    opt.textContent = 'minn engine' + (data.version ? ' ' + data.version : '');
-                    sel.querySelector('option[value="nightly"]').after(opt);
-                } catch (e) { /* offline — WordPress still works */ }
+                    this.minnRelease = { available: !!(data && data.available), version: (data && data.version) || null };
+                } catch (e) { this.minnRelease = { available: false, version: null }; /* offline — WordPress still works */ }
+                if (this.addType.open) this.renderAddType();
+            },
+
+            // --- The add form's site type -----------------------------------
+            // A field that completes from the kinds `cove add` makes, WordPress
+            // by default: a few letters (or wp, static) narrow the list, ↑↓
+            // move, ↵ or Tab pick, Esc puts the field back. Minn Engine can be
+            // picked once it has a release, as `cove add --minn` needs one.
+            get siteKinds() {
+                const m = this.minnRelease;
+                return [
+                    { id: 'wordpress', label: 'WordPress', hint: 'latest, nightly, or a version', dot: 'wp', words: ['wordpress', 'wp'] },
+                    { id: 'plain', label: 'Plain', hint: 'static files, no database', dot: 'static', words: ['plain', 'static', 'html'] },
+                    { id: 'minn', label: 'Minn Engine', hint: !m ? 'checking for a release…' : m.available ? (m.version ? 'release ' + m.version : 'the latest release') : 'no release yet', dot: 'minn', words: ['minn', 'engine'], disabled: !(m && m.available) },
+                    { id: 'laravel', label: 'Laravel', hint: 'on SQLite or MySQL', dot: 'laravel', words: ['laravel'] },
+                ];
+            },
+
+            // Kinds a word of which starts with the typed text come first
+            // ("la" is Laravel before pLAin), then any that merely contain it.
+            addTypeMatches() {
+                const q = this.addType.q.trim().toLowerCase();
+                if (!q) return this.siteKinds;
+                const starts = this.siteKinds.filter(k => k.words.some(w => w.startsWith(q)));
+                return starts.concat(this.siteKinds.filter(k => !starts.includes(k) && k.label.toLowerCase().includes(q)));
+            },
+
+            // Moves the highlight by step (0: onto the first that can be picked).
+            addTypeStep(step) {
+                const kinds = this.addTypeMatches(), t = this.addType;
+                if (!kinds.length) return;
+                let i = step ? t.index : -1, tries = kinds.length;
+                do { i = (i + (step || 1) + kinds.length) % kinds.length; } while (kinds[i].disabled && --tries > 0);
+                t.index = i;
+            },
+
+            // Opening empties the field, with the current type as its
+            // placeholder, so the first letter typed starts the search.
+            openAddType() {
+                const t = this.addType, input = $id('addTypeInput');
+                t.open = true;
+                t.q = '';
+                t.index = Math.max(0, this.siteKinds.findIndex(k => k.id === this.newSite.kind));
+                input.value = '';
+                this.renderAddType();
+            },
+
+            closeAddType() {
+                this.addType.open = false;
+                this.addType.q = '';
+                this.renderAddType();
+            },
+
+            pickAddType(id) {
+                const k = this.siteKinds.find(x => x.id === id);
+                if (!k || k.disabled) return false;
+                this.newSite.kind = id;
+                this.addType.open = false;
+                this.addType.q = '';
+                this.render();
+                return true;
+            },
+
+            renderAddType() {
+                const t = this.addType, input = $id('addTypeInput'), list = $id('addTypeList');
+                const current = this.siteKinds.find(k => k.id === this.newSite.kind);
+                show(list, t.open);
+                $id('addType').classList.toggle('is-open', t.open);
+                input.setAttribute('aria-expanded', t.open ? 'true' : 'false');
+                input.placeholder = t.open && current ? current.label : '';
+                if (!t.open) {
+                    input.value = current ? current.label : '';
+                    input.removeAttribute('aria-activedescendant');
+                    return;
+                }
+                const kinds = this.addTypeMatches();
+                t.index = Math.max(0, Math.min(t.index, kinds.length - 1));
+                list.innerHTML = kinds.length
+                    ? kinds.map((k, i) => '<button type="button" role="option" tabindex="-1" id="addTypeOpt-' + k.id + '" data-kind="' + k.id + '"' + (i === t.index ? ' class="is-active"' : '') + ' aria-selected="' + (k.id === this.newSite.kind) + '"' + (k.disabled ? ' disabled' : '') + '><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg><i class="sl-tdot ' + k.dot + '" aria-hidden="true"></i>' + k.label + '<small>' + this.escapeHtml(k.hint) + '</small></button>').join('')
+                    : '<div class="add-type-empty">no such type: wordpress, plain, minn or laravel</div>';
+                if (kinds[t.index]) input.setAttribute('aria-activedescendant', 'addTypeOpt-' + kinds[t.index].id);
+                else input.removeAttribute('aria-activedescendant');
+            },
+
+            bindAddType() {
+                const input = $id('addTypeInput'), list = $id('addTypeList');
+                input.addEventListener('focus', () => this.openAddType());
+                input.addEventListener('click', () => { if (!this.addType.open) this.openAddType(); });
+                input.addEventListener('input', () => {
+                    this.addType.open = true;
+                    this.addType.q = input.value;
+                    this.addTypeStep(0);
+                    this.renderAddType();
+                });
+                input.addEventListener('keydown', (e) => {
+                    const t = this.addType;
+                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        if (!t.open) { this.openAddType(); return; }
+                        this.addTypeStep(e.key === 'ArrowDown' ? 1 : -1);
+                        this.renderAddType();
+                    } else if (e.key === 'Enter' || e.key === 'Tab') {
+                        // A closed field lets Enter submit the form as usual.
+                        if (!t.open) return;
+                        const k = this.addTypeMatches()[t.index];
+                        if (e.key === 'Enter') e.preventDefault();
+                        if (k && !k.disabled) this.pickAddType(k.id);
+                        else if (e.key === 'Tab') this.closeAddType();
+                    } else if (e.key === 'Escape' && t.open) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        this.closeAddType();
+                    }
+                });
+                // Leaving the field: a whole name typed counts as picked.
+                input.addEventListener('blur', () => {
+                    const t = this.addType;
+                    if (!t.open) return;
+                    const q = t.q.trim().toLowerCase();
+                    const k = q && this.siteKinds.find(x => !x.disabled && (x.label.toLowerCase() === q || x.words.includes(q)));
+                    if (!k || !this.pickAddType(k.id)) this.closeAddType();
+                });
+                // Keep the field focused while an option is clicked.
+                list.addEventListener('mousedown', (e) => e.preventDefault());
+                list.addEventListener('click', (e) => {
+                    const b = e.target.closest('[data-kind]');
+                    if (b && !b.disabled) this.pickAddType(b.dataset.kind);
+                });
             },
 
             formatSize(bytes) {
@@ -16314,8 +16447,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (file) {
                     $id('addDropName').textContent = file.name + ' · ' + this.formatSize(file.size);
                     if (!this.newSite.name) { this.newSite.name = this.nameFromArchive(file.name); $id('newSiteName').value = this.newSite.name; }
-                    this.newSite.isPlain = false;
-                    $id('newSitePlain').checked = false;
+                    // An import makes a WordPress site.
+                    this.newSite.kind = 'wordpress';
                 }
                 this.render();
                 $id('newSiteName').focus();
@@ -16385,13 +16518,13 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.newSite.isLoading = true;
                 this.render();
                 const name = this.newSite.name;
-                const isPlain = this.newSite.isPlain;
-                // 'latest' is the server's default, so it's sent as nothing
-                // at all — keeps the generated command identical to what a
-                // plain `cove add <name>` produces.
-                const wpVersion = isPlain ? '' : this.newSite.wpVersion;
-
-                const isLaravel = wpVersion === 'laravel';
+                const kind = this.newSite.kind;
+                const isPlain = kind === 'plain', isLaravel = kind === 'laravel';
+                // The flavor cove add takes: a WordPress version, minn or
+                // laravel. 'latest' is the server's default, so it's sent as
+                // nothing at all — keeps the generated command identical to
+                // what a plain `cove add <name>` produces.
+                const wpVersion = kind === 'wordpress' ? this.newSite.wpVersion : isPlain ? '' : kind;
                 const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined, database: isLaravel ? this.newSite.database : undefined });
                 if (add.success) {
                     // Optimistic insert: we already know every field the row
@@ -16402,7 +16535,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.sites.push({
                         name,
                         domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
-                        type: isPlain ? 'Plain' : (wpVersion === 'minn' ? 'Minn' : isLaravel ? 'Laravel' : 'WordPress'),
+                        type: isPlain ? 'Plain' : kind === 'minn' ? 'Minn' : isLaravel ? 'Laravel' : 'WordPress',
                         display_path: '~/Cove/Sites/' + name + '.localhost',
                         full_path: SITES_DIR + '/' + name + '.localhost',
                         // Server calculates size in add_site and returns it
