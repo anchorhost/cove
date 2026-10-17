@@ -1,0 +1,57 @@
+# `cove postgres`: the PostgreSQL that Laravel sites on --database=pgsql use.
+# With no arguments, how it is; install sets it up (the first such site does
+# that too); start and stop; psql opens a shell as Cove's role.
+cove_postgres() {
+    local action="${1:-}"
+    case "$action" in
+        ""|status)
+            if ! cove_pg_configured; then
+                echo "PostgreSQL isn't set up for Cove yet."
+                echo "It is the first time a Laravel site asks for it (cove add myapp laravel --database=pgsql),"
+                echo "or now with: cove postgres install"
+                return 0
+            fi
+            local state="❌ Stopped" version="" dbs=""
+            if cove_pg_ready; then
+                state="✅ Running"
+                version=$(cove_pg_psql postgres -c 'SHOW server_version' 2>/dev/null | cut -d' ' -f1)
+                dbs=$(cove_pg_psql postgres -F ' ' -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY datname" 2>/dev/null)
+            fi
+            echo "  PostgreSQL:   $state${version:+ ($version)}"
+            echo "  Address:      127.0.0.1:$(cove_pg_port), role $(config_get PGSQL_USER)"
+            [ -n "$(config_get PGSQL_FORMULA)" ] && echo "  Formula:      $(config_get PGSQL_FORMULA) (Homebrew)"
+            if [ -n "$dbs" ]; then
+                echo "  Databases:"
+                printf '%s\n' "$dbs" | sed 's/^/    /'
+            fi
+            ;;
+        install)
+            ensure_postgres
+            ;;
+        start)
+            cove_pg_configured || { echo "PostgreSQL isn't set up for Cove yet: cove postgres install" >&2; exit 1; }
+            cove_pg_start
+            cove_pg_wait_ready "" 20 && echo "✅ PostgreSQL is running." || { echo "❌ PostgreSQL did not start." >&2; exit 1; }
+            ;;
+        stop)
+            cove_pg_configured || { echo "PostgreSQL isn't set up for Cove yet." >&2; exit 1; }
+            cove_pg_stop
+            echo "✅ PostgreSQL stopped. Laravel sites on it can't reach their database until: cove postgres start"
+            ;;
+        psql)
+            shift
+            ensure_postgres >/dev/null || exit 1
+            local db="${1:-postgres}" psql
+            [ $# -gt 0 ] && shift
+            psql=$(cove_pg_tool psql) || exit 1
+            PGPASSWORD="$(config_get PGSQL_PASSWORD)" exec "$psql" -h 127.0.0.1 -p "$(cove_pg_port)" -U "$(config_get PGSQL_USER)" -d "$db" "$@"
+            ;;
+        -h|--help|help)
+            echo "Usage: cove postgres [status|install|start|stop|psql [database]]"
+            ;;
+        *)
+            echo "Usage: cove postgres [status|install|start|stop|psql [database]]" >&2
+            exit 1
+            ;;
+    esac
+}

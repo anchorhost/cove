@@ -154,27 +154,40 @@ cove_import_laravel() {
     from=$(sed -n 's/^site=//p' "$work/meta" 2>/dev/null)
     from_dir=$(sed -n 's/^folder=//p' "$work/meta" 2>/dev/null)
 
+    # The dump's server: PostgreSQL when meta says so, MariaDB otherwise.
+    local server="mariadb"
+    [ "$(sed -n 's/^db_server=//p' "$work/meta" 2>/dev/null)" = "pgsql" ] && server="pgsql"
     if [ -f "$work/db.sql" ]; then
         source_config
+        if [ "$server" = "pgsql" ] && ! ensure_postgres; then
+            rm -rf "$work"
+            exit 1
+        fi
         db_name=$(cove_laravel_db_name "$site_name")
-        if cove_db_exists "$db_name"; then
+        if cove_server_db_exists "$server" "$db_name"; then
             rm -rf "$work"
             gum style --foreground red "❌ Error: A database named '$db_name' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
             exit 1
         fi
         echo "   - Restoring its database into '$db_name'…"
-        if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
-            || ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" --max_allowed_packet=512M "$db_name" < "$work/db.sql"; then
-            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        local loaded=false
+        if [ "$server" = "pgsql" ]; then
+            cove_server_db_create pgsql "$db_name" && cove_pg_load "$db_name" < "$work/db.sql" && loaded=true
+        else
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+                && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" --max_allowed_packet=512M "$db_name" < "$work/db.sql" && loaded=true
+        fi
+        if [ "$loaded" != true ]; then
+            cove_server_db_drop "$server" "$db_name"
             rm -rf "$work"
             gum style --foreground red "❌ Error: The database import failed; nothing was created."
             exit 1
         fi
-        pairs+=("\"DB_HOST\":\"127.0.0.1\"" "\"DB_PORT\":\"3306\"" "\"DB_DATABASE\":$(cove_json_str "$db_name")" "\"DB_USERNAME\":$(cove_json_str "$DB_USER")" "\"DB_PASSWORD\":$(cove_json_str "$DB_PASSWORD")")
+        pairs+=("$(cove_laravel_db_env "$server" "$db_name")")
     fi
 
     if ! mv "$work/project" "$site_dir"; then
-        [ -n "$db_name" ] && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        [ -n "$db_name" ] && cove_server_db_drop "$server" "$db_name"
         rm -rf "$work"
         gum style --foreground red "❌ Error: Could not move the project into $site_dir."
         exit 1

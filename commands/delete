@@ -74,10 +74,15 @@ cove_delete() {
     elif site_is_laravel "$site_dir"; then
         # Only the database Cove made for the site: one .env was pointed at
         # by hand may be shared, or someone else's.
-        local db_name
+        local db_name server
         if db_name=$(laravel_cove_db "$site_dir" "$site_name"); then
+            server=$(laravel_db_server "$site_dir")
             echo "🗄️ Deleting database: $db_name"
-            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+            if [ "$server" = "pgsql" ] && ! ensure_postgres >/dev/null; then
+                gum style --foreground yellow "⚠️  PostgreSQL isn't running, so '$db_name' stays. Drop it later: cove postgres psql, then DROP DATABASE $db_name;"
+            else
+                cove_server_db_drop "$server" "$db_name"
+            fi
         fi
     fi
 

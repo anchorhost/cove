@@ -496,7 +496,7 @@ function tools(): array {
             'inputSchema' => $obj([
                 'name' => ['type' => 'string', 'description' => 'Lowercase letters, numbers and hyphens, e.g. client-demo.'],
                 'type' => ['type' => 'string', 'enum' => ['wordpress', 'laravel', 'plain', 'minn'], 'description' => 'Default wordpress.'],
-                'database' => ['type' => 'string', 'enum' => ['sqlite', 'mysql', 'mariadb'], 'description' => 'Laravel only: sqlite (the default for a new app) or a database on Cove\'s MariaDB. With from: the one the project names, unless given.'],
+                'database' => ['type' => 'string', 'enum' => ['sqlite', 'mysql', 'mariadb', 'pgsql'], 'description' => 'Laravel only: sqlite (the default for a new app), a database on Cove\'s MariaDB, or pgsql on Cove\'s PostgreSQL (set up the first time, which takes a few minutes). With from: the one the project names, unless given.'],
                 'from' => ['type' => 'string', 'description' => 'Laravel only: an existing project to set up instead of a new app, a git URL (https://…, git@host:path) or a folder (copied; the original is left alone).'],
                 'branch' => ['type' => 'string', 'description' => 'With a git URL in from: the branch or tag to check out.'],
                 'seed' => ['type' => 'boolean', 'description' => 'Laravel only: run the database seeders after the migrations.'],
@@ -776,7 +776,7 @@ function call_tool(string $name, array $a): array {
                 $args[] = 'laravel';
                 if (!empty($a['wp_version']) || !empty($a['multisite'])) throw new ToolError('wp_version and multisite are for WordPress sites.');
                 if (!empty($a['database'])) {
-                    if (!in_array($a['database'], ['sqlite', 'mysql', 'mariadb'], true)) throw new ToolError('database is sqlite, mysql or mariadb.');
+                    if (!in_array($a['database'], ['sqlite', 'mysql', 'mariadb', 'pgsql'], true)) throw new ToolError('database is sqlite, mysql, mariadb or pgsql.');
                     $args[] = '--database=' . $a['database'];
                 }
                 $from = trim((string) ($a['from'] ?? ''));

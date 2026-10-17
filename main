@@ -1549,6 +1549,190 @@ linux_php_extension_packages() {
     esac
 }
 
+# --- PostgreSQL ------------------------------------------------------------
+# For Laravel sites that ask for it, so not part of `cove install`: the
+# first site on it (--database=pgsql) or `cove postgres install` sets it up.
+# On macOS that is Homebrew's postgresql@17, unless a PostgreSQL already
+# answers on 127.0.0.1:5432 and lets this account in (Homebrew's and
+# Postgres.app's trust the account that started them), which is used as it
+# is. On Linux it is the distribution's. Cove signs in as its own role,
+# cove_user, with a password kept in ~/Cove/config (PGSQL_*), as MariaDB's.
+COVE_PG_FORMULA="postgresql@17"
+
+# A PostgreSQL client tool ($1: psql, pg_dump, pg_isready): the server's own
+# formula's first (pg_dump can't be older than the server; the versioned
+# formulas aren't linked into PATH), else on PATH, else the newest found.
+cove_pg_tool() {
+    local tool="$1" formula d
+    formula=$(config_get PGSQL_FORMULA)
+    if [ -n "$formula" ]; then
+        for d in "/opt/homebrew/opt/$formula/bin" "/usr/local/opt/$formula/bin"; do
+            if [ -x "$d/$tool" ]; then echo "$d/$tool"; return 0; fi
+        done
+    fi
+    command -v "$tool" 2>/dev/null && return 0
+    d=$(for d in /opt/homebrew/opt/postgresql@*/bin /usr/local/opt/postgresql@*/bin /usr/lib/postgresql/*/bin /usr/pgsql-*/bin; do [ -x "$d/$tool" ] && echo "$d"; done | sort -V | tail -n 1)
+    [ -n "$d" ] || return 1
+    echo "$d/$tool"
+}
+
+cove_pg_port() {
+    local port
+    port=$(config_get PGSQL_PORT)
+    echo "${port:-5432}"
+}
+
+cove_pg_configured() {
+    [ -n "$(config_get PGSQL_USER)" ]
+}
+
+# Does PostgreSQL answer on 127.0.0.1 ($1 the port, Cove's by default)?
+cove_pg_ready() {
+    local tool
+    tool=$(cove_pg_tool pg_isready) || return 1
+    "$tool" -q -h 127.0.0.1 -p "${1:-$(cove_pg_port)}" -t 3
+}
+
+# psql as Cove's role: $1 the database, the rest psql's own arguments.
+# Quiet, unaligned rows, and stopping at the first error.
+cove_pg_psql() {
+    local db="$1" psql
+    shift
+    psql=$(cove_pg_tool psql) || { echo "❌ Error: psql isn't installed." >&2; return 1; }
+    PGPASSWORD="$(config_get PGSQL_PASSWORD)" PGCONNECT_TIMEOUT=5 "$psql" -X -q -tA -v ON_ERROR_STOP=1 \
+        -h 127.0.0.1 -p "$(cove_pg_port)" -U "$(config_get PGSQL_USER)" -d "$db" "$@"
+}
+
+# A database on Cove's PostgreSQL? Cove's database names are [a-z0-9_].
+cove_pg_db_exists() {
+    [ "$(cove_pg_psql postgres -c "SELECT 1 FROM pg_database WHERE datname = '$1'" 2>/dev/null)" = "1" ]
+}
+
+# psql as the server's superuser, for setting Cove's role up: on Linux the
+# postgres account; on macOS this one, which the server trusts.
+cove_pg_admin_psql() {
+    local psql
+    psql=$(cove_pg_tool psql) || return 1
+    if [ "$OS" = "macos" ]; then
+        PGCONNECT_TIMEOUT=5 "$psql" -X -q -tA -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -d postgres "$@"
+    elif [ "$(id -u)" = "0" ]; then
+        (cd /tmp && runuser -u postgres -- "$psql" -X -q -tA -v ON_ERROR_STOP=1 -d postgres "$@")
+    else
+        (cd /tmp && sudo -u postgres "$psql" -X -q -tA -v ON_ERROR_STOP=1 -d postgres "$@")
+    fi
+}
+
+cove_pg_start() {
+    if [ "$OS" = "macos" ]; then
+        local formula
+        formula=$(config_get PGSQL_FORMULA)
+        [ -n "$formula" ] && pkg_service start "$formula" >/dev/null 2>&1
+    else
+        $SUDO_CMD systemctl start postgresql >/dev/null 2>&1
+    fi
+}
+
+cove_pg_stop() {
+    if [ "$OS" = "macos" ]; then
+        local formula
+        formula=$(config_get PGSQL_FORMULA)
+        [ -n "$formula" ] && pkg_service stop "$formula" >/dev/null 2>&1
+    else
+        $SUDO_CMD systemctl stop postgresql >/dev/null 2>&1
+    fi
+}
+
+cove_pg_wait_ready() {
+    local i
+    for i in $(seq 1 "${2:-30}"); do
+        cove_pg_ready "$1" && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# PostgreSQL ready for Cove: set up the first time, started when it has
+# stopped. Progress on stdout, errors on stderr.
+ensure_postgres() {
+    if cove_pg_configured; then
+        cove_pg_ready && return 0
+        echo "🐘 Starting PostgreSQL…"
+        cove_pg_start
+        cove_pg_wait_ready "" 20 && return 0
+        echo "❌ Error: PostgreSQL isn't answering on 127.0.0.1:$(cove_pg_port). See: cove postgres" >&2
+        return 1
+    fi
+    cove_pg_setup
+}
+
+cove_pg_setup() {
+    local formula="" pass hba
+    echo "🐘 Setting up PostgreSQL for Cove…"
+    if [ "$OS" = "macos" ]; then
+        if cove_pg_ready 5432; then
+            if ! cove_pg_admin_psql -c 'SELECT 1' >/dev/null 2>&1; then
+                echo "❌ Error: A PostgreSQL already answers on 127.0.0.1:5432 (Postgres.app, DBngin, Herd?) and won't let Cove in." >&2
+                echo "   Stop it, or give this account a superuser role in it, then try again." >&2
+                return 1
+            fi
+            echo "   - Using the PostgreSQL already running on 127.0.0.1:5432."
+        else
+            if ! cove_pg_tool pg_ctl >/dev/null 2>&1 || ! "$MAC_BREW" list "$COVE_PG_FORMULA" >/dev/null 2>&1; then
+                echo "   - Installing $COVE_PG_FORMULA (a few minutes the first time)…"
+                if ! "$MAC_BREW" install "$COVE_PG_FORMULA" >&2; then
+                    echo "❌ Error: Could not install $COVE_PG_FORMULA." >&2
+                    return 1
+                fi
+            fi
+            formula="$COVE_PG_FORMULA"
+            config_set PGSQL_FORMULA "$formula"
+            pkg_service start "$formula" >/dev/null 2>&1
+            if ! cove_pg_wait_ready 5432 30; then
+                echo "❌ Error: $formula did not start. Try: $MAC_BREW services restart $formula" >&2
+                return 1
+            fi
+        fi
+    else
+        if ! cove_pg_tool pg_isready >/dev/null 2>&1 || ! systemctl list-unit-files postgresql.service >/dev/null 2>&1; then
+            echo "   - Installing PostgreSQL via $PKG_MANAGER…"
+            if [ "$PKG_MANAGER" = "apt" ]; then
+                $SUDO_CMD apt-get update -qq >/dev/null 2>&1
+                $SUDO_CMD env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql >/dev/null 2>&1
+            else
+                $SUDO_CMD dnf install -y -q postgresql-server postgresql >/dev/null 2>&1
+            fi || { echo "❌ Error: Could not install PostgreSQL." >&2; return 1; }
+        fi
+        # Fedora and RHEL leave the cluster to be made, and let connections
+        # from 127.0.0.1 in only as the matching system account (ident):
+        # Cove's role signs in with its password instead.
+        if [ "$PKG_MANAGER" = "dnf" ]; then
+            hba=/var/lib/pgsql/data/pg_hba.conf
+            $SUDO_CMD test -f /var/lib/pgsql/data/PG_VERSION || $SUDO_CMD postgresql-setup --initdb >/dev/null 2>&1
+            $SUDO_CMD sed -i -E 's/^(host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1\/32|::1\/128)[[:space:]]+)ident/\1md5/' "$hba"
+        fi
+        $SUDO_CMD systemctl enable postgresql >/dev/null 2>&1
+        $SUDO_CMD systemctl restart postgresql >/dev/null 2>&1
+        if ! cove_pg_wait_ready 5432 30; then
+            echo "❌ Error: PostgreSQL did not start. See: systemctl status postgresql" >&2
+            return 1
+        fi
+    fi
+    # Letters and digits only: the password goes into SQL and .env files.
+    pass=$(cove_random_password 24 | tr -dc 'A-Za-z0-9' | cut -c1-24)
+    if ! cove_pg_admin_psql -c "DO \$\$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'cove_user') THEN ALTER ROLE cove_user LOGIN SUPERUSER PASSWORD '$pass'; ELSE CREATE ROLE cove_user LOGIN SUPERUSER PASSWORD '$pass'; END IF; END \$\$;" >/dev/null; then
+        echo "❌ Error: Could not create Cove's role in PostgreSQL." >&2
+        return 1
+    fi
+    config_set PGSQL_USER cove_user
+    config_set PGSQL_PASSWORD "$pass"
+    config_set PGSQL_PORT 5432
+    if ! cove_pg_psql postgres -c 'SELECT 1' >/dev/null; then
+        echo "❌ Error: Cove's role can't sign in to PostgreSQL (check pg_hba.conf for 127.0.0.1)." >&2
+        return 1
+    fi
+    echo "   - ✅ PostgreSQL $(cove_pg_psql postgres -c 'SHOW server_version' | cut -d' ' -f1) is ready on 127.0.0.1:5432."
+}
+
 # --- Laravel ---------------------------------------------------------------
 # A Laravel site's folder is the project root, so Laravel's public/ is the
 # webroot Cove serves anyway. Cove's own files share that folder: these are
@@ -1643,18 +1827,76 @@ cove_db_exists() {
     [ -n "$(MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -N -e "SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '$1'" 2>/dev/null)" ]
 }
 
-# The MariaDB database a Laravel site uses when it is the one Cove made for
-# it; nothing (and status 1) for SQLite or any other database, which clone,
-# rename and delete then leave alone.
+# The database a Laravel site uses, on MariaDB or PostgreSQL, when it is the
+# one Cove made for it; nothing (and status 1) for SQLite or any other
+# database, which clone, rename and delete then leave alone.
 laravel_cove_db() {
     local site_dir="$1" site_name="$2" db
-    case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
-        mysql|mariadb) ;;
-        *) return 1 ;;
-    esac
+    laravel_db_server "$site_dir" >/dev/null || return 1
     db=$(laravel_env_get "$site_dir" DB_DATABASE)
     [ -n "$db" ] && [ "$db" = "$(cove_laravel_db_name "$site_name")" ] || return 1
     echo "$db"
+}
+
+# Which of Cove's servers a Laravel site's database is on, from .env:
+# mariadb (DB_CONNECTION mysql or mariadb) or pgsql; status 1 for SQLite or
+# anything else.
+laravel_db_server() {
+    case "$(laravel_env_get "$1" DB_CONNECTION)" in
+        mysql|mariadb) echo mariadb ;;
+        pgsql) echo pgsql ;;
+        *) return 1 ;;
+    esac
+}
+
+# A Laravel database on either server ($1 mariadb or pgsql, $2 the name,
+# [a-z0-9_] as Cove makes them). MariaDB's need source_config.
+cove_server_db_exists() {
+    if [ "$1" = "pgsql" ]; then cove_pg_db_exists "$2"; else cove_db_exists "$2"; fi
+}
+
+cove_server_db_create() {
+    if [ "$1" = "pgsql" ]; then
+        cove_pg_psql postgres -c "CREATE DATABASE \"$2\" ENCODING 'UTF8' TEMPLATE template0" >/dev/null
+    else
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$2\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    fi
+}
+
+# Dropped even with a queue worker still connected (FORCE ends its session).
+cove_server_db_drop() {
+    if [ "$1" = "pgsql" ]; then
+        cove_pg_psql postgres -c "DROP DATABASE IF EXISTS \"$2\" WITH (FORCE)" >/dev/null
+    else
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$2\`;"
+    fi
+}
+
+# A PostgreSQL database as plain SQL on stdout, without owners or grants so
+# it loads under any role.
+cove_pg_dump() {
+    local pg_dump
+    pg_dump=$(cove_pg_tool pg_dump) || { echo "❌ Error: pg_dump isn't installed." >&2; return 1; }
+    PGPASSWORD="$(config_get PGSQL_PASSWORD)" "$pg_dump" -h 127.0.0.1 -p "$(cove_pg_port)" -U "$(config_get PGSQL_USER)" --no-owner --no-acl "$1"
+}
+
+# A plain-SQL dump on stdin into a PostgreSQL database ($1). pg_dump 17.6
+# and later wrap a dump in \restrict lines that an older psql (another
+# machine's) refuses, so they go; nothing else is touched.
+cove_pg_load() {
+    sed -E '/^\\(un)?restrict [A-Za-z0-9]+$/d' | cove_pg_psql "$1" >/dev/null
+}
+
+# .env's database settings for Cove's server ($1) and database ($2), as JSON
+# members for laravel_env_set. MariaDB's need source_config.
+cove_laravel_db_env() {
+    local port="3306" user="$DB_USER" pass="$DB_PASSWORD"
+    if [ "$1" = "pgsql" ]; then
+        port=$(cove_pg_port)
+        user=$(config_get PGSQL_USER)
+        pass=$(config_get PGSQL_PASSWORD)
+    fi
+    printf '"DB_HOST":"127.0.0.1","DB_PORT":"%s","DB_DATABASE":%s,"DB_USERNAME":%s,"DB_PASSWORD":%s' "$port" "$(cove_json_str "$2")" "$(cove_json_str "$user")" "$(cove_json_str "$pass")"
 }
 
 # Points a Laravel site's own settings at a new name after a clone, rename,
@@ -4199,6 +4441,7 @@ function cove_laravel_facts($site_path, $site_name) {
     $conn = $env['DB_CONNECTION'] ?? 'sqlite';
     $db_name = null;
     if ($conn === 'mysql' || $conn === 'mariadb') $db_name = $env['DB_DATABASE'] ?? null;
+    elseif ($conn === 'pgsql' && ($env['DB_DATABASE'] ?? '') !== '') $db_name = 'pgsql:' . $env['DB_DATABASE'];
     elseif ($conn === 'sqlite' && is_file(cove_laravel_sqlite_path($site_path, $env))) $db_name = 'sqlite:' . $site_name;
     return [
         'version' => ($head !== false && preg_match("/const VERSION = '([^']+)'/", $head, $m)) ? $m[1] : null,
@@ -4405,6 +4648,214 @@ function cove_db_sqlite($action, $input, $file) {
     }
 }
 
+// The database view for a Laravel site's PostgreSQL database ("pgsql:<name>"
+// in the list), over PDO as Cove's role, in the schema the app uses
+// (public, unless its search_path says otherwise). The same actions as
+// MariaDB's and SQLite's above; PostgreSQL has no SHOW CREATE TABLE, so the
+// structure tab's statement is put together from the catalog.
+function cove_pgsql_pdo($cfg, $db) {
+    if (!class_exists('PDO') || !in_array('pgsql', PDO::getAvailableDrivers(), true)) throw new RuntimeException('This PHP has no pdo_pgsql.');
+    if (empty($cfg['PGSQL_USER'])) throw new RuntimeException('PostgreSQL isn\'t set up for Cove.');
+    $dsn = 'pgsql:host=127.0.0.1;port=' . (int) ($cfg['PGSQL_PORT'] ?? 5432) . ';dbname=' . $db . ';connect_timeout=5';
+    return new PDO($dsn, $cfg['PGSQL_USER'], $cfg['PGSQL_PASSWORD'] ?? '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+}
+
+// The statements in a console entry, split at the semicolons between them:
+// not inside quotes ('…', "…", $tag$…$tag$) or comments.
+function cove_pg_statements($sql) {
+    $out = []; $cur = ''; $n = strlen($sql); $i = 0;
+    while ($i < $n) {
+        $c = $sql[$i];
+        if ($c === "'" || $c === '"') {
+            $j = $i + 1;
+            while ($j < $n) { if ($sql[$j] === $c) { if ($j + 1 < $n && $sql[$j + 1] === $c) { $j += 2; continue; } break; } $j++; }
+            $cur .= substr($sql, $i, $j - $i + 1); $i = $j + 1; continue;
+        }
+        if ($c === '$' && preg_match('/\G\$([A-Za-z_][A-Za-z0-9_]*)?\$/', $sql, $m, 0, $i)) {
+            $end = strpos($sql, $m[0], $i + strlen($m[0]));
+            $j = $end === false ? $n : $end + strlen($m[0]);
+            $cur .= substr($sql, $i, $j - $i); $i = $j; continue;
+        }
+        if ($c === '-' && substr($sql, $i, 2) === '--') { $j = strpos($sql, "\n", $i); $j = $j === false ? $n : $j; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
+        if ($c === '/' && substr($sql, $i, 2) === '/*') { $j = strpos($sql, '*/', $i + 2); $j = $j === false ? $n : $j + 2; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
+        if ($c === ';') { if (trim($cur) !== '') $out[] = trim($cur); $cur = ''; $i++; continue; }
+        $cur .= $c; $i++;
+    }
+    if (trim($cur) !== '' && trim(preg_replace('~--[^\n]*|/\*.*?\*/~s', '', $cur)) !== '') $out[] = trim($cur);
+    return $out;
+}
+
+// A PostgreSQL value as the grid shows it: booleans as true/false, bytea
+// (a stream from PDO) as its bytes.
+function cove_pg_cell($v) {
+    if (is_bool($v)) return $v ? 'true' : 'false';
+    if (is_resource($v)) $v = stream_get_contents($v);
+    return cove_db_cell($v);
+}
+
+function cove_db_pgsql($action, $input, $db, $cfg) {
+    $cap = 500;
+    try {
+        $pdo = cove_pgsql_pdo($cfg, $db);
+        $q = fn($id) => '"' . str_replace('"', '""', (string) $id) . '"';
+        $tables = $pdo->query("SELECT c.relname, c.relkind, c.reltuples::bigint, pg_total_relation_size(c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'v', 'm', 'p') ORDER BY c.relname")->fetchAll(PDO::FETCH_NUM);
+        $names = array_column($tables, 0);
+        $table = (string) ($input['table'] ?? '');
+        if (in_array($action, ['db_rows', 'db_cell', 'db_update', 'db_delete_row', 'db_structure'], true) && !in_array($table, $names, true)) throw new RuntimeException('No such table.');
+        $rel = $q($table);
+
+        $describe = function () use ($pdo, $table) {
+            $st = $pdo->prepare("SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, pg_get_expr(d.adbin, d.adrelid), a.attidentity, a.attgenerated, col_description(a.attrelid, a.attnum), co.collname
+                FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum LEFT JOIN pg_collation co ON co.oid = a.attcollation AND a.attcollation <> 0
+                WHERE a.attrelid = to_regclass(format('%I.%I', current_schema(), ?::text)) AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum");
+            $st->execute([$table]);
+            $rows = $st->fetchAll(PDO::FETCH_NUM);
+            $st = $pdo->prepare("SELECT ic.relname, i.indisunique, i.indisprimary, am.amname, json_agg(a.attname ORDER BY array_position(i.indkey::int2[], a.attnum)), pg_get_indexdef(i.indexrelid)
+                FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid JOIN pg_am am ON am.oid = ic.relam JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                WHERE i.indrelid = to_regclass(format('%I.%I', current_schema(), ?::text)) GROUP BY ic.relname, i.indisunique, i.indisprimary, am.amname, i.indexrelid ORDER BY i.indisprimary DESC, ic.relname");
+            $st->execute([$table]);
+            $indexes = []; $pk = []; $defs = [];
+            foreach ($st->fetchAll(PDO::FETCH_NUM) as $ix) {
+                $cols = json_decode((string) $ix[4], true) ?: [];
+                $indexes[] = ['name' => $ix[0], 'unique' => (bool) $ix[1], 'type' => $ix[2] ? 'PRIMARY' : strtoupper($ix[3]), 'columns' => $cols];
+                if ($ix[2]) $pk = $cols; else $defs[] = $ix[5];
+            }
+            $cols = [];
+            foreach ($rows as $c) {
+                $extra = $c[4] !== '' && $c[4] !== null ? 'identity' : ($c[5] !== '' && $c[5] !== null ? 'generated' : (preg_match('/^nextval\(/', (string) $c[3]) ? 'serial' : ''));
+                $cols[] = ['name' => $c[0], 'type' => $c[1], 'null' => (bool) $c[2], 'key' => in_array($c[0], $pk, true) ? 'PRI' : '', 'default' => $c[3], 'extra' => $extra, 'collation' => $c[7], 'comment' => (string) $c[6]];
+            }
+            if (!$pk) {
+                $notnull = array_map(fn($c) => $c['name'], array_filter($cols, fn($c) => !$c['null']));
+                foreach ($indexes as $ix) {
+                    if ($ix['unique'] && $ix['columns'] && !array_diff($ix['columns'], $notnull)) { $pk = $ix['columns']; break; }
+                }
+            }
+            return [$cols, $pk, $indexes, $defs];
+        };
+        $row_where = function ($pk, $key) use ($q) {
+            if (!$pk) throw new RuntimeException('This table has no primary key, so rows cannot be addressed.');
+            if (!is_array($key)) throw new RuntimeException('Missing row key.');
+            $parts = []; $params = [];
+            foreach ($pk as $c) {
+                if (!array_key_exists($c, $key)) throw new RuntimeException('Missing row key.');
+                if ($key[$c] === null) { $parts[] = $q($c) . ' IS NULL'; }
+                else { $parts[] = $q($c) . '::text = ?'; $params[] = (string) $key[$c]; }
+            }
+            return [implode(' AND ', $parts), $params];
+        };
+
+        if ($action === 'db_tables') {
+            $out = [];
+            foreach ($tables as [$n, $kind, $est, $bytes]) {
+                $rows = (int) $est >= 0 ? (int) $est : null;
+                // Never analysed (a new table): counted, when small enough.
+                if ($rows === null && (int) $bytes < 50 * 1024 * 1024) {
+                    try { $rows = (int) $pdo->query('SELECT COUNT(*) FROM ' . $q($n))->fetchColumn(); } catch (Throwable $e) {}
+                }
+                $out[] = ['name' => $n, 'view' => $kind === 'v' || $kind === 'm', 'engine' => 'postgres', 'rows' => $rows, 'bytes' => (int) $bytes, 'collation' => null];
+            }
+            return ['success' => true, 'tables' => $out, 'wp' => null];
+        }
+        if ($action === 'db_structure') {
+            [$cols, $pk, $indexes, $defs] = $describe();
+            $lines = array_map(fn($c) => '  ' . $q($c['name']) . ' ' . $c['type'] . ($c['null'] ? '' : ' NOT NULL') . ($c['default'] !== null ? ' DEFAULT ' . $c['default'] : ''), $cols);
+            if ($pk) $lines[] = '  PRIMARY KEY (' . implode(', ', array_map($q, $pk)) . ')';
+            $create = 'CREATE TABLE ' . $rel . " (\n" . implode(",\n", $lines) . "\n);" . ($defs ? "\n" . implode(";\n", $defs) . ';' : '');
+            return ['success' => true, 'columns' => $cols, 'pk' => $pk, 'indexes' => $indexes, 'create' => $create];
+        }
+        if ($action === 'db_rows') {
+            [$cols, $pk] = $describe();
+            $cnames = array_map(fn($c) => $c['name'], $cols);
+            $limit = max(10, min(500, (int) ($input['limit'] ?? 100)));
+            $start = max(0, (int) ($input['start'] ?? 0));
+            $where = ''; $params = [];
+            $needle = (string) ($input['q'] ?? '');
+            $col = (string) ($input['col'] ?? '');
+            if ($needle !== '') {
+                $like = '%' . $needle . '%';
+                if ($col !== '' && in_array($col, $cnames, true)) { $where = ' WHERE ' . $q($col) . '::text ILIKE ?'; $params[] = $like; }
+                else {
+                    $parts = [];
+                    foreach (array_slice($cnames, 0, 60) as $n) { $parts[] = $q($n) . '::text ILIKE ?'; $params[] = $like; }
+                    $where = ' WHERE ' . implode(' OR ', $parts);
+                }
+            }
+            $order = '';
+            $sort = (string) ($input['sort'] ?? '');
+            $dir = ($input['dir'] ?? 'asc') === 'desc' ? 'DESC' : 'ASC';
+            if ($sort !== '' && in_array($sort, $cnames, true)) $order = ' ORDER BY ' . $q($sort) . ' ' . $dir;
+            elseif ($pk) $order = ' ORDER BY ' . implode(', ', array_map($q, $pk));
+            $st = $pdo->prepare('SELECT COUNT(*) FROM ' . $rel . $where);
+            $st->execute($params);
+            $total = (int) $st->fetchColumn();
+            $st = $pdo->prepare('SELECT ' . ($cnames ? implode(', ', array_map($q, $cnames)) : '*') . ' FROM ' . $rel . $where . $order . ' LIMIT ' . $limit . ' OFFSET ' . $start);
+            $st->execute($params);
+            $rows = array_map(fn($r) => array_map('cove_pg_cell', $r), $st->fetchAll(PDO::FETCH_NUM));
+            return ['success' => true, 'columns' => $cols, 'pk' => $pk, 'rows' => $rows, 'total' => $total, 'start' => $start, 'limit' => $limit];
+        }
+        if ($action === 'db_cell' || $action === 'db_update' || $action === 'db_delete_row') {
+            [$cols, $pk] = $describe();
+            [$w, $params] = $row_where($pk, $input['pk'] ?? null);
+            if ($action === 'db_delete_row') {
+                $st = $pdo->prepare('DELETE FROM ' . $rel . ' WHERE ' . $w);
+                $st->execute($params);
+                return ['success' => true, 'affected' => $st->rowCount()];
+            }
+            $col = (string) ($input['col'] ?? '');
+            if (!in_array($col, array_map(fn($c) => $c['name'], $cols), true)) throw new RuntimeException('Unknown column.');
+            if ($action === 'db_cell') {
+                $st = $pdo->prepare('SELECT ' . $q($col) . ' FROM ' . $rel . ' WHERE ' . $w . ' LIMIT 1');
+                $st->execute($params);
+                $r = $st->fetch(PDO::FETCH_NUM);
+                if (!$r) throw new RuntimeException('Row not found.');
+                $v = is_bool($r[0]) ? ($r[0] ? 'true' : 'false') : (is_resource($r[0]) ? stream_get_contents($r[0]) : $r[0]);
+                if ($v !== null && !mb_check_encoding((string) $v, 'UTF-8')) throw new RuntimeException('Binary values cannot be edited here.');
+                return ['success' => true, 'value' => $v === null ? null : (string) $v];
+            }
+            $isNull = !empty($input['null']);
+            $value = $isNull ? null : (string) ($input['value'] ?? '');
+            $st = $pdo->prepare('UPDATE ' . $rel . ' SET ' . $q($col) . ' = ' . ($isNull ? 'NULL' : '?') . ' WHERE ' . $w);
+            $st->execute($isNull ? $params : array_merge([$value], $params));
+            $affected = $st->rowCount();
+            $key = $input['pk'];
+            if (!$isNull && in_array($col, $pk, true)) $key[$col] = $value;
+            [$w2, $p2] = $row_where($pk, $key);
+            $st = $pdo->prepare('SELECT ' . implode(', ', array_map(fn($c) => $q($c['name']), $cols)) . ' FROM ' . $rel . ' WHERE ' . $w2 . ' LIMIT 1');
+            $st->execute($p2);
+            $row = $st->fetch(PDO::FETCH_NUM);
+            return ['success' => true, 'affected' => $affected, 'row' => $row ? array_map('cove_pg_cell', $row) : null];
+        }
+        if ($action === 'db_query') {
+            $sql = (string) ($input['sql'] ?? '');
+            if (trim($sql) === '') throw new RuntimeException('Nothing to run.');
+            $results = [];
+            $t0 = microtime(true);
+            foreach (cove_pg_statements($sql) as $stmt) {
+                try {
+                    $st = $pdo->query($stmt);
+                    if ($st->columnCount() > 0) {
+                        $cols = [];
+                        for ($k = 0; $k < $st->columnCount(); $k++) { $m = $st->getColumnMeta($k); $cols[] = $m['name'] ?? ('column ' . ($k + 1)); }
+                        $rows = []; $n = 0;
+                        while ($n < 100000 && ($r = $st->fetch(PDO::FETCH_NUM)) !== false) { if ($n++ < $cap) $rows[] = array_map('cove_pg_cell', $r); }
+                        $results[] = ['type' => 'rows', 'columns' => $cols, 'rows' => $rows, 'total' => $n, 'truncated' => $n > $cap];
+                    } else {
+                        $results[] = ['type' => 'ok', 'affected' => $st->rowCount(), 'insert_id' => 0, 'info' => ''];
+                    }
+                } catch (Throwable $e) {
+                    $results[] = ['type' => 'error', 'message' => $e->getMessage()];
+                    break;
+                }
+            }
+            return ['success' => true, 'results' => $results, 'ms' => round((microtime(true) - $t0) * 1000, 1)];
+        }
+        throw new RuntimeException('Unknown database action.');
+    } catch (Throwable $e) {
+        return ['success' => false, 'message' => $e->getMessage()];
+    }
+}
+
 // The console's SQL split into statements for SQLite, which runs one at a
 // time: semicolons inside quotes, identifiers and comments don't count. In a
 // CREATE TRIGGER they count only once its BEGIN … END closes, with CASE …
@@ -4528,6 +4979,8 @@ function cove_demo_databases($user_home, $sitedir) {
         if ($cfg === false && cove_site_is_laravel($sp)) {
             $env = cove_laravel_env($sp);
             if (in_array($env['DB_CONNECTION'] ?? '', ['mysql', 'mariadb'], true) && ($env['DB_DATABASE'] ?? '') !== '') $out[] = $env['DB_DATABASE'];
+            // Its PostgreSQL one, as the database view names it.
+            if (($env['DB_CONNECTION'] ?? '') === 'pgsql' && ($env['DB_DATABASE'] ?? '') !== '') $out[] = 'pgsql:' . $env['DB_DATABASE'];
         }
     }
     return $out;
@@ -5111,7 +5564,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 // A Laravel site's database: sqlite (the default) or mysql; with
                 // an existing project, nothing means the one it names.
-                $database = $flavor === 'laravel' && in_array($input['database'] ?? '', ['sqlite', 'mysql', 'mariadb'], true) ? '--database=' . $input['database'] : '';
+                $database = $flavor === 'laravel' && in_array($input['database'] ?? '', ['sqlite', 'mysql', 'mariadb', 'pgsql'], true) ? '--database=' . $input['database'] : '';
                 // An existing project to set up: a git URL or a folder, which
                 // the CLI checks; here only that it is one line of text.
                 $from = $flavor === 'laravel' ? trim((string) ($input['from'] ?? '')) : '';
@@ -6281,7 +6734,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'note' => 'WordPress on every Cove site is pointed at the SMTP port above.',
                     'actions' => [['kind' => 'mail', 'label' => 'open inbox'], ['kind' => 'open', 'label' => 'mailpit ↗', 'href' => $mailui]],
                 ],
-            ]]);
+            ] + (empty($__svc_cfg['PGSQL_USER']) ? [] : ['postgres' => (function () use ($__svc_cfg, $__svc_port_open) {
+                // For Laravel sites on --database=pgsql (`cove postgres`).
+                $port = (int) ($__svc_cfg['PGSQL_PORT'] ?? 5432);
+                $up = $__svc_port_open($port); $version = '—'; $count = '—';
+                if ($up) {
+                    try {
+                        $pg = cove_pgsql_pdo($__svc_cfg, 'postgres');
+                        $version = explode(' ', (string) $pg->query('SHOW server_version')->fetchColumn())[0];
+                        $count = (string) $pg->query("SELECT COUNT(*) FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'")->fetchColumn();
+                    } catch (Throwable $e) {}
+                }
+                return [
+                    'label' => 'PostgreSQL', 'running' => $up,
+                    'status' => $up ? 'Running on 127.0.0.1:' . $port . '.' : 'Not answering on 127.0.0.1:' . $port . ' — start it with: cove postgres start',
+                    'rows' => [
+                        ['version', $version],
+                        ['host', '127.0.0.1:' . $port],
+                        ['user', $__svc_cfg['PGSQL_USER']],
+                        ['password', $__svc_cfg['PGSQL_PASSWORD'] ?? '—'],
+                        ['databases', $count],
+                    ],
+                    'note' => 'For Laravel sites on --database=pgsql. Credentials stored in ~/Cove/config; cove postgres psql opens a shell.',
+                    'actions' => [['kind' => 'db', 'label' => 'open databases']],
+                ];
+            })()])]);
             exit;
         case 'db_list':
         case 'db_tables':
@@ -6309,6 +6786,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     exit;
                 }
                 echo json_encode(cove_db_sqlite($action, $input, cove_laravel_sqlite_path($__sp)));
+                exit;
+            }
+            // A database on Cove's PostgreSQL goes by "pgsql:<name>".
+            if (strncmp((string) ($input['db'] ?? ''), 'pgsql:', 6) === 0) {
+                $__pg = substr((string) $input['db'], 6);
+                $__pg_demo = cove_demo_sites($user_home) === null ? null : cove_demo_databases($user_home, $sitedir);
+                if (!preg_match('/^[A-Za-z0-9_][A-Za-z0-9_-]{0,62}$/', $__pg) || $__pg === 'postgres' || ($__pg_demo !== null && !in_array('pgsql:' . $__pg, $__pg_demo, true))) {
+                    echo json_encode(['success' => false, 'message' => 'No such database.']);
+                    exit;
+                }
+                echo json_encode(cove_db_pgsql($action, $input, $__pg, isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : []));
                 exit;
             }
             $__db_cfg = isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : [];
@@ -6426,7 +6914,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                     $out[] = ['name' => 'sqlite:' . substr($item, 0, -10), 'tables' => $n, 'bytes' => $light ? null : filesize($f)];
                 }
-                echo json_encode(['success' => true, 'databases' => $out, 'server' => $__db->server_info]);
+                // Databases on Cove's PostgreSQL, when it is set up and running,
+                // as "pgsql:<name>".
+                $__pg_version = null;
+                if (!empty($__cove_cfg['PGSQL_USER']) && $__demo_dbs === null || ($__demo_dbs !== null && preg_grep('/^pgsql:/', $__demo_dbs))) {
+                    try {
+                        $pg = cove_pgsql_pdo($__cove_cfg, 'postgres');
+                        $__pg_version = (string) $pg->query('SHOW server_version')->fetchColumn();
+                        foreach ($pg->query("SELECT datname, pg_database_size(datname) FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY datname")->fetchAll(PDO::FETCH_NUM) as [$pgname, $pgbytes]) {
+                            if ($__demo_dbs !== null && !in_array('pgsql:' . $pgname, $__demo_dbs, true)) continue;
+                            $n = null;
+                            if (!$light) {
+                                try { $n = (int) cove_pgsql_pdo($__cove_cfg, $pgname)->query("SELECT COUNT(*) FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace WHERE ns.nspname = current_schema() AND c.relkind IN ('r', 'p')")->fetchColumn(); } catch (Throwable $e) {}
+                            }
+                            $out[] = ['name' => 'pgsql:' . $pgname, 'tables' => $n, 'bytes' => $light ? null : (int) $pgbytes];
+                        }
+                    } catch (Throwable $e) {}
+                }
+                echo json_encode(['success' => true, 'databases' => $out, 'server' => $__db->server_info, 'pg_server' => $__pg_version]);
                 exit;
             }
 
@@ -8418,6 +8923,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 <button type="button" class="dot link" data-service="caddy" title="Caddy status">caddy</button>
                 <button type="button" class="dot link" data-service="mariadb" title="MariaDB status and credentials">mariadb</button>
                 <button type="button" class="dot link" data-service="mailpit" title="Mailpit status">mailpit</button>
+<?php if (!empty($config_data['PGSQL_USER'])): ?>
+                <button type="button" class="dot link" data-service="postgres" title="PostgreSQL status and credentials">postgres</button>
+<?php endif; ?>
                 <button type="button" class="dot link is-busy sweep-dot" id="navSweep" data-service="history" title="The nightly history sweep is running — click for the site it is on" style="display: none;">6/80</button>
             </div>
             <button class="theme-btn" id="btnTheme" title="Theme" aria-label="Theme" aria-haspopup="menu">
@@ -8545,10 +9053,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         <option value="nightly">nightly</option>
                     </select>
                     <input type="text" id="laravelFrom" placeholder="new app, or a git URL or folder to set up" spellcheck="false" autocomplete="off" aria-label="An existing Laravel project: a git URL or a folder" title="Empty for a new app. A git URL is cloned and a folder copied, then its packages installed, its database made and migrated, and its front end built" style="display: none;">
-                    <select class="wp-version" id="laravelDbSelect" title="Laravel's database: SQLite, Laravel's own default, or MySQL on Cove's MariaDB" aria-label="Laravel's database" style="display: none;">
+                    <select class="wp-version" id="laravelDbSelect" title="Laravel's database: SQLite, Laravel's own default; MySQL on Cove's MariaDB; or PostgreSQL, set up the first time a site asks for it" aria-label="Laravel's database" style="display: none;">
                         <option value="" id="laravelDbOwn" hidden>its own db</option>
                         <option value="sqlite">sqlite</option>
                         <option value="mysql">mysql</option>
+                        <option value="pgsql">pgsql</option>
                     </select>
                     <button class="pill primary" type="submit" id="btnCreate" disabled>
                         <span class="btn-spinner" id="createSpinner" aria-hidden="true" style="display: none;"></span>
@@ -12575,7 +13084,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // and sizes, which can take seconds on a box with thousands
                 // of tables.
                 const res = await this.apiPost('db_list', { light: true }, { quiet: true, timeoutMs: 15000 });
-                if (res.success) { d.list = res.databases || []; d.server = res.server || ''; d.error = null; }
+                if (res.success) { d.list = res.databases || []; d.server = res.server || ''; d.pgServer = res.pg_server || ''; d.error = null; }
                 else d.error = res.message || 'MariaDB is not answering.';
                 d.loaded = true;
                 d.loading = false;
@@ -12883,8 +13392,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.renderViewBack('dbBack', site);
                 const adminer = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) + (d.name ? '&db=' + encodeURIComponent(d.name) + (d.table ? '&select=' + encodeURIComponent(d.table) : '') : '');
                 $id('dbAdminerLink').href = adminer;
-                // Cove's Adminer signs in to MariaDB; an SQLite file stays here.
-                show($id('dbAdminerLink'), !String(d.name || '').startsWith('sqlite:'));
+                // Cove's Adminer signs in to MariaDB; SQLite and PostgreSQL stay here.
+                show($id('dbAdminerLink'), !/^(sqlite|pgsql):/.test(String(d.name || '')));
                 $id('dbAdminerLink').title = 'Open ' + (d.table ? d.table + ' in Adminer' : d.name ? d.name + ' in Adminer' : 'Adminer') + (site ? ' (' + site + '.localhost)' : '') + ' — exports, imports, schema changes, users';
             },
 
@@ -12946,6 +13455,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (site) sub.push('<a href="https://' + esc(site) + '.localhost' + PORT_SUFFIX + '" target="_blank" rel="noopener" style="color: var(--accent); text-decoration: none;">' + esc(site) + '.localhost</a>');
                 if (meta && meta.tables !== null) sub.push(meta.tables + ' table' + (meta.tables === 1 ? '' : 's') + ' · ' + this.formatSize(meta.bytes));
                 if (String(d.name).startsWith('sqlite:')) sub.push('SQLite, the site\'s database file');
+                else if (String(d.name).startsWith('pgsql:')) sub.push('PostgreSQL' + (d.pgServer ? ' ' + esc(String(d.pgServer).split(' ')[0]) : ''));
                 else if (d.server) sub.push('MariaDB ' + esc(d.server.replace(/-MariaDB.*$/, '')));
                 html += '<p class="db-ov-sub">' + sub.join(' · ') + '</p>';
                 if (d.tablesFor !== d.name) { html += '<div class="loading">Loading…</div>'; box.innerHTML = html; return; }
@@ -16650,7 +17160,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.showDbModal = true;
                 show($id('dbModal'), true);
                 const svcTitle = $id('svcTitle'), svcStatus = $id('svcStatus'), svcRows = $id('svcRows'), svcNote = $id('svcNote'), svcActions = $id('svcActions');
-                svcTitle.textContent = { caddy: 'Caddy', mariadb: 'MariaDB', mailpit: 'Mailpit' }[name] || name;
+                svcTitle.textContent = { caddy: 'Caddy', mariadb: 'MariaDB', mailpit: 'Mailpit', postgres: 'PostgreSQL' }[name] || name;
                 svcStatus.textContent = 'Checking…'; svcStatus.classList.remove('is-down');
                 svcRows.innerHTML = ''; svcNote.textContent = '';
                 svcActions.innerHTML = '<button class="pill" id="btnDbClose">close</button>';
@@ -17735,7 +18245,8 @@ show_general_help() {
     help_section "Laravel"
     help_cmd artisan "Runs a Laravel site's artisan from anywhere."
     help_cmd composer "Runs Composer in a site, on the PHP the site serves with."
-    help_cmd laravel "A Laravel site's queue worker and scheduler, kept running."
+    help_cmd laravel "A Laravel site's users, and its queue worker and scheduler, kept running."
+    help_cmd postgres "PostgreSQL for Laravel sites on it: status, install, start, stop, psql."
     echo ""
     help_section "Backups & transfer"
     help_cmd backup "A site's files and database as one zip, in ~/Cove/Backups."
@@ -17894,8 +18405,10 @@ display_command_help() {
             echo "                 for subdomain mode (store.<name>.localhost) — subsites"
             echo "                 resolve and get HTTPS automatically, no extra setup."
             echo "  --database=<db>  Laravel only: sqlite (the default, as with 'laravel new'),"
-            echo "                 mysql or mariadb (a database on Cove's MariaDB). With"
-            echo "                 --from, the one the project names unless given."
+            echo "                 mysql or mariadb (a database on Cove's MariaDB), or pgsql"
+            echo "                 (on Cove's PostgreSQL, set up the first time; see"
+            echo "                 'cove postgres'). With --from, the one the project names"
+            echo "                 unless given."
             echo "  --from=<src>   Laravel: set up an existing project instead of a new app."
             echo "                 A git URL (https://…, git@host:path) is cloned; a folder"
             echo "                 is copied, the original left as it is. Then its Composer"
@@ -17914,6 +18427,7 @@ display_command_help() {
             echo "  cove add mysite --multisite=subdomain  Subdomain multisite network."
             echo "  cove add myapp laravel                 Laravel on SQLite."
             echo "  cove add myapp laravel --database=mysql  Laravel on Cove's MariaDB."
+            echo "  cove add myapp laravel --database=pgsql  Laravel on PostgreSQL."
             echo "  cove add shop --from=git@github.com:acme/shop.git  An existing app, cloned."
             echo "  cove add shop --from=~/Herd/shop --seed  An existing app, copied, seeded."
             ;;
@@ -18111,6 +18625,9 @@ display_command_help() {
             ;;
         laravel)
             cove_laravel --help
+            ;;
+        postgres)
+            cove_postgres --help
             ;;
         composer)
             cove_composer --help
@@ -18603,6 +19120,9 @@ main() {
         laravel)
             check_dependencies
             cove_laravel "$@"
+            ;;
+        postgres|postgresql|pgsql)
+            cove_postgres "$@"
             ;;
         artisan)
             check_dependencies

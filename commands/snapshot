@@ -70,7 +70,7 @@ snapshot_create() {
     # Snapshots hold whole sites and their databases: this user only.
     chmod 700 "$SNAPSHOTS_DIR" 2>/dev/null
 
-    local wp_version="" kind="" laravel_ver=""
+    local wp_version="" kind="" laravel_ver="" db_server=""
     if [ -f "$public_dir/wp-config.php" ]; then
         local dump_cmd
         if ! dump_cmd=$(snapshot_dump_cmd); then
@@ -104,7 +104,23 @@ snapshot_create() {
         kind="laravel"
         laravel_ver=$(laravel_version "$site_dir")
         local dump_cmd db_name
-        if db_name=$(laravel_cove_db "$site_dir" "$site_name"); then
+        if db_name=$(laravel_cove_db "$site_dir" "$site_name") && [ "$(laravel_db_server "$site_dir")" = "pgsql" ]; then
+            # PostgreSQL's: plain SQL from pg_dump; meta says which server.
+            if ! ensure_postgres >&2; then
+                rm -rf "$dest"
+                return 1
+            fi
+            echo "   Dumping database '$db_name'…" >&2
+            if ! cove_pg_dump "$db_name" > "$dest/db.sql" 2>"$dest/.dump-err"; then
+                local err; err=$(tail -n 2 "$dest/.dump-err")
+                rm -rf "$dest"
+                gum style --foreground red "❌ Error: The database dump failed." "$err" >&2
+                return 1
+            fi
+            rm -f "$dest/.dump-err"
+            chmod 600 "$dest/db.sql"
+            db_server="pgsql"
+        elif [ -n "$db_name" ]; then
             if ! dump_cmd=$(snapshot_dump_cmd); then
                 rm -rf "$dest"
                 gum style --foreground red "❌ Error: Neither mariadb-dump nor mysqldump could be found." >&2
@@ -122,7 +138,7 @@ snapshot_create() {
             chmod 600 "$dest/db.sql"
         else
             case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
-                mysql|mariadb) echo "   ⚠️  .env names a database Cove didn't make for this site, so the snapshot holds the files only." >&2 ;;
+                mysql|mariadb|pgsql) echo "   ⚠️  .env names a database Cove didn't make for this site, so the snapshot holds the files only." >&2 ;;
             esac
         fi
     fi
@@ -150,6 +166,7 @@ snapshot_create() {
         echo "folder=$site_dir"
         [ -n "$kind" ] && echo "kind=$kind"
         [ -n "$laravel_ver" ] && echo "laravel=$laravel_ver"
+        [ -n "$db_server" ] && echo "db_server=$db_server"
     } > "$dest/meta"
     echo "$id"
 }
@@ -179,7 +196,34 @@ snapshot_restore() {
     safety="${safety##*$'\n'}"
     echo "   Saved as $safety." >&2
 
-    if [ -f "$src/db.sql" ]; then
+    local db_server
+    db_server=$(sed -n 's/^db_server=//p' "$src/meta" 2>/dev/null)
+    if [ -f "$src/db.sql" ] && [ "$files" = "project" ] && [ "$db_server" = "pgsql" ]; then
+        # A Laravel site's PostgreSQL database, as for MariaDB below: saved
+        # first when the snapshot just taken doesn't hold it, then made new.
+        local db_name safety_dir
+        ensure_postgres >&2 || return 1
+        db_name=$(cove_laravel_db_name "$site_name")
+        safety_dir="$SNAPSHOTS_DIR/$site_name/$safety"
+        if [ ! -f "$safety_dir/db.sql" ] && cove_pg_db_exists "$db_name"; then
+            if ! cove_pg_dump "$db_name" > "$safety_dir/db.sql" 2>/dev/null; then
+                rm -f "$safety_dir/db.sql"
+                gum style --foreground red "❌ Error: Could not save the database '$db_name' before replacing it." >&2
+                return 1
+            fi
+            chmod 600 "$safety_dir/db.sql"
+            echo "db_server=pgsql" >> "$safety_dir/meta"
+        fi
+        echo "   Restoring database '$db_name'…" >&2
+        if ! cove_server_db_drop pgsql "$db_name" || ! cove_server_db_create pgsql "$db_name"; then
+            gum style --foreground red "❌ Error: Could not recreate the database." >&2
+            return 1
+        fi
+        if ! cove_pg_load "$db_name" < "$src/db.sql"; then
+            gum style --foreground red "❌ Error: The database import failed. The files were not touched; snapshot $safety holds the state from before." >&2
+            return 1
+        fi
+    elif [ -f "$src/db.sql" ]; then
         local client wp_cmd db_name
         if ! client=$(snapshot_client_cmd); then
             gum style --foreground red "❌ Error: Neither mariadb nor mysql could be found." >&2
@@ -239,7 +283,7 @@ snapshot_restore() {
         fi
         if [ -f "$src/db.sql" ]; then
             case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
-                mysql|mariadb) COVE_ENV_SET="{\"DB_DATABASE\":$(cove_json_str "$db_name")}" laravel_env_set "$site_dir/.env" || true ;;
+                mysql|mariadb|pgsql) COVE_ENV_SET="{\"DB_DATABASE\":$(cove_json_str "$db_name")}" laravel_env_set "$site_dir/.env" || true ;;
             esac
         fi
         echo "$safety"

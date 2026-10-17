@@ -7,7 +7,7 @@ cove_add() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [flavor] [--plain] [--minn] [--php=8.2] [--multisite[=subdomain]] [--database=sqlite|mysql] [--from=<git URL or folder>] [--seed]"
+        echo "Usage: cove add <name> [flavor] [--plain] [--minn] [--php=8.2] [--multisite[=subdomain]] [--database=sqlite|mysql|pgsql] [--from=<git URL or folder>] [--seed]"
         exit 1
     fi
 
@@ -146,11 +146,10 @@ cove_add() {
         [ -n "$database" ] || [ -n "$from" ] || database="sqlite"
         case "$database" in
             ""|sqlite|mysql|mariadb) ;;
-            pgsql|postgres|postgresql)
-                gum style --foreground red "❌ Error: Cove has no PostgreSQL server." "Use --database=sqlite (the default), mysql or mariadb."
-                exit 1 ;;
+            # PostgreSQL is set up the first time a site asks for it.
+            pgsql|postgres|postgresql) database="pgsql" ;;
             *)
-                gum style --foreground red "❌ Error: Unknown database '$database'." "Use --database=sqlite (the default), mysql or mariadb."
+                gum style --foreground red "❌ Error: Unknown database '$database'." "Use --database=sqlite (the default), mysql, mariadb or pgsql."
                 exit 1 ;;
         esac
     elif [ -n "$database" ]; then
@@ -450,10 +449,12 @@ PHP
         db_line="Database: SQLite, $(laravel_env_get "$site_dir" DB_DATABASE)"
         [ "$db_line" = "Database: SQLite, " ] && db_line="Database: SQLite, database/database.sqlite"
         [ "$conn" = "sqlite" ] || db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's MariaDB ($conn)"
+        [ "$conn" = "pgsql" ] && db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's PostgreSQL"
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") set up from $from" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "What the tools printed: $site_dir/logs/laravel-setup.log" "${COVE_ADD_NOTES[@]}"
     elif [ "$site_type" == "laravel" ]; then
         local db_line="Database: SQLite, database/database.sqlite"
         [ "$database" != "sqlite" ] && db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's MariaDB ($database)"
+        [ "$database" = "pgsql" ] && db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's PostgreSQL"
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") Installed" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "Queued jobs run once a worker is going: cove artisan $site_name queue:work"
     fi
 }
@@ -469,7 +470,8 @@ PHP
 cove_add_laravel() {
     local site_name="$1" site_dir="$2" database="$3" php_pin="$4" seed="$5"
     local full_hostname="$site_name.localhost"
-    local php="$COVE_TOOLS_DIR/php" native="" prefix db_name=""
+    local php="$COVE_TOOLS_DIR/php" native="" prefix db_name="" server="mariadb"
+    [ "$database" = "pgsql" ] && server="pgsql"
 
     ensure_composer || return 1
     if [ -n "$php_pin" ]; then
@@ -489,7 +491,7 @@ cove_add_laravel() {
         source_config
         db_name=$(cove_laravel_db_name "$site_name")
         # Never one that exists already: a failed install drops what it made.
-        if ! cove_laravel_create_db "$db_name"; then
+        if ! cove_laravel_create_db "$db_name" "$server"; then
             rm -rf "$work"
             return 1
         fi
@@ -516,8 +518,8 @@ cove_add_laravel() {
             example="$example,\"DB_HOST\":null,\"DB_PORT\":null,\"DB_DATABASE\":null,\"DB_USERNAME\":null,\"DB_PASSWORD\":null"
             touch database/database.sqlite
         else
-            set="$set,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"3306\",\"DB_DATABASE\":$(cove_json_str "$db_name"),\"DB_USERNAME\":$(cove_json_str "$DB_USER"),\"DB_PASSWORD\":$(cove_json_str "$DB_PASSWORD")"
-            example="$example,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"3306\",\"DB_DATABASE\":$(cove_json_str "${site_name//-/_}"),\"DB_USERNAME\":\"root\",\"DB_PASSWORD\":\"\""
+            set="$set,$(cove_laravel_db_env "$server" "$db_name")"
+            example="$example,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"$( [ "$server" = pgsql ] && echo 5432 || echo 3306 )\",\"DB_DATABASE\":$(cove_json_str "${site_name//-/_}"),\"DB_USERNAME\":\"root\",\"DB_PASSWORD\":\"\""
         fi
         set="$set,\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t"),\"MAIL_FROM_ADDRESS\":$(cove_json_str "hello@$full_hostname")}"
         if ! COVE_ENV_SET="$set" laravel_env_set "$stage/.env" || ! COVE_ENV_SET="$example}" laravel_env_set "$stage/.env.example"; then
@@ -550,7 +552,7 @@ cove_add_laravel() {
     if [ $? -ne 0 ] || [ ! -f "$stage/artisan" ]; then
         gum style --foreground red "❌ Laravel installation failed. Please review the errors above."
         echo "   - Cleaning up failed installation..."
-        [ -n "$db_name" ] && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        [ -n "$db_name" ] && cove_server_db_drop "$server" "$db_name"
         rm -rf "$work"
         return 1
     fi
@@ -562,7 +564,7 @@ cove_add_laravel() {
     fi
     if [ -e "$site_dir" ] || ! mv "$stage" "$site_dir"; then
         gum style --foreground red "❌ Error: Could not move the application into $site_dir."
-        [ -n "$db_name" ] && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        [ -n "$db_name" ] && cove_server_db_drop "$server" "$db_name"
         rm -rf "$work"
         return 1
     fi
@@ -583,16 +585,21 @@ cove_laravel_need_pdo() {
     return 1
 }
 
-# A new database on Cove's MariaDB for a Laravel site, never one that exists
-# already. Needs source_config.
+# A new database for a Laravel site ($1) on Cove's MariaDB or PostgreSQL
+# ($2, mariadb by default; PostgreSQL is set up when it isn't yet), never
+# one that exists already. MariaDB needs source_config.
 cove_laravel_create_db() {
-    if cove_db_exists "$1"; then
-        gum style --foreground red "❌ Error: A database named '$1' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+    local name="$1" server="${2:-mariadb}"
+    if [ "$server" = "pgsql" ]; then
+        ensure_postgres || return 1
+    fi
+    if cove_server_db_exists "$server" "$name"; then
+        gum style --foreground red "❌ Error: A database named '$name' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
         return 1
     fi
-    echo "🗄️ Creating database: $1"
-    if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$1\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
-        gum style --foreground red "❌ Error: Could not create the database '$1'."
+    echo "🗄️ Creating database: $name"
+    if ! cove_server_db_create "$server" "$name"; then
+        gum style --foreground red "❌ Error: Could not create the database '$name'."
         return 1
     fi
 }
@@ -629,7 +636,7 @@ cove_find_node() {
 cove_add_laravel_from() {
     local site_name="$1" site_dir="$2" source="$3" branch="$4" database="$5" php_pin="$6" seed="$7"
     local full_hostname="$site_name.localhost"
-    local php="$COVE_TOOLS_DIR/php" native="" prefix db_name="" kind src="" work stage log conn was set mail_from k v
+    local php="$COVE_TOOLS_DIR/php" native="" prefix db_name="" server="mariadb" kind src="" work stage log conn was set mail_from k v
     COVE_ADD_NOTES=()
 
     # A folder is copied; anything else has to be a repository's address.
@@ -685,7 +692,7 @@ cove_add_laravel_from() {
     log="$work/laravel-setup.log"
     : > "$log"
     _cove_from_fail() {
-        [ -n "$db_name" ] && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        [ -n "$db_name" ] && cove_server_db_drop "$server" "$db_name"
         rm -rf "$work"
         return 1
     }
@@ -747,21 +754,18 @@ cove_add_laravel_from() {
     [ -n "$conn" ] || conn=$(sed -n "s/.*'default' *=> *env('DB_CONNECTION', *'\([a-z]*\)').*/\1/p" config/database.php 2>/dev/null | head -n 1)
     [ -n "$conn" ] || conn="sqlite"
     case "$conn" in
-        sqlite|mysql|mariadb) ;;
-        pgsql)
-            gum style --foreground red "❌ Error: This app uses PostgreSQL, which Cove doesn't run yet." "Try --database=sqlite or --database=mysql: Laravel's migrations usually work on either."
-            _cove_from_fail
-            return 1 ;;
+        sqlite|mysql|mariadb|pgsql) ;;
         *)
-            gum style --foreground red "❌ Error: This app's database is '$conn', which Cove can't provide." "Try --database=sqlite or --database=mysql."
+            gum style --foreground red "❌ Error: This app's database is '$conn', which Cove can't provide." "Try --database=sqlite, --database=mysql or --database=pgsql."
             _cove_from_fail
             return 1 ;;
     esac
     cove_laravel_need_pdo "$conn" "$native" || { _cove_from_fail; return 1; }
     if [ "$conn" != "sqlite" ]; then
         source_config
+        [ "$conn" = "pgsql" ] && server="pgsql"
         db_name=$(cove_laravel_db_name "$site_name")
-        cove_laravel_create_db "$db_name" || { db_name=""; _cove_from_fail; return 1; }
+        cove_laravel_create_db "$db_name" "$server" || { db_name=""; _cove_from_fail; return 1; }
     fi
 
     echo "   - Setting up .env for Cove…"
@@ -776,7 +780,7 @@ cove_add_laravel_from() {
         # Switched from a server database: its settings would name a file.
         [ "$was" = "sqlite" ] || set="$set,\"DB_HOST\":null,\"DB_PORT\":null,\"DB_DATABASE\":null,\"DB_USERNAME\":null,\"DB_PASSWORD\":null"
     else
-        set="$set,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"3306\",\"DB_DATABASE\":$(cove_json_str "$db_name"),\"DB_USERNAME\":$(cove_json_str "$DB_USER"),\"DB_PASSWORD\":$(cove_json_str "$DB_PASSWORD")"
+        set="$set,$(cove_laravel_db_env "$server" "$db_name")"
     fi
     if ! COVE_ENV_SET="$set}" laravel_env_set "$stage/.env"; then
         gum style --foreground red "❌ Error: Could not write the application's .env."
