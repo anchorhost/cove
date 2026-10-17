@@ -165,6 +165,13 @@ snapshot_restore() {
         return 1
     fi
 
+    # A failed swap's leftovers hold the only copy of some files: refused
+    # before anything is touched, the database included.
+    if [ "$files" = "project" ] && [ -e "$site_dir/.project.replaced" ]; then
+        gum style --foreground red "❌ Error: $site_dir/.project.replaced is left from an earlier restore." "Move its contents back into the site folder first; nothing was changed." >&2
+        return 1
+    fi
+
     # The way back: today's state, taken before anything is touched.
     echo "📸 Taking a snapshot of the current state first…" >&2
     local safety
