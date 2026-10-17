@@ -730,14 +730,15 @@ $__cove_laravel = isset($_SERVER['DOCUMENT_ROOT']) && is_file(dirname($_SERVER['
 // guard (its own user model and session), then redirects: to the path the
 // link names, the app's dashboard route, or home.
 function cove_laravel_sign_in($base, $who, $to) {
+    $site = preg_replace('/\.localhost$/', '', basename($base));
     require $base . '/vendor/autoload.php';
     $app = require $base . '/bootstrap/app.php';
     // A path on this site only: never //host or /\host, which browsers take
     // as another site.
     if (!preg_match('#^/(?![/\\\\])#', $to)) $to = '';
-    $route = function ($app) use ($who, $to) {
+    $route = function ($app) use ($who, $to, $site) {
         if ($app['router']->getRoutes()->getByName('cove.login')) return;
-        $app['router']->middleware('web')->name('cove.login')->get('/__cove/login/{token}', function () use ($who, $to) {
+        $app['router']->middleware('web')->name('cove.login')->get('/__cove/login/{token}', function () use ($who, $to, $site) {
             $text = function ($msg, $code) { return response($msg . "\n", $code)->header('Content-Type', 'text/plain; charset=utf-8'); };
             $guard = \Illuminate\Support\Facades\Auth::guard();
             if (!method_exists($guard, 'login') || !method_exists($guard, 'getProvider')) return $text("This app's default auth guard doesn't sign in with a session, so Cove can't log in to it.", 501);
@@ -754,7 +755,7 @@ function cove_laravel_sign_in($base, $who, $to) {
             } elseif ($who !== '') {
                 $user = $provider->retrieveByCredentials(['email' => $who]);
             }
-            if (!$user) return $text($who === '' ? 'This app has no users yet. Register one, then run cove login again.' : "No user '$who' in this app.", 404);
+            if (!$user) return $text($who === '' ? "This app has no users yet. Add one on the site's users tab in Cove, or: cove laravel $site user add you@example.com" : "No user '$who' in this app.", 404);
             $guard->login($user);
             request()->session()->regenerate();
             if ($to === '') {
@@ -5205,6 +5206,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'site_artisan':
         case 'site_laravel_op':
         case 'site_laravel_workers':
+        case 'site_laravel_users':
             // --- Site page: a Laravel site's routes, migrations, schedule
             // and artisan console, all through `cove artisan` so the site's
             // pinned PHP is honoured. As with WP-CLI above, every argument is
@@ -5279,6 +5281,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $data = json_decode((string) end($lines), true);
                 if (!is_array($data)) { echo json_encode(['success' => false, 'message' => trim(implode("\n", $lines)) ?: 'cove laravel failed.']); exit; }
                 echo json_encode(['success' => $code === 0, 'workers' => $data]);
+                exit;
+            }
+            if ($action === 'site_laravel_users') {
+                // The app's users through its auth model (`cove laravel <site>
+                // users`), shaped like WordPress's so one users tab serves
+                // both; or one added. A password typed in reaches the command
+                // through its environment, never a command line.
+                $op = (string) ($input['op'] ?? 'list');
+                $args = ['laravel', $site_name];
+                $env = getenv();
+                $env['HOME'] = $user_home;
+                if ($op === 'add') {
+                    $email = trim((string) ($input['email'] ?? ''));
+                    $name = trim((string) ($input['name'] ?? ''));
+                    $password = (string) ($input['password'] ?? '');
+                    if ($email === '' || strlen($email) > 191 || $email[0] === '-' || !filter_var($email, FILTER_VALIDATE_EMAIL)) { echo json_encode(['success' => false, 'message' => 'Enter an email address.']); exit; }
+                    if (strlen($name) > 191 || preg_match('/[\x00-\x1f\x7f]/', $name)) { echo json_encode(['success' => false, 'message' => 'That name is too long.']); exit; }
+                    if (strlen($password) > 200 || strpos($password, "\0") !== false) { echo json_encode(['success' => false, 'message' => 'That password is too long.']); exit; }
+                    array_push($args, 'user', 'add', $email);
+                    if ($name !== '') $args[] = '--name=' . $name;
+                    $env['COVE_USER_PASSWORD'] = $password;
+                } elseif ($op === 'list') {
+                    $args[] = 'users';
+                } else {
+                    echo json_encode(['success' => false, 'message' => 'Unknown operation.']);
+                    exit;
+                }
+                $args[] = '--format=json';
+                $cmd = escapeshellarg($cove_path);
+                foreach ($args as $a) $cmd .= ' ' . escapeshellarg($a);
+                $t0 = microtime(true);
+                $proc = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes, null, $env);
+                if (!is_resource($proc)) { echo json_encode(['success' => false, 'message' => 'Could not run cove.']); exit; }
+                $out = trim(preg_replace('/\x1b\[[0-9;]*m/', '', (string) stream_get_contents($pipes[1])));
+                fclose($pipes[1]);
+                proc_close($proc);
+                $ms = round((microtime(true) - $t0) * 1000);
+                $lines = explode("\n", $out);
+                $data = json_decode((string) end($lines), true);
+                if (!is_array($data)) { echo json_encode(['success' => false, 'message' => $out !== '' ? $out : 'cove laravel failed.']); exit; }
+                if (isset($data['error'])) { echo json_encode(['success' => false, 'message' => $data['error']]); exit; }
+                // What a log in names: the email, or the id when the email
+                // has characters `cove login` won't take.
+                $login = fn($u) => preg_match('/^[A-Za-z0-9._@+-]{1,60}$/', (string) ($u['email'] ?? '')) ? $u['email'] : (string) $u['id'];
+                if ($op === 'add') {
+                    echo json_encode(['success' => true, 'user' => ['id' => $data['id'], 'email' => $data['email'], 'name' => $data['name'], 'login' => $login($data), 'password' => $data['password']], 'ms' => $ms]);
+                    exit;
+                }
+                $items = array_map(fn($u) => ['ID' => $u['id'], 'user_login' => $login($u), 'display_name' => (string) ($u['name'] ?? ''), 'user_email' => (string) ($u['email'] ?? ''), 'roles' => '', 'verified' => $u['verified'] ?? null, 'registered' => (string) ($u['created'] ?? '')], $data['users'] ?? []);
+                echo json_encode(['success' => true, 'items' => $items, 'ms' => $ms, 'total' => $data['total'] ?? count($items), 'model' => $data['model'] ?? null]);
                 exit;
             }
             if ($action === 'site_laravel_op') {
@@ -5976,6 +6028,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if ($note) $response['note'] = implode(' ', $note);
                 } else {
                     $response = ['success' => false, 'message' => 'Failed to generate login link.', 'output' => $full_output];
+                    // The command's own reason, when it gave one.
+                    foreach ($output_lines as $line) {
+                        $line = trim(preg_replace('/\x1b\[[0-9;]*m/', '', $line));
+                        if (strpos($line, '❌') === 0) { $response['message'] = preg_replace('/^❌\s*(Error:\s*)?/u', '', $line); break; }
+                    }
+                    // A Laravel app no one has registered with yet: the
+                    // dashboard offers its users tab.
+                    if (strpos($full_output, 'has no users yet') !== false) {
+                        $response['code'] = 'no_users';
+                        $response['message'] = 'This app has no users yet. Add one, then log in as them.';
+                    }
                 }
 
             } else {
@@ -7986,6 +8049,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .st-row:hover { background: var(--panel-hover); }
         .st-plugins, .st-themes { grid-template-columns: minmax(0, 1fr) auto auto auto minmax(9rem, auto); }
         .st-users { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+        .st-useradd input { flex: 1 1 10rem; min-width: 0; background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.82rem; padding: 0.35rem 0.6rem; border-radius: var(--radius-md); }
+        .st-useradd input:focus { outline: 0; border-color: var(--accent); }
+        .st-useradd #userAddEmail { flex-basis: 14rem; }
+        .st-useradd-done { display: flex; align-items: center; flex-wrap: wrap; gap: 0.6rem; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); }
+        .st-useradd-done:empty { display: none; }
+        .st-useradd-done code { color: var(--text); background: var(--panel-hover); padding: 0.1rem 0.4rem; border-radius: var(--radius-sm); user-select: all; }
         .st-cron { grid-template-columns: minmax(0, 1fr) auto auto auto; }
         .st-routes { grid-template-columns: 7rem minmax(0, 1.3fr) minmax(0, 1fr); }
         .st-migrations, .st-schedule { grid-template-columns: minmax(0, 1fr) auto auto; }
@@ -8949,6 +9018,13 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <span class="mail-bar-note st-count"></span>
                     <button type="button" class="pill st-refresh" title="Re-read the list">refresh</button>
                 </div>
+                <form class="st-toolbar st-useradd" id="userAdd" style="display: none;" autocomplete="off" novalidate>
+                    <input id="userAddEmail" type="text" inputmode="email" placeholder="email" maxlength="191" spellcheck="false" autocomplete="off" aria-label="The new user's email">
+                    <input id="userAddName" type="text" placeholder="name (optional)" maxlength="191" spellcheck="false" autocomplete="off" aria-label="The new user's name">
+                    <input id="userAddPassword" type="text" placeholder="password (blank: make one up)" maxlength="200" spellcheck="false" autocomplete="off" aria-label="The new user's password">
+                    <button type="submit" class="pill primary" id="btnUserAdd" title="A verified user in the app's users table, through its own user model">add user</button>
+                </form>
+                <div class="st-useradd-done" id="userAddDone"></div>
                 <ul class="st-list"><li class="loading st-loading">Reading users…</li><li class="empty st-error" style="display: none;"></li></ul>
             </div>
             <div class="site-panel" id="sitePanel-cron" style="display: none;">
@@ -14036,7 +14112,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // routes, migrations, schedule and artisan, or just the basics.
             siteTabsFor(site) {
                 if (!site) return ['overview'];
-                if (site.type === 'Laravel') return ['overview', 'routes', 'migrations', 'schedule', 'traffic', 'snapshots', 'cli'];
+                if (site.type === 'Laravel') return ['overview', 'users', 'routes', 'migrations', 'schedule', 'traffic', 'snapshots', 'cli'];
                 if (this.isWpLike(site)) return ['overview', 'plugins', 'themes', 'users', 'cron', 'traffic', 'history', 'snapshots', 'cli'];
                 return ['overview', 'snapshots', 'traffic', 'history'];
             },
@@ -14070,10 +14146,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (!this.siteTabsFor(site).includes(tab)) return;
                 const t = this.siteTabState(tab);
                 if (t.loadedFor === site.name && !opts.force) return;
-                if (t.loadedFor !== site.name) { t.items = []; t.loadedFor = null; t.filter = t.filterFor === site.name ? t.filter : ''; t.status = 'all'; t.arm = null; t.open = null; t.diff = null; }
+                if (t.loadedFor !== site.name) { t.items = []; t.loadedFor = null; t.filter = t.filterFor === site.name ? t.filter : ''; t.status = 'all'; t.arm = null; t.open = null; t.diff = null; t.added = null; }
                 t.loading = true; t.error = null;
                 this.renderSiteTab();
-                const action = { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron', routes: 'site_routes', migrations: 'site_migrations', schedule: 'site_schedule', snapshots: 'site_snapshots', history: 'site_history' }[tab];
+                const action = tab === 'users' && site.type === 'Laravel' ? 'site_laravel_users' : { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron', routes: 'site_routes', migrations: 'site_migrations', schedule: 'site_schedule', snapshots: 'site_snapshots', history: 'site_history' }[tab];
                 const res = await this.apiPost(action, { site_name: site.name, check: !!opts.check }, { quiet: true, timeoutMs: opts.check ? 180000 : 90000 });
                 if (this.sitePage.name !== site.name) return;
                 t.loading = false;
@@ -14629,6 +14705,26 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (this.sitePage.name === site.name) this.renderSiteTab();
             },
 
+            // A Laravel app's new user, from the users tab's form. A password
+            // left blank is made up, and shown here once.
+            async siteUserAdd() {
+                const site = this.pageSite;
+                const t = this.siteTabState('users');
+                if (!site || site.type !== 'Laravel' || t.busy['+']) return;
+                const email = $id('userAddEmail').value.trim();
+                if (!email) { $id('userAddEmail').focus(); return; }
+                t.busy['+'] = 'add'; t.added = null;
+                this.renderSiteTab();
+                const res = await this.apiPost('site_laravel_users', { site_name: site.name, op: 'add', email, name: $id('userAddName').value.trim(), password: $id('userAddPassword').value }, { quiet: true, timeoutMs: 90000 });
+                delete t.busy['+'];
+                if (this.sitePage.name !== site.name) return;
+                if (!res.success || !res.user) { this.showSnack(res.message || 'Could not add the user.', true); this.renderSiteTab(); return; }
+                t.added = res.user;
+                for (const id of ['userAddEmail', 'userAddName', 'userAddPassword']) $id(id).value = '';
+                this.showSnack('Added ' + res.user.email + '.');
+                this.loadSiteTab({ force: true });
+            },
+
             async runSiteCli() {
                 const site = this.pageSite;
                 const c = this.sitePage.cli;
@@ -14722,6 +14818,18 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     if (b) { b.disabled = !!t.busy[op]; b.textContent = t.busy[op] ? running : idle; }
                 }
                 if (tab === 'migrations') { const b = panel.querySelector('.st-migrate'); if (b && !t.busy.migrate) b.disabled = !t.items.some(m => !m.ran); }
+                if (tab === 'users') {
+                    // Laravel's add-user form, and the user it just added.
+                    const lv = !!site && site.type === 'Laravel';
+                    show($id('userAdd'), lv);
+                    const add = $id('btnUserAdd');
+                    add.disabled = !!t.busy['+']; add.textContent = t.busy['+'] ? 'adding…' : 'add user';
+                    const a = lv && t.added;
+                    const e = (s) => this.escapeHtml(s == null ? '' : String(s));
+                    $id('userAddDone').innerHTML = a ? '<span>Added <strong>' + e(a.email) + '</strong>' + (a.password ? ', password <code>' + e(a.password) + '</code>' : '') + '</span>'
+                        + (a.password ? '<button type="button" class="pill ua-copy">copy password</button>' : '')
+                        + '<button type="button" class="pill primary ua-login">log in as ' + e(a.email) + '</button>' : '';
+                }
                 const count = panel.querySelector('.st-count');
                 if (!loaded) { count.textContent = savingText; return; }
                 const rows = this.siteTabVisible(tab);
@@ -14735,7 +14843,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const frag = document.createDocumentFragment();
                 const esc = (s) => this.escapeHtml(s == null ? '' : String(s));
                 const ms = site && site.multisite;
-                const emptyText = { history: 'No saves yet — press save now, or wait for tonight.', schedule: 'Nothing scheduled. Tasks are defined in routes/console.php.', migrations: (t.extra && t.extra.note) || 'No migrations.' }[tab] || 'Nothing here.';
+                const emptyText = { history: 'No saves yet — press save now, or wait for tonight.', schedule: 'Nothing scheduled. Tasks are defined in routes/console.php.', migrations: (t.extra && t.extra.note) || 'No migrations.', users: site && site.type === 'Laravel' ? 'No users yet. Add one above, then log in as them.' : 'No users.' }[tab] || 'Nothing here.';
                 if (!rows.length) { const li = document.createElement('li'); li.className = 'st-empty'; li.textContent = t.items.length ? 'Nothing matches.' : emptyText; frag.appendChild(li); }
                 for (const it of rows) {
                     const li = document.createElement('li');
@@ -14766,11 +14874,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             + (it.status === 'must-use' ? '<span></span>' : '<button type="button" class="st-auto' + (it.auto_update === 'on' ? ' is-on' : '') + '" data-op="' + (it.auto_update === 'on' ? 'auto-off' : 'auto-on') + '" title="Auto-updates ' + (it.auto_update === 'on' ? 'on — click to turn off' : 'off — click to turn on') + '">auto</button>')
                             + '<span class="st-actions">' + actions + '</span>';
                     } else if (tab === 'users') {
+                        const lv = site && site.type === 'Laravel';
                         const supers = (t.extra && t.extra.super_admins) || [];
                         const roles = String(it.roles || '').split(',').map(r => r.trim()).filter(Boolean);
                         if (supers.includes(it.user_login)) roles.unshift('super admin');
                         const blogs = Array.isArray(it.blogs) ? it.blogs : [];
-                        let chips = roles.map(r => '<span class="st-chip">' + esc(r) + '</span>');
+                        // A Laravel user has no role: whether the email was verified instead.
+                        let chips = lv ? (it.verified === false ? ['<span class="st-chip st-pending" title="email_verified_at is empty, so routes behind the verified middleware turn this user away">unverified</span>'] : it.verified ? ['<span class="st-chip">verified</span>'] : [])
+                            : roles.map(r => '<span class="st-chip">' + esc(r) + '</span>');
                         let loginUrl = '';
                         if (it.network_only && blogs.length) {
                             // Roles on subsites, shown with the site's path.
@@ -14785,8 +14896,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         const busy = t.busy[it.user_login];
                         li.dataset.login = it.user_login;
                         if (loginUrl) li.dataset.loginUrl = loginUrl;
-                        li.innerHTML = '<div class="st-main"><span class="st-title">' + esc(it.display_name || it.user_login) + '</span><span class="st-sub">' + esc(it.user_login) + ' · ' + esc(it.user_email) + '</span></div>'
-                            + '<span class="st-roles">' + (chips.length ? chips.join('') : '<span class="st-chip st-none">no role</span>') + '</span>'
+                        li.innerHTML = '<div class="st-main"><span class="st-title">' + esc(it.display_name || it.user_email || it.user_login) + '</span><span class="st-sub">' + (lv ? '#' + esc(it.ID) : esc(it.user_login)) + ' · ' + esc(it.user_email) + '</span></div>'
+                            + '<span class="st-roles">' + (chips.length ? chips.join('') : lv ? '' : '<span class="st-chip st-none">no role</span>') + '</span>'
                             + '<span class="st-ver" title="' + esc(it.registered || '') + '">' + esc(it.registered ? String(it.registered).slice(0, 10) : '') + '</span>'
                             + '<span class="st-actions"><button type="button" class="pill primary st-login"' + (busy ? ' disabled' : '') + ' title="One-time login as ' + esc(it.user_login) + (loginUrl ? ' on ' + esc(loginUrl) : '') + '">' + (busy ? 'opening…' : 'log in') + '</button></span>';
                     } else if (tab === 'snapshots') {
@@ -14993,6 +15104,13 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.bindTrafficModalEvents();
                 $id('siteHealth').addEventListener('click', (e) => { if (e.target.closest('.site-health-bit')) this.setSiteTab('traffic'); });
                 $id('btnSnapCreate').addEventListener('click', () => this.snapshotCreate());
+                $id('userAdd').addEventListener('submit', (e) => { e.preventDefault(); this.siteUserAdd(); });
+                $id('userAddDone').addEventListener('click', (e) => {
+                    const a = this.siteTabState('users').added;
+                    if (!a) return;
+                    if (e.target.closest('.ua-copy')) this.copyText(a.password, 'Password copied');
+                    if (e.target.closest('.ua-login')) this.siteUserLogin(a.login, '');
+                });
                 $id('btnHistSave').addEventListener('click', () => this.historySave());
                 $id('histNote').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this.historySave(); } if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.target.blur(); } });
                 $id('snapNote').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this.snapshotCreate(); } if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.target.blur(); } });
@@ -17227,12 +17345,23 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.touchRecent(name);
                 this.renderList();
                 this.renderSitePage();
-                const res = await this.apiPost('get_login_link', { site_name: name });
+                const res = await this.apiPost('get_login_link', { site_name: name }, { quiet: true });
                 if (res.success && res.url) {
                     this.openUrl(res.url);
                     this.showSnack(res.note || 'Login link opened in a new tab.', false, res.note ? { duration: 12000 } : {});
+                } else if (res.code !== 'no_users') {
+                    this.showSnack(res.message || (res.transport ? 'Network error.' : 'An error occurred.'), true);
                 }
                 site.isLoggingIn = false;
+                if (res.code === 'no_users') {
+                    // A Laravel app no one has registered with: its users tab,
+                    // ready for one, and a note rather than an error.
+                    this.showSnack(res.message);
+                    if (this.view !== 'site' || this.sitePage.name !== name) this.openSitePage(name);
+                    this.setSiteTab('users');
+                    $id('userAddEmail').focus();
+                    return;
+                }
                 this.renderList();
                 this.renderSitePage();
             },

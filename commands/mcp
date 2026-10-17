@@ -37,13 +37,14 @@ class ToolError extends Exception {}
 // later call: no editor is offered, and after $timeout seconds it is stopped.
 // Reading ends when the command exits, not at EOF, because a background job
 // it leaves behind (a reload's delayed signal check) keeps the pipe open.
-function cove(array $args, bool $merge = false, int $timeout = 1800): array {
+function cove(array $args, bool $merge = false, int $timeout = 1800, array $env_extra = []): array {
     $cmd = escapeshellarg(COVE_BIN);
     foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string) $a);
     $err = tempnam(sys_get_temp_dir(), 'cove-mcp-');
     $spec = [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => $merge ? ['redirect', 1] : ['file', $err, 'w']];
     $env = getenv();
     $env['EDITOR'] = $env['VISUAL'] = 'false';
+    $env = $env_extra + $env;
     $proc = proc_open($cmd, $spec, $pipes, null, $env);
     if (!is_resource($proc)) { @unlink($err); throw new ToolError('Could not run cove.'); }
     stream_set_blocking($pipes[1], false);
@@ -593,6 +594,17 @@ function tools(): array {
             ], ['site']),
             'annotations' => ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false],
         ],
+        'laravel_users' => [
+            'title' => 'Laravel users',
+            'description' => "A Laravel app's users, through the user model its auth config names (App\\Models\\User in a new app): lists them, or, given an email, adds one, verified, with the password given or a made-up one it returns. login_link then signs in as any of them.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'email' => ['type' => 'string', 'description' => 'Adds a user with this email. Leave out to list the users.'],
+                'name' => ['type' => 'string', 'description' => "The new user's name. Default: the email's local part."],
+                'password' => ['type' => 'string', 'description' => "The new user's password. Default: a random one, returned."],
+            ], ['site']),
+            'annotations' => ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => false, 'openWorldHint' => false],
+        ],
         'read_logs' => [
             'title' => 'Read logs',
             'description' => "Recent log entries: php = PHP errors from Cove's shared error log (just this site's when a site is named), debug = the site's own log (wp-content/debug.log, or a Laravel app's storage/logs), access = the site's requests (status, method, path, time).",
@@ -735,7 +747,7 @@ function call_tool(string $name, array $a): array {
                 [$wout] = cove(['laravel', $site, '--format=json']);
                 $workers = json_decode(trim((string) $wout), true);
                 if (is_array($workers)) $info['workers'] = ['queue' => $workers['queue']['running'] ? 'running' : ($workers['queue']['on'] ? 'starting' : 'off'), 'schedule' => $workers['schedule']['running'] ? 'running' : ($workers['schedule']['on'] ? 'starting' : 'off')];
-                $info['commands'] = 'artisan_read and artisan run artisan; laravel_workers runs queued jobs and scheduled tasks.';
+                $info['commands'] = 'artisan_read and artisan run artisan; laravel_workers runs queued jobs and scheduled tasks; laravel_users lists and adds users.';
             } else {
                 $info['type'] = 'Plain (static files)';
             }
@@ -817,7 +829,7 @@ function call_tool(string $name, array $a): array {
                 $args[] = '--plain';
                 [$out, $err, $code] = cove($args);
                 if ($code !== 0 || !preg_match('~https://\S+/__cove/login/[0-9a-f]{32}~', $out, $m)) throw new ToolError(clean($out . "\n" . $err) ?: 'cove login failed.');
-                return text($m[0] . "\n\nSigns in as " . (!empty($a['user']) ? $a['user'] : "the app's first user") . " through the app's own auth guard, then goes to " . (!empty($a['to']) ? $a['to'] : "its dashboard route, or home") . ". Works once, within five minutes, in a browser on this machine. An app with no users yet says so instead.");
+                return text($m[0] . "\n\nSigns in as " . (!empty($a['user']) ? $a['user'] : "the app's first user") . " through the app's own auth guard, then goes to " . (!empty($a['to']) ? $a['to'] : "its dashboard route, or home") . ". Works once, within five minutes, in a browser on this machine.");
             }
             if (!is_file(SITES . "/$site.localhost/public/wp-config.php")) throw new ToolError("'$site' has no admin to sign in to: it is a plain static site.");
             $args = ['login', $site];
@@ -889,6 +901,28 @@ function call_tool(string $name, array $a): array {
             if ($code !== 0 || !is_array($w)) throw new ToolError(clean($out . "\n" . $err) ?: 'cove laravel failed.');
             $say = function ($x) { return $x['running'] ? 'running (pid ' . $x['pid'] . ')' : ($x['on'] ? 'on, starting' : 'off'); };
             return text("queue worker: " . $say($w['queue']) . "\nscheduler: " . $say($w['schedule']) . "\nOutput: " . SITES . "/$site.localhost/logs/laravel-<worker>.log");
+
+        case 'laravel_users':
+            $site = laravel_arg($a);
+            $email = trim((string) ($a['email'] ?? ''));
+            if ($email === '') {
+                [$out, $err] = cove(['laravel', $site, 'users', '--format=json']);
+                $d = json_decode(trim((string) $out), true);
+                if (!is_array($d) || isset($d['error'])) throw new ToolError(($d['error'] ?? '') ?: (clean($out . "\n" . $err) ?: 'cove laravel failed.'));
+                if (!$d['users']) return text("$site has no users yet. laravel_users with an email adds one.");
+                $rows = [];
+                foreach ($d['users'] as $u) $rows[] = '#' . $u['id'] . '  ' . $u['email'] . ($u['name'] !== null && $u['name'] !== '' ? '  (' . $u['name'] . ')' : '') . ($u['verified'] === false ? '  unverified' : '');
+                return text(implode("\n", $rows) . ($d['total'] > count($d['users']) ? "\n… and " . ($d['total'] - count($d['users'])) . ' more' : '') . "\n\nModel: " . $d['model']);
+            }
+            if ($email[0] === '-' || !filter_var($email, FILTER_VALIDATE_EMAIL)) throw new ToolError('email is an email address.');
+            $args = ['laravel', $site, 'user', 'add', $email];
+            if (($a['name'] ?? '') !== '') $args[] = '--name=' . $a['name'];
+            $args[] = '--format=json';
+            // The password goes by environment, never on a command line.
+            [$out, $err] = cove($args, false, 300, ['COVE_USER_PASSWORD' => (string) ($a['password'] ?? '')]);
+            $d = json_decode(trim((string) $out), true);
+            if (!is_array($d) || isset($d['error'])) throw new ToolError(($d['error'] ?? '') ?: (clean($out . "\n" . $err) ?: 'cove laravel failed.'));
+            return text('Added ' . $d['email'] . ' (id ' . $d['id'] . ')' . ($d['password'] ? ', password: ' . $d['password'] : '') . '. login_link with user ' . $d['email'] . ' signs in as them.');
 
         case 'check_page':
             $site = site_arg($a);
@@ -1236,7 +1270,7 @@ function rpc_error($id, int $code, string $message): array {
     return ['jsonrpc' => '2.0', 'id' => $id, 'error' => ['code' => $code, 'message' => $message]];
 }
 
-const INSTRUCTIONS = "Cove runs local WordPress and Laravel sites on this machine, each at https://<name>.localhost: a WordPress site's files are in ~/Cove/Sites/<name>.localhost/public with a database of its own, and a Laravel site's folder ~/Cove/Sites/<name>.localhost is the project (artisan_read and artisan run artisan, laravel_workers runs its queue and scheduler). Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin, screenshot to see a page, check_page for a page's status and the PHP errors it caused, and read_logs for older errors. wp_read runs WP-CLI commands that only read; wp runs any. Take a snapshot (snapshot_create) before a change you might want to undo, or try it on a copy (clone_site); before editing plugin or theme code, history_save, so history_diff shows the edit and history_rollback can undo it. snapshot_restore and history_rollback each save the current state first. No tool here deletes a site, pulls or pushes one to a remote host, or changes Cove's own settings.";
+const INSTRUCTIONS = "Cove runs local WordPress and Laravel sites on this machine, each at https://<name>.localhost: a WordPress site's files are in ~/Cove/Sites/<name>.localhost/public with a database of its own, and a Laravel site's folder ~/Cove/Sites/<name>.localhost is the project (artisan_read and artisan run artisan, laravel_workers runs its queue and scheduler, laravel_users lists and adds its users). Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin or a Laravel app, screenshot to see a page, check_page for a page's status and the PHP errors it caused, and read_logs for older errors. wp_read runs WP-CLI commands that only read; wp runs any. Take a snapshot (snapshot_create) before a change you might want to undo, or try it on a copy (clone_site); before editing plugin or theme code, history_save, so history_diff shows the edit and history_rollback can undo it. snapshot_restore and history_rollback each save the current state first. No tool here deletes a site, pulls or pushes one to a remote host, or changes Cove's own settings.";
 
 function handle(array $msg): ?array {
     $id = $msg['id'] ?? null;

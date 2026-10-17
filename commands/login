@@ -303,6 +303,22 @@ cove_login_laravel() {
         gum style --foreground red "❌ Error: --to is a path on the site, such as /admin." >&2
         exit 1
     fi
+    # Said here, not on the page the link opens: an app with no users yet,
+    # without the one named, or not migrated. Anything else (a guard that
+    # isn't Eloquent's) is left to the sign-in route.
+    local check
+    check=$(COVE_LU_WHO="$who" laravel_users_run "$site_name" check)
+    case "$check" in
+        *'"total":0,'*)
+            gum style --foreground red "❌ Error: $site_name has no users yet. Add one: cove laravel $site_name user add you@example.com" >&2
+            exit 1 ;;
+        *'"found":false'*)
+            gum style --foreground red "❌ Error: No user '$who' in $site_name. List them: cove laravel $site_name users" >&2
+            exit 1 ;;
+        *'"code":"no_table"'*)
+            gum style --foreground red "❌ Error: $site_name has no users table yet: run its migrations (cove artisan $site_name migrate)." >&2
+            exit 1 ;;
+    esac
     mkdir -p "$dir" && chmod 700 "$dir" || exit 1
     find "$dir" -type f -mmin +10 -delete 2>/dev/null
     token=$(openssl rand -hex 16 2>/dev/null)
