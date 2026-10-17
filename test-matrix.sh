@@ -331,7 +331,9 @@ MCPCHECK
 fail() { echo "laravel: $*" >&2; exit 1; }
 # A new site's certificate can take a few seconds more than cove add waits.
 up() { local c i; for i in 1 2 3 4 5 6; do c=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 60 "https://$1.localhost/up"); [ "$c" = 200 ] && break; sleep 2; done; echo "$c"; }
-set -a; . /root/Cove/config; set +a
+# Read, not exported: an exported DB_PASSWORD (MariaDB's) would override
+# every app's .env, as Laravel lets the environment win.
+. /root/Cove/config
 dbs() { MYSQL_PWD="$DB_PASSWORD" mariadb -u "$DB_USER" -N -e 'SHOW DATABASES' 2>/dev/null; }
 cove add lvl laravel >/tmp/lv-add.log 2>&1 || fail "cove add (sqlite): $(tail -n 6 /tmp/lv-add.log)"
 [ "$(up lvl)" = 200 ] || fail "/up on the SQLite app answered $(up lvl)"
