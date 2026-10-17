@@ -71,7 +71,10 @@ laravel_reverb_install() {
     if ! laravel_reverb_available "$site_name"; then
         ensure_composer >/dev/null || return 1
         echo "   - Adding Reverb (composer require laravel/reverb, the broadcasting config, routes/channels.php)…"
-        laravel_artisan "$site_dir" install:broadcasting --reverb --without-node --no-interaction --composer="$COMPOSER_PHAR" >>"$log" 2>&1
+        # Broadcasting off for this run (a real variable beats .env): a try
+        # that failed mid-download leaves .env on reverb and routes/channels.php
+        # in place with no Pusher library, and the app then can't boot to retry.
+        BROADCAST_CONNECTION=null laravel_artisan "$site_dir" install:broadcasting --reverb --without-node --no-interaction --composer="$COMPOSER_PHAR" >>"$log" 2>&1
         if ! laravel_reverb_available "$site_name"; then
             gum style --foreground red "❌ Error: Reverb could not be added. See $log"
             return 1
