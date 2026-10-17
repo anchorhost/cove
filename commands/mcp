@@ -499,8 +499,8 @@ function tools(): array {
         ],
         'login_link' => [
             'title' => 'One-time login link',
-            'description' => "A one-time link that signs into a WordPress site's admin as an administrator (or the user named), for a browser or a browser-automation tool. Each link works once.",
-            'inputSchema' => $obj(['site' => $site, 'user' => ['type' => 'string', 'description' => 'A user login, email or ID. Default: the first administrator.'], 'url' => ['type' => 'string', 'description' => 'On a multisite network, the subsite to sign into.']], ['site']),
+            'description' => "A one-time link that signs into a WordPress site's admin as an administrator (or the user named), or into a Laravel app as its first user (or the one named, by id or email) through the app's own auth, for a browser or a browser-automation tool. Each link works once.",
+            'inputSchema' => $obj(['site' => $site, 'user' => ['type' => 'string', 'description' => 'A user login, email or ID. Default: the first administrator (WordPress) or the first user (Laravel).'], 'url' => ['type' => 'string', 'description' => 'WordPress: on a multisite network, the subsite to sign into.'], 'to' => ['type' => 'string', 'description' => 'Laravel: the path to land on, e.g. /admin. Default: the dashboard route, or home.']], ['site']),
             'annotations' => $rw,
         ],
         'wp_read' => [
@@ -791,7 +791,18 @@ function call_tool(string $name, array $a): array {
             return text($out);
 
         case 'login_link':
-            $site = site_arg($a, true);
+            $site = site_arg($a);
+            if (laravel_site($site)) {
+                // A Laravel app: Cove signs in through the app's own auth.
+                $args = ['login', $site];
+                if (!empty($a['user'])) $args[] = (string) $a['user'];
+                if (!empty($a['to'])) $args[] = '--to=' . $a['to'];
+                $args[] = '--plain';
+                [$out, $err, $code] = cove($args);
+                if ($code !== 0 || !preg_match('~https://\S+/__cove/login/[0-9a-f]{32}~', $out, $m)) throw new ToolError(clean($out . "\n" . $err) ?: 'cove login failed.');
+                return text($m[0] . "\n\nSigns in as " . (!empty($a['user']) ? $a['user'] : "the app's first user") . " through the app's own auth guard, then goes to " . (!empty($a['to']) ? $a['to'] : "its dashboard route, or home") . ". Works once, within five minutes, in a browser on this machine. An app with no users yet says so instead.");
+            }
+            if (!is_file(SITES . "/$site.localhost/public/wp-config.php")) throw new ToolError("'$site' has no admin to sign in to: it is a plain static site.");
             $args = ['login', $site];
             if (!empty($a['user'])) $args[] = (string) $a['user'];
             if (!empty($a['url'])) $args[] = '--url=' . $a['url'];

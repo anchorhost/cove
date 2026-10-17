@@ -725,6 +725,54 @@ if (!empty($_SERVER['COVE_TWIN_OF']) && isset($_SERVER['HTTP_HOST'])
 // app's, and its shutdown handler would print a second page after Laravel's.
 $__cove_laravel = isset($_SERVER['DOCUMENT_ROOT']) && is_file(dirname($_SERVER['DOCUMENT_ROOT']) . '/artisan');
 
+// `cove login` for a Laravel site: boots the app as index.php would, with
+// one route of Cove's that signs the user in through the app's default
+// guard (its own user model and session), then redirects: to the path the
+// link names, the app's dashboard route, or home.
+function cove_laravel_sign_in($base, $who, $to) {
+    require $base . '/vendor/autoload.php';
+    $app = require $base . '/bootstrap/app.php';
+    $app->booted(function ($app) use ($who, $to) {
+        $app['router']->middleware('web')->get('/__cove/login/{token}', function () use ($who, $to) {
+            $text = function ($msg, $code) { return response($msg . "\n", $code)->header('Content-Type', 'text/plain; charset=utf-8'); };
+            $guard = \Illuminate\Support\Facades\Auth::guard();
+            if (!method_exists($guard, 'login') || !method_exists($guard, 'getProvider')) return $text("This app's default auth guard doesn't sign in with a session, so Cove can't log in to it.", 501);
+            $provider = $guard->getProvider();
+            $user = null;
+            if (method_exists($provider, 'createModel')) {
+                $model = $provider->createModel();
+                $query = $model->newQuery();
+                if ($who === '') $user = $query->orderBy($model->getKeyName())->first();
+                elseif (ctype_digit($who)) $user = $query->whereKey($who)->first();
+                else $user = $query->where('email', $who)->first();
+            } elseif ($who !== '' && ctype_digit($who)) {
+                $user = $provider->retrieveById($who);
+            } elseif ($who !== '') {
+                $user = $provider->retrieveByCredentials(['email' => $who]);
+            }
+            if (!$user) return $text($who === '' ? 'This app has no users yet. Register one, then run cove login again.' : "No user '$who' in this app.", 404);
+            $guard->login($user);
+            request()->session()->regenerate();
+            if ($to === '') {
+                $to = '/';
+                foreach (['dashboard', 'filament.admin.pages.dashboard', 'home'] as $name) {
+                    if (\Illuminate\Support\Facades\Route::has($name)) { $to = route($name, [], false); break; }
+                }
+            }
+            return redirect()->to($to);
+        });
+    });
+    if (method_exists($app, 'handleRequest')) {
+        $app->handleRequest(\Illuminate\Http\Request::capture());
+    } else {
+        $kernel = $app->make(\Illuminate\Contracts\Http\Kernel::class);
+        $request = \Illuminate\Http\Request::capture();
+        $response = $kernel->handle($request);
+        $response->send();
+        $kernel->terminate($request, $response);
+    }
+}
+
 if (!$__cove_laravel) spl_autoload_register(function ($class) {
     $prefix = 'Whoops\\';
     $base_dir = __DIR__ . '/whoops/src/Whoops/';
@@ -766,6 +814,21 @@ if ($__cove_laravel) {
     if (!$__cove_local) {
         $_SERVER['APP_DEBUG'] = $_ENV['APP_DEBUG'] = 'false';
         putenv('APP_DEBUG=false');
+    } elseif (preg_match('#^/__cove/login/([0-9a-f]{32})$#', (string) parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH), $__cove_m)) {
+        // A one-time sign-in from `cove login` (cove_login_laravel): the
+        // token is taken, whatever happens next, then the app signs in.
+        $__cove_file = dirname(__DIR__) . '/cache/laravel-login/' . $__cove_m[1];
+        $__cove_t = is_file($__cove_file) ? json_decode((string) @file_get_contents($__cove_file), true) : null;
+        @unlink($__cove_file);
+        $__cove_site = preg_replace('/\.localhost$/', '', basename(dirname($_SERVER['DOCUMENT_ROOT'])));
+        if (!is_array($__cove_t) || ($__cove_t['site'] ?? '') !== $__cove_site || (int) ($__cove_t['expires'] ?? 0) < time()) {
+            http_response_code(410);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo "This sign-in link has expired or was already used. Make another with: cove login $__cove_site\n";
+            exit;
+        }
+        cove_laravel_sign_in(dirname($_SERVER['DOCUMENT_ROOT']), (string) ($__cove_t['user'] ?? ''), (string) ($__cove_t['to'] ?? ''));
+        exit;
     }
     unset($__cove_laravel, $__cove_local);
     return;
@@ -5840,7 +5903,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Parse the command's output to find the URL.
                 foreach ($output_lines as $line) {
-                    if (strpos($line, 'https://') !== false && strpos($line, '/wp-login.php') !== false) {
+                    if (strpos($line, 'https://') !== false && (strpos($line, '/wp-login.php') !== false || strpos($line, '/__cove/login/') !== false)) {
                         // Clean the line from any "gum" box characters.
                         $login_url = trim(preg_replace('/[│└┌]/u', '', $line));
                         break;
@@ -9530,6 +9593,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 return { cls: 'static', pill: 'STATIC', name: 'static', short: 'static' };
             },
             isWpLike(site) { return !!site && (site.type === 'WordPress' || site.type === 'Minn'); },
+            // A one-time login: WordPress's admin, or a Laravel app's own users.
+            canLogIn(site) { return this.isWpLike(site) || (!!site && site.type === 'Laravel'); },
 
             // The quick filter. A type pill on a row lands here with the
             // site's type; choosing the active chip again goes back to all.
@@ -9630,7 +9695,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         }
                         if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !typing) {
                             const s = this.pageSite;
-                            if (this.isWpLike(s)) { e.preventDefault(); this.getLoginLink(s.name); }
+                            if (this.canLogIn(s)) { e.preventDefault(); this.getLoginLink(s.name); }
                         }
                         return;
                     }
@@ -9707,7 +9772,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         const site = this.selectedSite();
                         if (!site) return;
                         e.preventDefault();
-                        if ((e.metaKey || e.ctrlKey) && this.isWpLike(site)) {
+                        if ((e.metaKey || e.ctrlKey) && this.canLogIn(site)) {
                             this.getLoginLink(site.name);
                         } else {
                             this.openSitePage(site.name);
@@ -10388,7 +10453,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             },
 
             siteButtonsHtml(site, more) {
-                const main = this.isWpLike(site)
+                const main = this.canLogIn(site)
                     ? '<button type="button" class="sl-btn primary" data-act="login"' + (site.isLoggingIn ? ' disabled' : '') + ' title="One-time admin login for ' + this.escapeHtml(site.name) + '">' + (site.isLoggingIn ? 'opening…' : 'log in') + '</button>'
                     : '<button type="button" class="sl-btn" data-act="open">open</button>';
                 return main + (more || '') + '<button type="button" class="sl-btn icon" data-act="menu" aria-label="More for ' + this.escapeHtml(site.name) + '" title="More (or right-click)"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/></svg></button>';
@@ -10801,8 +10866,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('ctxTitle').innerHTML = '<span class="sl-host">' + this.highlightedDomain(site.domain.replace(/:\d+$/, ''), '') + '</span><span class="sl-type ' + ti.cls + '">' + ti.pill + '</span>';
                 this.setCtxEcho('ctxManage');
                 const isWp = this.isWpLike(site);
-                show($id('ctxLogin'), isWp);
-                show($id('ctxDb'), isWp);
+                show($id('ctxLogin'), this.canLogIn(site));
+                show($id('ctxDb'), isWp || (site.type === 'Laravel' && !!site.db_name));
                 $id('ctxReveal').querySelector('span').textContent = this.revealLabel;
                 $id('ctxPin').querySelector('span').textContent = this.isPinned(site.name) ? 'Unpin from top' : 'Pin to top';
                 // Effective PHP as the item's meta; hide the item entirely on
@@ -13278,9 +13343,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('siteOpenLink').href = site.domain;
                 this.renderSiteShot(site);
                 const login = $id('btnSiteLogin');
-                show(login, isWp);
+                show(login, this.canLogIn(site));
                 login.disabled = !!site.isLoggingIn;
-                login.querySelector('.btn-label').textContent = site.isLoggingIn ? 'opening…' : (isMinn ? 'log in to Minn Admin' : 'log in to admin');
+                login.querySelector('.btn-label').textContent = site.isLoggingIn ? 'opening…' : (isMinn ? 'log in to Minn Admin' : site.type === 'Laravel' ? 'log in' : 'log in to admin');
                 // A Laravel site's database is its SQLite file or one on MariaDB.
                 show($id('tileDb'), isWp || (site.type === 'Laravel' && !!site.db_name));
                 show($id('siteNetwork'), !!site.multisite);
@@ -16510,7 +16575,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (!item) return;
                 // A site: Enter opens its page, Shift+Enter the site itself in
                 // a new tab, Cmd/Ctrl+Enter a one-time admin login.
-                if (event && (event.metaKey || event.ctrlKey) && this.isWpLike(item.site)) {
+                if (event && (event.metaKey || event.ctrlKey) && this.canLogIn(item.site)) {
                     this.closePalette();
                     this.getLoginLink(item.site.name);
                     return;
@@ -17558,16 +17623,22 @@ display_command_help() {
             echo "Usage: cove db fix-collation <site> | --all [--dry-run]"
             ;;
         login)
-            echo "Usage: cove login <site> [<user>] [--url=<subsite-url>]"
+            echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>]"
             echo ""
-            echo "Generates a one-time login link for a WordPress site."
-            echo "If no user is specified, it defaults to the first available administrator."
+            echo "Generates a one-time login link for a WordPress or Laravel site."
+            echo "WordPress: if no user is specified, the first available administrator."
+            echo "Laravel: the user is an id or email (default: the app's first user),"
+            echo "signed in through the app's own auth guard. The link works once, within"
+            echo "five minutes, and only from this machine."
             echo ""
             echo "Arguments:"
-            echo "  <site>         The name of the WordPress site."
-            echo "  <user>         (Optional) The user ID, email, or login of the admin to use."
+            echo "  <site>         The name of the site."
+            echo "  <user>         (Optional) The user ID, email, or login to use."
             echo "  --url=<url>    (Optional) On a multisite network, the subsite to log in to,"
             echo "                 e.g. --url=https://mysite.localhost/store/ — see 'cove network'."
+            echo "  --to=<path>    (Optional, Laravel) The page to land on, e.g. --to=/admin."
+            echo "                 Default: the app's dashboard route, or the home page."
+            echo "  --plain        Print only the link."
             ;;
         wp)
             cove_wp --help
