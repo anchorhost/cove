@@ -5386,6 +5386,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'site_plugins':
         case 'site_themes':
         case 'site_users':
+        case 'site_user_add':
         case 'site_cron':
         case 'site_plugin_op':
         case 'site_theme_op':
@@ -5496,7 +5497,67 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 $supers = [];
                 if ($__multisite) { [$so] = $__wp(['super-admin', 'list', '--skip-plugins', '--skip-themes']); [$so] = $__wp_clean($so); $supers = array_values(array_filter(array_map('trim', explode("\n", $so)))); }
-                echo json_encode(['success' => true, 'items' => array_values($items), 'ms' => $ms, 'multisite' => $__multisite, 'super_admins' => $supers]);
+                // The roles the add form offers (a plugin's own, such as
+                // shop_manager, are stored with the rest). Without them the
+                // list still shows.
+                [$ro, , $ms3] = $__wp(['role', 'list', '--fields=role,name', '--format=json', '--skip-plugins', '--skip-themes']);
+                $roles = null;
+                foreach (array_reverse(explode("\n", trim($ro))) as $line) { $roles = json_decode(trim($line), true); if (is_array($roles)) break; }
+                $roles = is_array($roles) ? array_values(array_filter($roles, fn($r) => is_array($r) && isset($r['role']))) : [];
+                $ms += $ms3;
+                echo json_encode(['success' => true, 'items' => array_values($items), 'ms' => $ms, 'multisite' => $__multisite, 'super_admins' => $supers, 'roles_available' => $roles]);
+                exit;
+            }
+
+            if ($action === 'site_user_add') {
+                // A new user from the users tab: `wp user create`, with the
+                // plugins loaded as they would be in the admin. The password,
+                // typed in or made up here, goes over stdin (--prompt), not on
+                // a command line; WP-CLI echoes the command it built, password
+                // and all, so nothing it prints is passed on but its error,
+                // with the password masked.
+                $email = trim((string) ($input['email'] ?? ''));
+                $login = trim((string) ($input['login'] ?? ''));
+                $role = (string) ($input['role'] ?? '');
+                $password = (string) ($input['password'] ?? '');
+                if ($email === '' || strlen($email) > 100 || $email[0] === '-' || !filter_var($email, FILTER_VALIDATE_EMAIL)) { echo json_encode(['success' => false, 'message' => 'Enter an email address.']); exit; }
+                // Left blank, the username is the email's local part, kept to
+                // the characters WordPress allows in one.
+                if ($login === '') $login = strtolower(preg_replace('/[^A-Za-z0-9_.@-]/', '', strstr($email, '@', true)));
+                if (!preg_match('/^[A-Za-z0-9_.@][A-Za-z0-9 _.@-]{0,59}$/', $login) || substr($login, -1) === ' ') { echo json_encode(['success' => false, 'message' => 'A username is letters, numbers, spaces and _ . - @, up to 60 of them.']); exit; }
+                if (!preg_match('/^[A-Za-z0-9_-]{1,64}$/', $role)) { echo json_encode(['success' => false, 'message' => 'Pick a role.']); exit; }
+                $generated = $password === '';
+                if ($generated) {
+                    $abc = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+                    for ($i = 0; $i < 20; $i++) $password .= $abc[random_int(0, strlen($abc) - 1)];
+                }
+                // WP-CLI reads it as a line and trims it.
+                if (strlen($password) > 200 || preg_match('/[\r\n\0]/', $password) || trim($password) !== $password) { echo json_encode(['success' => false, 'message' => "A password can't be over 200 characters, span lines, or start or end with a space."]); exit; }
+                $cmd = escapeshellarg($cove_path) . ' wp ' . escapeshellarg($site_name);
+                foreach (['user', 'create', $login, $email, '--role=' . $role, '--prompt=user_pass', '--porcelain'] as $a) $cmd .= ' ' . escapeshellarg($a);
+                $env = getenv();
+                $env['HOME'] = $user_home;
+                $t0 = microtime(true);
+                $proc = proc_open($cmd, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes, null, $env);
+                if (!is_resource($proc)) { echo json_encode(['success' => false, 'message' => 'Could not run cove.']); exit; }
+                fwrite($pipes[0], $password . "\n");
+                fclose($pipes[0]);
+                $out = (string) stream_get_contents($pipes[1]);
+                fclose($pipes[1]);
+                $code = proc_close($proc);
+                $ms = round((microtime(true) - $t0) * 1000);
+                [$out] = $__wp_clean(preg_replace('/\x1b\[[0-9;]*m/', '', $out));
+                $id = 0;
+                foreach (array_reverse(explode("\n", $out)) as $line) { if (preg_match('/^\s*(\d+)\s*$/', $line, $m)) { $id = (int) $m[1]; break; } }
+                if ($code !== 0 || !$id) {
+                    $why = 'WP-CLI could not create the user.';
+                    foreach (explode("\n", $out) as $line) {
+                        if (preg_match('/^Error:\s*(.+)$/', trim($line), $m)) { $why = trim(html_entity_decode(strip_tags(preg_replace('/^(<strong>)?Error(<\/strong>)?:\s*/i', '', $m[1])))); break; }
+                    }
+                    echo json_encode(['success' => false, 'message' => str_replace($password, '••••', $why)]);
+                    exit;
+                }
+                echo json_encode(['success' => true, 'user' => ['id' => $id, 'email' => $email, 'login' => $login, 'role' => $role, 'password' => $generated ? $password : null], 'ms' => $ms]);
                 exit;
             }
 
@@ -8049,8 +8110,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .st-row:hover { background: var(--panel-hover); }
         .st-plugins, .st-themes { grid-template-columns: minmax(0, 1fr) auto auto auto minmax(9rem, auto); }
         .st-users { grid-template-columns: minmax(0, 1fr) auto auto auto; }
-        .st-useradd input { flex: 1 1 10rem; min-width: 0; background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.82rem; padding: 0.35rem 0.6rem; border-radius: var(--radius-md); }
-        .st-useradd input:focus { outline: 0; border-color: var(--accent); }
+        .st-useradd input, .st-useradd select { flex: 1 1 10rem; min-width: 0; background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.82rem; padding: 0.35rem 0.6rem; border-radius: var(--radius-md); }
+        .st-useradd select { flex: 0 1 11rem; cursor: pointer; }
+        .st-useradd input:focus, .st-useradd select:focus { outline: 0; border-color: var(--accent); }
         .st-useradd #userAddEmail { flex-basis: 14rem; }
         .st-useradd-done { display: flex; align-items: center; flex-wrap: wrap; gap: 0.6rem; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); }
         .st-useradd-done:empty { display: none; }
@@ -9020,9 +9082,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 </div>
                 <form class="st-toolbar st-useradd" id="userAdd" style="display: none;" autocomplete="off" novalidate>
                     <input id="userAddEmail" type="text" inputmode="email" placeholder="email" maxlength="191" spellcheck="false" autocomplete="off" aria-label="The new user's email">
+                    <input id="userAddLogin" type="text" placeholder="username (optional)" title="Left blank, the part of the email before the @" maxlength="60" spellcheck="false" autocomplete="off" aria-label="The new user's username">
                     <input id="userAddName" type="text" placeholder="name (optional)" maxlength="191" spellcheck="false" autocomplete="off" aria-label="The new user's name">
-                    <input id="userAddPassword" type="text" placeholder="password (blank: make one up)" maxlength="200" spellcheck="false" autocomplete="off" aria-label="The new user's password">
-                    <button type="submit" class="pill primary" id="btnUserAdd" title="A verified user in the app's users table, through its own user model">add user</button>
+                    <select id="userAddRole" aria-label="The new user's role"></select>
+                    <input id="userAddPassword" type="text" placeholder="password (optional)" title="Left blank, one is made up and shown once" maxlength="200" spellcheck="false" autocomplete="off" aria-label="The new user's password">
+                    <button type="submit" class="pill primary" id="btnUserAdd">add user</button>
                 </form>
                 <div class="st-useradd-done" id="userAddDone"></div>
                 <ul class="st-list"><li class="loading st-loading">Reading users…</li><li class="empty st-error" style="display: none;"></li></ul>
@@ -14705,23 +14769,28 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (this.sitePage.name === site.name) this.renderSiteTab();
             },
 
-            // A Laravel app's new user, from the users tab's form. A password
-            // left blank is made up, and shown here once.
+            // A new user from the users tab's form: `wp user create` on a
+            // WordPress site, the app's own user model on a Laravel one. A
+            // password left blank is made up, and shown here once.
             async siteUserAdd() {
                 const site = this.pageSite;
                 const t = this.siteTabState('users');
-                if (!site || site.type !== 'Laravel' || t.busy['+']) return;
+                const lv = !!site && site.type === 'Laravel';
+                if (!site || !(lv || this.isWpLike(site)) || t.busy['+']) return;
                 const email = $id('userAddEmail').value.trim();
                 if (!email) { $id('userAddEmail').focus(); return; }
                 t.busy['+'] = 'add'; t.added = null;
                 this.renderSiteTab();
-                const res = await this.apiPost('site_laravel_users', { site_name: site.name, op: 'add', email, name: $id('userAddName').value.trim(), password: $id('userAddPassword').value }, { quiet: true, timeoutMs: 90000 });
+                const password = $id('userAddPassword').value;
+                const res = lv
+                    ? await this.apiPost('site_laravel_users', { site_name: site.name, op: 'add', email, name: $id('userAddName').value.trim(), password }, { quiet: true, timeoutMs: 90000 })
+                    : await this.apiPost('site_user_add', { site_name: site.name, email, login: $id('userAddLogin').value.trim(), role: $id('userAddRole').value, password }, { quiet: true, timeoutMs: 120000 });
                 delete t.busy['+'];
                 if (this.sitePage.name !== site.name) return;
                 if (!res.success || !res.user) { this.showSnack(res.message || 'Could not add the user.', true); this.renderSiteTab(); return; }
                 t.added = res.user;
-                for (const id of ['userAddEmail', 'userAddName', 'userAddPassword']) $id(id).value = '';
-                this.showSnack('Added ' + res.user.email + '.');
+                for (const id of ['userAddEmail', 'userAddLogin', 'userAddName', 'userAddPassword']) $id(id).value = '';
+                this.showSnack('Added ' + (lv ? res.user.email : res.user.login) + '.');
                 this.loadSiteTab({ force: true });
             },
 
@@ -14819,16 +14888,36 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 }
                 if (tab === 'migrations') { const b = panel.querySelector('.st-migrate'); if (b && !t.busy.migrate) b.disabled = !t.items.some(m => !m.ran); }
                 if (tab === 'users') {
-                    // Laravel's add-user form, and the user it just added.
+                    // The add-user form, and the user it just added. WordPress
+                    // asks for a username and a role; Laravel for a name.
                     const lv = !!site && site.type === 'Laravel';
-                    show($id('userAdd'), lv);
+                    const wp = !!site && !lv && this.isWpLike(site);
+                    show($id('userAdd'), lv || wp);
+                    show($id('userAddLogin'), wp);
+                    show($id('userAddRole'), wp);
+                    show($id('userAddName'), lv);
                     const add = $id('btnUserAdd');
                     add.disabled = !!t.busy['+']; add.textContent = t.busy['+'] ? 'adding…' : 'add user';
-                    const a = lv && t.added;
+                    add.title = lv ? "A verified user in the app's users table, through its own user model" : (site && site.multisite ? 'wp user create, on the main site of the network' : 'wp user create');
                     const e = (s) => this.escapeHtml(s == null ? '' : String(s));
-                    $id('userAddDone').innerHTML = a ? '<span>Added <strong>' + e(a.email) + '</strong>' + (a.password ? ', password <code>' + e(a.password) + '</code>' : '') + '</span>'
+                    if (wp) {
+                        // The site's roles once the list has them; until then
+                        // WordPress's own, so the form works straight away.
+                        const sel = $id('userAddRole');
+                        const have = (t.extra && t.extra.roles_available && t.extra.roles_available.length) ? t.extra.roles_available : ['administrator', 'editor', 'author', 'contributor', 'subscriber'].map(r => ({ role: r, name: r[0].toUpperCase() + r.slice(1) }));
+                        const key = have.map(r => r.role).join(',');
+                        if (sel.dataset.key !== key) {
+                            const was = sel.value || 'administrator';
+                            sel.innerHTML = have.map(r => '<option value="' + e(r.role) + '">' + e(r.name || r.role) + '</option>').join('');
+                            sel.value = have.some(r => r.role === was) ? was : have[0].role;
+                            sel.dataset.key = key;
+                        }
+                    }
+                    const a = (lv || wp) && t.added;
+                    const who = a ? (lv ? a.email : a.login) : '';
+                    $id('userAddDone').innerHTML = a ? '<span>Added <strong>' + e(who) + '</strong>' + (a.role ? ' (' + e(a.role) + ')' : '') + (a.password ? ', password <code>' + e(a.password) + '</code>' : '') + '</span>'
                         + (a.password ? '<button type="button" class="pill ua-copy">copy password</button>' : '')
-                        + '<button type="button" class="pill primary ua-login">log in as ' + e(a.email) + '</button>' : '';
+                        + '<button type="button" class="pill primary ua-login">log in as ' + e(who) + '</button>' : '';
                 }
                 const count = panel.querySelector('.st-count');
                 if (!loaded) { count.textContent = savingText; return; }
