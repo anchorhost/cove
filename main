@@ -8786,6 +8786,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .site-facts .fact-ver.insecure::after { content: "●"; margin-left: 0.25rem; color: var(--pill-warn-fg, #d08c30); font-size: 0.6em; vertical-align: middle; }
         .site-facts .fact-path { cursor: copy; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
         .site-facts .fact-path:hover { color: var(--text); }
+        .site-facts .fact-db { cursor: pointer; }
+        .site-facts .fact-db:hover { color: var(--accent); }
         .site-body { padding: 1.25rem 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 1.25rem; }
         .site-top { display: grid; grid-template-columns: minmax(260px, 400px) minmax(0, 1fr); gap: 1rem; align-items: start; }
         .site-shot { position: relative; display: block; aspect-ratio: 16 / 10; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--bg-sunk); overflow: hidden; text-decoration: none; color: var(--text-faint); }
@@ -11398,7 +11400,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     // The database .env names; the kind column has the version.
                     const l = site.laravel || {};
                     const names = { sqlite: 'SQLite', mysql: 'MySQL', mariadb: 'MariaDB', pgsql: 'PostgreSQL' };
-                    top = esc(names[l.db] || l.db || 'no database') + (l.db !== 'sqlite' && l.db_name ? ' <span class="n">· ' + esc(l.db_name) + '</span>' : ' <span class="n">database</span>');
+                    top = esc(names[l.db] || l.db || 'no database') + (l.db !== 'sqlite' && l.db_name ? ' <span class="n">· ' + esc(String(l.db_name).replace(/^pgsql:/, '')) + '</span>' : ' <span class="n">database</span>');
                 } else {
                     const c = site.card;
                     if (!c) top = '<span class="n">no history saves yet</span>';
@@ -14426,9 +14428,19 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (isMinn && site.minn_version) fact(site.minn_version, 'fact-ver', 'Minn Engine ' + site.minn_version);
                 if (isMinn && site.wp_version) fact('speaks wp ' + site.wp_version, '', 'The WordPress release whose contracts the engine speaks; none of its code runs here');
                 if (!isMinn && isWp && site.wp_version) fact(site.wp_version, 'fact-ver' + (site.wp_status === 'insecure' ? ' insecure' : ''), site.wp_status === 'insecure' ? 'wp.org marks this version insecure' : (site.wp_status === 'outdated' ? 'A newer WordPress is available' : ''));
+                // A Laravel site: its framework version and the database .env
+                // names, which opens in the database view.
+                const lv = site.type === 'Laravel' ? (site.laravel || {}) : null;
+                if (lv && lv.version) fact(lv.version, 'fact-ver', 'Laravel ' + lv.version);
+                if (lv && lv.db) {
+                    const label = { sqlite: 'sqlite', mysql: 'mysql', mariadb: 'mariadb', pgsql: 'postgres' }[lv.db] || lv.db;
+                    const dbn = String(lv.db_name || '').replace(/^(pgsql|sqlite):/, '');
+                    const f = fact(lv.db === 'sqlite' || !dbn ? label : label + ' · ' + dbn, lv.db_name ? 'fact-db' : '', lv.db_name ? 'Open the database' : 'Database: ' + label);
+                    if (lv.db_name) f.setAttribute('role', 'button');
+                }
                 if (site.multisite) fact('multisite · ' + site.multisite, 'fact-ms');
                 const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
-                if (isWp && effPhp) fact('php ' + effPhp, '', site.php_version ? 'Pinned with cove php' : 'Cove\'s default PHP');
+                if ((isWp || lv) && effPhp) fact('php ' + effPhp, '', site.php_version ? 'Pinned with cove php' : 'Cove\'s default PHP');
                 if (site.size_bytes) fact(this.formatSize(site.size_bytes), '', 'On disk');
                 if (site.modified_at) { const rel = this.formatRelative(site.modified_at); fact(rel === 'now' ? 'modified just now' : 'modified ' + rel + ' ago', '', new Date(site.modified_at * 1000).toLocaleString()); }
                 const path = fact(site.display_path, 'fact-path', 'Click to copy the path');
@@ -14439,7 +14451,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 show(login, this.canLogIn(site));
                 login.disabled = !!site.isLoggingIn;
                 login.querySelector('.btn-label').textContent = site.isLoggingIn ? 'opening…' : (isMinn ? 'log in to Minn Admin' : site.type === 'Laravel' ? 'log in' : 'log in to admin');
-                // A Laravel site's database is its SQLite file or one on MariaDB.
+                // A Laravel site's database: its SQLite file, or one on MariaDB or PostgreSQL.
                 show($id('tileDb'), isWp || (site.type === 'Laravel' && !!site.db_name));
                 show($id('siteNetwork'), !!site.multisite);
                 if (site.multisite) {
@@ -15032,6 +15044,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('siteFacts').addEventListener('click', (e) => {
                     const path = e.target.closest('.fact-path');
                     if (path) { this.copyPath(path.dataset.path); return; }
+                    if (e.target.closest('.fact-db')) { const s = this.pageSite; if (s) this.openDbForSite(s); return; }
                     const type = e.target.closest('.fact-type');
                     if (type) { this.setTypeFilter(type.dataset.type); this.setView('sites'); }
                 });
