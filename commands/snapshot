@@ -23,7 +23,9 @@ snapshot_size_bytes() {
 }
 
 # A snapshot's files: public/, or project/ for a Laravel site, whose code
-# lives beside its webroot. Prints which, or fails for neither.
+# lives beside its webroot. Prints which, or fails for neither. A project is
+# zipped with its links kept as links (public/storage is one, which import
+# repoints); a WordPress tree has them followed, so symlinked plugins travel.
 snapshot_files() {
     if [ -d "$1/project" ]; then echo project; elif [ -d "$1/public" ]; then echo public; else return 1; fi
 }
@@ -50,9 +52,11 @@ snapshot_meta_json() {
         "$(snapshot_json_escape "$wp")" "$(snapshot_json_escape "$laravel")" "$files_bytes" "$db_bytes" "$([ -f "$dir/db.sql" ] && echo true || echo false)"
 }
 
-# snapshot_create <site> <note> <auto:0|1>  → prints the new id on stdout (last line)
+# snapshot_create <site> <note> <auto:0|1> [project]  → prints the new id on
+# stdout (last line). "project" takes a Laravel site's whole folder even when
+# it no longer looks like one, as a restore of a project snapshot does.
 snapshot_create() {
-    local site_name="$1" note="$2" auto="${3:-0}"
+    local site_name="$1" note="$2" auto="${3:-0}" want="${4:-}"
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
     local id
@@ -94,7 +98,7 @@ snapshot_create() {
         rm -f "$dest/.dump-err"
         chmod 600 "$dest/db.sql"
         wp_version=$(sed -n "s/^\$wp_version = '\([^']*\)';/\1/p" "$public_dir/wp-includes/version.php" 2>/dev/null | head -n 1)
-    elif site_is_laravel "$site_dir"; then
+    elif [ "$want" = "project" ] || site_is_laravel "$site_dir"; then
         # The whole project; an SQLite database rides along inside it. A
         # MariaDB one is dumped only when it is the one Cove made.
         kind="laravel"
@@ -140,6 +144,10 @@ snapshot_create() {
         echo "note=$note"
         echo "auto=$auto"
         echo "wp=$wp_version"
+        # The site it was taken from, so a restore after a rename can point
+        # the site's own settings at its new name.
+        echo "site=$site_name"
+        echo "folder=$site_dir"
         [ -n "$kind" ] && echo "kind=$kind"
         [ -n "$laravel_ver" ] && echo "laravel=$laravel_ver"
     } > "$dest/meta"
@@ -160,7 +168,7 @@ snapshot_restore() {
     # The way back: today's state, taken before anything is touched.
     echo "📸 Taking a snapshot of the current state first…" >&2
     local safety
-    safety=$(snapshot_create "$site_name" "before restoring $id" 1) || return 1
+    safety=$(snapshot_create "$site_name" "before restoring $id" 1 "$( [ "$files" = "project" ] && echo project)") || return 1
     safety="${safety##*$'\n'}"
     echo "   Saved as $safety." >&2
 
@@ -172,8 +180,19 @@ snapshot_restore() {
         fi
         source_config
         if [ "$files" = "project" ]; then
-            # Back into the database Cove keeps for this Laravel site.
+            # Back into the database Cove keeps for this Laravel site. .env
+            # may name another one now, in which case the snapshot just taken
+            # doesn't hold this one: it gets a copy before it is replaced.
             db_name=$(cove_laravel_db_name "$site_name")
+            local safety_dir="$SNAPSHOTS_DIR/$site_name/$safety" dump_cmd
+            if [ ! -f "$safety_dir/db.sql" ] && cove_db_exists "$db_name" && dump_cmd=$(snapshot_dump_cmd); then
+                if ! MYSQL_PWD="$DB_PASSWORD" "$dump_cmd" -u"$DB_USER" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "$db_name" > "$safety_dir/db.sql" 2>/dev/null; then
+                    rm -f "$safety_dir/db.sql"
+                    gum style --foreground red "❌ Error: Could not save the database '$db_name' before replacing it." >&2
+                    return 1
+                fi
+                chmod 600 "$safety_dir/db.sql"
+            fi
         else
             wp_cmd=$(get_wp_cmd "$site_dir")
             db_name=$( (cd "$public_dir" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
@@ -201,6 +220,21 @@ snapshot_restore() {
             gum style --foreground red "❌ Error: Could not put the snapshot's files back. Snapshot $safety holds the state from before." >&2
             return 1
         fi
+        # Taken under another name (before a rename): its .env names that
+        # site's address, folder and database.
+        local from
+        from=$(sed -n 's/^site=//p' "$src/meta" 2>/dev/null)
+        local from_dir
+        from_dir=$(sed -n 's/^folder=//p' "$src/meta" 2>/dev/null)
+        [ -n "$from_dir" ] || from_dir="$SITES_DIR/$from.localhost"
+        if [ -n "$from" ] && [ "$from" != "$site_name" ]; then
+            laravel_retarget "$site_dir" "$from" "$site_name" "$from_dir" || true
+        fi
+        if [ -f "$src/db.sql" ]; then
+            case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
+                mysql|mariadb) COVE_ENV_SET="{\"DB_DATABASE\":$(cove_json_str "$db_name")}" laravel_env_set "$site_dir/.env" || true ;;
+            esac
+        fi
         echo "$safety"
         return 0
     fi
@@ -226,7 +260,13 @@ snapshot_restore() {
 # files stay), the copy's move in, and what moved aside is removed.
 snapshot_swap_project() {
     local site_dir="$1" from="$2" staging="$1/.project.restoring" old="$1/.project.replaced" entry name
-    rm -rf "$staging" "$old"
+    # A .project.replaced still here is a failed swap's only copy of the
+    # files: never thrown away, the restore stops instead.
+    if [ -e "$old" ]; then
+        echo "   $old is left from an earlier restore; move its contents back first." >&2
+        return 1
+    fi
+    rm -rf "$staging"
     if ! cove_copy_tree "$from" "$staging"; then
         rm -rf "$staging"
         return 1
@@ -236,13 +276,40 @@ snapshot_swap_project() {
         [ -e "$entry" ] || [ -L "$entry" ] || continue
         name="${entry##*/}"
         case " $COVE_SITE_OWN .project.restoring .project.replaced " in *" $name "*) continue ;; esac
-        mv "$entry" "$old/" || return 1
+        if ! mv "$entry" "$old/"; then
+            snapshot_swap_back "$site_dir" "$old" "$staging" 0
+            return 1
+        fi
     done
     for entry in "$staging"/* "$staging"/.[!.]* "$staging"/..?*; do
         [ -e "$entry" ] || [ -L "$entry" ] || continue
-        mv "$entry" "$site_dir/" || return 1
+        if ! mv "$entry" "$site_dir/"; then
+            snapshot_swap_back "$site_dir" "$old" "$staging" 1
+            return 1
+        fi
     done
     rm -rf "$staging" "$old"
+}
+
+# Undoes a half-done swap. When the snapshot's files had started moving in
+# ($4 = 1), everything in the folder but Cove's own files came from it (the
+# rest was moved aside), so it goes; then what was moved aside comes back.
+snapshot_swap_back() {
+    local site_dir="$1" old="$2" staging="$3" moved_in="$4" entry name
+    if [ "$moved_in" = 1 ]; then
+        for entry in "$site_dir"/* "$site_dir"/.[!.]* "$site_dir"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            name="${entry##*/}"
+            case " $COVE_SITE_OWN .project.restoring .project.replaced " in *" $name "*) continue ;; esac
+            rm -rf "$entry"
+        done
+    fi
+    for entry in "$old"/* "$old"/.[!.]* "$old"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        mv "$entry" "$site_dir/" || return 1
+    done
+    rm -rf "$staging"
+    rmdir "$old" 2>/dev/null
 }
 
 cove_snapshot() {
@@ -374,7 +441,7 @@ cove_snapshot() {
             rm -f "$tmp"
             if [ "$format" != "json" ]; then echo "📦 Packing snapshot ${id}…"; fi
             if [[ "$archive" == *.zip ]]; then
-                ( umask 077; cd "$src" && zip -qr -X "$tmp" "$(snapshot_files .)" $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
+                ( umask 077; cd "$src" && zip -qr -X $( [ "$(snapshot_files .)" = project ] && echo -y ) "$tmp" "$(snapshot_files .)" $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
             else
                 ( umask 077; cd "$src" && tar -czf "$tmp" "$(snapshot_files .)" $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: tar failed."; exit 1; }
             fi

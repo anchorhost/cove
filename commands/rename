@@ -128,12 +128,12 @@ cove_rename() {
         source_config
         local old_laravel_db=""
         old_laravel_db=$(laravel_cove_db "$new_site_dir" "$old_name")
-        if ! laravel_take_database "$new_site_dir" "$old_name" "$new_name" "$old_site_dir" >/dev/null; then
+        if ! laravel_take_database "$new_site_dir" "$old_name" "$new_name" >/dev/null; then
             gum style --foreground red "❌ Error: Failed to copy the Laravel site's database. Aborting; old database left intact."
             mv "$new_site_dir" "$old_site_dir"
             exit 1
         fi
-        laravel_retarget "$new_site_dir" "$old_name" "$new_name" || \
+        laravel_retarget "$new_site_dir" "$old_name" "$new_name" "$old_site_dir" || \
             gum style --foreground yellow "⚠️  Could not update APP_URL in .env; verify it under the new name."
         if [ -n "$old_laravel_db" ]; then
             echo "   - Dropping old database '$old_laravel_db'..."

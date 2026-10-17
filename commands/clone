@@ -39,6 +39,11 @@ cove_copy_project() {
 # dropped again if the import fails. Needs source_config.
 cove_copy_database() {
     local from="$1" to="$2" dump rc
+    # Never into one that exists: a failure would drop it.
+    if cove_db_exists "$to"; then
+        echo "   ❌ A database named '$to' already exists, perhaps left by an earlier site." >&2
+        return 1
+    fi
     dump=$(mktemp) || return 1
     if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$from" > "$dump" 2>/dev/null; then
         rm -f "$dump"
@@ -55,11 +60,12 @@ cove_copy_database() {
 }
 
 # A Laravel clone or rename's own database ($1 the site folder, $2 and $3
-# the old and new names, $4 the old folder): a copy of the one Cove made
-# under the old name, or for SQLite, a full path that named the old folder
-# pointed at the new one. Prints the new database, if any. Needs source_config.
+# the old and new names): a copy of the one Cove made under the old name,
+# with .env pointed at it. An SQLite file moves with the folder (see
+# laravel_retarget for a full path). Prints the new database, if any.
+# Needs source_config.
 laravel_take_database() {
-    local site_dir="$1" old_name="$2" new_name="$3" old_dir="$4" db new_db path
+    local site_dir="$1" old_name="$2" new_name="$3" db new_db
     if db=$(laravel_cove_db "$site_dir" "$old_name"); then
         new_db=$(cove_laravel_db_name "$new_name")
         echo "   - Copying database '$db' to '$new_db'..." >&2
@@ -72,13 +78,8 @@ laravel_take_database() {
         return 0
     fi
     case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
-        sqlite|"")
-            path=$(laravel_env_get "$site_dir" DB_DATABASE)
-            if [[ "$path" == "$old_dir/"* ]]; then
-                COVE_ENV_SET="{\"DB_DATABASE\":$(cove_json_str "$site_dir/${path#"$old_dir"/}")}" laravel_env_set "$site_dir/.env" || return 1
-            fi ;;
-        *)
-            echo "   ⚠️  .env names the database '$(laravel_env_get "$site_dir" DB_DATABASE)', which Cove didn't make for this site; it is left as it is." >&2 ;;
+        sqlite|"") ;;
+        *) echo "   ⚠️  .env names the database '$(laravel_env_get "$site_dir" DB_DATABASE)', which Cove didn't make for this site; it is left as it is." >&2 ;;
     esac
 }
 
@@ -248,13 +249,19 @@ cove_clone() {
 
     if [ "$is_laravel" = true ]; then
         source_config
-        if ! laravel_take_database "$new_dir" "$source_name" "$new_name" "$source_dir" >/dev/null; then
+        if ! laravel_take_database "$new_dir" "$source_name" "$new_name" >/dev/null; then
             gum style --foreground red "❌ Error: Failed to copy the Laravel site's database."
             rm -rf "$new_dir"
             exit 1
         fi
-        laravel_retarget "$new_dir" "$source_name" "$new_name" || \
+        laravel_retarget "$new_dir" "$source_name" "$new_name" "$source_dir" || \
             gum style --foreground yellow "⚠️  Could not update APP_URL in the clone's .env."
+        # An SQLite file named by a full path outside the folder isn't copied.
+        local sqlite_path
+        sqlite_path=$(laravel_env_get "$new_dir" DB_DATABASE)
+        if [ "$(laravel_env_get "$new_dir" DB_CONNECTION)" = "sqlite" ] && [[ "$sqlite_path" == /* ]] && [[ "$sqlite_path" != "$new_dir/"* ]]; then
+            gum style --foreground yellow "⚠️  Both sites use the SQLite file $sqlite_path, which is outside the site's folder."
+        fi
     fi
 
     # Made during `cove demo`: it joins the demo, like a site from `cove add`.

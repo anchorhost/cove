@@ -466,6 +466,12 @@ cove_add_laravel() {
     if [ "$database" != "sqlite" ]; then
         source_config
         db_name=$(cove_laravel_db_name "$site_name")
+        # Never one that exists already: a failed install drops what it made.
+        if cove_db_exists "$db_name"; then
+            gum style --foreground red "❌ Error: A database named '$db_name' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+            rm -rf "$work"
+            return 1
+        fi
         echo "🗄️ Creating database: $db_name"
         if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
             gum style --foreground red "❌ Error: Could not create the database '$db_name'."
@@ -528,7 +534,13 @@ cove_add_laravel() {
         rm -rf "$work"
         return 1
     fi
-    if ! mv "$stage" "$site_dir"; then
+    # The folder may have appeared during the install: a reload's logs/ for a
+    # site deleted just before takes nothing, anything more is refused rather
+    # than moved into.
+    if [ -d "$site_dir" ] && [ -z "$(ls -A "$site_dir" | grep -vx logs)" ]; then
+        rm -rf "$site_dir"
+    fi
+    if [ -e "$site_dir" ] || ! mv "$stage" "$site_dir"; then
         gum style --foreground red "❌ Error: Could not move the application into $site_dir."
         [ -n "$db_name" ] && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
         rm -rf "$work"

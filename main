@@ -1541,6 +1541,12 @@ cove_laravel_db_name() {
     echo "${n//-/_}"
 }
 
+# Is there a MariaDB database by this name? Needs source_config. Cove's
+# database names are [a-z0-9_], so the name is safe inside the quotes.
+cove_db_exists() {
+    [ -n "$(MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -N -e "SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '$1'" 2>/dev/null)" ]
+}
+
 # The MariaDB database a Laravel site uses when it is the one Cove made for
 # it; nothing (and status 1) for SQLite or any other database, which clone,
 # rename and delete then leave alone.
@@ -1555,16 +1561,31 @@ laravel_cove_db() {
     echo "$db"
 }
 
-# Points a Laravel site's own settings at a new name after a clone or rename:
-# APP_URL and the sender address Cove set, when they still name the old site.
+# Points a Laravel site's own settings at a new name after a clone, rename,
+# import or restore: APP_URL and the sender address Cove set, when they still
+# name the old site, and given the old folder ($4), absolute paths into it.
 # A cached config holds the old folder's paths, so it is cleared.
 laravel_retarget() {
-    local site_dir="$1" old_name="$2" new_name="$3" pairs=()
+    local site_dir="$1" old_name="$2" new_name="$3" old_dir="${4:-}" pairs=() path link target
     if [ "$(laravel_env_get "$site_dir" APP_URL)" = "$(url_for "$old_name.localhost")" ]; then
         pairs+=("\"APP_URL\":\"$(url_for "$new_name.localhost")\"")
     fi
     if [ "$(laravel_env_get "$site_dir" MAIL_FROM_ADDRESS)" = "hello@$old_name.localhost" ]; then
         pairs+=("\"MAIL_FROM_ADDRESS\":\"hello@$new_name.localhost\"")
+    fi
+    # Absolute paths into the old folder: an SQLite file written out in
+    # full, and the links in public/ (storage:link makes public/storage an
+    # absolute one), which would otherwise serve the old site's files.
+    if [ -n "$old_dir" ] && [ "$old_dir" != "$site_dir" ]; then
+        path=$(laravel_env_get "$site_dir" DB_DATABASE)
+        case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
+            sqlite|"") [[ "$path" == "$old_dir/"* ]] && pairs+=("\"DB_DATABASE\":$(cove_json_str "$site_dir/${path#"$old_dir"/}")") ;;
+        esac
+        for link in "$site_dir"/public/* "$site_dir"/public/.[!.]*; do
+            [ -L "$link" ] || continue
+            target=$(readlink "$link")
+            [[ "$target" == "$old_dir/"* ]] && ln -sfn "$site_dir/${target#"$old_dir"/}" "$link"
+        done
     fi
     if [ "${#pairs[@]}" -gt 0 ]; then
         COVE_ENV_SET="{$(IFS=,; echo "${pairs[*]}")}" laravel_env_set "$site_dir/.env" || return 1
