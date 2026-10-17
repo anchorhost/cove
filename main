@@ -4398,11 +4398,23 @@ function cove_db_sqlite($action, $input, $file) {
 
 // The console's SQL split into statements for SQLite, which runs one at a
 // time: semicolons inside quotes, identifiers and comments don't count. In a
-// CREATE TRIGGER they count only once its BEGIN … END closes, where CASE …
-// END inside the body nests. Comment-only pieces go.
+// CREATE TRIGGER they count only once its BEGIN … END closes, with CASE …
+// END inside nesting. A column may be called end (SET end = …, new.end): in
+// the body, the END that closes BEGIN comes before a ; or the end of the
+// input, and an END beside a dot is a name. Comment-only pieces go.
 function cove_sqlite_statements($sql) {
     $out = []; $cur = ''; $n = strlen($sql); $i = 0;
-    $words = []; $depth = 0;
+    $words = []; $stack = [];
+    // The next character that isn't space or part of a comment.
+    $peek = function ($at) use ($sql, $n) {
+        while ($at < $n) {
+            if (ctype_space($sql[$at])) { $at++; continue; }
+            if (substr($sql, $at, 2) === '--') { $e = strpos($sql, "\n", $at); $at = $e === false ? $n : $e; continue; }
+            if (substr($sql, $at, 2) === '/*') { $e = strpos($sql, '*/', $at + 2); $at = $e === false ? $n : $e + 2; continue; }
+            return $sql[$at];
+        }
+        return '';
+    };
     while ($i < $n) {
         $c = $sql[$i];
         if ($c === "'" || $c === '"' || $c === '`' || $c === '[') {
@@ -4427,13 +4439,19 @@ function cove_sqlite_statements($sql) {
             $w = strtoupper(substr($sql, $i, $j - $i));
             if (count($words) < 3) $words[] = $w;
             $trigger = $words && $words[0] === 'CREATE' && (($words[1] ?? '') === 'TRIGGER' || (in_array($words[1] ?? '', ['TEMP', 'TEMPORARY'], true) && ($words[2] ?? '') === 'TRIGGER'));
-            if ($trigger && ($w === 'BEGIN' || $w === 'CASE')) $depth++;
-            if ($trigger && $w === 'END') $depth = max(0, $depth - 1);
+            if ($trigger && ($w === 'BEGIN' || $w === 'CASE')) {
+                $stack[] = $w;
+            } elseif ($trigger && $w === 'END' && $stack) {
+                $before = substr(rtrim($cur), -1);
+                $next = $peek($j);
+                $name = $before === '.' || $next === '.' || (end($stack) === 'BEGIN' && $next !== ';' && $next !== '');
+                if (!$name) array_pop($stack);
+            }
             $cur .= substr($sql, $i, $j - $i);
             $i = $j;
             continue;
         }
-        if ($c === ';' && $depth === 0) {
+        if ($c === ';' && !$stack) {
             $out[] = $cur; $cur = ''; $words = []; $i++;
             continue;
         }
