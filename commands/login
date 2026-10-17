@@ -195,6 +195,10 @@ cove_login() {
 
     # 2. Check if the site exists and is a WordPress installation.
     if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
+        if site_is_laravel "$site_dir"; then
+            gum style --foreground red "❌ Error: '$site_name.localhost' is a Laravel site, with no WordPress admin to log in to."
+            exit 1
+        fi
         gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
         exit 1
     fi
