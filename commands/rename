@@ -52,6 +52,7 @@ cove_rename() {
     # --- Rename Directory ---
     # A Laravel site's workers run in the folder under the old name; they
     # start again under the new one below.
+    laravel_workers_hold "$old_name"
     laravel_workers_stop_site "$old_name"
     mv "$old_site_dir" "$new_site_dir"
     echo "   - Directory renamed."
@@ -178,5 +179,6 @@ cove_rename() {
     for kind in $LARAVEL_WORKER_KINDS; do
         laravel_worker_wanted "$new_name" "$kind" && laravel_worker_start "$new_name" "$kind"
     done
+    laravel_workers_release "$old_name"
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: $(url_for "$new_name.localhost")"
 }

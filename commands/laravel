@@ -24,14 +24,31 @@ laravel_worker_pid() {
     pid=$(cat "$LARAVEL_RUN_DIR/$1-$2.pid" 2>/dev/null) || return 1
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     args=$(ps -o args= -p "$pid" 2>/dev/null) || return 1
+    # The site's own artisan, by its full path: another site's worker, or a
+    # process that reused the pid, doesn't count.
     case "$args" in
-        *artisan*"$(laravel_worker_args "$2" | cut -d' ' -f1)"*) echo "$pid" ;;
+        *"$SITES_DIR/$1.localhost/artisan $(laravel_worker_args "$2" | cut -d' ' -f1)"*) echo "$pid" ;;
         *) return 1 ;;
     esac
 }
 
 laravel_worker_wanted() {
     grep -qx "$2" "$SITES_DIR/$1.localhost/laravel_workers" 2>/dev/null
+}
+
+# While a site is being renamed or deleted, the watchdog leaves its workers
+# alone: a hold in the run dir, taken before they stop and released after
+# (one older than ten minutes is from a run that died, and is ignored).
+laravel_workers_hold() {
+    mkdir -p "$LARAVEL_RUN_DIR" && : > "$LARAVEL_RUN_DIR/$1.hold"
+}
+
+laravel_workers_release() {
+    rm -f "$LARAVEL_RUN_DIR/$1.hold"
+}
+
+laravel_workers_held() {
+    [ -n "$(find "$LARAVEL_RUN_DIR/$1.hold" -mmin -10 2>/dev/null)" ]
 }
 
 # Keeps a worker's log from growing without end: past 5 MB, the last 512 KB
@@ -57,7 +74,7 @@ laravel_worker_start() {
         # A process group of its own (job control on), with the pid as its id.
         set -m
         PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" \
-            nohup "$COVE_TOOLS_DIR/php" artisan $(laravel_worker_args "$kind") >> "$site_dir/logs/laravel-$kind.log" 2>&1 < /dev/null &
+            nohup "$COVE_TOOLS_DIR/php" "$site_dir/artisan" $(laravel_worker_args "$kind") >> "$site_dir/logs/laravel-$kind.log" 2>&1 < /dev/null &
         echo "$!" > "$LARAVEL_RUN_DIR/$site_name-$kind.pid"
     )
 }
@@ -65,9 +82,11 @@ laravel_worker_start() {
 laravel_worker_stop() {
     local site_name="$1" kind="$2" pid i
     if pid=$(laravel_worker_pid "$site_name" "$kind"); then
+        # The whole group: queue:listen leaves at once on TERM, but the
+        # queue:work it started finishes the job in hand first.
         kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            kill -0 "$pid" 2>/dev/null || break
+        for i in $(seq 1 30); do
+            kill -0 -- "-$pid" 2>/dev/null || break
             sleep 0.5
         done
         kill -KILL -- "-$pid" 2>/dev/null
@@ -103,6 +122,7 @@ cove_laravel() {
                 for f in "$SITES_DIR"/*.localhost/laravel_workers; do
                     [ -f "$f" ] || continue
                     s=$(basename "$(dirname "$f")" .localhost)
+                    laravel_workers_held "$s" && continue
                     for k in $LARAVEL_WORKER_KINDS; do
                         if laravel_worker_wanted "$s" "$k"; then
                             laravel_worker_start "$s" "$k"
