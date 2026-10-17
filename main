@@ -1865,7 +1865,7 @@ cove_redis_site_env() {
 # webroot Cove serves anyway. Cove's own files share that folder: these are
 # listed in the app's .gitignore, never copied by clone or snapshot, and
 # never replaced by a restore.
-COVE_SITE_OWN="logs private history php_version mappings multisite twin tailscale_port lan_config laravel_workers"
+COVE_SITE_OWN="logs private history php_version mappings multisite twin tailscale_port lan_config laravel_workers reverb_port"
 
 site_is_laravel() {
     [ -f "$1/artisan" ] && [ -f "$1/bootstrap/app.php" ] && [ -f "$1/public/index.php" ]
@@ -2037,6 +2037,10 @@ laravel_retarget() {
     fi
     if [ "$(laravel_env_get "$site_dir" MAIL_FROM_ADDRESS)" = "hello@$old_name.localhost" ]; then
         pairs+=("\"MAIL_FROM_ADDRESS\":\"hello@$new_name.localhost\"")
+    fi
+    # The browser's way to its Reverb, under its own name.
+    if [ "$(laravel_env_get "$site_dir" VITE_REVERB_HOST)" = "$old_name.localhost" ]; then
+        pairs+=("\"VITE_REVERB_HOST\":\"$new_name.localhost\"")
     fi
     # Its own keys in Redis, under its own name.
     if [ -n "$old_name" ] && [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "${old_name}_" ]; then
@@ -3613,6 +3617,24 @@ emit_site_php_handler() {
     fi
 }
 
+# A Laravel site's Reverb (cove laravel <site> reverb on), when it is on:
+# its websocket path, /app/<key> exactly, goes to the port it listens on,
+# ahead of PHP, so the browser reaches it at wss://<site>.localhost. Any
+# other /app/… path stays the app's.
+emit_site_reverb_route() {
+    local site_path="$1" key port
+    [ -f "$site_path/artisan" ] && grep -qx reverb "$site_path/laravel_workers" 2>/dev/null || return 0
+    port=$(cat "$site_path/reverb_port" 2>/dev/null)
+    key=$(laravel_env_get "$site_path" REVERB_APP_KEY)
+    [[ "$port" =~ ^[0-9]+$ ]] && [[ "$key" =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+    {
+        echo "    @cove_reverb path /app/$key"
+        echo "    handle @cove_reverb {"
+        echo "        reverse_proxy 127.0.0.1:$port"
+        echo "    }"
+    } >> "$CADDYFILE_PATH"
+}
+
 # Files no site should hand to a browser: WordPress's debug.log (WP_DEBUG_LOG
 # writes it inside the web root) and other logs (cPanel's error_log), database
 # dumps and backup-plugin archives, editor leftovers (wp-config.php.bak,
@@ -4106,6 +4128,7 @@ EOM
                     emit_multisite_subdir_rewrites
                 fi
 
+                emit_site_reverb_route "$site_path"
                 emit_site_php_handler "$site_path"
 
                 if [ ! -f "$site_path/public/wp-config.php" ]; then
@@ -5872,8 +5895,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $kind = (string) ($input['kind'] ?? '');
                 if ($kind !== '') {
                     $state = (string) ($input['state'] ?? '');
-                    if (!in_array($kind, ['queue', 'schedule'], true) || !in_array($state, ['on', 'off'], true)) { echo json_encode(['success' => false, 'message' => 'Unknown worker.']); exit; }
+                    if (!in_array($kind, ['queue', 'schedule', 'reverb'], true) || !in_array($state, ['on', 'off'], true)) { echo json_encode(['success' => false, 'message' => 'Unknown worker.']); exit; }
                     array_push($args, $kind, $state);
+                    // Reverb's Caddy route needs a reload, which the dashboard
+                    // asks for itself afterwards (this request is served by it).
+                    if ($kind === 'reverb') $args[] = '--no-reload';
                 }
                 $cmd = 'HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path);
                 foreach ($args as $a) $cmd .= ' ' . escapeshellarg($a);
@@ -15120,6 +15146,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (this.sitePage.name !== site.name) return;
                 if (res.workers) { w.for = site.name; w.data = res.workers; }
                 if (!res.success) this.showSnack(res.message || 'Could not change the worker.', true);
+                else if (kind === 'reverb') {
+                    // Its websocket route is Caddy's: reloaded in the background.
+                    this.apiPost('reload_server', {}, { quiet: true });
+                    if (state === 'on') this.showSnack('Reverb is on at wss://' + site.name + '.localhost. Build the front end again (npm run build), or run npm run dev, so Echo uses it.', false, { duration: 12000 });
+                }
                 this.renderSiteWorkers();
             },
 
@@ -15131,8 +15162,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const foot = $id('schedFoot');
                 if (!on) { foot.textContent = ''; return; }
                 const data = w.for === site.name ? w.data : null;
-                const names = { queue: ['queue worker', 'artisan queue:listen: runs queued jobs, reloading the code for each'], schedule: ['scheduler', 'artisan schedule:work: runs the scheduled tasks every minute'] };
-                $id('siteWorkersRow').innerHTML = ['queue', 'schedule'].map(k => {
+                const names = { queue: ['queue worker', 'artisan queue:listen: runs queued jobs, reloading the code for each'], schedule: ['scheduler', 'artisan schedule:work: runs the scheduled tasks every minute'], reverb: ['reverb', 'artisan reverb:start: the app\'s websockets, at wss://' + site.name + '.localhost'] };
+                // Reverb's only for an app that has it.
+                $id('siteWorkersRow').innerHTML = ['queue', 'schedule'].concat(data && data.reverb ? ['reverb'] : []).map(k => {
                     const st = data ? data[k] : null;
                     const busy = w.busy === k;
                     const state = !st ? '…' : busy ? (st.on ? 'stopping…' : 'starting…') : st.running ? 'running' : st.on ? 'starting' : 'off';

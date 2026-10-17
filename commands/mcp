@@ -589,10 +589,10 @@ function tools(): array {
         ],
         'laravel_workers' => [
             'title' => 'Laravel workers',
-            'description' => "A Laravel site's queue worker (artisan queue:listen, so queued jobs run) and scheduler (artisan schedule:work, so scheduled tasks run each minute): shows them, or turns one on or off. One that is on keeps running, after a crash or a reboot too. Their output is in the site's logs/laravel-queue.log and logs/laravel-schedule.log.",
+            'description' => "A Laravel site's queue worker (artisan queue:listen, so queued jobs run), scheduler (artisan schedule:work, so scheduled tasks run each minute) and, for an app with Reverb, its websocket server (artisan reverb:start, reached at wss://<site>.localhost): shows them, or turns one on or off. One that is on keeps running, after a crash or a reboot too. Their output is in the site's logs/laravel-<worker>.log.",
             'inputSchema' => $obj([
                 'site' => $site,
-                'worker' => ['type' => 'string', 'enum' => ['queue', 'schedule'], 'description' => 'Which one to turn on or off. Leave out to see both.'],
+                'worker' => ['type' => 'string', 'enum' => ['queue', 'schedule', 'reverb'], 'description' => 'Which one to turn on or off. Leave out to see them all. reverb needs the app to have Reverb (cove laravel <site> reverb install adds it).'],
                 'state' => ['type' => 'string', 'enum' => ['on', 'off']],
             ], ['site']),
             'annotations' => ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false],
@@ -903,7 +903,7 @@ function call_tool(string $name, array $a): array {
             $site = laravel_arg($a);
             $args = ['laravel', $site];
             if (!empty($a['worker'])) {
-                if (!in_array($a['worker'], ['queue', 'schedule'], true) || !in_array($a['state'] ?? '', ['on', 'off'], true)) throw new ToolError('worker is queue or schedule, and state is on or off.');
+                if (!in_array($a['worker'], ['queue', 'schedule', 'reverb'], true) || !in_array($a['state'] ?? '', ['on', 'off'], true)) throw new ToolError('worker is queue, schedule or reverb, and state is on or off.');
                 array_push($args, $a['worker'], $a['state']);
             }
             $args[] = '--format=json';
@@ -911,7 +911,7 @@ function call_tool(string $name, array $a): array {
             $w = json_decode(trim((string) $out), true);
             if ($code !== 0 || !is_array($w)) throw new ToolError(clean($out . "\n" . $err) ?: 'cove laravel failed.');
             $say = function ($x) { return $x['running'] ? 'running (pid ' . $x['pid'] . ')' : ($x['on'] ? 'on, starting' : 'off'); };
-            return text("queue worker: " . $say($w['queue']) . "\nscheduler: " . $say($w['schedule']) . "\nOutput: " . SITES . "/$site.localhost/logs/laravel-<worker>.log");
+            return text("queue worker: " . $say($w['queue']) . "\nscheduler: " . $say($w['schedule']) . (isset($w['reverb']) ? "\nreverb: " . $say($w['reverb']) . " (wss://$site.localhost)" : '') . "\nOutput: " . SITES . "/$site.localhost/logs/laravel-<worker>.log");
 
         case 'laravel_users':
             $site = laravel_arg($a);

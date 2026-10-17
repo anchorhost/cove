@@ -1,20 +1,129 @@
 # cove laravel: a Laravel site's background workers. A queue worker
 # (artisan queue:listen, which reloads the app's code for every job) and the
 # scheduler (artisan schedule:work, which runs schedule:run each minute) are
-# what `composer run dev` would start beside `artisan serve`. Which ones a
+# what `composer run dev` would start beside `artisan serve`; an app with
+# Reverb can have its websocket server too (artisan reverb:start), on a port
+# of its own that Caddy answers wss://<site>.localhost/app/<key> from. Which ones a
 # site wants is kept in its laravel_workers file; the watchdog starts any
 # that should run and doesn't, so they come back after a crash or a reboot.
 # Each runs in a process group of its own, so stopping one takes the
 # children queue:listen spawns with it. Output goes to logs/laravel-<kind>.log.
 
 LARAVEL_RUN_DIR="$RUN_DIR/laravel"
-LARAVEL_WORKER_KINDS="queue schedule"
+LARAVEL_WORKER_KINDS="queue schedule reverb"
+
+# The artisan command a worker runs ($1 the kind), and its arguments ($2 the
+# site, for Reverb's port).
+laravel_worker_command() {
+    case "$1" in
+        queue)    echo "queue:listen" ;;
+        schedule) echo "schedule:work" ;;
+        reverb)   echo "reverb:start" ;;
+    esac
+}
 
 laravel_worker_args() {
     case "$1" in
         queue)    echo "queue:listen --tries=1 --timeout=0" ;;
         schedule) echo "schedule:work" ;;
+        reverb)   echo "reverb:start --host=127.0.0.1 --port=$(laravel_reverb_port "$2")" ;;
     esac
+}
+
+# The local port a site's Reverb listens on, kept in the site's reverb_port
+# (one of Cove's own files, so a clone gets a port of its own): the one it
+# has, else the first from 8080 up that no other site has and nothing
+# answers on.
+laravel_reverb_port() {
+    local site_dir="$SITES_DIR/$1.localhost" port taken
+    port=$(cat "$site_dir/reverb_port" 2>/dev/null)
+    if [[ "$port" =~ ^[0-9]+$ ]]; then echo "$port"; return 0; fi
+    taken=$(cat "$SITES_DIR"/*.localhost/reverb_port 2>/dev/null)
+    for port in $(seq 8080 8999); do
+        printf '%s\n' "$taken" | grep -qx "$port" && continue
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && continue
+        echo "$port" > "$site_dir/reverb_port" || return 1
+        echo "$port"
+        return 0
+    done
+    return 1
+}
+
+laravel_reverb_available() {
+    [ -d "$SITES_DIR/$1.localhost/vendor/laravel/reverb" ]
+}
+
+# Reverb into an app that hasn't it, as `artisan install:broadcasting
+# --reverb` would, made to work without a terminal: that command boots the
+# app again for reverb:install once broadcasting points at Reverb, which then
+# has no key and fails without a word, and its npm step insists on a TTY. So
+# the keys go into .env first, Composer is Cove's (Linux has no global one),
+# and Echo goes into the front end here. Output in logs/laravel-reverb-install.log.
+laravel_reverb_install() {
+    local site_name="$1" site_dir="$SITES_DIR/$1.localhost" log rand
+    log="$site_dir/logs/laravel-reverb-install.log"
+    mkdir -p "$site_dir/logs"
+    : > "$log"
+    if [ -z "$(laravel_env_get "$site_dir" REVERB_APP_KEY)" ]; then
+        rand() { LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c "$1"; }
+        COVE_ENV_SET="{\"REVERB_APP_ID\":\"$(( (RANDOM * 32768 + RANDOM) % 900000 + 100000 ))\",\"REVERB_APP_KEY\":\"$(rand 20)\",\"REVERB_APP_SECRET\":\"$(rand 20)\"}" laravel_env_set "$site_dir/.env" || return 1
+    fi
+    if ! laravel_reverb_available "$site_name"; then
+        ensure_composer >/dev/null || return 1
+        echo "   - Adding Reverb (composer require laravel/reverb, the broadcasting config, routes/channels.php)…"
+        laravel_artisan "$site_dir" install:broadcasting --reverb --without-node --no-interaction --composer="$COMPOSER_PHAR" >>"$log" 2>&1
+        if ! laravel_reverb_available "$site_name"; then
+            gum style --foreground red "❌ Error: Reverb could not be added. See $log"
+            return 1
+        fi
+    fi
+    # reverb:install, which the command above may not have managed: the
+    # config file and the rest of its .env settings (it keeps those there).
+    laravel_artisan "$site_dir" reverb:install --no-interaction >>"$log" 2>&1
+    if [ -f "$site_dir/package.json" ] && ! grep -q '"laravel-echo"' "$site_dir/package.json"; then
+        if cove_find_node && command -v npm >/dev/null 2>&1; then
+            echo "   - Adding Echo to the front end (npm install laravel-echo pusher-js)…"
+            (cd "$site_dir" && npm install --save-dev laravel-echo pusher-js --no-audit --no-fund) >>"$log" 2>&1 \
+                || gum style --foreground yellow "⚠️  npm couldn't add Echo; see $log"
+        else
+            gum style --foreground yellow "⚠️  Node.js isn't installed: add Echo to the front end with npm install --save-dev laravel-echo pusher-js"
+        fi
+    fi
+}
+
+# The front end built again, when there's one and Node to build it, so the
+# browser's Reverb settings (VITE_REVERB_*) take. Quiet; status 1 when it
+# didn't build.
+laravel_build_front_end() {
+    local site_dir="$SITES_DIR/$1.localhost"
+    [ -f "$site_dir/package.json" ] && grep -qE '"build"[[:space:]]*:' "$site_dir/package.json" || return 1
+    cove_find_node && command -v npm >/dev/null 2>&1 || return 1
+    (cd "$site_dir" && npm run build) >>"$site_dir/logs/laravel-reverb-install.log" 2>&1
+}
+
+# Turning Reverb on: the app has it (install:broadcasting --reverb put it
+# there), a port, and .env pointed both ways. The app itself (broadcasting
+# an event) talks to Reverb directly on 127.0.0.1; the browser (Echo) goes
+# through Caddy at wss://<site>.localhost, so https pages can reach it.
+laravel_reverb_enable() {
+    local site_name="$1" site_dir="$SITES_DIR/$1.localhost" key port https
+    if ! laravel_reverb_available "$site_name"; then
+        gum style --foreground red "❌ Error: This app doesn't have Reverb." "Add it, with Echo in the front end, and turn it on: cove laravel $site_name reverb install"
+        return 1
+    fi
+    key=$(laravel_env_get "$site_dir" REVERB_APP_KEY)
+    if ! [[ "$key" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        gum style --foreground red "❌ Error: .env has no REVERB_APP_KEY." "Set Reverb up with: cove artisan $site_name reverb:install"
+        return 1
+    fi
+    if ! port=$(laravel_reverb_port "$site_name"); then
+        gum style --foreground red "❌ Error: No free port between 8080 and 8999 for Reverb."
+        return 1
+    fi
+    https=$(https_port_suffix)
+    https="${https#:}"
+    COVE_ENV_SET="{\"REVERB_HOST\":\"127.0.0.1\",\"REVERB_PORT\":\"$port\",\"REVERB_SCHEME\":\"http\",\"VITE_REVERB_HOST\":\"$site_name.localhost\",\"VITE_REVERB_PORT\":\"${https:-443}\",\"VITE_REVERB_SCHEME\":\"https\"}" laravel_env_set "$site_dir/.env" || return 1
+    laravel_artisan "$site_dir" config:clear >/dev/null 2>&1 || true
 }
 
 # The running worker's pid, or failure. The pid file is checked against the
@@ -27,7 +136,7 @@ laravel_worker_pid() {
     # The site's own artisan, by its full path: another site's worker, or a
     # process that reused the pid, doesn't count.
     case "$args" in
-        *"$SITES_DIR/$1.localhost/artisan $(laravel_worker_args "$2" | cut -d' ' -f1)"*) echo "$pid" ;;
+        *"$SITES_DIR/$1.localhost/artisan $(laravel_worker_command "$2")"*) echo "$pid" ;;
         *) return 1 ;;
     esac
 }
@@ -74,7 +183,7 @@ laravel_worker_start() {
         # A process group of its own (job control on), with the pid as its id.
         set -m
         PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" \
-            nohup "$COVE_TOOLS_DIR/php" "$site_dir/artisan" $(laravel_worker_args "$kind") >> "$site_dir/logs/laravel-$kind.log" 2>&1 < /dev/null &
+            nohup "$COVE_TOOLS_DIR/php" "$site_dir/artisan" $(laravel_worker_args "$kind" "$site_name") >> "$site_dir/logs/laravel-$kind.log" 2>&1 < /dev/null &
         echo "$!" > "$LARAVEL_RUN_DIR/$site_name-$kind.pid"
     )
 }
@@ -189,6 +298,7 @@ laravel_workers_json() {
     local site_name="$1" kind pid sep="" out
     out="{\"site\":\"$site_name\""
     for kind in $LARAVEL_WORKER_KINDS; do
+        if [ "$kind" = "reverb" ] && ! laravel_reverb_available "$site_name" && ! laravel_worker_wanted "$site_name" reverb; then continue; fi
         pid=$(laravel_worker_pid "$site_name" "$kind") || pid=""
         out="$out,\"$kind\":{\"on\":$(laravel_worker_wanted "$site_name" "$kind" && echo true || echo false),\"running\":$([ -n "$pid" ] && echo true || echo false),\"pid\":${pid:-null}}"
     done
@@ -196,12 +306,13 @@ laravel_workers_json() {
 }
 
 cove_laravel() {
-    local site_name="" kind="" state="" extra="" user_name="" user_password="${COVE_USER_PASSWORD:-}" format="table" arg
+    local site_name="" kind="" state="" extra="" user_name="" user_password="${COVE_USER_PASSWORD:-}" format="table" no_reload=false arg
     for arg in "$@"; do
         case "$arg" in
             --format=*) format="${arg#*=}" ;;
             --name=*) user_name="${arg#*=}" ;;
             --password=*) user_password="${arg#*=}" ;;
+            --no-reload) no_reload=true ;;
             --ensure)
                 # The watchdog: start what should run and doesn't.
                 local f s k
@@ -226,7 +337,7 @@ cove_laravel() {
                 done
                 return 0 ;;
             -h|--help)
-                echo "Usage: cove laravel <site> [queue|schedule] [on|off] [--format=json]"
+                echo "Usage: cove laravel <site> [queue|schedule|reverb] [on|off] [--format=json]"
                 echo "       cove laravel <site> users [--format=json]"
                 echo "       cove laravel <site> user add <email> [--name=<name>] [--password=<password>]"
                 echo ""
@@ -240,6 +351,10 @@ cove_laravel() {
                 echo "             code for each one."
                 echo "  schedule   artisan schedule:work: runs the app's scheduled tasks each"
                 echo "             minute (routes/console.php)."
+                echo "  reverb     artisan reverb:start: the app's websocket server, for an app"
+                echo "             with Reverb (install:broadcasting --reverb). It listens on a"
+                echo "             port of its own; browsers reach it at wss://<site>.localhost,"
+                echo "             through Caddy, and .env is set up for both."
                 echo "A worker that is on keeps running: the watchdog starts it again after a"
                 echo "crash or a reboot. Its output goes to logs/laravel-<worker>.log in the site."
                 echo ""
@@ -247,6 +362,8 @@ cove_laravel() {
                 echo "  cove laravel myapp"
                 echo "  cove laravel myapp queue on"
                 echo "  cove laravel myapp schedule off"
+                echo "  cove laravel myapp reverb install   (adds Reverb to the app, then turns it on)"
+                echo "  cove laravel myapp reverb on"
                 return ;;
             -*) gum style --foreground red "❌ Error: Unknown option '$arg'."; exit 1 ;;
             *)
@@ -307,12 +424,25 @@ cove_laravel() {
 
     if [ -n "$kind" ]; then
         case "$kind" in
-            queue|schedule) ;;
+            queue|schedule|reverb) ;;
             scheduler) kind="schedule" ;;
-            *) gum style --foreground red "❌ Error: Unknown worker '$kind'." "Use queue or schedule."; exit 1 ;;
+            websockets|websocket) kind="reverb" ;;
+            *) gum style --foreground red "❌ Error: Unknown worker '$kind'." "Use queue, schedule or reverb."; exit 1 ;;
         esac
+        # reverb install: Reverb added to the app, then on, front end built.
+        local built=""
+        if [ "$kind" = "reverb" ] && [ "$state" = "install" ]; then
+            laravel_reverb_install "$site_name" || exit 1
+            state="on"
+            built=pending
+        fi
         case "$state" in
             on|start)
+                if [ "$kind" = "reverb" ]; then laravel_reverb_enable "$site_name" || exit 1; fi
+                if [ "$built" = "pending" ]; then
+                    echo "   - Building the front end with Reverb's settings…"
+                    if laravel_build_front_end "$site_name"; then built=yes; else built=no; fi
+                fi
                 grep -qx "$kind" "$site_dir/laravel_workers" 2>/dev/null || echo "$kind" >> "$site_dir/laravel_workers"
                 if ! laravel_worker_start "$site_name" "$kind"; then
                     gum style --foreground red "❌ Error: Could not start the $kind worker."
@@ -327,6 +457,14 @@ cove_laravel() {
             ""|status) ;;
             *) gum style --foreground red "❌ Error: Expected on or off, not '$state'."; exit 1 ;;
         esac
+        # Reverb's route in the Caddyfile comes and goes with it.
+        if [ "$kind" = "reverb" ] && [ -n "$state" ] && [ "$state" != "status" ] && [ "$no_reload" = false ]; then
+            cove_reload >/dev/null 2>&1 || gum style --foreground yellow "⚠️  Could not reload Caddy: run cove reload for wss://$site_name.localhost."
+        fi
+        if [ "$kind" = "reverb" ] && { [ "$state" = "on" ] || [ "$state" = "start" ]; } && [ "$format" != "json" ]; then
+            echo "📡 Reverb: wss://$site_name.localhost (port $(laravel_reverb_port "$site_name") on this machine)."
+            [ "$built" = "yes" ] || echo "   The browser's settings are in .env (VITE_REVERB_*): build the front end again (npm run build), or run npm run dev."
+        fi
     fi
 
     if [ "$format" = "json" ]; then
@@ -336,6 +474,7 @@ cove_laravel() {
     local k pid line
     echo "Laravel $(laravel_version "$site_dir") · $site_name.localhost"
     for k in $LARAVEL_WORKER_KINDS; do
+        if [ "$k" = "reverb" ] && ! laravel_reverb_available "$site_name" && ! laravel_worker_wanted "$site_name" reverb; then continue; fi
         pid=$(laravel_worker_pid "$site_name" "$k") || pid=""
         if [ -n "$pid" ]; then line="running (pid $pid)"
         elif laravel_worker_wanted "$site_name" "$k"; then line="on, not running yet (the watchdog starts it within a minute)"
