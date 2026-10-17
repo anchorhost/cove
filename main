@@ -1516,6 +1516,18 @@ ensure_composer() {
     chmod 755 "$tmp" && mv -f "$tmp" "$COMPOSER_PHAR"
 }
 
+# The php-zts extension packages FrankenPHP's Linux packages leave out:
+# mysqli for WordPress, PDO with its SQLite and MySQL drivers for Laravel,
+# and what both use besides. apt spells the PDO drivers with a hyphen, dnf
+# with an underscore.
+linux_php_extension_packages() {
+    local base="php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath php-zts-pdo"
+    case "$PKG_MANAGER" in
+        apt) echo "$base php-zts-pdo-sqlite php-zts-pdo-mysql" ;;
+        dnf) echo "$base php-zts-pdo_sqlite php-zts-pdo_mysql" ;;
+    esac
+}
+
 # --- Laravel ---------------------------------------------------------------
 # A Laravel site's folder is the project root, so Laravel's public/ is the
 # webroot Cove serves anyway. Cove's own files share that folder: these are
@@ -18225,6 +18237,22 @@ main() {
                 echo "   - Restarting FrankenPHP to apply its updated service definition..."
                 start_caddy_service
                 for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
+            fi
+            # Linux installs before Laravel support lack PDO (Laravel's only
+            # way to its database): install it, then restart FrankenPHP once
+            # so the web server loads it too.
+            if [ "$OS" = "linux" ] && [ -n "$(linux_php_extension_packages)" ] \
+                && ! frankenphp php-cli -r 'exit(extension_loaded("pdo_sqlite") && extension_loaded("pdo_mysql") ? 0 : 1);' 2>/dev/null; then
+                echo "   - Installing PHP's PDO extensions (for Laravel sites)..."
+                if [ "$PKG_MANAGER" = "apt" ]; then
+                    $SUDO_CMD apt install -y $(linux_php_extension_packages) >/dev/null 2>&1 || true
+                else
+                    $SUDO_CMD dnf install -y $(linux_php_extension_packages) >/dev/null 2>&1 || true
+                fi
+                if frankenphp php-cli -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);' 2>/dev/null && is_caddy_running; then
+                    $SUDO_CMD systemctl restart cove.service
+                    for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
+                fi
             fi
             if [ "$OS" = "linux" ] && fix_cove_service_home; then
                 echo "   - Restarting FrankenPHP so it sees the right home folder..."

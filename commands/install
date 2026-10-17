@@ -419,14 +419,14 @@ cove_install() {
     # On Linux with apt/dnf, FrankenPHP needs additional PHP extensions installed
     # The DEB/RPM packages don't include all extensions by default
     if [ "$OS" = "linux" ]; then
-        echo "📦 Installing FrankenPHP PHP extensions for WordPress..."
+        echo "📦 Installing FrankenPHP PHP extensions for WordPress and Laravel..."
         if [ "$PKG_MANAGER" = "apt" ]; then
             # Install required PHP extensions for WordPress via apt
-            $SUDO_CMD apt install -y php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath 2>/dev/null || true
+            $SUDO_CMD apt install -y $(linux_php_extension_packages) 2>/dev/null || true
             echo "✅ FrankenPHP PHP extensions installed."
         elif [ "$PKG_MANAGER" = "dnf" ]; then
             # Install required PHP extensions for WordPress via dnf
-            $SUDO_CMD dnf install -y php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath 2>/dev/null || true
+            $SUDO_CMD dnf install -y $(linux_php_extension_packages) 2>/dev/null || true
             echo "✅ FrankenPHP PHP extensions installed."
         fi
         

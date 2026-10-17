@@ -433,10 +433,13 @@ lane_b() { # previous release -> candidate + post-upgrade
         # the same sequence cove upgrade performs after downloading.
         incus file push "$SRC/cove.sh" "$c/usr/local/bin/cove"
         # post-upgrade also points cove.service and the watchdog at root's real
-        # home (/root): units before 2.4 said /home/root.
+        # home (/root): units before 2.4 said /home/root. And it installs PDO,
+        # which installs before Laravel support lack, for the web server too.
         if cx "$c" chmod +x /usr/local/bin/cove && cx "$c" cove post-upgrade \
             && cx "$c" systemctl show cove.service -p Environment | grep -q 'HOME=/root' \
-            && cx "$c" systemctl show cove-watchdog.service -p Environment | grep -q 'HOME=/root'; then
+            && cx "$c" systemctl show cove-watchdog.service -p Environment | grep -q 'HOME=/root' \
+            && cx "$c" bash -c 'PHPRC=/root/Cove/php.ini frankenphp php-cli -r "exit(extension_loaded(\"pdo_sqlite\") && extension_loaded(\"pdo_mysql\") ? 0 : 1);"' \
+            && cx "$c" bash -c 'printf "%s" "<?php echo extension_loaded(\"pdo_sqlite\") ? \"pdo-on\" : \"pdo-off\";" > /root/Cove/Sites/u1.localhost/public/pdo-check.php; curl -sk --max-time 20 https://u1.localhost/pdo-check.php | grep -q pdo-on'; then
             res "$c" upgrade_post PASS
         else
             res "$c" upgrade_post FAIL

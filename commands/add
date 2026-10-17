@@ -454,7 +454,11 @@ cove_add_laravel() {
     local ext="pdo_sqlite"
     [ "$database" = "sqlite" ] || ext="pdo_mysql"
     if ! COVE_EXT="$ext" COVE_PHP_BIN="$native" "$php" -r 'exit(extension_loaded(getenv("COVE_EXT")) ? 0 : 1);' 2>/dev/null; then
-        gum style --foreground red "❌ Error: This PHP has no $ext extension." "Laravel talks to its database through PDO, so it can't run here yet."
+        local fix="Laravel talks to its database through PDO, so it can't run here yet."
+        if [ -n "$(linux_php_extension_packages)" ]; then
+            fix="Install PHP's PDO extensions, then restart Cove's web server:"$'\n'"  sudo $PKG_MANAGER install $(linux_php_extension_packages | tr ' ' '\n' | grep pdo | tr '\n' ' ')"$'\n'"  sudo systemctl restart cove"
+        fi
+        gum style --foreground red "❌ Error: This PHP has no $ext extension." "$fix"
         return 1
     fi
 
