@@ -2,7 +2,7 @@
 
 **The calm way to run local WordPress.**
 
-Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one-click admin login, zero Docker. It bundles Caddy, FrankenPHP, MariaDB, and Mailpit into one self-contained toolchain for WordPress and plain static sites, with a dashboard at `https://cove.localhost` for your sites, their mail, their databases, their logs, and their files.
+Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one-click admin login, zero Docker. It bundles Caddy, FrankenPHP, MariaDB, and Mailpit into one self-contained toolchain for WordPress, Laravel, and plain static sites, with a dashboard at `https://cove.localhost` for your sites, their mail, their databases, their logs, and their files.
 
 ## ✨ Features
 
@@ -10,6 +10,7 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
   * **Web Dashboard**: A built-in GUI at `https://cove.localhost` with five views. **Sites**, a summary of what your cove holds (plugins, themes, WordPress and PHP versions, disk) over a list grouped by when each site last changed, with filters like `plugin:woo` or `is:outdated`, pins, bulk actions, and one-click admin logins; **Mail**, an inbox of everything your sites send, scoped per site; **Databases**, a browser with in-place editing and a SQL console; **Logs**, PHP errors per site, `debug.log`, and access logs, live; and **Files**, a file manager and editor over each site's directory. Every view has a real URL.
   * **Automatic HTTPS**: Every site is served over HTTPS using Caddy's internal CA — no cert wrangling.
   * **WordPress & Static Sites**: Spin up a fresh WordPress install — any version, nightly, or a multisite network — a [Minn Engine](https://minn.run) site, or a plain static site with one command.
+  * **Laravel**: `cove add myapp laravel` creates a Laravel app the way `laravel new` does, on SQLite by default or on Cove's MariaDB with `--database=mysql`, its mail caught in Cove's mailbox. `cove artisan` and `cove composer` run on the PHP the site serves with, and the dashboard shows its database, its `laravel.log`, and its errors.
   * **Per-site PHP**: Pin any site to an older PHP (`cove php mysite 8.2`); it runs on a native php-fpm behind the same Caddy, with TLS, logs, and URLs unchanged.
   * **WordPress Migration**: Pull a remote site down via SSH (`cove pull`) or push a local site up (`cove push`), including a single tenant of a WP Freighter install (`--tenant`).
   * **Database Management**: Browse and edit any table from the dashboard, run SQL with `⌘↵`, plus Adminer with passwordless auto-login for exports and schema work. `cove db backup` snapshots every site; `cove db list` shows credentials.
@@ -78,7 +79,7 @@ Cove provides a simple set of commands to manage your local environment.
 
 | Command | Description |
 | --- | --- |
-| `cove add <name> [flavor]` | Creates a new WordPress site (`<name>.localhost`). The optional flavor says what goes inside it: a version (`6.4.3`, `6.9-RC1`), `nightly`, `latest` (the default), `minn` for a Minn Engine site (the latest WordPress with the engine installed over it, WordPress's own files parked in `wp-parked/` for `wp minn eject`), or `plain` for a static site with no database. `--multisite` builds a subdirectory network, `--multisite=subdomain` a subdomain one (subsites get HTTPS automatically); `--php=<ver>` pins the PHP version. Every WordPress site is created with `WP_ENVIRONMENT_TYPE` set to `local` (so core and plugins that check `wp_get_environment_type()` treat it as a sandbox) and `WP_DEBUG_LOG` on, writing to `wp-content/debug.log`. |
+| `cove add <name> [flavor]` | Creates a new WordPress site (`<name>.localhost`). The optional flavor says what goes inside it: a version (`6.4.3`, `6.9-RC1`), `nightly`, `latest` (the default), `minn` for a Minn Engine site (the latest WordPress with the engine installed over it, WordPress's own files parked in `wp-parked/` for `wp minn eject`), `laravel` for a Laravel app (see below), or `plain` for a static site with no database. `--multisite` builds a subdirectory network, `--multisite=subdomain` a subdomain one (subsites get HTTPS automatically); `--php=<ver>` pins the PHP version. Every WordPress site is created with `WP_ENVIRONMENT_TYPE` set to `local` (so core and plugins that check `wp_get_environment_type()` treat it as a sandbox) and `WP_DEBUG_LOG` on, writing to `wp-content/debug.log`. A `laravel` site's folder is the project, so its `public/` is the webroot; it gets an SQLite database (Laravel's own default) or, with `--database=mysql` or `mariadb`, one on Cove's MariaDB, and its `.env` is set up with the site's https address and mail to Cove's mailbox. |
 | `cove clone <source> <new-name>` | Copies a site — files, database, and custom Caddy rules — under a new name, rewriting stored URLs to the new domain. Uses a copy-on-write clone on APFS and btrfs, so it's fast and the two copies share disk until one is written to. |
 | `cove delete <name> [--force]` | Deletes a site's directory and its associated database. |
 | `cove rename <old-name> <new-name>` | Renames a site, its directory, database, and runs `wp search-replace` so stored URLs (siteurl, home, serialized content) all update to the new domain. |
@@ -92,6 +93,8 @@ Cove provides a simple set of commands to manage your local environment.
 | `cove snapshot <site> [create\|list\|restore <id>\|delete <id>\|export <id>]` | Point-in-time copies of a site's files and database under `~/Cove/Snapshots/<site>/`, restorable in place; a restore snapshots the current state first so it can be undone. `--note="…"` labels one. |
 | `cove screenshot <site> [--out=<file.png>]` | Captures the site's front page with a headless Chromium-family browser; the dashboard shows the capture on the site's page. `--sweep [--max=N] [--idle-only]` refreshes stale previews in the background (the watchdog does this while the desktop is idle). |
 | `cove wp <site> <args…>` | Runs WP-CLI inside a site from anywhere, on the PHP the site is pinned to: `cove wp mysite plugin list`. |
+| `cove artisan <site> <args…>` | Runs a Laravel site's artisan from anywhere, on the PHP the site serves with: `cove artisan myapp migrate`. |
+| `cove composer <site> <args…>` | Runs Composer in a site's folder on the PHP the site serves with, so platform checks and `@php` scripts agree with the site. Cove keeps its own `composer.phar`, checked against getcomposer.org's published SHA-256. |
 | `cove path <name>` | Outputs the full system path to a site's public directory. |
 | `cove url <name>` | Prints the full HTTPS URL for a site (including the port suffix when on alternative ports). |
 | `cove php [<site>] [<version>\|default]` | Per-site PHP version switching. Pinning routes a site through a native Homebrew `php@<version>` php-fpm behind Caddy; `default` returns it to FrankenPHP's bundled PHP. The pin travels with the site through clone and rename. |
@@ -238,7 +241,7 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
   * Every site Cove manages, with its WordPress version (flagged when wp.org marks it insecure), PHP pin, disk usage, and last-modified time.
   * Filter by name (press `/` from anywhere) or by type (click a `WP` / `STATIC` pill); sort by name, type, size, or last modified; pin the sites you are working on to the top.
   * `⌘K` opens a command palette that searches sites and commands from anywhere: `↵` opens a site's page, `⇧↵` the site itself, `⌘↵` a one-time admin login.
-  * Add WordPress or plain sites from a form that offers real WordPress versions, or drop a backup zip on the form to import one; delete with an undo window, or bulk-delete everything a filter matches — behind a dialog that lists the sites and asks for their number to be typed.
+  * Add WordPress, Laravel, or plain sites from a form that offers real WordPress versions (and, for Laravel, SQLite or MySQL), or drop a backup zip on the form to import one; delete with an undo window, or bulk-delete everything a filter matches — behind a dialog that lists the sites and asks for their number to be typed.
   * Click a row to open the site's page (below). Right-click any row for the menu: manage, open, one-time admin login, rename, reveal in Finder, browse files, database, PHP version, logs, mail, copy path, pin, delete.
   * The `caddy`, `mariadb`, and `mailpit` dots in the top bar open a panel with each service's status, version, ports, and credentials.
 
@@ -258,7 +261,7 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
 
 ### Databases — `/db`, `/db/<database>/<table>`
 
-  * Every database with the site that owns it, table counts, and sizes. A WordPress database opens on an overview: site URL, home, prefix, theme, post and user counts, and the largest autoloaded options.
+  * Every database with the site that owns it, table counts, and sizes, including a Laravel site's SQLite file (as `sqlite:<site>`). A WordPress database opens on an overview: site URL, home, prefix, theme, post and user counts, and the largest autoloaded options.
   * Any table as a grid: column types in the header, click to sort, a search box for one column or all, paging. Tables with a primary key are editable in place — double-click a cell, `↵` saves, `Esc` cancels, `⌘⌫` writes `NULL` — and rows can be deleted.
   * A **structure** tab with columns, indexes, and the `CREATE TABLE`; a **sql** console that runs several statements at a time with `⌘↵`, shows results as grids or affected-row counts with timings, and keeps a history.
   * Adminer stays one click away, deep-linked to the open table, for exports, imports, schema changes, and users.
@@ -266,7 +269,7 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
 ### Logs — `/logs`, `/logs/<site>/<tab>`
 
   * The system logs on the left — the shared PHP error log, Caddy's process and reload logs, the watchdog, Mailpit, php-fpm — and below them every site, most recently active first.
-  * Pick a site for three tabs: **php errors** from the shared log scoped to that site, its own **debug.log**, and its Caddy **access** log. "View log" in a site's row menu opens whichever one the site actually writes to.
+  * Pick a site for three tabs: **php errors** from the shared log scoped to that site, its own **debug.log** (a Laravel site's **laravel.log**), and its Caddy **access** log. "View log" in a site's row menu opens whichever one the site actually writes to.
   * Entries are parsed into a level chip, the message, and `file:line`; consecutive repeats fold into one row with a count, and a click opens the stack trace. Filter by level, search, page back through **older**, or leave **live** on and watch the file grow.
   * Files are read backwards in chunks, so a 100 MB error log answers as fast as a small one.
 
