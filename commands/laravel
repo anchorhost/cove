@@ -95,14 +95,14 @@ laravel_reverb_install() {
 }
 
 # The front end built again, when there's one and Node to build it, so the
-# browser's Reverb settings (VITE_REVERB_*) take. Quiet; status 1 when it
-# didn't build.
+# browser's Reverb settings (VITE_REVERB_*) take. Quiet; status 1 when there
+# was nothing to build it with, 2 when the build failed.
 laravel_build_front_end() {
     local site_dir="$SITES_DIR/$1.localhost"
     [ -f "$site_dir/package.json" ] && grep -qE '"build"[[:space:]]*:' "$site_dir/package.json" || return 1
     cove_find_node && command -v npm >/dev/null 2>&1 || return 1
     # Vite plugins may run php artisan: Cove's php comes first on PATH.
-    (cd "$site_dir" && PATH="$COVE_TOOLS_DIR:$PATH" PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" npm run build) >>"$site_dir/logs/laravel-reverb-install.log" 2>&1
+    (cd "$site_dir" && PATH="$COVE_TOOLS_DIR:$PATH" PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" npm run build) >>"$site_dir/logs/laravel-reverb-install.log" 2>&1 || return 2
 }
 
 # Turning Reverb on: the app has it (install:broadcasting --reverb put it
@@ -445,7 +445,8 @@ cove_laravel() {
                 if [ "$kind" = "reverb" ]; then laravel_reverb_enable "$site_name" || exit 1; fi
                 if [ "$built" = "pending" ]; then
                     echo "   - Building the front end with Reverb's settings…"
-                    if laravel_build_front_end "$site_name"; then built=yes; else built=no; fi
+                    built=yes
+                    laravel_build_front_end "$site_name" || { [ $? -eq 2 ] && built=failed || built=no; }
                 fi
                 grep -qx "$kind" "$site_dir/laravel_workers" 2>/dev/null || echo "$kind" >> "$site_dir/laravel_workers"
                 if ! laravel_worker_start "$site_name" "$kind"; then
@@ -467,7 +468,11 @@ cove_laravel() {
         fi
         if [ "$kind" = "reverb" ] && { [ "$state" = "on" ] || [ "$state" = "start" ]; } && [ "$format" != "json" ]; then
             echo "📡 Reverb: wss://$site_name.localhost (port $(laravel_reverb_port "$site_name") on this machine)."
-            [ "$built" = "yes" ] || echo "   The browser's settings are in .env (VITE_REVERB_*): build the front end again (npm run build), or run npm run dev."
+            if [ "$built" = "failed" ]; then
+                gum style --foreground yellow "⚠️  The front end didn't build; see $site_dir/logs/laravel-reverb-install.log" "   Echo reaches the browser once it does: npm run build, or npm run dev."
+            elif [ "$built" != "yes" ]; then
+                echo "   The browser's settings are in .env (VITE_REVERB_*): build the front end again (npm run build), or run npm run dev."
+            fi
         fi
     fi
 
