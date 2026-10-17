@@ -16,6 +16,7 @@
     * `cove mcp` creates Laravel sites (`create_site` with `type: laravel`), runs artisan (`artisan`, with `artisan_read` for commands that only read), turns the workers on and off (`laravel_workers`), signs in (`login_link`), and reads `laravel.log` (`read_logs`). Like `wp`, `artisan` runs code in the site you name: it refuses commands that wait on a terminal and ones that wipe the whole database (`db:wipe`, `migrate:fresh`/`reset`/`refresh`).
     * Clone, rename, snapshots, backups and delete handle the whole project, and the database when it is the one Cove made: copied under the new name, restored, or dropped. A database `.env` was pointed at by hand is left alone. Absolute paths into the old folder follow the site (an SQLite file named in full, the `public/storage` link), and a snapshot taken before a rename restores under the new name. `cove import` takes a Cove backup of a Laravel site and sets its `.env` up for this machine.
     * Laravel's own error pages stay in charge of a Laravel site, and its debug page shows only on this machine: a LAN, Tailscale or `cove share` visitor gets the plain one. Vite's dev server (`npm run dev`) works as it is, with hot reloading, since browsers let an https page load from `localhost`.
+    * On Linux, `cove install` (and the upgrade, for existing installs) adds PHP's PDO extensions for SQLite and MySQL, which the FrankenPHP packages leave out and Laravel can't do without.
 
 ### 🛠️ Improvements & Changes
 
