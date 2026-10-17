@@ -332,10 +332,17 @@ static const NSInteger kServiceRowStartIndex = 2;
     return self.serviceStates[key].boolValue;
 }
 
+// PostgreSQL and Redis are there for the Laravel sites that asked for them,
+// run by Homebrew (or found running), not by cove enable/disable: shown, but
+// not counted towards whether Cove itself is running.
+- (BOOL)isOptionalServiceKey:(NSString *)key {
+    return [key isEqualToString:@"postgres"] || [key isEqualToString:@"redis"];
+}
+
 - (NSInteger)runningServiceCount {
     NSInteger count = 0;
-    for (NSNumber *running in self.serviceStates.allValues) {
-        if (running.boolValue) {
+    for (NSString *key in self.serviceStates) {
+        if (![self isOptionalServiceKey:key] && self.serviceStates[key].boolValue) {
             count++;
         }
     }
@@ -347,7 +354,7 @@ static const NSInteger kServiceRowStartIndex = 2;
         return NO;
     }
     for (NSString *key in self.serviceKeys) {
-        if (!self.serviceStates[key].boolValue) {
+        if (![self isOptionalServiceKey:key] && !self.serviceStates[key].boolValue) {
             return NO;
         }
     }

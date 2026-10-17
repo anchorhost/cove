@@ -371,7 +371,7 @@ cove delete lvp2 --force >/dev/null 2>&1 && cove delete lvp --force >/dev/null 2
 cove redis install >/tmp/lv-redis.log 2>&1 || fail "cove redis install: $(tail -n 4 /tmp/lv-redis.log)"
 [ "$(cove redis cli ping)" = PONG ] || fail "Redis doesn't answer PING"
 [ "$(cove artisan lvl tinker --execute="config(['cache.default' => 'redis']); Cache::put('matrix', 'ok', 60); echo Cache::get('matrix');" 2>&1 | tail -n 1)" = ok ] || fail "Laravel's cache on Redis"
-cove redis cli -n 1 --scan --pattern 'lvl_*' | grep -q . || fail "the cache key isn't under the site's prefix"
+cove redis cli -n 1 --scan --pattern 'cove:lvl:*' | grep -q . || fail "the cache key isn't under the site's prefix"
 # Reverb: added to the app (no Node here, so no Echo), then its websocket
 # answered through Caddy at wss://lvl.localhost.
 cove laravel lvl reverb install >/tmp/lv-reverb.log 2>&1 || fail "reverb install: $(tail -n 6 /tmp/lv-reverb.log)"

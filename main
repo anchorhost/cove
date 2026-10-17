@@ -1559,9 +1559,31 @@ linux_php_extension_packages() {
 # cove_user, with a password kept in ~/Cove/config (PGSQL_*), as MariaDB's.
 COVE_PG_FORMULA="postgresql@17"
 
-# A PostgreSQL client tool ($1: psql, pg_dump, pg_isready): the server's own
-# formula's first (pg_dump can't be older than the server; the versioned
-# formulas aren't linked into PATH), else on PATH, else the newest found.
+# Folders that may hold PostgreSQL's client tools: PATH's, Homebrew's
+# versioned formulas (not linked into PATH), the distributions', and
+# Postgres.app's.
+cove_pg_client_dirs() {
+    local d
+    d=$(command -v psql 2>/dev/null) && dirname "$d"
+    for d in /opt/homebrew/opt/postgresql@*/bin /usr/local/opt/postgresql@*/bin /usr/lib/postgresql/*/bin /usr/pgsql-*/bin \
+        /Applications/Postgres.app/Contents/Versions/*/bin "$HOME/Applications/Postgres.app/Contents/Versions"/*/bin; do
+        [ -x "$d/psql" ] && echo "$d"
+    done
+}
+
+# The newest of those (by its pg_dump's version), as "<major> <folder>".
+cove_pg_newest_client() {
+    local d v
+    cove_pg_client_dirs | while IFS= read -r d; do
+        v=$("$d/pg_dump" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -n 1)
+        [ -n "$v" ] && echo "$v $d"
+    done | sort -V | tail -n 1
+}
+
+# A PostgreSQL client tool ($1: psql, pg_dump, pg_isready): from the folder
+# chosen at setup (the server's own formula, or for a server Cove found
+# running, the newest client there is: pg_dump refuses a newer server),
+# else the newest found.
 cove_pg_tool() {
     local tool="$1" formula d
     formula=$(config_get PGSQL_FORMULA)
@@ -1570,10 +1592,11 @@ cove_pg_tool() {
             if [ -x "$d/$tool" ]; then echo "$d/$tool"; return 0; fi
         done
     fi
-    command -v "$tool" 2>/dev/null && return 0
-    d=$(for d in /opt/homebrew/opt/postgresql@*/bin /usr/local/opt/postgresql@*/bin /usr/lib/postgresql/*/bin /usr/pgsql-*/bin; do [ -x "$d/$tool" ] && echo "$d"; done | sort -V | tail -n 1)
-    [ -n "$d" ] || return 1
-    echo "$d/$tool"
+    d=$(config_get PGSQL_BIN)
+    if [ -n "$d" ] && [ -x "$d/$tool" ]; then echo "$d/$tool"; return 0; fi
+    d=$(cove_pg_newest_client | cut -d' ' -f2-)
+    if [ -n "$d" ] && [ -x "$d/$tool" ]; then echo "$d/$tool"; return 0; fi
+    command -v "$tool" 2>/dev/null
 }
 
 cove_pg_port() {
@@ -1676,6 +1699,11 @@ cove_pg_setup() {
                 return 1
             fi
             echo "   - Using the PostgreSQL already running on 127.0.0.1:5432."
+            # Its clients: the newest there are, as pg_dump can't be older
+            # than the server.
+            local newest
+            newest=$(cove_pg_newest_client | cut -d' ' -f2-)
+            [ -n "$newest" ] && config_set PGSQL_BIN "$newest"
         else
             if ! cove_pg_tool pg_ctl >/dev/null 2>&1 || ! "$MAC_BREW" list "$COVE_PG_FORMULA" >/dev/null 2>&1; then
                 echo "   - Installing $COVE_PG_FORMULA (a few minutes the first time)…"
@@ -1687,6 +1715,17 @@ cove_pg_setup() {
             formula="$COVE_PG_FORMULA"
             config_set PGSQL_FORMULA "$formula"
             pkg_service start "$formula" >/dev/null 2>&1
+            # nanobrew skips the formula's post-install step, which is what
+            # makes Homebrew's data folder: made here when it's missing.
+            if [ "$MAC_BREW" = "nb" ] && ! cove_pg_wait_ready 5432 8; then
+                local initdb datadir
+                initdb=$(cove_pg_tool initdb)
+                datadir="$("$MAC_BREW" --prefix 2>/dev/null)/var/$formula"
+                if [ -n "$initdb" ] && [ "$datadir" != "/var/$formula" ] && [ ! -f "$datadir/PG_VERSION" ]; then
+                    "$initdb" --locale=en_US.UTF-8 -E UTF-8 "$datadir" >/dev/null 2>&1
+                    pkg_service restart "$formula" >/dev/null 2>&1
+                fi
+            fi
             if ! cove_pg_wait_ready 5432 30; then
                 echo "❌ Error: $formula did not start. Try: $MAC_BREW services restart $formula" >&2
                 return 1
@@ -1719,7 +1758,8 @@ cove_pg_setup() {
     fi
     # Letters and digits only: the password goes into SQL and .env files.
     pass=$(cove_random_password 24 | tr -dc 'A-Za-z0-9' | cut -c1-24)
-    if ! cove_pg_admin_psql -c "DO \$\$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'cove_user') THEN ALTER ROLE cove_user LOGIN SUPERUSER PASSWORD '$pass'; ELSE CREATE ROLE cove_user LOGIN SUPERUSER PASSWORD '$pass'; END IF; END \$\$;" >/dev/null; then
+    # Over stdin, not -c: a command line shows in ps, and sudo logs it.
+    if ! printf '%s\n' "DO \$\$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'cove_user') THEN ALTER ROLE cove_user LOGIN SUPERUSER PASSWORD '$pass'; ELSE CREATE ROLE cove_user LOGIN SUPERUSER PASSWORD '$pass'; END IF; END \$\$;" | cove_pg_admin_psql >/dev/null; then
         echo "❌ Error: Could not create Cove's role in PostgreSQL." >&2
         return 1
     fi
@@ -1836,18 +1876,46 @@ ensure_redis() {
     echo "   - ✅ Redis is ready on 127.0.0.1:6379."
 }
 
-# Removes the keys a site kept in Cove's Redis ($1 its prefix), when Redis
-# is set up and answering; a delete calls it.
+# The key prefix Cove gives a site's Redis keys: cove:<site>:, a shape no
+# Laravel default has (theirs end in _database_ or _cache_) and no other
+# site's can share, as a site name has no colon.
+cove_redis_prefix() {
+    echo "cove:$1:"
+}
+
+# Redis's numbered databases that hold keys (Laravel keeps its cache in 1
+# and the rest in 0), when Redis is set up and answering.
+cove_redis_dbs() {
+    local cli
+    cove_redis_configured && cove_redis_ready || return 1
+    cli=$(command -v redis-cli || command -v valkey-cli) || return 1
+    "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" info keyspace 2>/dev/null | tr -d '\r' | sed -n 's/^db\([0-9]*\):.*/\1/p'
+}
+
+# Removes the keys a site kept in Cove's Redis ($1 its prefix); a delete
+# calls it. Key names go NUL-separated, so one with a space or a quote is
+# still one key.
 cove_redis_forget() {
-    local cli prefix="$1"
-    [ -n "$prefix" ] && cove_redis_configured && cove_redis_ready || return 0
+    local cli prefix="$1" n
+    [ -n "$prefix" ] || return 0
     cli=$(command -v redis-cli || command -v valkey-cli) || return 0
-    # Every numbered database that holds keys: Laravel keeps its cache in
-    # 1 and the rest in 0.
-    local n
-    for n in $("$cli" -h 127.0.0.1 -p "$(cove_redis_port)" info keyspace 2>/dev/null | tr -d '\r' | sed -n 's/^db\([0-9]*\):.*/\1/p'); do
+    for n in $(cove_redis_dbs); do
         "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" --scan --pattern "${prefix}*" 2>/dev/null \
-            | xargs -n 500 "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" unlink >/dev/null 2>&1
+            | tr '\n' '\0' | xargs -0 -n 500 "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" unlink >/dev/null 2>&1
+    done
+    return 0
+}
+
+# Moves a site's keys to its new prefix ($1 old, $2 new) when it is renamed,
+# so queued jobs, sessions and the cache come along. Run while its workers
+# are held.
+cove_redis_move() {
+    local cli old="$1" new="$2" n
+    cli=$(command -v redis-cli || command -v valkey-cli) || return 0
+    for n in $(cove_redis_dbs); do
+        "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" --scan --pattern "${old}*" 2>/dev/null \
+            | awk -v old="$old" -v new="$new" '{ k = $0; n = new substr(k, length(old) + 1); gsub(/\\/, "\\\\", k); gsub(/"/, "\\\"", k); gsub(/\\/, "\\\\", n); gsub(/"/, "\\\"", n); print "RENAME \"" k "\" \"" n "\"" }' \
+            | "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" >/dev/null 2>&1
     done
     return 0
 }
@@ -1857,7 +1925,7 @@ cove_redis_forget() {
 # two apps (both named Laravel, say) never read each other's cache, sessions
 # or queue.
 cove_redis_site_env() {
-    printf '"REDIS_HOST":"127.0.0.1","REDIS_PORT":"%s","REDIS_PASSWORD":null,"REDIS_PREFIX":%s' "$(cove_redis_port)" "$(cove_json_str "${1}_")"
+    printf '"REDIS_URL":null,"REDIS_HOST":"127.0.0.1","REDIS_PORT":"%s","REDIS_PASSWORD":null,"REDIS_PREFIX":%s' "$(cove_redis_port)" "$(cove_json_str "$(cove_redis_prefix "$1")")"
 }
 
 # --- Laravel ---------------------------------------------------------------
@@ -1990,10 +2058,13 @@ cove_server_db_create() {
     fi
 }
 
-# Dropped even with a queue worker still connected (FORCE ends its session).
+# Dropped even with a queue worker still connected: its session is ended
+# first (DROP … WITH (FORCE) would, but only from PostgreSQL 13). Two -c,
+# as DROP DATABASE can't run inside the transaction one would share.
 cove_server_db_drop() {
     if [ "$1" = "pgsql" ]; then
-        cove_pg_psql postgres -c "DROP DATABASE IF EXISTS \"$2\" WITH (FORCE)" >/dev/null
+        cove_pg_psql postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$2' AND pid <> pg_backend_pid()" \
+            -c "DROP DATABASE IF EXISTS \"$2\"" >/dev/null
     else
         MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$2\`;"
     fi
@@ -2007,11 +2078,12 @@ cove_pg_dump() {
     PGPASSWORD="$(config_get PGSQL_PASSWORD)" "$pg_dump" -h 127.0.0.1 -p "$(cove_pg_port)" -U "$(config_get PGSQL_USER)" --no-owner --no-acl "$1"
 }
 
-# A plain-SQL dump on stdin into a PostgreSQL database ($1). pg_dump 17.6
-# and later wrap a dump in \restrict lines that an older psql (another
-# machine's) refuses, so they go; nothing else is touched.
+# A plain-SQL dump on stdin into a PostgreSQL database ($1). Two lines a
+# newer pg_dump writes that an older server or psql (another machine's)
+# refuses go: 17.6's \restrict wrapping, and 17's SET transaction_timeout
+# (a setting 16 and older don't have, and a no-op for a load anyway).
 cove_pg_load() {
-    sed -E '/^\\(un)?restrict [A-Za-z0-9]+$/d' | cove_pg_psql "$1" >/dev/null
+    sed -E -e '/^\\(un)?restrict [A-Za-z0-9]+$/d' -e '/^SET transaction_timeout = 0;$/d' | cove_pg_psql "$1" >/dev/null
 }
 
 # .env's database settings for Cove's server ($1) and database ($2), as JSON
@@ -2043,8 +2115,8 @@ laravel_retarget() {
         pairs+=("\"VITE_REVERB_HOST\":\"$new_name.localhost\"")
     fi
     # Its own keys in Redis, under its own name.
-    if [ -n "$old_name" ] && [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "${old_name}_" ]; then
-        pairs+=("\"REDIS_PREFIX\":\"${new_name}_\"")
+    if [ -n "$old_name" ] && [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "$(cove_redis_prefix "$old_name")" ]; then
+        pairs+=("\"REDIS_PREFIX\":\"$(cove_redis_prefix "$new_name")\"")
     fi
     # Absolute paths into the old folder: an SQLite file written out in
     # full, and the links in public/ (storage:link makes public/storage an
@@ -4830,14 +4902,22 @@ function cove_pgsql_pdo($cfg, $db) {
 }
 
 // The statements in a console entry, split at the semicolons between them:
-// not inside quotes ('…', "…", $tag$…$tag$) or comments.
-function cove_pg_statements($sql) {
+// not inside quotes ('…', E'…' with its backslash escapes, "…",
+// $tag$…$tag$) or comments (-- and /* */, which nest in PostgreSQL). With
+// $pdo_escape, a ? outside them becomes ?? so PDO doesn't take it for a
+// placeholder (jsonb's ?, ?| and ?&).
+function cove_pg_statements($sql, $pdo_escape = false) {
     $out = []; $cur = ''; $n = strlen($sql); $i = 0;
     while ($i < $n) {
         $c = $sql[$i];
         if ($c === "'" || $c === '"') {
+            $esc = $c === "'" && $i > 0 && ($sql[$i - 1] === 'E' || $sql[$i - 1] === 'e') && ($i < 2 || !preg_match('/[A-Za-z0-9_]/', $sql[$i - 2]));
             $j = $i + 1;
-            while ($j < $n) { if ($sql[$j] === $c) { if ($j + 1 < $n && $sql[$j + 1] === $c) { $j += 2; continue; } break; } $j++; }
+            while ($j < $n) {
+                if ($esc && $sql[$j] === '\\') { $j += 2; continue; }
+                if ($sql[$j] === $c) { if ($j + 1 < $n && $sql[$j + 1] === $c) { $j += 2; continue; } break; }
+                $j++;
+            }
             $cur .= substr($sql, $i, $j - $i + 1); $i = $j + 1; continue;
         }
         if ($c === '$' && preg_match('/\G\$([A-Za-z_][A-Za-z0-9_]*)?\$/', $sql, $m, 0, $i)) {
@@ -4846,9 +4926,17 @@ function cove_pg_statements($sql) {
             $cur .= substr($sql, $i, $j - $i); $i = $j; continue;
         }
         if ($c === '-' && substr($sql, $i, 2) === '--') { $j = strpos($sql, "\n", $i); $j = $j === false ? $n : $j; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
-        if ($c === '/' && substr($sql, $i, 2) === '/*') { $j = strpos($sql, '*/', $i + 2); $j = $j === false ? $n : $j + 2; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
+        if ($c === '/' && substr($sql, $i, 2) === '/*') {
+            $depth = 1; $j = $i + 2;
+            while ($j < $n && $depth > 0) {
+                if (substr($sql, $j, 2) === '/*') { $depth++; $j += 2; }
+                elseif (substr($sql, $j, 2) === '*/') { $depth--; $j += 2; }
+                else $j++;
+            }
+            $cur .= substr($sql, $i, $j - $i); $i = $j; continue;
+        }
         if ($c === ';') { if (trim($cur) !== '') $out[] = trim($cur); $cur = ''; $i++; continue; }
-        $cur .= $c; $i++;
+        $cur .= ($pdo_escape && $c === '?') ? '??' : $c; $i++;
     }
     if (trim($cur) !== '' && trim(preg_replace('~--[^\n]*|/\*.*?\*/~s', '', $cur)) !== '') $out[] = trim($cur);
     return $out;
@@ -5000,7 +5088,37 @@ function cove_db_pgsql($action, $input, $db, $cfg) {
             if (trim($sql) === '') throw new RuntimeException('Nothing to run.');
             $results = [];
             $t0 = microtime(true);
-            foreach (cove_pg_statements($sql) as $stmt) {
+            // The pgsql extension, where there is one, runs SQL as written;
+            // PDO reads ? and :name as placeholders (an array slice [1:2]
+            // too), so through it a ? is escaped.
+            if (function_exists('pg_connect')) {
+                $conn = @pg_connect('host=127.0.0.1 port=' . (int) ($cfg['PGSQL_PORT'] ?? 5432) . ' dbname=' . $db . ' user=' . $cfg['PGSQL_USER'] . " password='" . str_replace(["\\", "'"], ["\\\\", "\\'"], (string) ($cfg['PGSQL_PASSWORD'] ?? '')) . "' connect_timeout=5", PGSQL_CONNECT_FORCE_NEW);
+                if (!$conn) throw new RuntimeException('PostgreSQL is not answering.');
+                foreach (cove_pg_statements($sql) as $stmt) {
+                    $res = @pg_query($conn, $stmt);
+                    if ($res === false) { $results[] = ['type' => 'error', 'message' => trim((string) pg_last_error($conn))]; break; }
+                    if (pg_num_fields($res) > 0) {
+                        $cols = [];
+                        for ($k = 0; $k < pg_num_fields($res); $k++) $cols[] = pg_field_name($res, $k);
+                        $rows = []; $n = 0; $types = [];
+                        for ($k = 0; $k < pg_num_fields($res); $k++) $types[$k] = pg_field_type($res, $k);
+                        while ($n < 100000 && ($r = pg_fetch_row($res)) !== false) {
+                            if ($n++ >= $cap) continue;
+                            foreach ($r as $k => $v) {
+                                if ($v !== null && $types[$k] === 'bool') $r[$k] = $v === 't' ? 'true' : 'false';
+                                elseif ($v !== null && $types[$k] === 'bytea') $r[$k] = pg_unescape_bytea($v);
+                            }
+                            $rows[] = array_map('cove_db_cell', $r);
+                        }
+                        $results[] = ['type' => 'rows', 'columns' => $cols, 'rows' => $rows, 'total' => $n, 'truncated' => $n > $cap];
+                    } else {
+                        $results[] = ['type' => 'ok', 'affected' => pg_affected_rows($res), 'insert_id' => 0, 'info' => ''];
+                    }
+                }
+                pg_close($conn);
+                return ['success' => true, 'results' => $results, 'ms' => round((microtime(true) - $t0) * 1000, 1)];
+            }
+            foreach (cove_pg_statements($sql, true) as $stmt) {
                 try {
                     $st = $pdo->query($stmt);
                     if ($st->columnCount() > 0) {
@@ -6906,7 +7024,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'note' => 'WordPress on every Cove site is pointed at the SMTP port above.',
                     'actions' => [['kind' => 'mail', 'label' => 'open inbox'], ['kind' => 'open', 'label' => 'mailpit ↗', 'href' => $mailui]],
                 ],
-            ] + (empty($__svc_cfg['PGSQL_USER']) ? [] : ['postgres' => (function () use ($__svc_cfg, $__svc_port_open) {
+            ] + (empty($__svc_cfg['PGSQL_USER']) ? [] : ['postgres' => (function () use ($__svc_cfg, $__svc_port_open, $user_home, $sitedir) {
                 // For Laravel sites on --database=pgsql (`cove postgres`).
                 $port = (int) ($__svc_cfg['PGSQL_PORT'] ?? 5432);
                 $up = $__svc_port_open($port); $version = '—'; $count = '—';
@@ -6914,7 +7032,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     try {
                         $pg = cove_pgsql_pdo($__svc_cfg, 'postgres');
                         $version = explode(' ', (string) $pg->query('SHOW server_version')->fetchColumn())[0];
-                        $count = (string) $pg->query("SELECT COUNT(*) FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'")->fetchColumn();
+                        // During a demo, only how many are its own.
+                        $count = cove_demo_sites($user_home) === null
+                            ? (string) $pg->query("SELECT COUNT(*) FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'")->fetchColumn()
+                            : (string) count(preg_grep('/^pgsql:/', cove_demo_databases($user_home, $sitedir)));
                     } catch (Throwable $e) {}
                 }
                 return [
@@ -6994,6 +7115,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $__pg_demo = cove_demo_sites($user_home) === null ? null : cove_demo_databases($user_home, $sitedir);
                 if (!preg_match('/^[A-Za-z0-9_][A-Za-z0-9_-]{0,62}$/', $__pg) || $__pg === 'postgres' || ($__pg_demo !== null && !in_array('pgsql:' . $__pg, $__pg_demo, true))) {
                     echo json_encode(['success' => false, 'message' => 'No such database.']);
+                    exit;
+                }
+                // Cove's PostgreSQL role is a superuser: during a demo the
+                // console, which could look past the demo's databases (the
+                // catalog, other databases' files), is off.
+                if ($__pg_demo !== null && $action === 'db_query') {
+                    echo json_encode(['success' => false, 'message' => 'The SQL console is off for PostgreSQL databases during a demo.']);
                     exit;
                 }
                 echo json_encode(cove_db_pgsql($action, $input, $__pg, isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : []));
@@ -12327,12 +12455,15 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         this.closeUserRole();
                     }
                 });
-                // Leaving the field: a whole name or slug typed counts as picked.
+                // Leaving the field with something typed picks what it
+                // highlights (a whole name or slug first), as ↵ would; a
+                // click on add user mid-search then adds the role shown, never
+                // a silent Administrator.
                 input.addEventListener('blur', () => {
                     const r = this.userRole;
                     if (!r.open) return;
                     const q = r.q.trim().toLowerCase();
-                    const m = q && this.userRoles.find(x => x.label.toLowerCase() === q || x.id.toLowerCase() === q);
+                    const m = q && (this.userRoles.find(x => x.label.toLowerCase() === q || x.id.toLowerCase() === q) || this.userRoleMatches()[r.index]);
                     if (!m || !this.pickUserRole(m.id)) this.closeUserRole();
                 });
                 // Keep the field focused while an option is clicked.
@@ -15122,7 +15253,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (!this.siteTabsFor(site).includes(tab)) return;
                 const t = this.siteTabState(tab);
                 if (t.loadedFor === site.name && !opts.force) return;
-                if (t.loadedFor !== site.name) { t.items = []; t.loadedFor = null; t.filter = t.filterFor === site.name ? t.filter : ''; t.status = 'all'; t.arm = null; t.open = null; t.diff = null; t.added = null; }
+                if (t.loadedFor !== site.name) {
+                    t.items = []; t.loadedFor = null; t.filter = t.filterFor === site.name ? t.filter : ''; t.status = 'all'; t.arm = null; t.open = null; t.diff = null; t.added = null;
+                    // Another site's add-user form starts empty, password included.
+                    if (tab === 'users') for (const id of ['userAddEmail', 'userAddLogin', 'userAddName', 'userAddPassword']) $id(id).value = '';
+                }
                 t.loading = true; t.error = null;
                 this.renderSiteTab();
                 const action = tab === 'users' && site.type === 'Laravel' ? 'site_laravel_users' : { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron', routes: 'site_routes', migrations: 'site_migrations', schedule: 'site_schedule', snapshots: 'site_snapshots', history: 'site_history' }[tab];
@@ -19439,10 +19574,11 @@ main() {
                 for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
             fi
             # Linux installs before Laravel support lack PDO (Laravel's only
-            # way to its database): install it, then restart FrankenPHP once
-            # so the web server loads it too.
+            # way to its database), and those before PostgreSQL and Redis
+            # their drivers: install them, then restart FrankenPHP once so
+            # the web server loads them too.
             if [ "$OS" = "linux" ] && [ -n "$(linux_php_extension_packages)" ] \
-                && ! frankenphp php-cli -r 'exit(extension_loaded("pdo_sqlite") && extension_loaded("pdo_mysql") ? 0 : 1);' 2>/dev/null; then
+                && ! frankenphp php-cli -r 'exit(extension_loaded("pdo_sqlite") && extension_loaded("pdo_mysql") && extension_loaded("pdo_pgsql") && extension_loaded("redis") ? 0 : 1);' 2>/dev/null; then
                 echo "   - Installing PHP's PDO extensions (for Laravel sites)..."
                 if [ "$PKG_MANAGER" = "apt" ]; then
                     $SUDO_CMD apt install -y $(linux_php_extension_packages) >/dev/null 2>&1 || true

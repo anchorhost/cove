@@ -3,6 +3,14 @@
 # with cove add --from that uses it does that too); start and stop; cli
 # opens redis-cli.
 cove_redis() {
+    # One Cove found running is started and stopped by whatever runs it.
+    case "${1:-}" in
+        start|stop)
+            if [ "$OS" = "macos" ] && cove_redis_configured && [ -z "$(config_get REDIS_FORMULA)" ]; then
+                echo "Cove uses the Redis it found running on 127.0.0.1:$(cove_redis_port); $1 it where it came from." >&2
+                exit 1
+            fi ;;
+    esac
     case "${1:-}" in
         ""|status)
             if ! cove_redis_configured; then
@@ -26,7 +34,6 @@ cove_redis() {
             ;;
         install) ensure_redis ;;
         start)
-            cove_redis_configured || { echo "Redis isn't set up for Cove yet: cove redis install" >&2; exit 1; }
             cove_redis_start
             cove_redis_wait_ready "" 20 && echo "✅ Redis is running." || { echo "❌ Redis did not start." >&2; exit 1; }
             ;;

@@ -76,7 +76,7 @@ cove_delete() {
         # by hand may be shared, or someone else's.
         local db_name server
         # Its keys in Cove's Redis, when the prefix is the one Cove gave it.
-        [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "${site_name}_" ] && cove_redis_forget "${site_name}_"
+        [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "$(cove_redis_prefix "$site_name")" ] && cove_redis_forget "$(cove_redis_prefix "$site_name")"
         if db_name=$(laravel_cove_db "$site_dir" "$site_name"); then
             server=$(laravel_db_server "$site_dir")
             echo "🗄️ Deleting database: $db_name"

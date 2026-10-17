@@ -3,6 +3,15 @@
 # that too); start and stop; psql opens a shell as Cove's role.
 cove_postgres() {
     local action="${1:-}"
+    # One Cove found running (Postgres.app, its own Homebrew service) is
+    # started and stopped by whatever runs it.
+    case "$action" in
+        start|stop)
+            if [ "$OS" = "macos" ] && cove_pg_configured && [ -z "$(config_get PGSQL_FORMULA)" ]; then
+                echo "Cove uses the PostgreSQL it found running on 127.0.0.1:$(cove_pg_port); $action it where it came from (Postgres.app, brew services…)." >&2
+                exit 1
+            fi ;;
+    esac
     case "$action" in
         ""|status)
             if ! cove_pg_configured; then
@@ -29,7 +38,6 @@ cove_postgres() {
             ensure_postgres
             ;;
         start)
-            cove_pg_configured || { echo "PostgreSQL isn't set up for Cove yet: cove postgres install" >&2; exit 1; }
             cove_pg_start
             cove_pg_wait_ready "" 20 && echo "✅ PostgreSQL is running." || { echo "❌ PostgreSQL did not start." >&2; exit 1; }
             ;;

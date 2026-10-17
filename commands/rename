@@ -138,8 +138,13 @@ cove_rename() {
             mv "$new_site_dir" "$old_site_dir"
             exit 1
         fi
+        # Its keys in Cove's Redis move with the prefix (queued jobs too),
+        # while its workers are held; read before retarget changes it.
+        local moves_redis=false
+        [ "$(laravel_env_get "$new_site_dir" REDIS_PREFIX)" = "$(cove_redis_prefix "$old_name")" ] && moves_redis=true
         laravel_retarget "$new_site_dir" "$old_name" "$new_name" "$old_site_dir" || \
             gum style --foreground yellow "⚠️  Could not update APP_URL in .env; verify it under the new name."
+        [ "$moves_redis" = true ] && cove_redis_move "$(cove_redis_prefix "$old_name")" "$(cove_redis_prefix "$new_name")"
         if [ -n "$old_laravel_db" ]; then
             echo "   - Dropping old database '$old_laravel_db'..."
             cove_server_db_drop "$old_laravel_server" "$old_laravel_db"

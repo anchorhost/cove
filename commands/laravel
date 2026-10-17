@@ -83,7 +83,7 @@ laravel_reverb_install() {
     if [ -f "$site_dir/package.json" ] && ! grep -q '"laravel-echo"' "$site_dir/package.json"; then
         if cove_find_node && command -v npm >/dev/null 2>&1; then
             echo "   - Adding Echo to the front end (npm install laravel-echo pusher-js)…"
-            (cd "$site_dir" && npm install --save-dev laravel-echo pusher-js --no-audit --no-fund) >>"$log" 2>&1 \
+            (cd "$site_dir" && PATH="$COVE_TOOLS_DIR:$PATH" PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" npm install --save-dev laravel-echo pusher-js --no-audit --no-fund) >>"$log" 2>&1 \
                 || gum style --foreground yellow "⚠️  npm couldn't add Echo; see $log"
         else
             gum style --foreground yellow "⚠️  Node.js isn't installed: add Echo to the front end with npm install --save-dev laravel-echo pusher-js"
@@ -98,7 +98,8 @@ laravel_build_front_end() {
     local site_dir="$SITES_DIR/$1.localhost"
     [ -f "$site_dir/package.json" ] && grep -qE '"build"[[:space:]]*:' "$site_dir/package.json" || return 1
     cove_find_node && command -v npm >/dev/null 2>&1 || return 1
-    (cd "$site_dir" && npm run build) >>"$site_dir/logs/laravel-reverb-install.log" 2>&1
+    # Vite plugins may run php artisan: Cove's php comes first on PATH.
+    (cd "$site_dir" && PATH="$COVE_TOOLS_DIR:$PATH" PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" npm run build) >>"$site_dir/logs/laravel-reverb-install.log" 2>&1
 }
 
 # Turning Reverb on: the app has it (install:broadcasting --reverb put it

@@ -1,4 +1,6 @@
 cove_add() {
+    # Where the command was run from, for a relative --from.
+    local caller_dir="$PWD"
     cd ~/
     local site_name="$1"
     local site_type="wordpress"
@@ -54,7 +56,9 @@ cove_add() {
             --multisite-subdomain) multisite_mode="subdomain" ;;
             --database=*)   database="${arg#*=}" ;;
             # The shell leaves a ~ after = alone, so expand it here too.
-            --from=*)       from="${arg#*=}"; from="${from/#\~/$HOME}" ;;
+            --from=*)       from="${arg#*=}"; from="${from/#\~/$HOME}"
+                            # A folder named relative to where cove ran.
+                            if [[ "$from" != /* ]] && [ -e "$caller_dir/$from" ]; then from="$caller_dir/$from"; fi ;;
             --branch=*)     branch="${arg#*=}" ;;
             --seed)         seed=true ;;
             -*)             ;;  # unknown flags ignored, as before
@@ -522,7 +526,7 @@ cove_add_laravel() {
             example="$example,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"$( [ "$server" = pgsql ] && echo 5432 || echo 3306 )\",\"DB_DATABASE\":$(cove_json_str "${site_name//-/_}"),\"DB_USERNAME\":\"root\",\"DB_PASSWORD\":\"\""
         fi
         # A prefix of its own, so its keys stay apart once it uses Redis.
-        set="$set,\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t"),\"MAIL_FROM_ADDRESS\":$(cove_json_str "hello@$full_hostname"),\"REDIS_PREFIX\":$(cove_json_str "${site_name}_")}"
+        set="$set,\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t"),\"MAIL_FROM_ADDRESS\":$(cove_json_str "hello@$full_hostname"),\"REDIS_PREFIX\":$(cove_json_str "$(cove_redis_prefix "$site_name")")}"
         if ! COVE_ENV_SET="$set" laravel_env_set "$stage/.env" || ! COVE_ENV_SET="$example}" laravel_env_set "$stage/.env.example"; then
             echo "❌ Error: Could not write the application's .env."
             exit 1
@@ -706,7 +710,11 @@ cove_add_laravel_from() {
         if ! (
             if [ ! -t 0 ]; then
                 export GIT_TERMINAL_PROMPT=0
-                export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}"
+                # Unless the user picks their own (core.sshCommand, say a
+                # key of its own), which this would override.
+                if [ -z "${GIT_SSH_COMMAND:-}" ] && [ -z "$(git config --get core.sshCommand 2>/dev/null)" ]; then
+                    export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
+                fi
             fi
             if [ -n "$branch" ]; then
                 git -c protocol.ext.allow=never clone --quiet --branch "$branch" -- "$source" "$stage"
@@ -726,13 +734,23 @@ cove_add_laravel_from() {
         fi
     else
         echo "   - Copying $src (vendor/ and node_modules/ are installed fresh)…"
-        # public/hot is Vite's dev-server marker: copied, it would point
-        # every page at a server that isn't running.
-        if ! mkdir "$stage" || ! (cd "$src" && COPYFILE_DISABLE=1 tar -cf - --exclude=./vendor --exclude=./node_modules --exclude=./public/hot .) | (cd "$stage" && tar -xpf -) 2>>"$log"; then
-            gum style --foreground red "❌ Error: Could not copy $src."
+        # Everything at the top but vendor/ and node_modules/, named one by
+        # one: an --exclude pattern also matches deeper folders on macOS's
+        # tar (resources/views/vendor, public/vendor). Both sides' errors
+        # count, so an unreadable file doesn't make a quiet partial copy.
+        local rc_read rc_write
+        mkdir "$stage" || { _cove_from_fail; return 1; }
+        (cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name vendor ! -name node_modules -print0 | COPYFILE_DISABLE=1 tar --null -cf - -T -) 2>>"$log" \
+            | (cd "$stage" && tar -xpf -) 2>>"$log"
+        rc_read=${PIPESTATUS[0]} rc_write=${PIPESTATUS[1]}
+        if [ "$rc_read" -ne 0 ] || [ "$rc_write" -ne 0 ]; then
+            gum style --foreground red "❌ Error: Could not copy $src." "$(tail -n 3 "$log")"
             _cove_from_fail
             return 1
         fi
+        # Vite's dev-server marker: copied, it would point every page at a
+        # server that isn't running.
+        rm -f "$stage/public/hot"
     fi
     if ! grep -q '"laravel/framework"' "$stage/composer.json" 2>/dev/null; then
         gum style --foreground red "❌ Error: $source has no laravel/framework in its composer.json."
@@ -771,7 +789,10 @@ cove_add_laravel_from() {
     fi
 
     echo "   - Setting up .env for Cove…"
-    set="{\"APP_URL\":$(cove_json_str "$(url_for "$full_hostname")"),\"DB_CONNECTION\":\"$conn\",\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t")"
+    # A database URL (DB_URL, or DATABASE_URL before Laravel 11) would win
+    # over every DB_ setting below, and could name the project's real
+    # server: the migrations would run there. It goes.
+    set="{\"DB_URL\":null,\"DATABASE_URL\":null,\"APP_URL\":$(cove_json_str "$(url_for "$full_hostname")"),\"DB_CONNECTION\":\"$conn\",\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t")"
     mail_from=$(laravel_env_get "$stage" MAIL_FROM_ADDRESS)
     if [ -z "$mail_from" ] || [ "$mail_from" = "hello@example.com" ]; then
         set="$set,\"MAIL_FROM_ADDRESS\":$(cove_json_str "hello@$full_hostname")"
@@ -856,7 +877,19 @@ cove_add_laravel_from() {
         local file
         file=$(laravel_env_get "$site_dir" DB_DATABASE)
         [ -n "$file" ] || file="database/database.sqlite"
+        [ "$file" = ":memory:" ] && file="$site_dir/database/database.sqlite"
         [[ "$file" == /* ]] || file="$site_dir/$file"
+        # A file outside the project (another folder's, the original's) is
+        # copied in, so the migrations never touch the one it names.
+        if [[ "$file" != "$site_dir/"* ]]; then
+            local own="$site_dir/database/$(basename "$file")"
+            mkdir -p "$site_dir/database"
+            if [ -f "$file" ] && [ ! -e "$own" ]; then
+                cp "$file" "$own" && COVE_ADD_NOTES+=("ℹ️  Its SQLite database, $file, was copied into the site: database/$(basename "$file").")
+            fi
+            COVE_ENV_SET="{\"DB_DATABASE\":$(cove_json_str "$own")}" laravel_env_set "$site_dir/.env"
+            file="$own"
+        fi
         [ -e "$file" ] || { mkdir -p "$(dirname "$file")" && : > "$file"; }
     fi
     if [ -z "$(laravel_env_get "$site_dir" APP_KEY)" ] && ! _cove_from_artisan key:generate; then
@@ -892,6 +925,8 @@ cove_add_laravel_from() {
                 fi
             fi
             if [ -n "$pm" ]; then
+                # Vite plugins may run php artisan (Wayfinder does): Cove's.
+                export PATH="$COVE_TOOLS_DIR:$PATH" PHP_BINARY="$php" COVE_PHP_BIN="$native"
                 echo "   - Installing JavaScript packages ($pm)…"
                 local install=("$pm" install)
                 [ "$pm" = npm ] && install+=(--no-audit --no-fund)
@@ -915,7 +950,7 @@ cove_add_laravel_from() {
     done
     if [ -n "$uses" ]; then
         if ensure_redis >>"$log" 2>&1 && COVE_ENV_SET="{$(cove_redis_site_env "$site_name")}" laravel_env_set "$site_dir/.env"; then
-            COVE_ADD_NOTES+=("ℹ️  Its${uses} use Redis: Cove's, on 127.0.0.1:$(cove_redis_port), keys prefixed ${site_name}_.")
+            COVE_ADD_NOTES+=("ℹ️  Its${uses} use Redis: Cove's, on 127.0.0.1:$(cove_redis_port), keys prefixed $(cove_redis_prefix "$site_name").")
             if ! COVE_PHP_BIN="$native" "$php" -r 'exit(extension_loaded("redis") ? 0 : 1);' 2>/dev/null && [ ! -d vendor/predis/predis ] && [ "$(laravel_env_get "$site_dir" REDIS_CLIENT)" != "predis" ]; then
                 COVE_ADD_NOTES+=("⚠️  This PHP has no redis extension: add the predis client (cove composer $site_name require predis/predis) and set REDIS_CLIENT=predis.")
             fi
@@ -923,7 +958,7 @@ cove_add_laravel_from() {
             COVE_ADD_NOTES+=("⚠️  Its${uses} use Redis, which Cove couldn't start (see logs/laravel-setup.log): set them to database or file in .env.")
         fi
     else
-        COVE_ENV_SET="{\"REDIS_PREFIX\":$(cove_json_str "${site_name}_")}" laravel_env_set "$site_dir/.env" >/dev/null 2>&1
+        COVE_ENV_SET="{\"REDIS_PREFIX\":$(cove_json_str "$(cove_redis_prefix "$site_name")")}" laravel_env_set "$site_dir/.env" >/dev/null 2>&1
     fi
     [ "$kind" = folder ] && [ "$conn" != "sqlite" ] && COVE_ADD_NOTES+=("ℹ️  The database started empty: the migrations made its tables, and none of the original's rows came along.")
     cd ~/ || true
