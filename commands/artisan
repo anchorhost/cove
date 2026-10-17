@@ -1,0 +1,31 @@
+cove_artisan() {
+    local site_name="$1"
+    if [ -z "$site_name" ] || [ "$site_name" == "--help" ] || [ "$site_name" == "-h" ]; then
+        echo "Usage: cove artisan <site> <artisan arguments…>"
+        echo ""
+        echo "Runs a Laravel site's artisan from anywhere, on the PHP the site serves with."
+        echo "Examples:"
+        echo "  cove artisan myapp migrate"
+        echo "  cove artisan myapp route:list"
+        echo "  cove artisan myapp queue:work"
+        echo "  cove artisan myapp help migrate    (cove reads --help itself)"
+        [ -z "$site_name" ] && exit 1
+        return
+    fi
+    shift
+
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if [ ! -d "$site_dir" ] || ! site_is_laravel "$site_dir"; then
+        gum style --foreground red "❌ Error: Laravel site '$site_name.localhost' not found."
+        exit 1
+    fi
+
+    write_php_tools || exit 1
+    cd "$site_dir" || exit 1
+    PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" exec "$COVE_TOOLS_DIR/php" artisan "$@"
+}

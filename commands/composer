@@ -1,0 +1,32 @@
+cove_composer() {
+    local site_name="$1"
+    if [ -z "$site_name" ] || [ "$site_name" == "--help" ] || [ "$site_name" == "-h" ]; then
+        echo "Usage: cove composer <site> <composer arguments…>"
+        echo ""
+        echo "Runs Composer in a site's folder, on the PHP the site serves with, so its"
+        echo "platform checks and @php scripts see the same PHP as the site."
+        echo "Cove keeps its own composer.phar in ~/Cove/App, fetched on first use."
+        echo "Examples:"
+        echo "  cove composer myapp require laravel/sanctum"
+        echo "  cove composer myapp update"
+        echo "  cove composer myapp self-update"
+        [ -z "$site_name" ] && exit 1
+        return
+    fi
+    shift
+
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if [ ! -f "$site_dir/composer.json" ]; then
+        gum style --foreground red "❌ Error: '$site_name.localhost' has no composer.json in its folder."
+        exit 1
+    fi
+
+    ensure_composer || exit 1
+    cd "$site_dir" || exit 1
+    COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" exec "$COVE_TOOLS_DIR/composer" "$@"
+}

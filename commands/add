@@ -7,7 +7,7 @@ cove_add() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [flavor] [--plain] [--minn] [--php=8.2] [--multisite[=subdomain]]"
+        echo "Usage: cove add <name> [flavor] [--plain] [--minn] [--php=8.2] [--multisite[=subdomain]] [--database=sqlite|mysql]"
         exit 1
     fi
 
@@ -37,6 +37,7 @@ cove_add() {
     local minn_zip=""
     local php_pin=""
     local multisite_mode=""
+    local database=""
     shift
     for arg in "$@"; do
         case "$arg" in
@@ -50,6 +51,7 @@ cove_add() {
             --multisite)    multisite_mode="subdirectory" ;;
             --multisite=*)  multisite_mode="${arg#*=}" ;;
             --multisite-subdomain) multisite_mode="subdomain" ;;
+            --database=*)   database="${arg#*=}" ;;
             -*)             ;;  # unknown flags ignored, as before
             *)              [ -z "$flavor" ] && flavor="$arg" ;;
         esac
@@ -95,6 +97,8 @@ cove_add() {
             site_type="plain" ;;
         minn)
             minn=true ;;
+        laravel)
+            site_type="laravel" ;;
         nightly|trunk)
             wp_version="nightly" ;;
         [0-9]*)
@@ -108,9 +112,40 @@ cove_add() {
             fi
             wp_version="$flavor" ;;
         *)
-            gum style --foreground red "❌ Error: Unknown option '$flavor'." "Expected a WordPress version (6.4.3), 'nightly', 'latest', 'minn', or 'plain'."
+            gum style --foreground red "❌ Error: Unknown option '$flavor'." "Expected a WordPress version (6.4.3), 'nightly', 'latest', 'minn', 'laravel', or 'plain'."
             exit 1 ;;
     esac
+
+    # A Laravel application is its own kind of site: no WordPress to pin,
+    # network or hand to Minn Engine.
+    if [ "$site_type" == "laravel" ]; then
+        local laravel_conflict=""
+        if [ "$plain_flag" = true ]; then
+            laravel_conflict="A site is either plain or Laravel."
+        elif [ "$minn" = true ]; then
+            laravel_conflict="Minn Engine installs over WordPress, not Laravel."
+        elif [ -n "$multisite_mode" ]; then
+            laravel_conflict="Multisite is a WordPress network."
+        fi
+        if [ -n "$laravel_conflict" ]; then
+            gum style --foreground red "❌ Error: Cannot create a Laravel site with those options." "$laravel_conflict"
+            exit 1
+        fi
+        # Laravel's own default, as `laravel new` has it.
+        [ -n "$database" ] || database="sqlite"
+        case "$database" in
+            sqlite|mysql|mariadb) ;;
+            pgsql|postgres|postgresql)
+                gum style --foreground red "❌ Error: Cove has no PostgreSQL server." "Use --database=sqlite (the default), mysql or mariadb."
+                exit 1 ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown database '$database'." "Use --database=sqlite (the default), mysql or mariadb."
+                exit 1 ;;
+        esac
+    elif [ -n "$database" ]; then
+        gum style --foreground red "❌ Error: --database is for Laravel sites." "WordPress sites always get a MariaDB database; try 'cove add $site_name laravel --database=$database'."
+        exit 1
+    fi
 
     if [ "$plain_flag" = true ]; then
         # --plain alongside a version is a contradiction rather than a harmless
@@ -188,6 +223,9 @@ cove_add() {
         echo "➕ Creating Minn Engine site: $full_hostname"
     else
         echo "➕ Creating $site_type site: $full_hostname"
+    fi
+    if [ "$site_type" == "laravel" ]; then
+        cove_add_laravel "$site_name" "$site_dir" "$database" "$php_pin" || exit 1
     fi
     mkdir -p "$site_dir/public" "$site_dir/logs"
     if [ -n "$php_pin" ]; then
@@ -386,7 +424,121 @@ PHP
         else
             gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: $(url_for "$full_hostname")/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
         fi
+    elif [ "$site_type" == "laravel" ]; then
+        local db_line="Database: SQLite, database/database.sqlite"
+        [ "$database" != "sqlite" ] && db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's MariaDB ($database)"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") Installed" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "Queued jobs run once a worker is going: cove artisan $site_name queue:work"
     fi
+}
+
+# Creates a Laravel application for `cove add <name> laravel` the way
+# `laravel new` does: the skeleton from Composer without its scripts, .env
+# from .env.example, an app key, the database, then the migrations. Then Cove's
+# own settings go into .env: the https address, mail to Cove's mailbox through
+# the same sendmail wrapper WordPress uses (so `cove demo` holds it too), and
+# MariaDB credentials when asked for. It is built in a folder under
+# ~/Cove/cache and moved into place whole, so the dashboard and a reload never
+# see half an application. Composer's output goes to a log shown on failure.
+cove_add_laravel() {
+    local site_name="$1" site_dir="$2" database="$3" php_pin="$4"
+    local full_hostname="$site_name.localhost"
+    local php="$COVE_TOOLS_DIR/php" native="" prefix db_name=""
+
+    ensure_composer || return 1
+    if [ -n "$php_pin" ]; then
+        prefix=$(php_fpm_prefix_for "$php_pin")
+        [ -n "$prefix" ] && [ -x "$prefix/bin/php" ] && native="$prefix/bin/php"
+    fi
+
+    # Laravel's database layer is PDO, which some FrankenPHP builds lack.
+    local ext="pdo_sqlite"
+    [ "$database" = "sqlite" ] || ext="pdo_mysql"
+    if ! COVE_EXT="$ext" COVE_PHP_BIN="$native" "$php" -r 'exit(extension_loaded(getenv("COVE_EXT")) ? 0 : 1);' 2>/dev/null; then
+        gum style --foreground red "❌ Error: This PHP has no $ext extension." "Laravel talks to its database through PDO, so it can't run here yet."
+        return 1
+    fi
+
+    mkdir -p "$COVE_DIR/cache" || return 1
+    local work
+    work=$(mktemp -d "$COVE_DIR/cache/laravel-new-$site_name.XXXXXX") || return 1
+    local stage="$work/app" log="$work/install.log"
+
+    if [ "$database" != "sqlite" ]; then
+        source_config
+        db_name=$(cove_laravel_db_name "$site_name")
+        echo "🗄️ Creating database: $db_name"
+        if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
+            gum style --foreground red "❌ Error: Could not create the database '$db_name'."
+            rm -rf "$work"
+            return 1
+        fi
+    fi
+
+    # A JSON string for laravel_env_set (Cove's names and passwords hold no
+    # control characters).
+    json_str() { local v="${1//\\/\\\\}"; printf '"%s"' "${v//\"/\\\"}"; }
+
+    (
+        export COVE_PHP_BIN="$native" PHP_BINARY="$php"
+        echo "Installing Laravel..."
+        if ! "$COVE_TOOLS_DIR/composer" create-project laravel/laravel "$stage" --remove-vcs --prefer-dist --no-scripts --no-interaction --no-progress > "$log" 2>&1; then
+            echo "❌ Error: Composer could not create the application:"
+            tail -n 15 "$log" | sed 's/^/   /'
+            exit 1
+        fi
+        cd "$stage" || exit 1
+        "$COVE_TOOLS_DIR/composer" run-script post-root-package-install --no-interaction >> "$log" 2>&1
+        [ -f .env ] || cp .env.example .env
+        chmod 755 artisan
+
+        local set example
+        set="{\"APP_URL\":$(json_str "$(url_for "$full_hostname")"),\"DB_CONNECTION\":\"$database\""
+        example="{\"DB_CONNECTION\":\"$database\""
+        if [ "$database" = "sqlite" ]; then
+            set="$set,\"DB_HOST\":null,\"DB_PORT\":null,\"DB_DATABASE\":null,\"DB_USERNAME\":null,\"DB_PASSWORD\":null"
+            example="$example,\"DB_HOST\":null,\"DB_PORT\":null,\"DB_DATABASE\":null,\"DB_USERNAME\":null,\"DB_PASSWORD\":null"
+            touch database/database.sqlite
+        else
+            set="$set,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"3306\",\"DB_DATABASE\":$(json_str "$db_name"),\"DB_USERNAME\":$(json_str "$DB_USER"),\"DB_PASSWORD\":$(json_str "$DB_PASSWORD")"
+            example="$example,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"3306\",\"DB_DATABASE\":$(json_str "${site_name//-/_}"),\"DB_USERNAME\":\"root\",\"DB_PASSWORD\":\"\""
+        fi
+        set="$set,\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(json_str "$APP_DIR/cove-sendmail.sh -t"),\"MAIL_FROM_ADDRESS\":$(json_str "hello@$full_hostname")}"
+        if ! COVE_ENV_SET="$set" laravel_env_set "$stage/.env" || ! COVE_ENV_SET="$example}" laravel_env_set "$stage/.env.example"; then
+            echo "❌ Error: Could not write the application's .env."
+            exit 1
+        fi
+
+        if ! "$php" artisan key:generate --no-interaction >> "$log" 2>&1; then
+            echo "❌ Error: artisan key:generate failed:"
+            tail -n 15 "$log" | sed 's/^/   /'
+            exit 1
+        fi
+        echo "   - Running migrations..."
+        if ! "$php" artisan migrate --force --no-interaction >> "$log" 2>&1; then
+            echo "❌ Error: The migrations failed:"
+            tail -n 15 "$log" | sed 's/^/   /'
+            exit 1
+        fi
+
+        # Cove keeps a few files of its own in the site folder, which is
+        # also the project: keep them out of the application's repository.
+        printf '\n# Cove: this site'"'"'s own files (access logs, backups, settings)\n%s\n' "$(printf '/%s\n' $COVE_SITE_OWN)" >> .gitignore
+    ) 2> >(grep -v -E '^(PHP )?Deprecated:' >&2)
+
+    if [ $? -ne 0 ] || [ ! -f "$stage/artisan" ]; then
+        gum style --foreground red "❌ Laravel installation failed. Please review the errors above."
+        echo "   - Cleaning up failed installation..."
+        [ -n "$db_name" ] && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        rm -rf "$work"
+        return 1
+    fi
+    if ! mv "$stage" "$site_dir"; then
+        gum style --foreground red "❌ Error: Could not move the application into $site_dir."
+        [ -n "$db_name" ] && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        rm -rf "$work"
+        return 1
+    fi
+    rm -rf "$work"
 }
 
 # Downloads a Minn Engine release zip (the latest by default, or the URL or
