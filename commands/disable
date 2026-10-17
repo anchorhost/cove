@@ -1,6 +1,13 @@
 cove_disable() {
     echo "🛑 Disabling Cove services..."
 
+    # Laravel sites' workers (cove laravel); their on/off choice is kept, and
+    # the watchdog starts them again after the next enable.
+    if ls "$RUN_DIR"/laravel/*.pid >/dev/null 2>&1; then
+        echo "   - Stopping Laravel workers..."
+        cove_laravel --stop-all
+    fi
+
     echo "   - Stopping Caddy/FrankenPHP..."
 
     # Stop services on MacOS

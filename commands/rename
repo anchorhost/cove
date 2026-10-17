@@ -50,6 +50,9 @@ cove_rename() {
     echo "🔄 Renaming '$old_name.localhost' to '$new_name.localhost'..."
 
     # --- Rename Directory ---
+    # A Laravel site's workers run in the folder under the old name; they
+    # start again under the new one below.
+    laravel_workers_stop_site "$old_name"
     mv "$old_site_dir" "$new_site_dir"
     echo "   - Directory renamed."
 
@@ -171,5 +174,9 @@ cove_rename() {
     regenerate_caddyfile
     prune_etc_hosts "$old_name.localhost"
 
+    local kind
+    for kind in $LARAVEL_WORKER_KINDS; do
+        laravel_worker_wanted "$new_name" "$kind" && laravel_worker_start "$new_name" "$kind"
+    done
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: $(url_for "$new_name.localhost")"
 }

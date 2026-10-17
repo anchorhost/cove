@@ -55,6 +55,7 @@ cove_delete() {
     fi
 
     echo "🔥 Deleting site: $site_name.localhost"
+    laravel_workers_stop_site "$site_name"
     if [ -f "$site_dir/public/wp-config.php" ]; then
         local db_name wp_cmd
         wp_cmd=$(get_wp_cmd "$site_dir")

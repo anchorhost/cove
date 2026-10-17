@@ -1458,7 +1458,7 @@ ensure_composer() {
 # webroot Cove serves anyway. Cove's own files share that folder: these are
 # listed in the app's .gitignore, never copied by clone or snapshot, and
 # never replaced by a restore.
-COVE_SITE_OWN="logs private history php_version mappings multisite twin tailscale_port lan_config"
+COVE_SITE_OWN="logs private history php_version mappings multisite twin tailscale_port lan_config laravel_workers"
 
 site_is_laravel() {
     [ -f "$1/artisan" ] && [ -f "$1/bootstrap/app.php" ] && [ -f "$1/public/index.php" ]
@@ -2006,6 +2006,12 @@ if [ -n "\$rot_mb" ] && [ "\$rot_mb" -gt 0 ]; then
             "$watchdog_cove" log rotate --apply >/dev/null 2>&1
         fi
     fi
+fi
+# Laravel sites' workers (cove laravel <site> queue|schedule on): any that
+# should run and doesn't is started again, so they come back after a crash
+# or a reboot.
+if ls "$SITES_DIR"/*.localhost/laravel_workers >/dev/null 2>&1; then
+    "$watchdog_cove" laravel --ensure >/dev/null 2>&1
 fi
 last_s=\$(cat "\$sweep_stamp" 2>/dev/null || echo 0)
 if [ \$((now_s - last_s)) -ge 300 ]; then
@@ -5089,6 +5095,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'site_schedule':
         case 'site_artisan':
         case 'site_laravel_op':
+        case 'site_laravel_workers':
             // --- Site page: a Laravel site's routes, migrations, schedule
             // and artisan console, all through `cove artisan` so the site's
             // pinned PHP is honoured. As with WP-CLI above, every argument is
@@ -5145,6 +5152,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 if (!$items && $code !== 0) { echo json_encode(['success' => false, 'message' => $out !== '' ? $out : 'artisan failed (' . $code . ').']); exit; }
                 echo json_encode(['success' => true, 'items' => $items, 'ms' => $ms, 'note' => $items ? null : $out]);
+                exit;
+            }
+            if ($action === 'site_laravel_workers') {
+                // The queue worker and scheduler (`cove laravel`): their
+                // state, or one turned on or off first.
+                $args = ['laravel', $site_name];
+                $kind = (string) ($input['kind'] ?? '');
+                if ($kind !== '') {
+                    $state = (string) ($input['state'] ?? '');
+                    if (!in_array($kind, ['queue', 'schedule'], true) || !in_array($state, ['on', 'off'], true)) { echo json_encode(['success' => false, 'message' => 'Unknown worker.']); exit; }
+                    array_push($args, $kind, $state);
+                }
+                $cmd = 'HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path);
+                foreach ($args as $a) $cmd .= ' ' . escapeshellarg($a);
+                exec($cmd . ' --format=json 2>&1 </dev/null', $lines, $code);
+                $data = json_decode((string) end($lines), true);
+                if (!is_array($data)) { echo json_encode(['success' => false, 'message' => trim(implode("\n", $lines)) ?: 'cove laravel failed.']); exit; }
+                echo json_encode(['success' => $code === 0, 'workers' => $data]);
                 exit;
             }
             if ($action === 'site_laravel_op') {
@@ -7850,6 +7875,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .st-title a { color: inherit; text-decoration: none; }
         .st-title a:hover { color: var(--accent); text-decoration: underline; }
         .st-chip.st-pending { color: var(--warn); border-color: var(--warn); }
+        .pill .wk-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 0.35rem; background: var(--panel-border-strong); vertical-align: 1px; }
+        .pill .wk-dot.is-running { background: var(--accent); }
+        .pill .wk-dot.is-starting { background: var(--warn); }
+        #schedFoot .sl-link { font-family: var(--font-mono); font-size: inherit; padding: 0; }
         .st-main { min-width: 0; display: flex; flex-direction: column; gap: 0.1rem; }
         .st-title { font-size: 0.88rem; color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .st-title.st-mono { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 400; }
@@ -8745,6 +8774,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     </ul>
                 </section>
 
+                <section class="site-section" id="siteWorkers" style="display: none;">
+                    <div class="site-section-head"><span>workers</span><span class="sec-meta">kept running by the watchdog · output in logs/laravel-*.log</span></div>
+                    <div class="site-manage" id="siteWorkersRow"></div>
+                </section>
+
                 <section class="site-section" id="siteManage">
                     <div class="site-section-head"><span>manage</span></div>
                     <div class="site-manage" id="siteManageRow">
@@ -8833,6 +8867,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <button type="button" class="pill st-refresh" title="Read the schedule again">refresh</button>
                 </div>
                 <ul class="st-list"><li class="loading st-loading">Reading the schedule…</li><li class="empty st-error" style="display: none;"></li></ul>
+                <div class="st-foot" id="schedFoot"></div>
             </div>
             <div class="site-panel" id="sitePanel-traffic" style="display: none;">
                 <div class="st-toolbar">
@@ -9284,7 +9319,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             selectedName: null,
             ctxMenu: { open: false, site: null, x: 0, y: 0, openedAt: 0 },
             fileCtx: { open: false, target: null, x: 0, y: 0, openedAt: 0 },
-            sitePage: { name: null, tab: 'overview', tabs: {}, shot: { busy: null, asked: {}, unsupported: false }, net: { items: [], loading: false, error: null, loadedFor: null }, busy: null, cli: { cmd: '', output: '', code: 0, ms: 0, ran: null, running: false, history: [], histIdx: -1 } },
+            sitePage: { name: null, tab: 'overview', tabs: {}, workers: { for: null, data: null, busy: null }, shot: { busy: null, asked: {}, unsupported: false }, net: { items: [], loading: false, error: null, loadedFor: null }, busy: null, cli: { cmd: '', output: '', code: 0, ms: 0, ran: null, running: false, history: [], histIdx: -1 } },
             siteDeleteConfirm: null,
             tabCtx: { open: false, x: 0, y: 0, openedAt: 0, items: [], title: '' },
             palette: { open: false, query: '', index: 0 },
@@ -13221,6 +13256,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const isWp = this.isWpLike(site);
                 const isMinn = site.type === 'Minn';
                 $id('siteLogsDesc').textContent = 'PHP errors, ' + (site.type === 'Laravel' ? 'laravel.log' : 'debug.log') + ', and the access log, live.';
+                this.renderSiteWorkers();
                 const facts = $id('siteFacts');
                 facts.innerHTML = '';
                 const fact = (text, cls, title) => { const s = document.createElement('span'); s.className = 'fact' + (cls ? ' ' + cls : ''); s.textContent = text; if (title) s.title = title; facts.appendChild(s); return s; };
@@ -13243,7 +13279,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 show(login, isWp);
                 login.disabled = !!site.isLoggingIn;
                 login.querySelector('.btn-label').textContent = site.isLoggingIn ? 'opening…' : (isMinn ? 'log in to Minn Admin' : 'log in to admin');
-                show($id('tileDb'), isWp);
+                // A Laravel site's database is its SQLite file or one on MariaDB.
+                show($id('tileDb'), isWp || (site.type === 'Laravel' && !!site.db_name));
                 show($id('siteNetwork'), !!site.multisite);
                 if (site.multisite) {
                     // A deep link renders before the sites list lands; fetch
@@ -13848,6 +13885,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     if (t.dataset.go === 'logs') this.openLogsForSite(s.name);
                 });
                 $id('btnSiteNetworkRefresh').addEventListener('click', () => this.loadSiteNetwork(true));
+                for (const id of ['siteWorkersRow', 'schedFoot']) $id(id).addEventListener('click', (e) => { const b = e.target.closest('[data-worker]'); if (b) this.toggleSiteWorker(b.dataset.worker); });
                 $id('siteNetList').addEventListener('click', (e) => {
                     const row = e.target.closest('.net-row');
                     if (!row || !row.dataset.url) return;
@@ -13905,7 +13943,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const tab = p.tab;
                 const site = this.pageSite;
                 if (tab === 'traffic') { this.loadTraffic(opts); return; }
-                if (tab === 'overview') { this.loadSiteHealth(); return; }
+                if (tab === 'overview') { this.loadSiteHealth(); this.loadSiteWorkers(); return; }
+                if (tab === 'schedule') this.loadSiteWorkers();
                 if (!site || !['plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule', 'snapshots', 'history'].includes(tab)) return;
                 if (!this.siteTabsFor(site).includes(tab)) return;
                 const t = this.siteTabState(tab);
@@ -13948,6 +13987,49 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const last = (res.message || '').split('\n').filter(Boolean).pop() || '';
                 this.showSnack(last.replace(/^(Success|Error|Warning): /, '') || (res.success ? 'Done.' : 'Failed.'), !res.success);
                 this.loadSiteTab({ force: true });
+            },
+
+            // --- A Laravel site's workers (cove laravel) ----------------------
+            async loadSiteWorkers(kind, state) {
+                const site = this.pageSite;
+                const w = this.sitePage.workers;
+                if (!site || site.type !== 'Laravel') return;
+                if (kind) w.busy = kind;
+                this.renderSiteWorkers();
+                const res = await this.apiPost('site_laravel_workers', kind ? { site_name: site.name, kind, state } : { site_name: site.name }, { quiet: true, timeoutMs: 60000 });
+                w.busy = null;
+                if (this.sitePage.name !== site.name) return;
+                if (res.workers) { w.for = site.name; w.data = res.workers; }
+                if (!res.success) this.showSnack(res.message || 'Could not change the worker.', true);
+                this.renderSiteWorkers();
+            },
+
+            renderSiteWorkers() {
+                const site = this.pageSite;
+                const w = this.sitePage.workers;
+                const on = site && site.type === 'Laravel';
+                show($id('siteWorkers'), on);
+                const foot = $id('schedFoot');
+                if (!on) { foot.textContent = ''; return; }
+                const data = w.for === site.name ? w.data : null;
+                const names = { queue: ['queue worker', 'artisan queue:listen: runs queued jobs, reloading the code for each'], schedule: ['scheduler', 'artisan schedule:work: runs the scheduled tasks every minute'] };
+                $id('siteWorkersRow').innerHTML = ['queue', 'schedule'].map(k => {
+                    const st = data ? data[k] : null;
+                    const busy = w.busy === k;
+                    const state = !st ? '…' : busy ? (st.on ? 'stopping…' : 'starting…') : st.running ? 'running' : st.on ? 'starting' : 'off';
+                    const dot = st && st.running ? 'is-running' : st && st.on ? 'is-starting' : '';
+                    return '<button type="button" class="pill" data-worker="' + k + '"' + (busy || !st ? ' disabled' : '') + ' title="' + this.escapeHtml(names[k][1] + (st ? (st.on ? ' · click to turn off' : ' · click to turn on') : '')) + '"><span class="pill-label"><i class="wk-dot ' + dot + '"></i>' + names[k][0] + '</span><span class="pill-meta">' + state + (st && st.pid ? ' · pid ' + st.pid : '') + '</span></button>';
+                }).join('');
+                const sch = data ? data.schedule : null;
+                foot.innerHTML = !sch ? '' : sch.running ? 'The scheduler is running these every minute. <button type="button" class="sl-link" data-worker="schedule">turn it off</button>'
+                    : 'The scheduler is off, so these run only when you press run due now. <button type="button" class="sl-link" data-worker="schedule">turn it on</button>';
+            },
+
+            toggleSiteWorker(kind) {
+                const w = this.sitePage.workers;
+                const st = w.data && w.data[kind];
+                if (!st || w.busy) return;
+                this.loadSiteWorkers(kind, st.on ? 'off' : 'on');
             },
 
             // One of Laravel's one-click artisan commands, then a refetch.
@@ -17133,6 +17215,7 @@ show_general_help() {
     help_section "Laravel"
     help_cmd artisan "Runs a Laravel site's artisan from anywhere."
     help_cmd composer "Runs Composer in a site, on the PHP the site serves with."
+    help_cmd laravel "A Laravel site's queue worker and scheduler, kept running."
     echo ""
     help_section "Backups & transfer"
     help_cmd backup "A site's files and database as one zip, in ~/Cove/Backups."
@@ -17489,6 +17572,9 @@ display_command_help() {
             ;;
         artisan)
             cove_artisan --help
+            ;;
+        laravel)
+            cove_laravel --help
             ;;
         composer)
             cove_composer --help
@@ -17977,6 +18063,10 @@ main() {
         wp)
             check_dependencies
             cove_wp "$@"
+            ;;
+        laravel)
+            check_dependencies
+            cove_laravel "$@"
             ;;
         artisan)
             check_dependencies

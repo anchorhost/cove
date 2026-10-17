@@ -1,0 +1,195 @@
+# cove laravel: a Laravel site's background workers. A queue worker
+# (artisan queue:listen, which reloads the app's code for every job) and the
+# scheduler (artisan schedule:work, which runs schedule:run each minute) are
+# what `composer run dev` would start beside `artisan serve`. Which ones a
+# site wants is kept in its laravel_workers file; the watchdog starts any
+# that should run and doesn't, so they come back after a crash or a reboot.
+# Each runs in a process group of its own, so stopping one takes the
+# children queue:listen spawns with it. Output goes to logs/laravel-<kind>.log.
+
+LARAVEL_RUN_DIR="$RUN_DIR/laravel"
+LARAVEL_WORKER_KINDS="queue schedule"
+
+laravel_worker_args() {
+    case "$1" in
+        queue)    echo "queue:listen --tries=1 --timeout=0" ;;
+        schedule) echo "schedule:work" ;;
+    esac
+}
+
+# The running worker's pid, or failure. The pid file is checked against the
+# process it names, so a pid reused by something else doesn't count.
+laravel_worker_pid() {
+    local pid args
+    pid=$(cat "$LARAVEL_RUN_DIR/$1-$2.pid" 2>/dev/null) || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    args=$(ps -o args= -p "$pid" 2>/dev/null) || return 1
+    case "$args" in
+        *artisan*"$(laravel_worker_args "$2" | cut -d' ' -f1)"*) echo "$pid" ;;
+        *) return 1 ;;
+    esac
+}
+
+laravel_worker_wanted() {
+    grep -qx "$2" "$SITES_DIR/$1.localhost/laravel_workers" 2>/dev/null
+}
+
+# Keeps a worker's log from growing without end: past 5 MB, the last 512 KB
+# stay (written back in place, as the worker holds the file open).
+laravel_worker_trim_log() {
+    local log="$1" tmp
+    [ -f "$log" ] || return 0
+    [ "$(wc -c < "$log" 2>/dev/null | tr -d ' ')" -gt 5242880 ] 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    tail -c 524288 "$log" > "$tmp" && cat "$tmp" > "$log"
+    rm -f "$tmp"
+}
+
+laravel_worker_start() {
+    local site_name="$1" kind="$2" site_dir="$SITES_DIR/$1.localhost"
+    laravel_worker_pid "$site_name" "$kind" >/dev/null && return 0
+    site_is_laravel "$site_dir" || return 1
+    write_php_tools || return 1
+    mkdir -p "$LARAVEL_RUN_DIR" "$site_dir/logs" || return 1
+    laravel_worker_trim_log "$site_dir/logs/laravel-$kind.log"
+    (
+        cd "$site_dir" || exit 1
+        # A process group of its own (job control on), with the pid as its id.
+        set -m
+        PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" \
+            nohup "$COVE_TOOLS_DIR/php" artisan $(laravel_worker_args "$kind") >> "$site_dir/logs/laravel-$kind.log" 2>&1 < /dev/null &
+        echo "$!" > "$LARAVEL_RUN_DIR/$site_name-$kind.pid"
+    )
+}
+
+laravel_worker_stop() {
+    local site_name="$1" kind="$2" pid i
+    if pid=$(laravel_worker_pid "$site_name" "$kind"); then
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        kill -KILL -- "-$pid" 2>/dev/null
+    fi
+    rm -f "$LARAVEL_RUN_DIR/$site_name-$kind.pid"
+}
+
+# Every worker of a site stopped (delete, rename, disable); what it wants
+# stays in laravel_workers.
+laravel_workers_stop_site() {
+    local kind
+    for kind in $LARAVEL_WORKER_KINDS; do laravel_worker_stop "$1" "$kind"; done
+}
+
+laravel_workers_json() {
+    local site_name="$1" kind pid sep="" out
+    out="{\"site\":\"$site_name\""
+    for kind in $LARAVEL_WORKER_KINDS; do
+        pid=$(laravel_worker_pid "$site_name" "$kind") || pid=""
+        out="$out,\"$kind\":{\"on\":$(laravel_worker_wanted "$site_name" "$kind" && echo true || echo false),\"running\":$([ -n "$pid" ] && echo true || echo false),\"pid\":${pid:-null}}"
+    done
+    echo "$out}"
+}
+
+cove_laravel() {
+    local site_name="" kind="" state="" format="table" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --format=*) format="${arg#*=}" ;;
+            --ensure)
+                # The watchdog: start what should run and doesn't.
+                local f s k
+                for f in "$SITES_DIR"/*.localhost/laravel_workers; do
+                    [ -f "$f" ] || continue
+                    s=$(basename "$(dirname "$f")" .localhost)
+                    for k in $LARAVEL_WORKER_KINDS; do
+                        if laravel_worker_wanted "$s" "$k"; then
+                            laravel_worker_start "$s" "$k"
+                            laravel_worker_trim_log "$SITES_DIR/$s.localhost/logs/laravel-$k.log"
+                        fi
+                    done
+                done
+                return 0 ;;
+            --stop-all)
+                local p
+                for p in "$LARAVEL_RUN_DIR"/*.pid; do
+                    [ -f "$p" ] || continue
+                    p=$(basename "$p" .pid)
+                    laravel_worker_stop "${p%-*}" "${p##*-}"
+                done
+                return 0 ;;
+            -h|--help)
+                echo "Usage: cove laravel <site> [queue|schedule] [on|off] [--format=json]"
+                echo ""
+                echo "A Laravel site's background workers. With no arguments, shows them."
+                echo "  queue      artisan queue:listen: runs queued jobs, reloading the app's"
+                echo "             code for each one."
+                echo "  schedule   artisan schedule:work: runs the app's scheduled tasks each"
+                echo "             minute (routes/console.php)."
+                echo "A worker that is on keeps running: the watchdog starts it again after a"
+                echo "crash or a reboot. Its output goes to logs/laravel-<worker>.log in the site."
+                echo ""
+                echo "Examples:"
+                echo "  cove laravel myapp"
+                echo "  cove laravel myapp queue on"
+                echo "  cove laravel myapp schedule off"
+                return ;;
+            -*) gum style --foreground red "❌ Error: Unknown option '$arg'."; exit 1 ;;
+            *)
+                if [ -z "$site_name" ]; then site_name="$arg"
+                elif [ -z "$kind" ]; then kind="$arg"
+                elif [ -z "$state" ]; then state="$arg"
+                fi ;;
+        esac
+    done
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove laravel <site> [queue|schedule] [on|off]"
+        exit 1
+    fi
+    if ! validate_site_name "$site_name" || ! site_is_laravel "$SITES_DIR/$site_name.localhost"; then
+        gum style --foreground red "❌ Error: Laravel site '$site_name.localhost' not found."
+        exit 1
+    fi
+    local site_dir="$SITES_DIR/$site_name.localhost"
+
+    if [ -n "$kind" ]; then
+        case "$kind" in
+            queue|schedule) ;;
+            scheduler) kind="schedule" ;;
+            *) gum style --foreground red "❌ Error: Unknown worker '$kind'." "Use queue or schedule."; exit 1 ;;
+        esac
+        case "$state" in
+            on|start)
+                grep -qx "$kind" "$site_dir/laravel_workers" 2>/dev/null || echo "$kind" >> "$site_dir/laravel_workers"
+                if ! laravel_worker_start "$site_name" "$kind"; then
+                    gum style --foreground red "❌ Error: Could not start the $kind worker."
+                    exit 1
+                fi ;;
+            off|stop)
+                laravel_worker_stop "$site_name" "$kind"
+                if [ -f "$site_dir/laravel_workers" ]; then
+                    grep -vx "$kind" "$site_dir/laravel_workers" > "$site_dir/laravel_workers.tmp"
+                    if [ -s "$site_dir/laravel_workers.tmp" ]; then mv -f "$site_dir/laravel_workers.tmp" "$site_dir/laravel_workers"; else rm -f "$site_dir/laravel_workers.tmp" "$site_dir/laravel_workers"; fi
+                fi ;;
+            ""|status) ;;
+            *) gum style --foreground red "❌ Error: Expected on or off, not '$state'."; exit 1 ;;
+        esac
+    fi
+
+    if [ "$format" = "json" ]; then
+        laravel_workers_json "$site_name"
+        return
+    fi
+    local k pid line
+    echo "Laravel $(laravel_version "$site_dir") · $site_name.localhost"
+    for k in $LARAVEL_WORKER_KINDS; do
+        pid=$(laravel_worker_pid "$site_name" "$k") || pid=""
+        if [ -n "$pid" ]; then line="running (pid $pid)"
+        elif laravel_worker_wanted "$site_name" "$k"; then line="on, not running yet (the watchdog starts it within five minutes)"
+        else line="off"
+        fi
+        printf '  %-9s %s\n' "$k" "$line"
+    done
+}
