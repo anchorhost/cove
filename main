@@ -1538,14 +1538,14 @@ ensure_composer() {
 }
 
 # The php-zts extension packages FrankenPHP's Linux packages leave out:
-# mysqli for WordPress, PDO with its SQLite and MySQL drivers for Laravel,
-# and what both use besides. apt spells the PDO drivers with a hyphen, dnf
-# with an underscore.
+# mysqli for WordPress, PDO with its SQLite, MySQL and PostgreSQL drivers
+# and phpredis for Laravel, and what both use besides. apt spells the PDO
+# drivers with a hyphen, dnf with an underscore.
 linux_php_extension_packages() {
-    local base="php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath php-zts-pdo"
+    local base="php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath php-zts-pdo php-zts-redis"
     case "$PKG_MANAGER" in
-        apt) echo "$base php-zts-pdo-sqlite php-zts-pdo-mysql" ;;
-        dnf) echo "$base php-zts-pdo_sqlite php-zts-pdo_mysql" ;;
+        apt) echo "$base php-zts-pdo-sqlite php-zts-pdo-mysql php-zts-pdo-pgsql" ;;
+        dnf) echo "$base php-zts-pdo_sqlite php-zts-pdo_mysql php-zts-pdo_pgsql" ;;
     esac
 }
 
@@ -1733,6 +1733,133 @@ cove_pg_setup() {
     echo "   - ✅ PostgreSQL $(cove_pg_psql postgres -c 'SHOW server_version' | cut -d' ' -f1) is ready on 127.0.0.1:5432."
 }
 
+# --- Redis -----------------------------------------------------------------
+# For Laravel sites whose cache, sessions or queue live in it, so, like
+# PostgreSQL, set up the first time one needs it (cove add --from on such an
+# app, or `cove redis install`): Homebrew's redis on macOS, the
+# distribution's on Linux (Valkey, Redis's open fork, where that is what a
+# distribution ships as redis). A server already answering on
+# 127.0.0.1:6379 is used as it is. No password: it listens on loopback only.
+# Each site keeps its own keys apart with REDIS_PREFIX (cove_redis_site_env).
+cove_redis_configured() {
+    [ -n "$(config_get REDIS_PORT)" ]
+}
+
+cove_redis_port() {
+    local port
+    port=$(config_get REDIS_PORT)
+    echo "${port:-6379}"
+}
+
+# Does something answer PING on 127.0.0.1 ($1 the port)? Without
+# redis-cli, a bare RESP PING over bash's /dev/tcp.
+cove_redis_ready() {
+    local port="${1:-$(cove_redis_port)}" cli reply
+    cli=$(command -v redis-cli || command -v valkey-cli)
+    if [ -n "$cli" ]; then
+        [ "$("$cli" -h 127.0.0.1 -p "$port" ping 2>/dev/null)" = "PONG" ]
+        return
+    fi
+    reply=$( (exec 3<>"/dev/tcp/127.0.0.1/$port" && printf 'PING\r\n' >&3 && head -c 7 <&3) 2>/dev/null)
+    [[ "$reply" == "+PONG"* ]]
+}
+
+cove_redis_service() {
+    local s
+    for s in redis-server redis valkey; do
+        if systemctl list-unit-files "$s.service" 2>/dev/null | grep -q "^$s.service"; then echo "$s"; return 0; fi
+    done
+    echo redis
+}
+
+cove_redis_start() {
+    if [ "$OS" = "macos" ]; then
+        [ -n "$(config_get REDIS_FORMULA)" ] && pkg_service start "$(config_get REDIS_FORMULA)" >/dev/null 2>&1
+    else
+        $SUDO_CMD systemctl start "$(cove_redis_service)" >/dev/null 2>&1
+    fi
+}
+
+cove_redis_stop() {
+    if [ "$OS" = "macos" ]; then
+        [ -n "$(config_get REDIS_FORMULA)" ] && pkg_service stop "$(config_get REDIS_FORMULA)" >/dev/null 2>&1
+    else
+        $SUDO_CMD systemctl stop "$(cove_redis_service)" >/dev/null 2>&1
+    fi
+}
+
+cove_redis_wait_ready() {
+    local i
+    for i in $(seq 1 "${2:-20}"); do
+        cove_redis_ready "$1" && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Redis ready for Cove: set up the first time, started when it has stopped.
+# Progress on stdout, errors on stderr.
+ensure_redis() {
+    if cove_redis_configured; then
+        cove_redis_ready && return 0
+        echo "🧰 Starting Redis…"
+        cove_redis_start
+        cove_redis_wait_ready "" 20 && return 0
+        echo "❌ Error: Redis isn't answering on 127.0.0.1:$(cove_redis_port). See: cove redis" >&2
+        return 1
+    fi
+    echo "🧰 Setting up Redis for Cove…"
+    if cove_redis_ready 6379; then
+        echo "   - Using the Redis already running on 127.0.0.1:6379."
+    elif [ "$OS" = "macos" ]; then
+        if ! "$MAC_BREW" list redis >/dev/null 2>&1; then
+            echo "   - Installing redis…"
+            "$MAC_BREW" install redis >&2 || { echo "❌ Error: Could not install redis." >&2; return 1; }
+        fi
+        config_set REDIS_FORMULA redis
+        pkg_service start redis >/dev/null 2>&1
+    else
+        echo "   - Installing Redis via $PKG_MANAGER…"
+        if [ "$PKG_MANAGER" = "apt" ]; then
+            $SUDO_CMD apt-get update -qq >/dev/null 2>&1
+            $SUDO_CMD env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq redis-server >/dev/null 2>&1
+        else
+            $SUDO_CMD dnf install -y -q redis >/dev/null 2>&1 || $SUDO_CMD dnf install -y -q valkey >/dev/null 2>&1
+        fi || { echo "❌ Error: Could not install Redis." >&2; return 1; }
+        $SUDO_CMD systemctl enable --now "$(cove_redis_service)" >/dev/null 2>&1
+    fi
+    if ! cove_redis_wait_ready 6379 20; then
+        echo "❌ Error: Redis did not start on 127.0.0.1:6379." >&2
+        return 1
+    fi
+    config_set REDIS_PORT 6379
+    echo "   - ✅ Redis is ready on 127.0.0.1:6379."
+}
+
+# Removes the keys a site kept in Cove's Redis ($1 its prefix), when Redis
+# is set up and answering; a delete calls it.
+cove_redis_forget() {
+    local cli prefix="$1"
+    [ -n "$prefix" ] && cove_redis_configured && cove_redis_ready || return 0
+    cli=$(command -v redis-cli || command -v valkey-cli) || return 0
+    # Every numbered database that holds keys: Laravel keeps its cache in
+    # 1 and the rest in 0.
+    local n
+    for n in $("$cli" -h 127.0.0.1 -p "$(cove_redis_port)" info keyspace 2>/dev/null | tr -d '\r' | sed -n 's/^db\([0-9]*\):.*/\1/p'); do
+        "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" --scan --pattern "${prefix}*" 2>/dev/null \
+            | xargs -n 500 "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" unlink >/dev/null 2>&1
+    done
+    return 0
+}
+
+# A Laravel site's Redis settings for Cove's server, as JSON members for
+# laravel_env_set: loopback, no password, and a prefix of the site's own so
+# two apps (both named Laravel, say) never read each other's cache, sessions
+# or queue.
+cove_redis_site_env() {
+    printf '"REDIS_HOST":"127.0.0.1","REDIS_PORT":"%s","REDIS_PASSWORD":null,"REDIS_PREFIX":%s' "$(cove_redis_port)" "$(cove_json_str "${1}_")"
+}
+
 # --- Laravel ---------------------------------------------------------------
 # A Laravel site's folder is the project root, so Laravel's public/ is the
 # webroot Cove serves anyway. Cove's own files share that folder: these are
@@ -1910,6 +2037,10 @@ laravel_retarget() {
     fi
     if [ "$(laravel_env_get "$site_dir" MAIL_FROM_ADDRESS)" = "hello@$old_name.localhost" ]; then
         pairs+=("\"MAIL_FROM_ADDRESS\":\"hello@$new_name.localhost\"")
+    fi
+    # Its own keys in Redis, under its own name.
+    if [ -n "$old_name" ] && [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "${old_name}_" ]; then
+        pairs+=("\"REDIS_PREFIX\":\"${new_name}_\"")
     fi
     # Absolute paths into the old folder: an SQLite file written out in
     # full, and the links in public/ (storage:link makes public/storage an
@@ -6758,6 +6889,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'note' => 'For Laravel sites on --database=pgsql. Credentials stored in ~/Cove/config; cove postgres psql opens a shell.',
                     'actions' => [['kind' => 'db', 'label' => 'open databases']],
                 ];
+            })()]) + (empty($__svc_cfg['REDIS_PORT']) ? [] : ['redis' => (function () use ($__svc_cfg) {
+                // For Laravel sites' cache, sessions and queues (`cove redis`),
+                // asked over its own protocol, so no PHP extension is needed.
+                $port = (int) $__svc_cfg['REDIS_PORT'];
+                $info = '';
+                $sock = @fsockopen('127.0.0.1', $port, $e, $es, 0.5);
+                if ($sock) {
+                    stream_set_timeout($sock, 1);
+                    fwrite($sock, "INFO\r\n");
+                    $len = (int) substr((string) fgets($sock), 1);
+                    while ($len > 0 && strlen($info) < $len && !feof($sock)) $info .= (string) fread($sock, $len - strlen($info));
+                    fclose($sock);
+                }
+                $up = $info !== '';
+                $version = preg_match('/^(?:redis|valkey)_version:(\S+)/m', $info, $m) ? $m[1] : '—';
+                $keys = preg_match_all('/^db\d+:keys=(\d+)/m', $info, $mm) ? (string) array_sum($mm[1]) : '0';
+                return [
+                    'label' => 'Redis', 'running' => $up,
+                    'status' => $up ? 'Running on 127.0.0.1:' . $port . '.' : 'Not answering on 127.0.0.1:' . $port . ' — start it with: cove redis start',
+                    'rows' => [
+                        ['version', $version],
+                        ['host', '127.0.0.1:' . $port],
+                        ['password', 'none (loopback only)'],
+                        ['keys', $up ? $keys : '—'],
+                    ],
+                    'note' => 'For Laravel sites\' cache, sessions and queues. Each site\'s keys carry its own prefix (REDIS_PREFIX); cove redis cli opens a shell.',
+                    'actions' => [],
+                ];
             })()])]);
             exit;
         case 'db_list':
@@ -8925,6 +9084,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 <button type="button" class="dot link" data-service="mailpit" title="Mailpit status">mailpit</button>
 <?php if (!empty($config_data['PGSQL_USER'])): ?>
                 <button type="button" class="dot link" data-service="postgres" title="PostgreSQL status and credentials">postgres</button>
+<?php endif; ?>
+<?php if (!empty($config_data['REDIS_PORT'])): ?>
+                <button type="button" class="dot link" data-service="redis" title="Redis status">redis</button>
 <?php endif; ?>
                 <button type="button" class="dot link is-busy sweep-dot" id="navSweep" data-service="history" title="The nightly history sweep is running — click for the site it is on" style="display: none;">6/80</button>
             </div>
@@ -17160,7 +17322,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.showDbModal = true;
                 show($id('dbModal'), true);
                 const svcTitle = $id('svcTitle'), svcStatus = $id('svcStatus'), svcRows = $id('svcRows'), svcNote = $id('svcNote'), svcActions = $id('svcActions');
-                svcTitle.textContent = { caddy: 'Caddy', mariadb: 'MariaDB', mailpit: 'Mailpit', postgres: 'PostgreSQL' }[name] || name;
+                svcTitle.textContent = { caddy: 'Caddy', mariadb: 'MariaDB', mailpit: 'Mailpit', postgres: 'PostgreSQL', redis: 'Redis' }[name] || name;
                 svcStatus.textContent = 'Checking…'; svcStatus.classList.remove('is-down');
                 svcRows.innerHTML = ''; svcNote.textContent = '';
                 svcActions.innerHTML = '<button class="pill" id="btnDbClose">close</button>';
@@ -18247,6 +18409,7 @@ show_general_help() {
     help_cmd composer "Runs Composer in a site, on the PHP the site serves with."
     help_cmd laravel "A Laravel site's users, and its queue worker and scheduler, kept running."
     help_cmd postgres "PostgreSQL for Laravel sites on it: status, install, start, stop, psql."
+    help_cmd redis "Redis for Laravel sites' cache, sessions and queues: status, install, start, stop, cli."
     echo ""
     help_section "Backups & transfer"
     help_cmd backup "A site's files and database as one zip, in ~/Cove/Backups."
@@ -18628,6 +18791,9 @@ display_command_help() {
             ;;
         postgres)
             cove_postgres --help
+            ;;
+        redis)
+            cove_redis --help
             ;;
         composer)
             cove_composer --help
@@ -19123,6 +19289,9 @@ main() {
             ;;
         postgres|postgresql|pgsql)
             cove_postgres "$@"
+            ;;
+        redis|valkey)
+            cove_redis "$@"
             ;;
         artisan)
             check_dependencies

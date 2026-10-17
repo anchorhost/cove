@@ -50,6 +50,17 @@ cove_status() {
         fi
     fi
     
+    # PostgreSQL and Redis, once a Laravel site has had them set up.
+    local pg_status="" redis_status=""
+    if cove_pg_configured; then
+        pg_status="❌ Stopped"
+        cove_pg_ready && pg_status="✅ Running"
+    fi
+    if cove_redis_configured; then
+        redis_status="❌ Stopped"
+        cove_redis_ready && redis_status="✅ Running"
+    fi
+
     # Native php-fpm units for sites pinned to an older PHP (`cove php`).
     # One row per version with an installed unit; nothing pinned = no rows.
     local fpm_lines=""
@@ -81,6 +92,8 @@ cove_status() {
         [[ "$caddy_status" == *Running* ]] && echo "caddy=running" || echo "caddy=stopped"
         [[ "$mariadb_status" == *Running* ]] && echo "mariadb=running" || echo "mariadb=stopped"
         [[ "$mailpit_status" == *Running* ]] && echo "mailpit=running" || echo "mailpit=stopped"
+        if [ -n "$pg_status" ]; then [[ "$pg_status" == *Running* ]] && echo "postgres=running" || echo "postgres=stopped"; fi
+        if [ -n "$redis_status" ]; then [[ "$redis_status" == *Running* ]] && echo "redis=running" || echo "redis=stopped"; fi
         [ -n "$fpm_porcelain" ] && printf '%s' "$fpm_porcelain"
         return 0
     fi
@@ -89,6 +102,8 @@ cove_status() {
     echo "  Caddy Server: $caddy_status"
     echo "  MariaDB:      $mariadb_status"
     echo "  Mailpit:      $mailpit_status"
+    [ -n "$pg_status" ] && echo "  PostgreSQL:   $pg_status"
+    [ -n "$redis_status" ] && echo "  Redis:        $redis_status"
     [ -n "$fpm_lines" ] && printf '%s' "$fpm_lines"
     echo ""
 

@@ -319,6 +319,8 @@ static const NSInteger kServiceRowStartIndex = 2;
     if ([key isEqualToString:@"caddy"])   { return @"Caddy"; }
     if ([key isEqualToString:@"mariadb"]) { return @"MariaDB"; }
     if ([key isEqualToString:@"mailpit"]) { return @"Mailpit"; }
+    if ([key isEqualToString:@"postgres"]) { return @"PostgreSQL"; }
+    if ([key isEqualToString:@"redis"])   { return @"Redis"; }
     if ([key hasPrefix:@"php-fpm-"]) {
         return [NSString stringWithFormat:@"PHP-FPM %@",
                 [key substringFromIndex:[@"php-fpm-" length]]];

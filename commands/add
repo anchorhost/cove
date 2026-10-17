@@ -521,7 +521,8 @@ cove_add_laravel() {
             set="$set,$(cove_laravel_db_env "$server" "$db_name")"
             example="$example,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"$( [ "$server" = pgsql ] && echo 5432 || echo 3306 )\",\"DB_DATABASE\":$(cove_json_str "${site_name//-/_}"),\"DB_USERNAME\":\"root\",\"DB_PASSWORD\":\"\""
         fi
-        set="$set,\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t"),\"MAIL_FROM_ADDRESS\":$(cove_json_str "hello@$full_hostname")}"
+        # A prefix of its own, so its keys stay apart once it uses Redis.
+        set="$set,\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t"),\"MAIL_FROM_ADDRESS\":$(cove_json_str "hello@$full_hostname"),\"REDIS_PREFIX\":$(cove_json_str "${site_name}_")}"
         if ! COVE_ENV_SET="$set" laravel_env_set "$stage/.env" || ! COVE_ENV_SET="$example}" laravel_env_set "$stage/.env.example"; then
             echo "❌ Error: Could not write the application's .env."
             exit 1
@@ -914,11 +915,24 @@ cove_add_laravel_from() {
         fi
     fi
 
-    # Services this machine's Cove doesn't run.
+    # Redis, when the app keeps its cache, sessions or queue there: Cove's,
+    # set up if it isn't yet, with a key prefix of the site's own.
+    local uses=""
     for k in CACHE_STORE CACHE_DRIVER SESSION_DRIVER QUEUE_CONNECTION; do
-        v=$(laravel_env_get "$site_dir" "$k")
-        [ "$v" = "redis" ] && COVE_ADD_NOTES+=("⚠️  $k is redis, and Cove runs no Redis: set it to database (or file) in .env.")
+        [ "$(laravel_env_get "$site_dir" "$k")" = "redis" ] && uses="$uses $k"
     done
+    if [ -n "$uses" ]; then
+        if ensure_redis >>"$log" 2>&1 && COVE_ENV_SET="{$(cove_redis_site_env "$site_name")}" laravel_env_set "$site_dir/.env"; then
+            COVE_ADD_NOTES+=("ℹ️  Its${uses} use Redis: Cove's, on 127.0.0.1:$(cove_redis_port), keys prefixed ${site_name}_.")
+            if ! COVE_PHP_BIN="$native" "$php" -r 'exit(extension_loaded("redis") ? 0 : 1);' 2>/dev/null && [ ! -d vendor/predis/predis ] && [ "$(laravel_env_get "$site_dir" REDIS_CLIENT)" != "predis" ]; then
+                COVE_ADD_NOTES+=("⚠️  This PHP has no redis extension: add the predis client (cove composer $site_name require predis/predis) and set REDIS_CLIENT=predis.")
+            fi
+        else
+            COVE_ADD_NOTES+=("⚠️  Its${uses} use Redis, which Cove couldn't start (see logs/laravel-setup.log): set them to database or file in .env.")
+        fi
+    else
+        COVE_ENV_SET="{\"REDIS_PREFIX\":$(cove_json_str "${site_name}_")}" laravel_env_set "$site_dir/.env" >/dev/null 2>&1
+    fi
     [ "$kind" = folder ] && [ "$conn" != "sqlite" ] && COVE_ADD_NOTES+=("ℹ️  The database started empty: the migrations made its tables, and none of the original's rows came along.")
     cd ~/ || true
     return 0
