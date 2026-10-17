@@ -723,11 +723,9 @@ if (!empty($_SERVER['COVE_TWIN_OF']) && isset($_SERVER['HTTP_HOST'])
 // A Laravel site (artisan beside the webroot) has error pages and handlers
 // of its own, and its own copy of Whoops: Cove's would load ahead of the
 // app's, and its shutdown handler would print a second page after Laravel's.
-if (isset($_SERVER['DOCUMENT_ROOT']) && is_file(dirname($_SERVER['DOCUMENT_ROOT']) . '/artisan')) {
-    return;
-}
+$__cove_laravel = isset($_SERVER['DOCUMENT_ROOT']) && is_file(dirname($_SERVER['DOCUMENT_ROOT']) . '/artisan');
 
-spl_autoload_register(function ($class) {
+if (!$__cove_laravel) spl_autoload_register(function ($class) {
     $prefix = 'Whoops\\';
     $base_dir = __DIR__ . '/whoops/src/Whoops/';
     
@@ -761,6 +759,18 @@ foreach (['HTTP_X_COVE_SHARE', 'HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 
     }
 }
 unset($__cove_ra, $__cove_h);
+if ($__cove_laravel) {
+    // Laravel's debug page is for this machine too. Anyone else gets its
+    // plain error page: APP_DEBUG set here wins over .env, which Laravel
+    // reads without overwriting what the environment already has.
+    if (!$__cove_local) {
+        $_SERVER['APP_DEBUG'] = $_ENV['APP_DEBUG'] = 'false';
+        putenv('APP_DEBUG=false');
+    }
+    unset($__cove_laravel, $__cove_local);
+    return;
+}
+unset($__cove_laravel);
 if (!$__cove_local) {
     unset($__cove_local);
     // Keep what Whoops did for these levels below: swallow them. Otherwise a
