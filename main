@@ -5293,10 +5293,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($cur !== '' || $has) $tokens[] = $cur;
                 if (!$tokens) { echo json_encode(['success' => false, 'message' => 'Nothing to run.']); exit; }
                 // Commands that wait on a terminal, or run until stopped.
+                // Artisan takes any unambiguous abbreviation (serv, q:w) and
+                // ignores case, so a name matches when each of its :-parts
+                // begins its counterpart's.
                 $long = ['tinker', 'db', 'serve', 'dev', 'pail', 'queue:work', 'queue:listen', 'schedule:work', 'horizon', 'reverb:start', 'octane:start', 'octane:frankenphp'];
-                if (in_array($tokens[0], $long, true)) {
-                    echo json_encode(['success' => false, 'message' => 'artisan ' . $tokens[0] . ' waits on a terminal or runs until stopped, so it can\'t run here. Use a terminal: cove artisan ' . $site_name . ' ' . $tokens[0]]);
-                    exit;
+                $g = explode(':', strtolower($tokens[0]));
+                foreach ($long as $name) {
+                    $p = explode(':', $name);
+                    if (count($p) !== count($g)) continue;
+                    $all = true;
+                    foreach ($g as $i => $part) { if ($part === '' || strpos($p[$i], $part) !== 0) { $all = false; break; } }
+                    if ($all) {
+                        echo json_encode(['success' => false, 'message' => 'artisan ' . $name . ' waits on a terminal or runs until stopped, so it can\'t run here. Use a terminal: cove artisan ' . $site_name . ' ' . $name]);
+                        exit;
+                    }
                 }
                 [$out, $code, $ms] = $__artisan($tokens);
                 echo json_encode(['success' => true, 'output' => $out, 'code' => $code, 'ms' => $ms]);

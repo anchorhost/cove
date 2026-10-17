@@ -254,6 +254,23 @@ const ARTISAN_READ = [
 const ARTISAN_LONG = ['tinker', 'db', 'serve', 'dev', 'pail', 'queue:work', 'queue:listen', 'schedule:work', 'horizon', 'reverb:start', 'octane:start', 'octane:frankenphp'];
 const ARTISAN_WIPE = ['db:wipe', 'migrate:fresh', 'migrate:reset', 'migrate:refresh'];
 
+// The blocked command a name stands for, if any. Artisan takes any
+// unambiguous abbreviation (serv, migrate:fr, m:f) and ignores case, so a
+// name matches when each of its :-parts begins its counterpart's.
+function artisan_names(string $given, array $names): ?string {
+    $g = explode(':', strtolower($given));
+    foreach ($names as $name) {
+        $p = explode(':', $name);
+        if (count($p) !== count($g)) continue;
+        $all = true;
+        foreach ($g as $i => $part) {
+            if ($part === '' || strpos($p[$i], $part) !== 0) { $all = false; break; }
+        }
+        if ($all) return $name;
+    }
+    return null;
+}
+
 function artisan_tokens(array $a): array {
     $tokens = !empty($a['args']) && is_array($a['args']) ? array_map('strval', array_values($a['args'])) : split_line((string) ($a['command'] ?? ''));
     if ($tokens && $tokens[0] === 'php') array_shift($tokens);
@@ -855,9 +872,8 @@ function call_tool(string $name, array $a): array {
         case 'artisan':
             $site = laravel_arg($a);
             $tokens = artisan_tokens($a);
-            $cmd = strtolower($tokens[0]);
-            if (in_array($cmd, ARTISAN_LONG, true)) throw new ToolError("artisan $cmd waits on a terminal or runs until stopped, so it can't run here." . (in_array($cmd, ['queue:work', 'queue:listen', 'schedule:work'], true) ? ' laravel_workers keeps a queue worker and the scheduler running.' : ''));
-            if (in_array($cmd, ARTISAN_WIPE, true)) throw new ToolError("`artisan $cmd` wipes the whole database, which this server leaves to a terminal. Take a snapshot first (snapshot_create) and run it yourself with: cove artisan $site $cmd");
+            if ($cmd = artisan_names($tokens[0], ARTISAN_LONG)) throw new ToolError("artisan $cmd waits on a terminal or runs until stopped, so it can't run here." . (in_array($cmd, ['queue:work', 'queue:listen', 'schedule:work'], true) ? ' laravel_workers keeps a queue worker and the scheduler running.' : ''));
+            if ($cmd = artisan_names($tokens[0], ARTISAN_WIPE)) throw new ToolError("`artisan $cmd` wipes the whole database, which this server leaves to a terminal. Take a snapshot first (snapshot_create) and run it yourself with: cove artisan $site $cmd"); 
             return run_artisan($site, $tokens);
 
         case 'laravel_workers':
