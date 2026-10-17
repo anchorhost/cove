@@ -347,6 +347,14 @@ code=$(curl -sk --max-time 60 -c /tmp/lv-jar -b /tmp/lv-jar "$link" -o /dev/null
 me=""
 for i in 1 2 3 4 5; do me=$(curl -sk --max-time 60 -b /tmp/lv-jar https://lvl.localhost/me); [ "$me" = m@matrix.test ] && break; sleep 1; done
 [ "$me" = m@matrix.test ] || fail "the login link did not sign in: /me said $(echo "$me" | head -c 80)"
+# An existing project from a folder outside Cove: copied without vendor/,
+# packages installed again, its SQLite rows along with it.
+rm -rf /root/lv-src && cp -a /root/Cove/Sites/lvl.localhost /root/lv-src && rm -rf /root/lv-src/logs
+cove add lvf --from=/root/lv-src >/tmp/lv-from.log 2>&1 || fail "cove add --from: $(tail -n 8 /tmp/lv-from.log)"
+[ "$(up lvf)" = 200 ] || fail "/up on the app from a folder answered $(up lvf)"
+cove laravel lvf users | grep -q 'm@matrix.test' || fail "the copied app lost its users"
+grep -q "^DB_DATABASE=/root/lv-src" /root/Cove/Sites/lvf.localhost/.env && fail "the copy's .env still names the original's database"
+cove delete lvf --force >/dev/null 2>&1 || fail "delete lvf"
 cove add lvm laravel --database=mysql >/tmp/lv-addm.log 2>&1 || fail "cove add (mysql): $(tail -n 6 /tmp/lv-addm.log)"
 [ "$(up lvm)" = 200 ] || fail "/up on the MariaDB app answered $(up lvm)"
 if cove login lvm --plain >/dev/null 2>&1; then fail "cove login made a link for an app with no users"; fi
