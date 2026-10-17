@@ -4016,6 +4016,92 @@ function cove_minn_version($public) {
     return ($head !== false && preg_match("/MINN_ENGINE_VERSION', '([^']+)'/", $head, $m)) ? $m[1] : null;
 }
 
+// A Laravel application with its project root at the site folder, as the
+// CLI's site_is_laravel has it.
+function cove_site_is_laravel($site_path) {
+    return is_file($site_path . '/artisan') && is_file($site_path . '/bootstrap/app.php') && is_file($site_path . '/public/index.php');
+}
+
+// A Laravel .env as key => value, quotes removed and nothing expanded:
+// enough for the keys the dashboard reads.
+function cove_laravel_env($site_path) {
+    $out = [];
+    foreach (@file($site_path . '/.env', FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+        if (!preg_match('/^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$/', $line, $m)) continue;
+        $v = trim($m[2]);
+        if (strlen($v) >= 2 && ($v[0] === '"' || $v[0] === "'") && substr($v, -1) === $v[0]) $v = substr($v, 1, -1);
+        elseif (($p = strpos($v, ' #')) !== false) $v = rtrim(substr($v, 0, $p));
+        $out[$m[1]] = $v;
+    }
+    return $out;
+}
+
+// The SQLite file a Laravel site uses: DB_DATABASE when it is an absolute
+// path, else Laravel's own default, database/database.sqlite.
+function cove_laravel_sqlite_path($site_path, $env = null) {
+    $env = $env ?? cove_laravel_env($site_path);
+    $db = $env['DB_DATABASE'] ?? '';
+    return ($db !== '' && $db[0] === '/') ? $db : $site_path . '/database/database.sqlite';
+}
+
+// What the sites list says about a Laravel site: the framework's version
+// (its own constant, no boot) and the database .env names. An SQLite
+// database goes by "sqlite:<site>" in the database view.
+function cove_laravel_facts($site_path, $site_name) {
+    $head = @file_get_contents($site_path . '/vendor/laravel/framework/src/Illuminate/Foundation/Application.php', false, null, 0, 16384);
+    $env = cove_laravel_env($site_path);
+    $conn = $env['DB_CONNECTION'] ?? 'sqlite';
+    $db_name = null;
+    if ($conn === 'mysql' || $conn === 'mariadb') $db_name = $env['DB_DATABASE'] ?? null;
+    elseif ($conn === 'sqlite' && is_file(cove_laravel_sqlite_path($site_path, $env))) $db_name = 'sqlite:' . $site_name;
+    return [
+        'version' => ($head !== false && preg_match("/const VERSION = '([^']+)'/", $head, $m)) ? $m[1] : null,
+        'db' => $conn,
+        'db_name' => $db_name,
+    ];
+}
+
+// A Laravel site's log: the newest file in storage/logs (laravel.log, or
+// today's file when the app logs daily).
+function cove_laravel_log($site_path) {
+    $log = $site_path . '/storage/logs/laravel.log'; $mt = 0;
+    foreach (glob($site_path . '/storage/logs/*.log') ?: [] as $f) {
+        $t = (int) @filemtime($f);
+        if ($t > $mt) { $mt = $t; $log = $f; }
+    }
+    return $log;
+}
+
+// When a Laravel site last changed: its own folders and settings, since
+// public/ keeps the dates Composer's package gave it.
+function cove_laravel_mtime($site_path) {
+    $t = 0;
+    foreach (['', '/app', '/routes', '/resources', '/config', '/database', '/.env', '/composer.lock'] as $p) $t = max($t, (int) @filemtime($site_path . $p));
+    return $t ?: null;
+}
+
+// Errors Laravel logged in the last day, in its newest storage/logs file.
+// Its stamps are in the app's timezone, which is UTC unless changed.
+function cove_recent_laravel_errors($site_path) {
+    $log = cove_laravel_log($site_path);
+    $mt = (int) @filemtime($log);
+    if (!$mt || $mt < time() - 86400) return 0;
+    $size = (int) @filesize($log);
+    $fh = @fopen($log, 'rb');
+    if (!$fh) return 0;
+    fseek($fh, max(0, $size - 2097152));
+    $text = (string) fread($fh, 2097152);
+    fclose($fh);
+    if (!preg_match_all('/^\[(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})[^\]]*\] [\w-]+\.(?:ERROR|CRITICAL|ALERT|EMERGENCY):/m', $text, $m)) return 0;
+    $cut = time() - 86400;
+    $n = 0;
+    foreach ($m[1] as $when) {
+        $t = strtotime(str_replace('T', ' ', $when) . ' UTC');
+        if ($t && $t >= $cut) $n++;
+    }
+    return $n;
+}
+
 // --- What the sites list says about each site ---------------------------
 // Beyond the name: what runs it and the last plugin or theme change (from
 // the nightly history save), when someone last opened it in a browser, and
@@ -4365,11 +4451,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                     $multisite_mode = is_file($site_path . '/multisite') ? trim((string) @file_get_contents($site_path . '/multisite')) : '';
                     $is_minn = cove_site_is_minn($site_path . '/public');
                     $is_wp = $is_minn || file_exists($site_path . '/public/wp-config.php');
+                    $laravel = !$is_wp && cove_site_is_laravel($site_path) ? cove_laravel_facts($site_path, str_replace('.localhost', '', $item)) : null;
 
                     $__f = $__facts[$item] ?? [];
                     $__f['visit'] = cove_last_visit($site_path . '/logs/caddy.log', $__f['visit'] ?? null);
                     $static_facts = null;
-                    if (!$is_wp) {
+                    if (!$is_wp && !$laravel) {
                         $pm = @filemtime($site_path . '/public') ?: 0;
                         if (($__f['static']['mtime'] ?? -1) !== $pm) $__f['static'] = cove_static_facts($site_path . '/public') + ['mtime' => $pm];
                         $static_facts = ['title' => $__f['static']['title'], 'files' => $__f['static']['files']];
@@ -4383,7 +4470,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'mappings' => $mappings_list,
                         'multisite' => $multisite_mode !== '' ? $multisite_mode : null,
                         'domain' => 'https://' . $item . $__cove_port_suffix,
-                        'type' => $is_minn ? 'Minn' : (file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain'),
+                        'type' => $is_minn ? 'Minn' : ($laravel ? 'Laravel' : (file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain')),
+                        // Laravel: {version, db (the connection), db_name}.
+                        'laravel' => $laravel,
                         // On a Minn site, the WordPress release the engine speaks.
                         'wp_version' => $wp_version,
                         'minn_version' => $is_minn ? cove_minn_version($site_path . '/public') : null,
@@ -4394,8 +4483,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'display_path' => '~/Cove/Sites/' . $item,
                         'full_path' => $site_path,
                         'size_bytes' => isset($size_cache[$item]) ? (int) $size_cache[$item] : null,
-                        'modified_at' => $mtime ?: null,
-                        'db_name' => $db_name,
+                        'modified_at' => ($laravel ? cove_laravel_mtime($site_path) : $mtime) ?: null,
+                        'db_name' => $laravel ? $laravel['db_name'] : $db_name,
                         // Per-site PHP pin (`cove php`); null = Cove's default PHP.
                         'php_version' => is_file($site_path . '/php_version') ? trim((string) @file_get_contents($site_path . '/php_version')) : null,
                         // When the dashboard's preview of the front page was captured.
@@ -4406,7 +4495,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'static' => $static_facts,
                         // Unix time of the last visit from a browser, or null.
                         'seen_at' => $__f['visit']['ts'],
-                        'php_errors' => $is_wp ? cove_recent_php_errors($site_path . '/public/wp-content/debug.log') : 0,
+                        'php_errors' => $is_wp ? cove_recent_php_errors($site_path . '/public/wp-content/debug.log') : ($laravel ? cove_recent_laravel_errors($site_path) : 0),
                         'twin' => $twin_domain,
                     ];
                 }
@@ -4616,11 +4705,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $flavor = 'plain';
                 } elseif (!empty($input['wp_version']) && $input['wp_version'] !== 'latest') {
                     $v = $input['wp_version'];
-                    if ($v === 'nightly' || $v === 'minn' || preg_match('/^\d+(\.\d+){1,2}(-[A-Za-z0-9.]+)?$/', $v)) {
+                    if ($v === 'nightly' || $v === 'minn' || $v === 'laravel' || preg_match('/^\d+(\.\d+){1,2}(-[A-Za-z0-9.]+)?$/', $v)) {
                         $flavor = $v;
                     }
                 }
-                $command = sprintf('HOME=%s %s add %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $flavor !== '' ? escapeshellarg($flavor) : '');
+                // A Laravel site's database: sqlite (the default) or mysql.
+                $database = $flavor === 'laravel' && in_array($input['database'] ?? '', ['sqlite', 'mysql', 'mariadb'], true) ? '--database=' . $input['database'] : '';
+                $command = sprintf('HOME=%s %s add %s %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $flavor !== '' ? escapeshellarg($flavor) : '', $database !== '' ? escapeshellarg($database) : '');
                 // Remember we're adding so the post-exec block below can
                 // measure the new site's size and fold it into the cache.
                 $add_site_target = $site_name;
@@ -5836,7 +5927,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     case 'reload':   return [$__logs_dir . '/caddy-reload.log', 'caddy', null];
                     case 'watchdog': return [$__logs_dir . '/watchdog.log', 'plain', null];
                     case 'mailpit':  return [$__logs_dir . '/mailpit.log', 'plain', null];
-                    case 'debug':    return $site_dir ? [$site_dir . '/public/wp-content/debug.log', 'php', null] : null;
+                    case 'debug':
+                        if (!$site_dir) return null;
+                        // A Laravel site's own log takes the WordPress debug.log's place.
+                        if (cove_site_is_laravel($site_dir)) return [cove_laravel_log($site_dir), 'laravel', null];
+                        return [$site_dir . '/public/wp-content/debug.log', 'php', null];
                     case 'access':   return $site_dir ? [$site_dir . '/logs/caddy.log', 'caddy', null] : null;
                 }
                 if (preg_match('/^fpm-(\d+\.\d+)$/', $source, $m)) return [$__logs_dir . '/php-fpm-' . $m[1] . '.log', 'plain', null];
@@ -5858,10 +5953,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         if ($item === '.' || $item === '..' || substr($item, -10) !== '.localhost' || !is_dir($sitedir . '/' . $item)) continue;
                         if (cove_demo_hides($user_home, $item)) continue;
                         $name = substr($item, 0, -10);
-                        $dbg = $sitedir . '/' . $item . '/public/wp-content/debug.log';
+                        $is_laravel = cove_site_is_laravel($sitedir . '/' . $item);
+                        $dbg = $is_laravel ? cove_laravel_log($sitedir . '/' . $item) : $sitedir . '/' . $item . '/public/wp-content/debug.log';
                         $acc = $sitedir . '/' . $item . '/logs/caddy.log';
                         $d = is_file($dbg) ? filesize($dbg) : null; $a = is_file($acc) ? filesize($acc) : null;
-                        $sites[] = ['name' => $name, 'debug' => $d, 'access' => $a, 'mtime' => max($d ? filemtime($dbg) : 0, $a ? filemtime($acc) : 0) ?: null];
+                        $sites[] = ['name' => $name, 'debug' => $d, 'access' => $a, 'laravel' => $is_laravel, 'mtime' => max($d ? filemtime($dbg) : 0, $a ? filemtime($acc) : 0) ?: null];
                     }
                 }
                 echo json_encode(['success' => true, 'system' => $system, 'sites' => $sites, 'dir' => $__logs_dir]);
@@ -5890,6 +5986,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 foreach (explode("\n", $text) as $line) {
                     if ($line === '' || $line === "\r") continue;
                     if ($__log_kind === 'php' && $out && $line[0] !== '[') { $out[count($out) - 1] .= "\n" . $line; continue; }
+                    // Laravel's entries open with a dated stamp; its "[stacktrace]"
+                    // and "[previous exception]" lines belong to the entry above.
+                    if ($__log_kind === 'laravel' && $out && !preg_match('/^\[\d{4}-\d{2}-\d{2}[ T]\d/', $line)) { $out[count($out) - 1] .= "\n" . $line; continue; }
                     $out[] = $line;
                 }
                 return $out;
@@ -5940,7 +6039,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($start > 0) {
                     // Drop the partial entry at the top of the chunk; the next
                     // (older) chunk will contain it whole.
-                    $pos = $__log_kind === 'php' ? strpos($text, "\n[") : strpos($text, "\n");
+                    if ($__log_kind === 'laravel') $pos = preg_match('/\n\[\d{4}-\d{2}-\d{2}[ T]\d/', $text, $__lm, PREG_OFFSET_CAPTURE) ? $__lm[0][1] : false;
+                    else $pos = $__log_kind === 'php' ? strpos($text, "\n[") : strpos($text, "\n");
                     if ($pos === false) { $scanned += $end - $start; $end = $start; continue; }
                     $text = substr($text, $pos + 1);
                     $start += $pos + 1;
@@ -6397,6 +6497,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             --pill-minn-bg: color-mix(in oklch, oklch(74% 0.15 45) 18%, transparent);
             --pill-minn-fg: #f2a582;
             --pill-minn-fg: oklch(82% 0.11 45);
+            /* Laravel: a violet, clear of both the teal and Minn's coral. */
+            --pill-laravel-bg: rgba(160, 138, 230, 0.18);
+            --pill-laravel-bg: color-mix(in oklch, oklch(70% 0.13 295) 18%, transparent);
+            --pill-laravel-fg: #c3b2f2;
+            --pill-laravel-fg: oklch(82% 0.08 295);
             --pill-static-bg: #1e2320;
             --pill-static-fg: #9a9d94;
             --input-bg: #0b0e0c;
@@ -6407,6 +6512,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             --ok: #2bb98a;
             --warn: #e3a94f;
             --minn: #e5845c;
+            --laravel: #a08ae6;
             --mark: rgba(77, 176, 194, 0.24);
             --scrim: rgba(15, 18, 16, 0.86);
             --shadow-pop: 0 1px 2px rgba(0, 0, 0, 0.4), 0 14px 40px rgba(0, 0, 0, 0.45);
@@ -6440,6 +6546,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             --pill-minn-bg: color-mix(in oklch, oklch(66% 0.15 45) 14%, transparent);
             --pill-minn-fg: #8a3d1e;
             --pill-minn-fg: oklch(44% 0.11 45);
+            --pill-laravel-bg: rgba(120, 92, 204, 0.13);
+            --pill-laravel-bg: color-mix(in oklch, oklch(55% 0.15 295) 14%, transparent);
+            --pill-laravel-fg: #4b3690;
+            --pill-laravel-fg: oklch(42% 0.13 295);
             --pill-static-bg: #f1ede5;
             --pill-static-fg: #8a8781;
             --input-bg: #fbfaf7;
@@ -6448,6 +6558,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             --ok: #089772;
             --warn: #a8650f;
             --minn: #d3704a;
+            --laravel: #7d63c9;
             --mark: rgba(58, 151, 169, 0.22);
             --scrim: rgba(251, 250, 247, 0.86);
             --shadow-pop: 0 1px 2px rgba(26, 28, 27, 0.06), 0 10px 30px rgba(26, 28, 27, 0.1);
@@ -6700,6 +6811,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .sl-type:hover { filter: brightness(1.12); }
         .sl-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
         .sl-type.minn { background: var(--pill-minn-bg); color: var(--pill-minn-fg); }
+        .sl-type.laravel { background: var(--pill-laravel-bg); color: var(--pill-laravel-fg); }
         .sl-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); box-shadow: inset 0 0 0 1px var(--hairline); }
         .sl-ver { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); white-space: nowrap; }
         .sl-php { font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-faint); border: 1px solid var(--hairline); border-radius: 999px; padding: 0 0.4rem; white-space: nowrap; }
@@ -6709,6 +6821,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .site-type:hover { filter: brightness(1.15); }
         .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
         .site-type.minn { background: var(--pill-minn-bg); color: var(--pill-minn-fg); }
+        .site-type.laravel { background: var(--pill-laravel-bg); color: var(--pill-laravel-fg); }
         .site-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); }
         @keyframes php-pulse { 50% { opacity: 0.45; } }
         .sl-php.applying { border-color: var(--accent); color: var(--text-dim); animation: php-pulse 1.2s ease-in-out infinite; }
@@ -6795,6 +6908,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .sl-tdot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
         .sl-tdot.wp { background: var(--accent); }
         .sl-tdot.minn { background: var(--minn); }
+        .sl-tdot.laravel { background: var(--laravel); }
         .sl-tdot.static { background: var(--panel-border-strong); }
 
         .sl-state { margin-top: 1.6rem; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); border: 1px dashed var(--panel-border); border-radius: 12px; }
@@ -7692,6 +7806,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <select class="wp-version" id="wpVersionSelect" title="What to install: a WordPress version, or Minn Engine once it has a release" aria-label="What to install">
                         <option value="latest">latest</option>
                         <option value="nightly">nightly</option>
+                        <option value="laravel">laravel</option>
+                    </select>
+                    <select class="wp-version" id="laravelDbSelect" title="Laravel's database: SQLite, Laravel's own default, or MySQL on Cove's MariaDB" aria-label="Laravel's database" style="display: none;">
+                        <option value="sqlite">sqlite</option>
+                        <option value="mysql">mysql</option>
                     </select>
                     <button class="pill primary" type="submit" id="btnCreate" disabled>
                         <span class="btn-spinner" id="createSpinner" aria-hidden="true" style="display: none;"></span>
@@ -8178,7 +8297,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <button type="button" class="site-tile" data-go="files"><span class="site-tile-text"><span class="site-tile-name">files</span><span class="site-tile-desc">Browse and edit the site's directory, upload, tidy up.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M8 10 h16 l5 5 h27 v22 H8 Z"/><path class="art-line" d="M8 10 h16 l5 5 h27 v22 H8 Z"/><path class="art-line" d="M8 20 h48"/><path class="art-line" d="M20 28 h18 M20 33 h12"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
                     <button type="button" class="site-tile" data-go="db" id="tileDb"><span class="site-tile-text"><span class="site-tile-name">database</span><span class="site-tile-desc">Tables, rows in place, a SQL console.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M16 9 a16 5 0 0 1 32 0 v22 a16 5 0 0 1 -32 0 Z"/><ellipse class="art-line" cx="32" cy="9" rx="16" ry="5"/><path class="art-line" d="M16 9 v22 a16 5 0 0 0 32 0 V9"/><path class="art-line" d="M16 20 a16 5 0 0 0 32 0"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
                     <button type="button" class="site-tile" data-go="mail"><span class="site-tile-text"><span class="site-tile-name">mail</span><span class="site-tile-desc">Everything this site has sent, links lifted out.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M9 12 h46 v24 H9 Z"/><path class="art-line" d="M9 12 h46 v24 H9 Z"/><path class="art-line" d="M9 13 l23 15 l23 -15"/><path class="art-line" d="M9 36 l17 -13 M55 36 l-17 -13"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
-                    <button type="button" class="site-tile" data-go="logs"><span class="site-tile-text"><span class="site-tile-name">logs</span><span class="site-tile-desc">PHP errors, debug.log, and the access log, live.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M14 6 h36 v30 H14 Z"/><path class="art-line" d="M14 6 h36 v30 H14 Z"/><path class="art-line" d="M21 14 h22 M21 20 h14 M21 26 h18"/><circle class="art-dot" cx="45" cy="26" r="2.2"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
+                    <button type="button" class="site-tile" data-go="logs"><span class="site-tile-text"><span class="site-tile-name">logs</span><span class="site-tile-desc" id="siteLogsDesc">PHP errors, debug.log, and the access log, live.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M14 6 h36 v30 H14 Z"/><path class="art-line" d="M14 6 h36 v30 H14 Z"/><path class="art-line" d="M21 14 h22 M21 20 h14 M21 26 h18"/><circle class="art-dot" cx="45" cy="26" r="2.2"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
                 </div>
                 </div>
                 <div class="site-health" id="siteHealth"></div>
@@ -8734,7 +8853,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // from the site objects because getSites() rebuilds those from the
             // server and would drop a flag stored on them mid-install.
             phpApplying: {},
-            newSite: { name: '', isPlain: false, wpVersion: 'latest', isLoading: false },
+            newSite: { name: '', isPlain: false, wpVersion: 'latest', database: 'sqlite', isLoading: false },
             // Populated lazily the first time the add row opens — no reason
             // to hit wp.org on a page load that never creates a site. Stays
             // empty when offline, leaving 'latest' and 'nightly' available.
@@ -8802,7 +8921,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             get totalBytes() { return this.sites.reduce((t, s) => t + (s.size_bytes || 0), 0); },
             // Every site the quick filter and the filter box let through, in
             // the chosen order. The box takes words (part of the address, or
-            // the type) and tokens: type:wp|minn|static, is:pinned|idle|
+            // the type) and tokens: type:wp|minn|laravel|static, is:pinned|idle|
             // outdated|insecure|multisite, has:mail|errors|preview|twin,
             // plugin:<slug>, theme:<name>, php:<version>.
             get filteredSites() {
@@ -8862,7 +8981,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
             sortSites(list) {
                 // Version segments compare numerically so 6.10 outranks 6.9.
-                const ver = s => (s.type === 'Minn' ? s.minn_version : s.wp_version) || '';
+                const ver = s => (s.type === 'Minn' ? s.minn_version : s.type === 'Laravel' ? (s.laravel || {}).version : s.wp_version) || '';
                 const vcmp = (a, b) => {
                     const pa = ver(a).split('.'), pb = ver(b).split('.');
                     for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
@@ -8871,7 +8990,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     }
                     return 0;
                 };
-                const rank = { WordPress: 0, Minn: 1, Plain: 2 };
+                const rank = { WordPress: 0, Minn: 1, Laravel: 2, Plain: 3 };
                 const by = {
                     name: (a, b) => a.name.localeCompare(b.name),
                     size: (a, b) => (b.size_bytes || 0) - (a.size_bytes || 0) || a.name.localeCompare(b.name),
@@ -8886,6 +9005,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     { id: 'all', label: 'all', test: () => true },
                     { id: 'wp', label: 'wordpress', test: s => s.type === 'WordPress' },
                     { id: 'minn', label: 'minn', test: s => s.type === 'Minn' },
+                    { id: 'laravel', label: 'laravel', test: s => s.type === 'Laravel' },
                     { id: 'static', label: 'static', test: s => s.type === 'Plain' },
                     { id: 'pinned', label: 'pinned', test: s => this.isPinned(s.name) },
                     { id: 'attention', label: 'php errors', dot: 'danger', test: s => !!this.siteAttention(s) },
@@ -8919,6 +9039,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             siteTypeInfo(type) {
                 if (type === 'WordPress') return { cls: 'wp', pill: 'WP', name: 'WordPress', short: 'wp' };
                 if (type === 'Minn') return { cls: 'minn', pill: 'MINN', name: 'Minn Engine', short: 'minn' };
+                if (type === 'Laravel') return { cls: 'laravel', pill: 'LARAVEL', name: 'Laravel', short: 'laravel' };
                 return { cls: 'static', pill: 'STATIC', name: 'static', short: 'static' };
             },
             isWpLike(site) { return !!site && (site.type === 'WordPress' || site.type === 'Minn'); },
@@ -9315,7 +9436,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.newSite.isPlain = e.target.checked;
                     this.render();
                 });
-                $id('wpVersionSelect').addEventListener('change', (e) => { this.newSite.wpVersion = e.target.value; });
+                $id('wpVersionSelect').addEventListener('change', (e) => { this.newSite.wpVersion = e.target.value; this.renderChrome(); });
+                $id('laravelDbSelect').addEventListener('change', (e) => { this.newSite.database = e.target.value; this.renderChrome(); });
                 $id('addForm').addEventListener('submit', (e) => { e.preventDefault(); this.addSite(); });
                 const drop = $id('addDrop');
                 const dropInput = $id('addDropInput');
@@ -9562,13 +9684,17 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const sel = $id('wpVersionSelect');
                 show(sel, !this.newSite.isPlain);
                 sel.disabled = this.newSite.isLoading || this.newSite.isPlain;
+                // Laravel asks one more thing: its database.
+                const isLaravel = !this.newSite.isPlain && this.newSite.wpVersion === 'laravel';
+                show($id('laravelDbSelect'), isLaravel);
+                $id('laravelDbSelect').disabled = this.newSite.isLoading;
                 $id('btnCreate').disabled = !this.newSite.name || this.newSite.isLoading;
                 show($id('createSpinner'), this.newSite.isLoading);
                 $id('createLabel').textContent = this.newSite.isLoading ? 'creating…' : (this.importFile ? 'create & import' : 'create');
                 this.renderImportProgress();
                 // The same, from a terminal.
                 const nm = this.newSite.name || 'mysite';
-                const fl = this.newSite.isPlain ? ' plain' : (this.newSite.wpVersion && this.newSite.wpVersion !== 'latest' ? ' ' + this.newSite.wpVersion : '');
+                const fl = this.newSite.isPlain ? ' plain' : (this.newSite.wpVersion && this.newSite.wpVersion !== 'latest' ? ' ' + this.newSite.wpVersion : '') + (isLaravel && this.newSite.database !== 'sqlite' ? ' --database=' + this.newSite.database : '');
                 $id('addEcho').textContent = this.importFile ? 'cove import ' + nm + ' ' + this.importFile.name : 'cove add ' + nm + fl;
 
                 // Theme button tooltip tracks the mode it would switch to.
@@ -9699,6 +9825,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
             siteVerHtml(site) {
                 const esc = (v) => this.escapeHtml(v == null ? '' : String(v));
+                if (site.type === 'Laravel') {
+                    const v = (site.laravel || {}).version;
+                    return v ? '<span class="sl-ver" title="Laravel ' + esc(v) + '">' + esc(v) + '</span>' : '';
+                }
                 if (site.type === 'Minn') {
                     if (!site.minn_version) return '';
                     return '<span class="sl-ver" title="Minn Engine ' + esc(site.minn_version) + (site.wp_version ? ', speaking WordPress ' + esc(site.wp_version) : '') + '">' + esc(site.minn_version) + '</span>';
@@ -9743,6 +9873,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     const st = site.static || {};
                     const files = st.files ? '<span class="n">' + (st.files >= 5000 ? '5000+' : st.files) + ' file' + (st.files === 1 ? '' : 's') + '</span>' : '';
                     top = st.title ? '“' + esc(st.title) + '”' + (files ? ' <span class="n">·</span> ' + files : '') : (files || '<span class="n">static files</span>');
+                } else if (site.type === 'Laravel') {
+                    // The database .env names; the kind column has the version.
+                    const l = site.laravel || {};
+                    const names = { sqlite: 'SQLite', mysql: 'MySQL', mariadb: 'MariaDB', pgsql: 'PostgreSQL' };
+                    top = esc(names[l.db] || l.db || 'no database') + (l.db !== 'sqlite' && l.db_name ? ' <span class="n">· ' + esc(l.db_name) + '</span>' : ' <span class="n">database</span>');
                 } else {
                     const c = site.card;
                     if (!c) top = '<span class="n">no history saves yet</span>';
@@ -9815,7 +9950,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
             siteIdxHtml(site, q) {
                 const t = this.siteTypeInfo(site.type);
-                const v = site.type === 'Minn' ? site.minn_version : site.wp_version;
+                const v = site.type === 'Minn' ? site.minn_version : site.type === 'Laravel' ? (site.laravel || {}).version : site.wp_version;
                 return '<div class="' + this.siteStateClasses(site, 'sl-idx', true) + '" data-name="' + this.escapeHtml(site.name) + '" title="' + this.escapeHtml(t.name + (v ? ' ' + v : '') + ' · changed ' + this.formatRelative(site.modified_at) + ' ago' + (site.size_bytes ? ' · ' + this.formatSize(site.size_bytes) : '')) + '">'
                     + '<i class="sl-tdot ' + t.cls + '" aria-hidden="true"></i>' + this.siteHostHtml(site, q) + this.sitePinHtml(site) + this.siteSignalsHtml(site) + '<span class="sl-age">' + this.formatRelative(site.modified_at) + '</span></div>';
             },
@@ -9927,6 +10062,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const types = [
                     { type: 'WordPress', color: 'var(--accent)', chip: 'wp' },
                     { type: 'Minn', color: 'var(--minn)', chip: 'minn' },
+                    { type: 'Laravel', color: 'var(--laravel)', chip: 'laravel' },
                     { type: 'Plain', color: 'var(--panel-border-strong)', chip: 'static' },
                 ].map(t => ({ ...t, n: sites.filter(s => s.type === t.type).length, b: sites.filter(s => s.type === t.type).reduce((x, s) => x + (s.size_bytes || 0), 0) })).filter(t => t.n);
                 const typeName = (t) => esc(this.siteTypeInfo(t.type).name.toLowerCase());
@@ -12036,6 +12172,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     l.dir = res.dir || '';
                     l.sourcesLoaded = true;
                     this.renderLogsSide();
+                    // The debug.log tab is called laravel.log on a Laravel site.
+                    this.renderLogsBar();
                 });
                 return l.sourcesPromise;
             },
@@ -12186,6 +12324,22 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         }
                         e.detail = JSON.stringify(j, null, 2);
                     } catch (err) { e.msg = head; e.detail = rest; }
+                } else if (kind === 'laravel') {
+                    // [2026-10-17 06:04:48] local.ERROR: message {"exception":"[object]
+                    // (RuntimeException(code: 0): message at /path/file.php:22)
+                    // [stacktrace] … Stamps are the app's timezone, UTC by default.
+                    const m = /^\[(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})[^\]]*\]\s+[\w-]+\.([A-Z]+):\s?(.*)$/s.exec(head);
+                    if (m) {
+                        const t = Date.parse(m[1] + 'T' + m[2] + 'Z');
+                        e.ts = isNaN(t) ? null : t / 1000;
+                        e.level = /^(EMERGENCY|ALERT|CRITICAL|ERROR)$/.test(m[3]) ? 'error' : m[3] === 'WARNING' ? 'warning' : m[3] === 'NOTICE' ? 'notice' : m[3] === 'DEBUG' ? 'log' : 'info';
+                        e.msg = m[4].replace(/\s+[\[{]".*$/s, '');
+                        const at = / at (\/\S+?):(\d+)\)/.exec(raw);
+                        if (at) { e.file = at[1]; e.line = at[2]; }
+                    }
+                    e.detail = rest || (m && m[4] !== e.msg ? m[4] : '');
+                    const sm = /\/Sites\/([a-z0-9-]+)\.localhost\//i.exec(raw);
+                    if (sm) e.site = sm[1].toLowerCase();
                 } else {
                     const m = /^\[([^\]]+)\]\s?(.*)$/s.exec(head);
                     let body = head;
@@ -12319,6 +12473,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         b.classList.toggle('is-active', l.tab === t);
                         b.setAttribute('aria-selected', l.tab === t ? 'true' : 'false');
                         if (meta && t === 'debug') b.style.opacity = meta.debug ? '' : '0.5';
+                        if (t === 'debug') { b.textContent = meta && meta.laravel ? 'laravel.log' : 'debug.log'; b.title = meta && meta.laravel ? 'storage/logs, the newest file' : 'wp-content/debug.log'; }
                         if (meta && t === 'access') b.style.opacity = meta.access ? '' : '0.5';
                     });
                 }
@@ -12342,9 +12497,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     $id('logsEmptyText').textContent = l.missing ? 'No log file yet.' : filtered ? 'Nothing matches.' : (l.site && l.tab === 'errors' ? 'No PHP errors mention this site.' : 'Nothing logged.');
                     const meta = l.site ? l.sites.find(x => x.name === l.site) : null;
                     $id('logsEmptyHint').textContent = l.missing
-                        ? (l.tab === 'debug' ? 'Set WP_DEBUG and WP_DEBUG_LOG in wp-config.php and WordPress will write one.' : '')
+                        ? (l.tab === 'debug' ? (meta && meta.laravel ? 'Laravel writes storage/logs/laravel.log the first time something is logged.' : 'Set WP_DEBUG and WP_DEBUG_LOG in wp-config.php and WordPress will write one.') : '')
                         : filtered ? 'Press Esc to clear the filters.'
-                        : (l.site && l.tab === 'errors' && meta && meta.debug) ? 'This site keeps its PHP errors in its own debug.log — see the debug.log tab.'
+                        : (l.site && l.tab === 'errors' && meta && meta.debug) ? (meta.laravel ? 'Laravel keeps this site\'s errors in its own log — see the laravel.log tab.' : 'This site keeps its PHP errors in its own debug.log — see the debug.log tab.')
                         : (l.scanned ? 'Looked through the last ' + this.formatSize(l.scanned) + '.' : '');
                 }
                 const tpl = $id('tpl-log-row');
@@ -12490,6 +12645,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 }
                 const isWp = this.isWpLike(site);
                 const isMinn = site.type === 'Minn';
+                $id('siteLogsDesc').textContent = 'PHP errors, ' + (site.type === 'Laravel' ? 'laravel.log' : 'debug.log') + ', and the access log, live.';
                 const facts = $id('siteFacts');
                 facts.innerHTML = '';
                 const fact = (text, cls, title) => { const s = document.createElement('span'); s.className = 'fact' + (cls ? ' ' + cls : ''); s.textContent = text; if (title) s.title = title; facts.appendChild(s); return s; };
@@ -12531,7 +12687,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // Tabs: WordPress only; a static site has just the overview.
                 if (!isWp && p.tab !== 'overview' && p.tab !== 'snapshots' && p.tab !== 'traffic' && p.tab !== 'history') { p.tab = 'overview'; this.syncUrl({ replace: true }); }
                 show($id('siteTabs'), true);
-                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); show(b, isWp || ['overview', 'snapshots', 'traffic', 'history'].includes(b.dataset.tab)); });
+                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); show(b, isWp || ['overview', 'snapshots', 'traffic'].includes(b.dataset.tab) || (b.dataset.tab === 'history' && site.type !== 'Laravel')); });
                 for (const tb of this.siteTabs) show($id('sitePanel-' + tb), p.tab === tb);
                 this.renderSiteTab();
             },
@@ -15994,7 +16150,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // plain `cove add <name>` produces.
                 const wpVersion = isPlain ? '' : this.newSite.wpVersion;
 
-                const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined });
+                const isLaravel = wpVersion === 'laravel';
+                const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined, database: isLaravel ? this.newSite.database : undefined });
                 if (add.success) {
                     // Optimistic insert: we already know every field the row
                     // template uses. No auto-refresh — the Caddy reload that
@@ -16004,7 +16161,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.sites.push({
                         name,
                         domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
-                        type: isPlain ? 'Plain' : (wpVersion === 'minn' ? 'Minn' : 'WordPress'),
+                        type: isPlain ? 'Plain' : (wpVersion === 'minn' ? 'Minn' : isLaravel ? 'Laravel' : 'WordPress'),
                         display_path: '~/Cove/Sites/' + name + '.localhost',
                         full_path: SITES_DIR + '/' + name + '.localhost',
                         // Server calculates size in add_site and returns it
@@ -16019,6 +16176,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     $id('newSiteName').value = '';
                     this.newSite.wpVersion = 'latest';
                     $id('wpVersionSelect').value = 'latest';
+                    this.newSite.database = 'sqlite';
+                    $id('laravelDbSelect').value = 'sqlite';
                     this.adding = false;
                     this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
 
@@ -16029,7 +16188,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.alerts.push({
                         id: Date.now() + Math.random(),
                         name,
-                        isPlain,
+                        // A Laravel app has no admin to sign in to: "open site", as for plain.
+                        isPlain: isPlain || isLaravel,
                         isLoggingIn: false,
                     });
                 }
