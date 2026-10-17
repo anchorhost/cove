@@ -329,7 +329,8 @@ MCPCHECK
         # shipped without PDO, which Laravel needs; cove add says so.
         if cx "$c" bash -s <<'LARAVELCHECK'
 fail() { echo "laravel: $*" >&2; exit 1; }
-up() { curl -sk -o /dev/null -w '%{http_code}' --max-time 60 "https://$1.localhost/up"; }
+# A new site's certificate can take a few seconds more than cove add waits.
+up() { local c i; for i in 1 2 3 4 5 6; do c=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 60 "https://$1.localhost/up"); [ "$c" = 200 ] && break; sleep 2; done; echo "$c"; }
 set -a; . /root/Cove/config; set +a
 dbs() { MYSQL_PWD="$DB_PASSWORD" mariadb -u "$DB_USER" -N -e 'SHOW DATABASES' 2>/dev/null; }
 cove add lvl laravel >/tmp/lv-add.log 2>&1 || fail "cove add (sqlite): $(tail -n 6 /tmp/lv-add.log)"
@@ -355,6 +356,20 @@ cove add lvf --from=/root/lv-src >/tmp/lv-from.log 2>&1 || fail "cove add --from
 cove laravel lvf users | grep -q 'm@matrix.test' || fail "the copied app lost its users"
 grep -q "^DB_DATABASE=/root/lv-src" /root/Cove/Sites/lvf.localhost/.env && fail "the copy's .env still names the original's database"
 cove delete lvf --force >/dev/null 2>&1 || fail "delete lvf"
+# PostgreSQL, set up by the first site that asks for it; its database copied
+# by a clone and dropped by a delete.
+cove add lvp laravel --database=pgsql >/tmp/lv-addp.log 2>&1 || fail "cove add (pgsql): $(tail -n 8 /tmp/lv-addp.log)"
+[ "$(up lvp)" = 200 ] || fail "/up on the PostgreSQL app answered $(up lvp)"
+cove laravel lvp user add p@matrix.test >/dev/null 2>&1 || fail "user add on PostgreSQL"
+cove clone lvp lvp2 >/tmp/lv-clonep.log 2>&1 || fail "clone (pgsql): $(tail -n 4 /tmp/lv-clonep.log)"
+cove laravel lvp2 users | grep -q 'p@matrix.test' || fail "the PostgreSQL clone lost its users"
+cove delete lvp2 --force >/dev/null 2>&1 && cove delete lvp --force >/dev/null 2>&1 || fail "delete (pgsql)"
+[ "$(cove postgres psql postgres -tAc "SELECT count(*) FROM pg_database WHERE datname LIKE 'cove_lvp%'")" = 0 ] || fail "delete left a PostgreSQL database"
+# Redis, and phpredis in FrankenPHP's PHP: a cache entry under the site's own prefix.
+cove redis install >/tmp/lv-redis.log 2>&1 || fail "cove redis install: $(tail -n 4 /tmp/lv-redis.log)"
+[ "$(cove redis cli ping)" = PONG ] || fail "Redis doesn't answer PING"
+[ "$(cove artisan lvl tinker --execute="config(['cache.default' => 'redis']); Cache::put('matrix', 'ok', 60); echo Cache::get('matrix');" 2>&1 | tail -n 1)" = ok ] || fail "Laravel's cache on Redis"
+cove redis cli -n 1 --scan --pattern 'lvl_*' | grep -q . || fail "the cache key isn't under the site's prefix"
 cove add lvm laravel --database=mysql >/tmp/lv-addm.log 2>&1 || fail "cove add (mysql): $(tail -n 6 /tmp/lv-addm.log)"
 [ "$(up lvm)" = 200 ] || fail "/up on the MariaDB app answered $(up lvm)"
 if cove login lvm --plain >/dev/null 2>&1; then fail "cove login made a link for an app with no users"; fi
