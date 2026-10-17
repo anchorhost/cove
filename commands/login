@@ -299,7 +299,7 @@ cove_login_laravel() {
         gum style --foreground red "❌ Error: '$who' is not a user id or email." >&2
         exit 1
     fi
-    if [ -n "$to" ] && ! [[ "$to" =~ ^/[A-Za-z0-9._~/?=\&%:+,@!-]*$ ]]; then
+    if [ -n "$to" ] && { ! [[ "$to" =~ ^/[A-Za-z0-9._~/?=\&%:+,@!-]*$ ]] || [[ "$to" == //* ]]; }; then
         gum style --foreground red "❌ Error: --to is a path on the site, such as /admin." >&2
         exit 1
     fi

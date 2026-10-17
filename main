@@ -732,8 +732,12 @@ $__cove_laravel = isset($_SERVER['DOCUMENT_ROOT']) && is_file(dirname($_SERVER['
 function cove_laravel_sign_in($base, $who, $to) {
     require $base . '/vendor/autoload.php';
     $app = require $base . '/bootstrap/app.php';
-    $app->booted(function ($app) use ($who, $to) {
-        $app['router']->middleware('web')->get('/__cove/login/{token}', function () use ($who, $to) {
+    // A path on this site only: never //host or /\host, which browsers take
+    // as another site.
+    if (!preg_match('#^/(?![/\\\\])#', $to)) $to = '';
+    $route = function ($app) use ($who, $to) {
+        if ($app['router']->getRoutes()->getByName('cove.login')) return;
+        $app['router']->middleware('web')->name('cove.login')->get('/__cove/login/{token}', function () use ($who, $to) {
             $text = function ($msg, $code) { return response($msg . "\n", $code)->header('Content-Type', 'text/plain; charset=utf-8'); };
             $guard = \Illuminate\Support\Facades\Auth::guard();
             if (!method_exists($guard, 'login') || !method_exists($guard, 'getProvider')) return $text("This app's default auth guard doesn't sign in with a session, so Cove can't log in to it.", 501);
@@ -761,7 +765,11 @@ function cove_laravel_sign_in($base, $who, $to) {
             }
             return redirect()->to($to);
         });
-    });
+    };
+    // Added before the app's own routes load, so a catch-all of theirs can't
+    // answer first; and again after, if a route cache replaced them all.
+    $app->booting($route);
+    $app->booted($route);
     if (method_exists($app, 'handleRequest')) {
         $app->handleRequest(\Illuminate\Http\Request::capture());
     } else {
@@ -814,12 +822,18 @@ if ($__cove_laravel) {
     if (!$__cove_local) {
         $_SERVER['APP_DEBUG'] = $_ENV['APP_DEBUG'] = 'false';
         putenv('APP_DEBUG=false');
+        // A cached config (artisan optimize, config:cache) would keep the
+        // debug setting it was cached with: point Laravel at a cache that
+        // can't exist (nothing lives under /dev/null), so it reads config.
+        $_SERVER['APP_CONFIG_CACHE'] = $_ENV['APP_CONFIG_CACHE'] = '/dev/null/cove-no-config-cache.php';
+        putenv('APP_CONFIG_CACHE=/dev/null/cove-no-config-cache.php');
     } elseif (preg_match('#^/__cove/login/([0-9a-f]{32})$#', (string) parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH), $__cove_m)) {
         // A one-time sign-in from `cove login` (cove_login_laravel): the
         // token is taken, whatever happens next, then the app signs in.
         $__cove_file = dirname(__DIR__) . '/cache/laravel-login/' . $__cove_m[1];
+        // Only the request that removes the file may use it.
         $__cove_t = is_file($__cove_file) ? json_decode((string) @file_get_contents($__cove_file), true) : null;
-        @unlink($__cove_file);
+        if (!@unlink($__cove_file)) $__cove_t = null;
         $__cove_site = preg_replace('/\.localhost$/', '', basename(dirname($_SERVER['DOCUMENT_ROOT'])));
         if (!is_array($__cove_t) || ($__cove_t['site'] ?? '') !== $__cove_site || (int) ($__cove_t['expires'] ?? 0) < time()) {
             http_response_code(410);
