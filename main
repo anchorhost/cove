@@ -2068,6 +2068,21 @@ laravel_retarget() {
     fi
 }
 
+# Why an artisan or Composer step failed, from its log ($1; $2 the line its
+# output starts after): the message under the last exception's name
+# (artisan prints the class, then the message), or the last line that says
+# anything. ANSI colours go.
+laravel_log_why() {
+    awk -v from="${2:-0}" 'NR <= from { next }
+         { gsub(/\033\[[0-9;]*m/, ""); line[NR] = $0 }
+         /^[[:space:]]+[A-Za-z\\]*(Exception|Error)[[:space:]]*$/ { n = NR }
+         $0 !~ /^[[:space:]]*$/ && $0 !~ /^(PHP )?Deprecated:/ { last = $0 }
+         END {
+             if (n) for (i = n + 1; i <= NR; i++) if (line[i] !~ /^[[:space:]]*$/) { last = line[i]; break }
+             sub(/^[[:space:]]+/, "", last); print substr(last, 1, 300)
+         }' "$1"
+}
+
 # Runs artisan in a site ($1 the site folder) on the PHP the site serves with.
 laravel_artisan() {
     local site_dir="$1"

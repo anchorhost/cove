@@ -528,15 +528,16 @@ cove_add_laravel() {
             exit 1
         fi
 
+        local mark
+        mark=$(wc -l < "$log" | tr -d ' ')
         if ! "$php" artisan key:generate --no-interaction >> "$log" 2>&1; then
-            echo "❌ Error: artisan key:generate failed:"
-            tail -n 15 "$log" | sed 's/^/   /'
+            echo "❌ Error: artisan key:generate failed: $(laravel_log_why "$log" "$mark")"
             exit 1
         fi
         echo "   - Running migrations..."
+        mark=$(wc -l < "$log" | tr -d ' ')
         if ! "$php" artisan migrate --force --no-interaction >> "$log" 2>&1; then
-            echo "❌ Error: The migrations failed:"
-            tail -n 15 "$log" | sed 's/^/   /'
+            echo "❌ Error: The migrations failed: $(laravel_log_why "$log" "$mark")"
             exit 1
         fi
         # The skeleton's seeder makes one user, test@example.com.
@@ -847,16 +848,7 @@ cove_add_laravel_from() {
     _cove_from_artisan() { _cove_from_mark; (export COVE_PHP_BIN="$native" PHP_BINARY="$php"; "$php" artisan "$@" --no-interaction) >>"$log" 2>&1; }
     # Why the last step failed: the message under the last exception's name
     # (artisan prints the class, then the message), or its last line.
-    _cove_from_why() {
-        awk -v from="$mark" 'NR <= from { next }
-             { gsub(/\033\[[0-9;]*m/, ""); line[NR] = $0 }
-             /^[[:space:]]+[A-Za-z\\]*(Exception|Error)[[:space:]]*$/ { n = NR }
-             $0 !~ /^[[:space:]]*$/ && $0 !~ /^(PHP )?Deprecated:/ { last = $0 }
-             END {
-                 if (n) for (i = n + 1; i <= NR; i++) if (line[i] !~ /^[[:space:]]*$/) { last = line[i]; break }
-                 sub(/^[[:space:]]+/, "", last); print substr(last, 1, 200)
-             }' "$log"
-    }
+    _cove_from_why() { laravel_log_why "$log" "$mark"; }
     # A copied folder's absolute paths into the original (an SQLite file
     # named in full, the public/storage link) point at this copy instead.
     [ "$kind" = folder ] && laravel_retarget "$site_dir" "" "$site_name" "$src" >/dev/null 2>&1

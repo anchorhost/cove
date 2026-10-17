@@ -358,7 +358,7 @@ grep -q "^DB_DATABASE=/root/lv-src" /root/Cove/Sites/lvf.localhost/.env && fail 
 cove delete lvf --force >/dev/null 2>&1 || fail "delete lvf"
 # PostgreSQL, set up by the first site that asks for it; its database copied
 # by a clone and dropped by a delete.
-cove add lvp laravel --database=pgsql >/tmp/lv-addp.log 2>&1 || fail "cove add (pgsql): $(tail -n 8 /tmp/lv-addp.log)"
+cove add lvp laravel --database=pgsql >/tmp/lv-addp.log 2>&1 || fail "cove add (pgsql): $(grep -v '^[[:space:]]*$' /tmp/lv-addp.log | tail -n 20)"
 [ "$(up lvp)" = 200 ] || fail "/up on the PostgreSQL app answered $(up lvp)"
 cove laravel lvp user add p@matrix.test >/dev/null 2>&1 || fail "user add on PostgreSQL"
 cove clone lvp lvp2 >/tmp/lv-clonep.log 2>&1 || fail "clone (pgsql): $(tail -n 4 /tmp/lv-clonep.log)"
