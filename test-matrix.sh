@@ -334,12 +334,17 @@ set -a; . /root/Cove/config; set +a
 dbs() { MYSQL_PWD="$DB_PASSWORD" mariadb -u "$DB_USER" -N -e 'SHOW DATABASES' 2>/dev/null; }
 cove add lvl laravel >/tmp/lv-add.log 2>&1 || fail "cove add (sqlite): $(tail -n 6 /tmp/lv-add.log)"
 [ "$(up lvl)" = 200 ] || fail "/up on the SQLite app answered $(up lvl)"
+# Added well before it is asked for: PHP rereads a changed file only every
+# couple of seconds (opcache.revalidate_freq).
+printf '%s\n' "Route::get('/me', fn () => auth()->user()?->email ?? 'guest')->middleware('web');" >> /root/Cove/Sites/lvl.localhost/routes/web.php
 cove artisan lvl migrate:status 2>&1 | grep -q 'create_users_table.*Ran' || fail "migrate:status"
 cove artisan lvl tinker --execute='\App\Models\User::factory()->create(["email" => "m@matrix.test"]);' >/tmp/lv-user.log 2>&1 || fail "creating a user: $(tail -n 3 /tmp/lv-user.log)"
-printf '%s\n' "Route::get('/me', fn () => auth()->user()?->email ?? 'guest')->middleware('web');" >> /root/Cove/Sites/lvl.localhost/routes/web.php
 link=$(cove login lvl --plain) || fail "cove login"
-curl -sk --max-time 60 -c /tmp/lv-jar -b /tmp/lv-jar "$link" -o /dev/null
-curl -sk --max-time 60 -b /tmp/lv-jar https://lvl.localhost/me | grep -q 'm@matrix.test' || fail "the login link did not sign in"
+code=$(curl -sk --max-time 60 -c /tmp/lv-jar -b /tmp/lv-jar "$link" -o /dev/null -w '%{http_code}')
+[ "$code" = 302 ] || fail "the login link answered $code"
+me=""
+for i in 1 2 3 4 5; do me=$(curl -sk --max-time 60 -b /tmp/lv-jar https://lvl.localhost/me); [ "$me" = m@matrix.test ] && break; sleep 1; done
+[ "$me" = m@matrix.test ] || fail "the login link did not sign in: /me said $(echo "$me" | head -c 80)"
 cove add lvm laravel --database=mysql >/tmp/lv-addm.log 2>&1 || fail "cove add (mysql): $(tail -n 6 /tmp/lv-addm.log)"
 [ "$(up lvm)" = 200 ] || fail "/up on the MariaDB app answered $(up lvm)"
 cove clone lvm lvm2 >/tmp/lv-clone.log 2>&1 || fail "clone: $(tail -n 4 /tmp/lv-clone.log)"
