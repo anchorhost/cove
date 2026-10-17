@@ -5452,7 +5452,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $size = 0;
             exec('du -sk ' . escapeshellarg($sitedir . '/' . $site_name . '.localhost') . ' 2>/dev/null', $du);
             if ($du && preg_match('/^(\d+)/', $du[0], $mm)) $size = (int) $mm[1] * 1024;
-            echo json_encode(['success' => true, 'size_bytes' => $size, 'output' => $out]);
+            echo json_encode(['success' => true, 'size_bytes' => $size, 'output' => $out, 'type' => cove_site_is_laravel($sitedir . '/' . $site_name . '.localhost') ? 'Laravel' : 'WordPress']);
             exit;
         case 'site_backup':
             // One zip of the site's files and database, via `cove backup`,
@@ -8091,7 +8091,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             </template>
 
             <div class="add-row" id="addRow" style="display: none;">
-                <div class="add-drop" id="addDrop" title="Import a backup: a zip or tar.gz holding a WordPress tree and a .sql dump — a Cove snapshot export, a Local export, a host backup">
+                <div class="add-drop" id="addDrop" title="Import a backup: a zip or tar.gz holding a WordPress tree and a .sql dump — a Cove snapshot export, a Local export, a host backup — or a Cove backup of a Laravel site">
                     <span class="add-drop-art" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11M7 9l5-5 5 5"/><path d="M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></svg></span>
                     <span class="add-drop-text" id="addDropText">drop a backup zip here to import a site, or <u>choose one</u> — otherwise create a fresh site below</span>
                     <span class="add-drop-file" id="addDropFile" style="display: none;"><span id="addDropName"></span><button type="button" class="filter-chip-x" id="addDropClear" aria-label="Remove the archive" title="Remove">×</button></span>
@@ -16539,7 +16539,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.sites.push({
                     name,
                     domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
-                    type: 'WordPress',
+                    type: res.type || 'WordPress',
                     display_path: '~/Cove/Sites/' + name + '.localhost',
                     full_path: SITES_DIR + '/' + name + '.localhost',
                     size_bytes: (typeof res.size_bytes === 'number') ? res.size_bytes : null,
@@ -16552,7 +16552,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('newSiteName').value = '';
                 this.adding = false;
                 this.apiPost('reload_server');
-                this.alerts.push({ id: Date.now() + Math.random(), name, isPlain: false, isLoggingIn: false });
+                // A Laravel backup imports as a Laravel site: "open site", no admin login.
+                this.alerts.push({ id: Date.now() + Math.random(), name, isPlain: res.type === 'Laravel', isLoggingIn: false });
                 this.render();
                 this.getSites();
             },

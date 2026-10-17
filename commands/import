@@ -13,6 +13,10 @@ cove_import() {
                 echo "at any depth) and a .sql or .sql.gz dump; Cove snapshot exports, Local"
                 echo "exports, and most host backups qualify. URLs are rewritten to the new"
                 echo "site's address. Multisite archives are not supported yet."
+                echo ""
+                echo "A Cove backup of a Laravel site (cove backup, or a snapshot export)"
+                echo "becomes a Laravel site: its project, its database, and its .env set up"
+                echo "for this machine and the new name."
                 return
                 ;;
             -*)
@@ -50,6 +54,12 @@ cove_import() {
     esac
     archive=$(cd "$(dirname "$archive")" && pwd -P)/$(basename "$archive")
 
+    # A Cove backup of a Laravel site: project/ beside db.sql and meta.
+    if archive_has_laravel_project "$archive"; then
+        cove_import_laravel "$site_name" "$archive" "$no_reload" "$php_pin"
+        return
+    fi
+
     echo "📦 Importing $(basename "$archive") into a new site '$site_name.localhost'…"
     echo "   1/2 Creating the site…"
     # A subprocess: cove add exits on its own failures, and this keeps it
@@ -79,4 +89,113 @@ cove_import() {
         cove_reload
     fi
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Imported into $site_name.localhost" "$(url_for "$site_name.localhost")" "Log in with: cove login $site_name"
+}
+
+# Does a backup archive hold a Laravel project the way Cove's backups and
+# snapshot exports pack one, project/artisan at the top?
+archive_has_laravel_project() {
+    local archive="$1"
+    case "$archive" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -Z1 "$archive" 2>/dev/null | grep -qx 'project/artisan'
+            else
+                COVE_ZIP="$archive" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->locateName("project/artisan") !== false ? 0 : 1);'
+            fi ;;
+        *) tar -tzf "$archive" 2>/dev/null | grep -qxE '(\./)?project/artisan' ;;
+    esac
+}
+
+# A site from a Cove backup of a Laravel site. The project moves into place
+# whole; a MariaDB dump goes into the database Cove makes for the new name;
+# .env is pointed at this machine's Cove (database credentials, the mail
+# wrapper's path) and at the new name, folder and address.
+cove_import_laravel() {
+    local site_name="$1" archive="$2" no_reload="$3" php_pin="$4"
+    local site_dir="$SITES_DIR/$site_name.localhost" work db_name="" from from_dir owner protected_name pairs=() mail_path rc
+    for protected_name in $PROTECTED_NAMES; do
+        if [ "$site_name" == "$protected_name" ]; then
+            gum style --foreground red "❌ Error: '$site_name' is a reserved name. Choose another."
+            exit 1
+        fi
+    done
+    if owner=$(cove_domain_owner "$site_name.localhost"); then
+        gum style --foreground red "❌ Error: '$site_name.localhost' already answers as $owner."
+        exit 1
+    fi
+    if [ -n "$php_pin" ]; then
+        php_pin=$(normalize_php_version "$php_pin")
+        if [ -z "$php_pin" ]; then
+            gum style --foreground red "❌ Error: Invalid PHP version." "Use a version like 8.3 or php@8.3."
+            exit 1
+        fi
+        ensure_php_formula "$php_pin" || exit 1
+    fi
+
+    echo "📦 Importing $(basename "$archive"), a Laravel site, into '$site_name.localhost'…"
+    mkdir -p "$COVE_DIR/cache" || exit 1
+    work=$(mktemp -d "$COVE_DIR/cache/import-$site_name.XXXXXX") || exit 1
+    echo "   - Unpacking…"
+    case "$archive" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -q "$archive" -d "$work"
+            else
+                COVE_ZIP="$archive" COVE_DEST="$work" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->extractTo(getenv("COVE_DEST")) ? 0 : 1);'
+            fi ;;
+        *) tar -xzf "$archive" -C "$work" ;;
+    esac
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ ! -f "$work/project/artisan" ]; then
+        rm -rf "$work"
+        gum style --foreground red "❌ Error: Could not unpack the archive's Laravel project."
+        exit 1
+    fi
+    from=$(sed -n 's/^site=//p' "$work/meta" 2>/dev/null)
+    from_dir=$(sed -n 's/^folder=//p' "$work/meta" 2>/dev/null)
+
+    if [ -f "$work/db.sql" ]; then
+        source_config
+        db_name=$(cove_laravel_db_name "$site_name")
+        if cove_db_exists "$db_name"; then
+            rm -rf "$work"
+            gum style --foreground red "❌ Error: A database named '$db_name' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+            exit 1
+        fi
+        echo "   - Restoring its database into '$db_name'…"
+        if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+            || ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" --max_allowed_packet=512M "$db_name" < "$work/db.sql"; then
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+            rm -rf "$work"
+            gum style --foreground red "❌ Error: The database import failed; nothing was created."
+            exit 1
+        fi
+        pairs+=("\"DB_HOST\":\"127.0.0.1\"" "\"DB_PORT\":\"3306\"" "\"DB_DATABASE\":$(cove_json_str "$db_name")" "\"DB_USERNAME\":$(cove_json_str "$DB_USER")" "\"DB_PASSWORD\":$(cove_json_str "$DB_PASSWORD")")
+    fi
+
+    if ! mv "$work/project" "$site_dir"; then
+        [ -n "$db_name" ] && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        rm -rf "$work"
+        gum style --foreground red "❌ Error: Could not move the project into $site_dir."
+        exit 1
+    fi
+    rm -rf "$work"
+    mkdir -p "$site_dir/logs"
+    [ -n "$php_pin" ] && echo "$php_pin" > "$site_dir/php_version"
+
+    echo "   - Setting up .env for this machine…"
+    mail_path=$(laravel_env_get "$site_dir" MAIL_SENDMAIL_PATH)
+    [[ "$mail_path" == */cove-sendmail.sh\ -t ]] && pairs+=("\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t")")
+    if [ "${#pairs[@]}" -gt 0 ] && ! COVE_ENV_SET="{$(IFS=,; echo "${pairs[*]}")}" laravel_env_set "$site_dir/.env"; then
+        gum style --foreground yellow "⚠️  Could not update .env; check its database and mail settings."
+    fi
+    if [ -n "$from" ]; then
+        laravel_retarget "$site_dir" "$from" "$site_name" "${from_dir:-$SITES_DIR/$from.localhost}" || \
+            gum style --foreground yellow "⚠️  Could not update APP_URL in .env."
+    fi
+
+    if [ "$no_reload" = false ]; then
+        cove_reload
+    fi
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Imported into $site_name.localhost" "$(url_for "$site_name.localhost")" "Laravel $(laravel_version "$site_dir")$( [ -n "$db_name" ] && echo " on $db_name" )" "Artisan: cove artisan $site_name <command>"
 }
