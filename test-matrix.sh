@@ -370,6 +370,14 @@ cove redis install >/tmp/lv-redis.log 2>&1 || fail "cove redis install: $(tail -
 [ "$(cove redis cli ping)" = PONG ] || fail "Redis doesn't answer PING"
 [ "$(cove artisan lvl tinker --execute="config(['cache.default' => 'redis']); Cache::put('matrix', 'ok', 60); echo Cache::get('matrix');" 2>&1 | tail -n 1)" = ok ] || fail "Laravel's cache on Redis"
 cove redis cli -n 1 --scan --pattern 'lvl_*' | grep -q . || fail "the cache key isn't under the site's prefix"
+# Reverb: added to the app (no Node here, so no Echo), then its websocket
+# answered through Caddy at wss://lvl.localhost.
+cove laravel lvl reverb install >/tmp/lv-reverb.log 2>&1 || fail "reverb install: $(tail -n 6 /tmp/lv-reverb.log)"
+key=$(grep '^REVERB_APP_KEY=' /root/Cove/Sites/lvl.localhost/.env | cut -d= -f2)
+code=""
+for i in 1 2 3 4 5; do code=$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' -m 5 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "https://lvl.localhost/app/$key?protocol=7&client=js&version=8.4.0"); [ "$code" = 101 ] && break; sleep 2; done
+[ "$code" = 101 ] || fail "Reverb's websocket through Caddy answered $code"
+cove laravel lvl reverb off >/dev/null 2>&1
 cove add lvm laravel --database=mysql >/tmp/lv-addm.log 2>&1 || fail "cove add (mysql): $(tail -n 6 /tmp/lv-addm.log)"
 [ "$(up lvm)" = 200 ] || fail "/up on the MariaDB app answered $(up lvm)"
 if cove login lvm --plain >/dev/null 2>&1; then fail "cove login made a link for an app with no users"; fi
