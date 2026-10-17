@@ -8110,9 +8110,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .st-row:hover { background: var(--panel-hover); }
         .st-plugins, .st-themes { grid-template-columns: minmax(0, 1fr) auto auto auto minmax(9rem, auto); }
         .st-users { grid-template-columns: minmax(0, 1fr) auto auto auto; }
-        .st-useradd input, .st-useradd select { flex: 1 1 10rem; min-width: 0; background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.82rem; padding: 0.35rem 0.6rem; border-radius: var(--radius-md); }
-        .st-useradd select { flex: 0 1 11rem; cursor: pointer; }
-        .st-useradd input:focus, .st-useradd select:focus { outline: 0; border-color: var(--accent); }
+        .st-useradd input { flex: 1 1 10rem; min-width: 0; background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.82rem; padding: 0.35rem 0.6rem; border-radius: var(--radius-md); }
+        .st-useradd input:focus { outline: 0; border-color: var(--accent); }
+        .st-useradd .st-role { flex: 0 1 12rem; min-width: 9rem; }
+        .st-useradd .st-role input { width: 100%; padding-right: 2rem; cursor: pointer; }
+        .st-useradd .st-role input:focus { cursor: text; }
+        .st-role .sl-menu { max-height: 13.5rem; overflow-y: auto; }
         .st-useradd #userAddEmail { flex-basis: 14rem; }
         .st-useradd-done { display: flex; align-items: center; flex-wrap: wrap; gap: 0.6rem; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); }
         .st-useradd-done:empty { display: none; }
@@ -9084,7 +9087,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <input id="userAddEmail" type="text" inputmode="email" placeholder="email" maxlength="191" spellcheck="false" autocomplete="off" aria-label="The new user's email">
                     <input id="userAddLogin" type="text" placeholder="username (optional)" title="Left blank, the part of the email before the @" maxlength="60" spellcheck="false" autocomplete="off" aria-label="The new user's username">
                     <input id="userAddName" type="text" placeholder="name (optional)" maxlength="191" spellcheck="false" autocomplete="off" aria-label="The new user's name">
-                    <select id="userAddRole" aria-label="The new user's role"></select>
+                    <div class="add-type st-role" id="userRole">
+                        <input type="text" id="userRoleInput" role="combobox" aria-label="The new user's role" aria-autocomplete="list" aria-expanded="false" aria-controls="userRoleList" autocomplete="off" spellcheck="false" title="The new user's role: type a few letters, ↑↓ to choose, ↵ to pick">
+                        <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                        <div class="sl-menu" id="userRoleList" role="listbox" aria-label="Roles" style="display: none;"></div>
+                    </div>
                     <input id="userAddPassword" type="text" placeholder="password (optional)" title="Left blank, one is made up and shown once" maxlength="200" spellcheck="false" autocomplete="off" aria-label="The new user's password">
                     <button type="submit" class="pill primary" id="btnUserAdd">add user</button>
                 </form>
@@ -9597,6 +9604,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // kind: wordpress | plain | minn | laravel (the add form's type field).
             newSite: { name: '', kind: 'wordpress', wpVersion: 'latest', database: 'sqlite', isLoading: false },
             addType: { open: false, q: '', index: 0 },
+            userRole: { open: false, q: '', index: 0, value: 'administrator' },
             minnRelease: null,
             // Populated lazily the first time the add row opens — no reason
             // to hit wp.org on a page load that never creates a site. Stays
@@ -11440,6 +11448,128 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 list.addEventListener('click', (e) => {
                     const b = e.target.closest('[data-kind]');
                     if (b && !b.disabled) this.pickAddType(b.dataset.kind);
+                });
+            },
+
+            // --- The add-user form's role (WordPress) -----------------------
+            // The same kind of field as the site type: the site's roles, a
+            // few letters narrowing them (a word of the name or the slug, so
+            // "sub" finds Subscriber and EDD Subscriber), ↑↓ to move, ↵ or
+            // Tab to pick, Esc to put the field back.
+            get userRoles() {
+                const t = this.sitePage.tabs.users;
+                const have = t && t.loadedFor === this.sitePage.name && t.extra && Array.isArray(t.extra.roles_available) && t.extra.roles_available.length ? t.extra.roles_available : null;
+                // Until the site's list lands, WordPress's own.
+                return (have || ['administrator', 'editor', 'author', 'contributor', 'subscriber'].map(r => ({ role: r, name: r[0].toUpperCase() + r.slice(1) })))
+                    .map(r => ({ id: String(r.role), label: String(r.name || r.role) }));
+            },
+
+            userRoleMatches() {
+                const q = this.userRole.q.trim().toLowerCase();
+                const roles = this.userRoles;
+                if (!q) return roles;
+                const words = (r) => r.label.toLowerCase().split(/\s+/).concat(r.id.toLowerCase().split(/[_-]+/), [r.id.toLowerCase()]);
+                const starts = roles.filter(r => words(r).some(w => w.startsWith(q)));
+                // A name that starts with it first: "sub" is Subscriber, then EDD Subscriber.
+                starts.sort((a, b) => b.label.toLowerCase().startsWith(q) - a.label.toLowerCase().startsWith(q));
+                return starts.concat(roles.filter(r => !starts.includes(r) && (r.label.toLowerCase().includes(q) || r.id.toLowerCase().includes(q))));
+            },
+
+            openUserRole() {
+                const r = this.userRole;
+                r.open = true;
+                r.q = '';
+                r.index = Math.max(0, this.userRoles.findIndex(x => x.id === r.value));
+                $id('userRoleInput').value = '';
+                this.renderUserRole();
+            },
+
+            closeUserRole() {
+                this.userRole.open = false;
+                this.userRole.q = '';
+                this.renderUserRole();
+            },
+
+            pickUserRole(id) {
+                if (!this.userRoles.some(x => x.id === id)) return false;
+                Object.assign(this.userRole, { value: id, open: false, q: '' });
+                this.renderUserRole();
+                return true;
+            },
+
+            renderUserRole() {
+                const r = this.userRole, input = $id('userRoleInput'), list = $id('userRoleList');
+                const roles = this.userRoles;
+                // A role picked on another site that this one doesn't have.
+                if (!roles.some(x => x.id === r.value)) r.value = roles.some(x => x.id === 'administrator') ? 'administrator' : (roles[0] ? roles[0].id : '');
+                const current = roles.find(x => x.id === r.value);
+                show(list, r.open);
+                $id('userRole').classList.toggle('is-open', r.open);
+                input.setAttribute('aria-expanded', r.open ? 'true' : 'false');
+                input.placeholder = r.open && current ? current.label : 'role';
+                if (!r.open) {
+                    input.value = current ? current.label : '';
+                    input.removeAttribute('aria-activedescendant');
+                    return;
+                }
+                const matches = this.userRoleMatches();
+                r.index = Math.max(0, Math.min(r.index, matches.length - 1));
+                const e = (s) => this.escapeHtml(s);
+                list.innerHTML = matches.length
+                    ? matches.map((x, i) => '<button type="button" role="option" tabindex="-1" id="userRoleOpt-' + i + '" data-role="' + e(x.id) + '"' + (i === r.index ? ' class="is-active"' : '') + ' aria-selected="' + (x.id === r.value) + '"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg>' + e(x.label) + (x.id !== x.label.toLowerCase() ? '<small>' + e(x.id) + '</small>' : '') + '</button>').join('')
+                    : '<div class="add-type-empty">no role matches “' + e(r.q.trim()) + '”</div>';
+                const active = list.querySelector('.is-active');
+                if (!active) { input.removeAttribute('aria-activedescendant'); return; }
+                input.setAttribute('aria-activedescendant', active.id);
+                // Keep the highlight in view as ↑↓ move it through a long list.
+                if (active.offsetTop < list.scrollTop) list.scrollTop = active.offsetTop - 4;
+                else if (active.offsetTop + active.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = active.offsetTop + active.offsetHeight - list.clientHeight + 4;
+            },
+
+            bindUserRole() {
+                const input = $id('userRoleInput'), list = $id('userRoleList');
+                const step = (d) => {
+                    const n = this.userRoleMatches().length;
+                    if (n) this.userRole.index = (this.userRole.index + d + n) % n;
+                };
+                input.addEventListener('focus', () => this.openUserRole());
+                input.addEventListener('click', () => { if (!this.userRole.open) this.openUserRole(); });
+                input.addEventListener('input', () => {
+                    Object.assign(this.userRole, { open: true, q: input.value, index: 0 });
+                    this.renderUserRole();
+                });
+                input.addEventListener('keydown', (e) => {
+                    const r = this.userRole;
+                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        if (!r.open) { this.openUserRole(); return; }
+                        step(e.key === 'ArrowDown' ? 1 : -1);
+                        this.renderUserRole();
+                    } else if (e.key === 'Enter' || e.key === 'Tab') {
+                        // A closed field lets Enter submit the form as usual.
+                        if (!r.open) return;
+                        const m = this.userRoleMatches()[r.index];
+                        if (e.key === 'Enter') e.preventDefault();
+                        if (!m || !this.pickUserRole(m.id)) this.closeUserRole();
+                    } else if (e.key === 'Escape' && r.open) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        this.closeUserRole();
+                    }
+                });
+                // Leaving the field: a whole name or slug typed counts as picked.
+                input.addEventListener('blur', () => {
+                    const r = this.userRole;
+                    if (!r.open) return;
+                    const q = r.q.trim().toLowerCase();
+                    const m = q && this.userRoles.find(x => x.label.toLowerCase() === q || x.id.toLowerCase() === q);
+                    if (!m || !this.pickUserRole(m.id)) this.closeUserRole();
+                });
+                // Keep the field focused while an option is clicked.
+                list.addEventListener('mousedown', (e) => e.preventDefault());
+                list.addEventListener('click', (e) => {
+                    const b = e.target.closest('[data-role]');
+                    if (b) this.pickUserRole(b.dataset.role);
                 });
             },
 
@@ -14784,7 +14914,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const password = $id('userAddPassword').value;
                 const res = lv
                     ? await this.apiPost('site_laravel_users', { site_name: site.name, op: 'add', email, name: $id('userAddName').value.trim(), password }, { quiet: true, timeoutMs: 90000 })
-                    : await this.apiPost('site_user_add', { site_name: site.name, email, login: $id('userAddLogin').value.trim(), role: $id('userAddRole').value, password }, { quiet: true, timeoutMs: 120000 });
+                    : await this.apiPost('site_user_add', { site_name: site.name, email, login: $id('userAddLogin').value.trim(), role: this.userRole.value, password }, { quiet: true, timeoutMs: 120000 });
                 delete t.busy['+'];
                 if (this.sitePage.name !== site.name) return;
                 if (!res.success || !res.user) { this.showSnack(res.message || 'Could not add the user.', true); this.renderSiteTab(); return; }
@@ -14894,25 +15024,13 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     const wp = !!site && !lv && this.isWpLike(site);
                     show($id('userAdd'), lv || wp);
                     show($id('userAddLogin'), wp);
-                    show($id('userAddRole'), wp);
+                    show($id('userRole'), wp);
                     show($id('userAddName'), lv);
                     const add = $id('btnUserAdd');
                     add.disabled = !!t.busy['+']; add.textContent = t.busy['+'] ? 'adding…' : 'add user';
                     add.title = lv ? "A verified user in the app's users table, through its own user model" : (site && site.multisite ? 'wp user create, on the main site of the network' : 'wp user create');
                     const e = (s) => this.escapeHtml(s == null ? '' : String(s));
-                    if (wp) {
-                        // The site's roles once the list has them; until then
-                        // WordPress's own, so the form works straight away.
-                        const sel = $id('userAddRole');
-                        const have = (t.extra && t.extra.roles_available && t.extra.roles_available.length) ? t.extra.roles_available : ['administrator', 'editor', 'author', 'contributor', 'subscriber'].map(r => ({ role: r, name: r[0].toUpperCase() + r.slice(1) }));
-                        const key = have.map(r => r.role).join(',');
-                        if (sel.dataset.key !== key) {
-                            const was = sel.value || 'administrator';
-                            sel.innerHTML = have.map(r => '<option value="' + e(r.role) + '">' + e(r.name || r.role) + '</option>').join('');
-                            sel.value = have.some(r => r.role === was) ? was : have[0].role;
-                            sel.dataset.key = key;
-                        }
-                    }
+                    if (wp) this.renderUserRole();
                     const a = (lv || wp) && t.added;
                     const who = a ? (lv ? a.email : a.login) : '';
                     $id('userAddDone').innerHTML = a ? '<span>Added <strong>' + e(who) + '</strong>' + (a.role ? ' (' + e(a.role) + ')' : '') + (a.password ? ', password <code>' + e(a.password) + '</code>' : '') + '</span>'
@@ -15194,6 +15312,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('siteHealth').addEventListener('click', (e) => { if (e.target.closest('.site-health-bit')) this.setSiteTab('traffic'); });
                 $id('btnSnapCreate').addEventListener('click', () => this.snapshotCreate());
                 $id('userAdd').addEventListener('submit', (e) => { e.preventDefault(); this.siteUserAdd(); });
+                this.bindUserRole();
                 $id('userAddDone').addEventListener('click', (e) => {
                     const a = this.siteTabState('users').added;
                     if (!a) return;
