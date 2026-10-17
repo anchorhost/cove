@@ -474,10 +474,6 @@ cove_add_laravel() {
         fi
     fi
 
-    # A JSON string for laravel_env_set (Cove's names and passwords hold no
-    # control characters).
-    json_str() { local v="${1//\\/\\\\}"; printf '"%s"' "${v//\"/\\\"}"; }
-
     (
         export COVE_PHP_BIN="$native" PHP_BINARY="$php"
         echo "Installing Laravel..."
@@ -492,17 +488,17 @@ cove_add_laravel() {
         chmod 755 artisan
 
         local set example
-        set="{\"APP_URL\":$(json_str "$(url_for "$full_hostname")"),\"DB_CONNECTION\":\"$database\""
+        set="{\"APP_URL\":$(cove_json_str "$(url_for "$full_hostname")"),\"DB_CONNECTION\":\"$database\""
         example="{\"DB_CONNECTION\":\"$database\""
         if [ "$database" = "sqlite" ]; then
             set="$set,\"DB_HOST\":null,\"DB_PORT\":null,\"DB_DATABASE\":null,\"DB_USERNAME\":null,\"DB_PASSWORD\":null"
             example="$example,\"DB_HOST\":null,\"DB_PORT\":null,\"DB_DATABASE\":null,\"DB_USERNAME\":null,\"DB_PASSWORD\":null"
             touch database/database.sqlite
         else
-            set="$set,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"3306\",\"DB_DATABASE\":$(json_str "$db_name"),\"DB_USERNAME\":$(json_str "$DB_USER"),\"DB_PASSWORD\":$(json_str "$DB_PASSWORD")"
-            example="$example,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"3306\",\"DB_DATABASE\":$(json_str "${site_name//-/_}"),\"DB_USERNAME\":\"root\",\"DB_PASSWORD\":\"\""
+            set="$set,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"3306\",\"DB_DATABASE\":$(cove_json_str "$db_name"),\"DB_USERNAME\":$(cove_json_str "$DB_USER"),\"DB_PASSWORD\":$(cove_json_str "$DB_PASSWORD")"
+            example="$example,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"3306\",\"DB_DATABASE\":$(cove_json_str "${site_name//-/_}"),\"DB_USERNAME\":\"root\",\"DB_PASSWORD\":\"\""
         fi
-        set="$set,\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(json_str "$APP_DIR/cove-sendmail.sh -t"),\"MAIL_FROM_ADDRESS\":$(json_str "hello@$full_hostname")}"
+        set="$set,\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t"),\"MAIL_FROM_ADDRESS\":$(cove_json_str "hello@$full_hostname")}"
         if ! COVE_ENV_SET="$set" laravel_env_set "$stage/.env" || ! COVE_ENV_SET="$example}" laravel_env_set "$stage/.env.example"; then
             echo "❌ Error: Could not write the application's .env."
             exit 1

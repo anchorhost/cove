@@ -69,6 +69,14 @@ cove_delete() {
         fi
         echo "🗄️ Deleting database: $db_name"
         MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+    elif site_is_laravel "$site_dir"; then
+        # Only the database Cove made for the site: one .env was pointed at
+        # by hand may be shared, or someone else's.
+        local db_name
+        if db_name=$(laravel_cove_db "$site_dir" "$site_name"); then
+            echo "🗄️ Deleting database: $db_name"
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        fi
     fi
 
     # Don't trust the bare rm — a pre-1.10 dashboard-created site would be

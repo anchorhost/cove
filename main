@@ -1517,6 +1517,13 @@ laravel_env_set() {
     '
 }
 
+# A JSON string for laravel_env_set (Cove's names, paths and passwords hold
+# no control characters).
+cove_json_str() {
+    local v="${1//\\/\\\\}"
+    printf '"%s"' "${v//\"/\\\"}"
+}
+
 # The database Cove creates for a Laravel site that asks for MySQL or MariaDB.
 # Hyphens become underscores, as the Laravel installer does.
 cove_laravel_db_name() {
@@ -4129,6 +4136,12 @@ function cove_demo_databases($user_home, $sitedir) {
     foreach (cove_demo_sites($user_home) ?? [] as $site) {
         $cfg = @file_get_contents($sitedir . '/' . $site . '.localhost/public/wp-config.php', false, null, 0, 16384);
         if ($cfg !== false && preg_match('/define\s*\(\s*[\'"]DB_NAME[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $cfg, $m)) $out[] = $m[1];
+        // A Laravel site's: the MariaDB database its .env names.
+        $sp = $sitedir . '/' . $site . '.localhost';
+        if ($cfg === false && cove_site_is_laravel($sp)) {
+            $env = cove_laravel_env($sp);
+            if (in_array($env['DB_CONNECTION'] ?? '', ['mysql', 'mariadb'], true) && ($env['DB_DATABASE'] ?? '') !== '') $out[] = $env['DB_DATABASE'];
+        }
     }
     return $out;
 }

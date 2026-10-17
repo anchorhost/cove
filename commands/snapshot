@@ -1,5 +1,6 @@
-# Snapshots: a point-in-time copy of a site's public/ tree and its database
-# under ~/Cove/Snapshots/<site>/<id>/, restorable in place. The tree is a
+# Snapshots: a point-in-time copy of a site's public/ tree (a Laravel site's
+# whole project, as project/) and its database under
+# ~/Cove/Snapshots/<site>/<id>/, restorable in place. The tree is a
 # copy-on-write clone where the filesystem allows (APFS, btrfs, xfs), so
 # taking one costs seconds and only the blocks that later change take room.
 # A restore first takes a snapshot of its own, so it can itself be undone.
@@ -21,6 +22,12 @@ snapshot_size_bytes() {
     echo $(( ${kb:-0} * 1024 ))
 }
 
+# A snapshot's files: public/, or project/ for a Laravel site, whose code
+# lives beside its webroot. Prints which, or fails for neither.
+snapshot_files() {
+    if [ -d "$1/project" ]; then echo project; elif [ -d "$1/public" ]; then echo public; else return 1; fi
+}
+
 snapshot_json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | tr -d '\n\r'
 }
@@ -28,18 +35,19 @@ snapshot_json_escape() {
 # meta.json for one snapshot directory, on one line.
 snapshot_meta_json() {
     local dir="$1"
-    local id created note auto wp files_bytes db_bytes
+    local id created note auto wp laravel files_bytes db_bytes
     id=$(basename "$dir")
     created=$(sed -n 's/^created=//p' "$dir/meta" 2>/dev/null)
     note=$(sed -n 's/^note=//p' "$dir/meta" 2>/dev/null)
     auto=$(sed -n 's/^auto=//p' "$dir/meta" 2>/dev/null)
     wp=$(sed -n 's/^wp=//p' "$dir/meta" 2>/dev/null)
-    files_bytes=$(snapshot_size_bytes "$dir/public")
+    laravel=$(sed -n 's/^laravel=//p' "$dir/meta" 2>/dev/null)
+    files_bytes=$(snapshot_size_bytes "$dir/$(snapshot_files "$dir")")
     db_bytes=0
     [ -f "$dir/db.sql" ] && db_bytes=$(stat -f%z "$dir/db.sql" 2>/dev/null || stat -c%s "$dir/db.sql" 2>/dev/null || echo 0)
-    printf '{"id":"%s","created":%s,"note":"%s","auto":%s,"wp":"%s","files_bytes":%s,"db_bytes":%s,"has_db":%s}' \
+    printf '{"id":"%s","created":%s,"note":"%s","auto":%s,"wp":"%s","laravel":"%s","files_bytes":%s,"db_bytes":%s,"has_db":%s}' \
         "$id" "${created:-0}" "$(snapshot_json_escape "$note")" "$([ "$auto" == "1" ] && echo true || echo false)" \
-        "$(snapshot_json_escape "$wp")" "$files_bytes" "$db_bytes" "$([ -f "$dir/db.sql" ] && echo true || echo false)"
+        "$(snapshot_json_escape "$wp")" "$(snapshot_json_escape "$laravel")" "$files_bytes" "$db_bytes" "$([ -f "$dir/db.sql" ] && echo true || echo false)"
 }
 
 # snapshot_create <site> <note> <auto:0|1>  → prints the new id on stdout (last line)
@@ -58,7 +66,7 @@ snapshot_create() {
     # Snapshots hold whole sites and their databases: this user only.
     chmod 700 "$SNAPSHOTS_DIR" 2>/dev/null
 
-    local wp_version=""
+    local wp_version="" kind="" laravel_ver=""
     if [ -f "$public_dir/wp-config.php" ]; then
         local dump_cmd
         if ! dump_cmd=$(snapshot_dump_cmd); then
@@ -86,10 +94,43 @@ snapshot_create() {
         rm -f "$dest/.dump-err"
         chmod 600 "$dest/db.sql"
         wp_version=$(sed -n "s/^\$wp_version = '\([^']*\)';/\1/p" "$public_dir/wp-includes/version.php" 2>/dev/null | head -n 1)
+    elif site_is_laravel "$site_dir"; then
+        # The whole project; an SQLite database rides along inside it. A
+        # MariaDB one is dumped only when it is the one Cove made.
+        kind="laravel"
+        laravel_ver=$(laravel_version "$site_dir")
+        local dump_cmd db_name
+        if db_name=$(laravel_cove_db "$site_dir" "$site_name"); then
+            if ! dump_cmd=$(snapshot_dump_cmd); then
+                rm -rf "$dest"
+                gum style --foreground red "❌ Error: Neither mariadb-dump nor mysqldump could be found." >&2
+                return 1
+            fi
+            source_config
+            echo "   Dumping database '$db_name'…" >&2
+            if ! MYSQL_PWD="$DB_PASSWORD" "$dump_cmd" -u"$DB_USER" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "$db_name" > "$dest/db.sql" 2>"$dest/.dump-err"; then
+                local err; err=$(tail -n 2 "$dest/.dump-err")
+                rm -rf "$dest"
+                gum style --foreground red "❌ Error: The database dump failed." "$err" >&2
+                return 1
+            fi
+            rm -f "$dest/.dump-err"
+            chmod 600 "$dest/db.sql"
+        else
+            case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
+                mysql|mariadb) echo "   ⚠️  .env names a database Cove didn't make for this site, so the snapshot holds the files only." >&2 ;;
+            esac
+        fi
     fi
 
     echo "   Copying files…" >&2
-    if ! cove_copy_tree "$public_dir" "$dest/public"; then
+    local copied=true
+    if [ "$kind" = "laravel" ]; then
+        cove_copy_project "$site_dir" "$dest/project" || copied=false
+    else
+        cove_copy_tree "$public_dir" "$dest/public" || copied=false
+    fi
+    if [ "$copied" = false ]; then
         rm -rf "$dest"
         gum style --foreground red "❌ Error: Could not copy the site's files." >&2
         return 1
@@ -99,6 +140,8 @@ snapshot_create() {
         echo "note=$note"
         echo "auto=$auto"
         echo "wp=$wp_version"
+        [ -n "$kind" ] && echo "kind=$kind"
+        [ -n "$laravel_ver" ] && echo "laravel=$laravel_ver"
     } > "$dest/meta"
     echo "$id"
 }
@@ -108,8 +151,8 @@ snapshot_restore() {
     local site_name="$1" id="$2"
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
-    local src="$SNAPSHOTS_DIR/$site_name/$id"
-    if [ ! -d "$src/public" ]; then
+    local src="$SNAPSHOTS_DIR/$site_name/$id" files
+    if ! files=$(snapshot_files "$src"); then
         gum style --foreground red "❌ Error: Snapshot '$id' not found for '$site_name.localhost'." >&2
         return 1
     fi
@@ -128,8 +171,13 @@ snapshot_restore() {
             return 1
         fi
         source_config
-        wp_cmd=$(get_wp_cmd "$site_dir")
-        db_name=$( (cd "$public_dir" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        if [ "$files" = "project" ]; then
+            # Back into the database Cove keeps for this Laravel site.
+            db_name=$(cove_laravel_db_name "$site_name")
+        else
+            wp_cmd=$(get_wp_cmd "$site_dir")
+            db_name=$( (cd "$public_dir" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        fi
         if [ -z "$db_name" ]; then
             gum style --foreground red "❌ Error: Could not read DB_NAME from wp-config.php." >&2
             return 1
@@ -148,6 +196,14 @@ snapshot_restore() {
     fi
 
     echo "   Restoring files…" >&2
+    if [ "$files" = "project" ]; then
+        if ! snapshot_swap_project "$site_dir" "$src/project"; then
+            gum style --foreground red "❌ Error: Could not put the snapshot's files back. Snapshot $safety holds the state from before." >&2
+            return 1
+        fi
+        echo "$safety"
+        return 0
+    fi
     local staging="$site_dir/.public.restoring"
     rm -rf "$staging"
     if ! cove_copy_tree "$src/public" "$staging"; then
@@ -163,6 +219,30 @@ snapshot_restore() {
         (cd "$public_dir" && $wp_cmd cache flush --skip-plugins --skip-themes >/dev/null 2>&1) || true
     fi
     echo "$safety"
+}
+
+# Puts a snapshot's Laravel project back into a site folder ($1, from $2):
+# a copy is staged beside it, the folder's entries move aside (Cove's own
+# files stay), the copy's move in, and what moved aside is removed.
+snapshot_swap_project() {
+    local site_dir="$1" from="$2" staging="$1/.project.restoring" old="$1/.project.replaced" entry name
+    rm -rf "$staging" "$old"
+    if ! cove_copy_tree "$from" "$staging"; then
+        rm -rf "$staging"
+        return 1
+    fi
+    mkdir "$old" || return 1
+    for entry in "$site_dir"/* "$site_dir"/.[!.]* "$site_dir"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name="${entry##*/}"
+        case " $COVE_SITE_OWN .project.restoring .project.replaced " in *" $name "*) continue ;; esac
+        mv "$entry" "$old/" || return 1
+    done
+    for entry in "$staging"/* "$staging"/.[!.]* "$staging"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        mv "$entry" "$site_dir/" || return 1
+    done
+    rm -rf "$staging" "$old"
 }
 
 cove_snapshot() {
@@ -239,7 +319,7 @@ cove_snapshot() {
                 local first=1 d
                 for d in "${dirs[@]}"; do
                     d="${d%/}"
-                    [ -d "$d/public" ] || continue
+                    snapshot_files "$d" >/dev/null || continue
                     [ $first -eq 1 ] || printf ','
                     first=0
                     snapshot_meta_json "$d"
@@ -255,12 +335,12 @@ cove_snapshot() {
             local d
             for d in "${dirs[@]}"; do
                 d="${d%/}"
-                [ -d "$d/public" ] || continue
+                snapshot_files "$d" >/dev/null || continue
                 local created note auto bytes
                 created=$(sed -n 's/^created=//p' "$d/meta" 2>/dev/null)
                 note=$(sed -n 's/^note=//p' "$d/meta" 2>/dev/null)
                 auto=$(sed -n 's/^auto=//p' "$d/meta" 2>/dev/null)
-                bytes=$(( $(snapshot_size_bytes "$d/public") + $( [ -f "$d/db.sql" ] && (stat -f%z "$d/db.sql" 2>/dev/null || stat -c%s "$d/db.sql") || echo 0 ) ))
+                bytes=$(( $(snapshot_size_bytes "$d/$(snapshot_files "$d")") + $( [ -f "$d/db.sql" ] && (stat -f%z "$d/db.sql" 2>/dev/null || stat -c%s "$d/db.sql") || echo 0 ) ))
                 printf "  %-22s  %-19s  %-9s  %s%s\n" "$(basename "$d")" "$(date -r "${created:-0}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@${created:-0}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$(awk -v b="$bytes" 'BEGIN{ s="B"; if (b>=1073741824){b/=1073741824; s="GB"} else if (b>=1048576){b/=1048576; s="MB"} else if (b>=1024){b/=1024; s="KB"}; printf (b>=10||s=="B") ? "%d %s" : "%.1f %s", b, s }')" "$note" "$([ "$auto" == "1" ] && echo ' (auto)')"
             done
             ;;
@@ -283,7 +363,7 @@ cove_snapshot() {
                 exit 1
             fi
             local src="$SNAPSHOTS_DIR/$site_name/$id"
-            if [ ! -d "$src/public" ]; then
+            if ! snapshot_files "$src" >/dev/null; then
                 gum style --foreground red "❌ Error: Snapshot '$id' not found."
                 exit 1
             fi
@@ -294,9 +374,9 @@ cove_snapshot() {
             rm -f "$tmp"
             if [ "$format" != "json" ]; then echo "📦 Packing snapshot $id…"; fi
             if [[ "$archive" == *.zip ]]; then
-                ( umask 077; cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
+                ( umask 077; cd "$src" && zip -qr -X "$tmp" "$(snapshot_files .)" $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
             else
-                ( umask 077; cd "$src" && tar -czf "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: tar failed."; exit 1; }
+                ( umask 077; cd "$src" && tar -czf "$tmp" "$(snapshot_files .)" $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: tar failed."; exit 1; }
             fi
             mv -f "$tmp" "$archive"
             local bytes

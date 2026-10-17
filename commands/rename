@@ -122,6 +122,23 @@ cove_rename() {
 
         echo "   - Dropping old database '$old_db_name'..."
         MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
+    elif site_is_laravel "$new_site_dir"; then
+        # A Laravel site's database follows the name only when it is the one
+        # Cove made: copied, .env pointed at the copy, then the old one dropped.
+        source_config
+        local old_laravel_db=""
+        old_laravel_db=$(laravel_cove_db "$new_site_dir" "$old_name")
+        if ! laravel_take_database "$new_site_dir" "$old_name" "$new_name" "$old_site_dir" >/dev/null; then
+            gum style --foreground red "❌ Error: Failed to copy the Laravel site's database. Aborting; old database left intact."
+            mv "$new_site_dir" "$old_site_dir"
+            exit 1
+        fi
+        laravel_retarget "$new_site_dir" "$old_name" "$new_name" || \
+            gum style --foreground yellow "⚠️  Could not update APP_URL in .env; verify it under the new name."
+        if [ -n "$old_laravel_db" ]; then
+            echo "   - Dropping old database '$old_laravel_db'..."
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$old_laravel_db\`;"
+        fi
     fi
 
     # --- Snapshots and the dashboard preview follow the name ---
