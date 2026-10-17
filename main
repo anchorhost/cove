@@ -5109,9 +5109,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $flavor = $v;
                     }
                 }
-                // A Laravel site's database: sqlite (the default) or mysql.
+                // A Laravel site's database: sqlite (the default) or mysql; with
+                // an existing project, nothing means the one it names.
                 $database = $flavor === 'laravel' && in_array($input['database'] ?? '', ['sqlite', 'mysql', 'mariadb'], true) ? '--database=' . $input['database'] : '';
-                $command = sprintf('HOME=%s %s add %s %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $flavor !== '' ? escapeshellarg($flavor) : '', $database !== '' ? escapeshellarg($database) : '');
+                // An existing project to set up: a git URL or a folder, which
+                // the CLI checks; here only that it is one line of text.
+                $from = $flavor === 'laravel' ? trim((string) ($input['from'] ?? '')) : '';
+                if ($from !== '' && (strlen($from) > 500 || $from[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $from))) {
+                    $response['message'] = "That isn't a git URL or a folder.";
+                    break;
+                }
+                $command = sprintf('HOME=%s %s add %s %s %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $flavor !== '' ? escapeshellarg($flavor) : '', $database !== '' ? escapeshellarg($database) : '', $from !== '' ? escapeshellarg('--from=' . $from) : '');
                 // Remember we're adding so the post-exec block below can
                 // measure the new site's size and fold it into the cache.
                 $add_site_target = $site_name;
@@ -7038,6 +7046,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
                 }
+                // What setting up an existing project couldn't finish (the
+                // migrations, the front end): the summary's ⚠️ and ℹ️ lines.
+                $notes = [];
+                foreach ($output as $line) {
+                    $line = trim(preg_replace('/^\s*│|│\s*$/u', '', preg_replace('/\x1b\[[0-9;]*m/', '', $line)));
+                    if (preg_match('/^(⚠️|ℹ️)\s*(.+)$/u', $line, $m)) $notes[] = $m[2];
+                    elseif ($notes && preg_match('/^Fix it, then: (.+)$/', $line, $m)) $notes[count($notes) - 1] .= ' Then: ' . $m[1];
+                }
+                if ($notes) $response['notes'] = $notes;
             }
         } else {
             // Translate known failure signatures into user-friendly messages.
@@ -7070,6 +7087,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $msg = 'Invalid site name.';
                 } elseif (stripos($err_text, 'WordPress installation failed') !== false) {
                     $msg = 'WordPress installation failed — check the logs.';
+                } else {
+                    // Otherwise the command's own reason, and what it suggests
+                    // (setting up an existing project fails in many ways).
+                    $lines = array_values(array_filter(array_map(fn($l) => trim(preg_replace('/\x1b\[[0-9;]*m/', '', $l)), $output), 'strlen'));
+                    foreach ($lines as $i => $l) {
+                        if (strpos($l, '❌') !== 0) continue;
+                        $msg = preg_replace('/^❌\s*(Error:\s*)?/u', '', $l);
+                        foreach (array_slice($lines, $i + 1) as $next) {
+                            if (preg_match('/^(The locked packages|A package needs|If it\'s there|Try --database|Expected |Copy a site with)/', $next)) $msg .= ' ' . $next;
+                        }
+                        break;
+                    }
                 }
             }
             $response = ['success' => false, 'message' => $msg, 'output' => $err_text];
@@ -8515,7 +8544,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         <option value="latest">latest</option>
                         <option value="nightly">nightly</option>
                     </select>
+                    <input type="text" id="laravelFrom" placeholder="new app, or a git URL or folder to set up" spellcheck="false" autocomplete="off" aria-label="An existing Laravel project: a git URL or a folder" title="Empty for a new app. A git URL is cloned and a folder copied, then its packages installed, its database made and migrated, and its front end built" style="display: none;">
                     <select class="wp-version" id="laravelDbSelect" title="Laravel's database: SQLite, Laravel's own default, or MySQL on Cove's MariaDB" aria-label="Laravel's database" style="display: none;">
+                        <option value="" id="laravelDbOwn" hidden>its own db</option>
                         <option value="sqlite">sqlite</option>
                         <option value="mysql">mysql</option>
                     </select>
@@ -9610,7 +9641,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // server and would drop a flag stored on them mid-install.
             phpApplying: {},
             // kind: wordpress | plain | minn | laravel (the add form's type field).
-            newSite: { name: '', kind: 'wordpress', wpVersion: 'latest', database: 'sqlite', isLoading: false },
+            newSite: { name: '', kind: 'wordpress', wpVersion: 'latest', database: 'sqlite', from: '', isLoading: false },
             addType: { open: false, q: '', index: 0 },
             userRole: { open: false, q: '', index: 0, value: 'administrator' },
             minnRelease: null,
@@ -10197,6 +10228,16 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.bindAddType();
                 $id('wpVersionSelect').addEventListener('change', (e) => { this.newSite.wpVersion = e.target.value; this.renderChrome(); });
                 $id('laravelDbSelect').addEventListener('change', (e) => { this.newSite.database = e.target.value; this.renderChrome(); });
+                // An existing project brings its own database unless one is
+                // picked; a new app starts on SQLite.
+                $id('laravelFrom').addEventListener('input', (e) => {
+                    const had = !!this.newSite.from;
+                    this.newSite.from = e.target.value.trim();
+                    if (!had && this.newSite.from && this.newSite.database === 'sqlite') this.newSite.database = '';
+                    if (had && !this.newSite.from && this.newSite.database === '') this.newSite.database = 'sqlite';
+                    $id('laravelDbSelect').value = this.newSite.database;
+                    this.renderChrome();
+                });
                 $id('addForm').addEventListener('submit', (e) => { e.preventDefault(); this.addSite(); });
                 const drop = $id('addDrop');
                 const dropInput = $id('addDropInput');
@@ -10449,13 +10490,20 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const isLaravel = kind === 'laravel';
                 show($id('laravelDbSelect'), isLaravel);
                 $id('laravelDbSelect').disabled = this.newSite.isLoading;
+                show($id('laravelFrom'), isLaravel);
+                $id('laravelFrom').disabled = this.newSite.isLoading;
+                $id('laravelDbOwn').hidden = !this.newSite.from;
                 $id('btnCreate').disabled = !this.newSite.name || this.newSite.isLoading;
                 show($id('createSpinner'), this.newSite.isLoading);
                 $id('createLabel').textContent = this.newSite.isLoading ? 'creating…' : (this.importFile ? 'create & import' : 'create');
                 this.renderImportProgress();
                 // The same, from a terminal.
                 const nm = this.newSite.name || 'mysite';
-                const fl = kind === 'wordpress' ? (this.newSite.wpVersion && this.newSite.wpVersion !== 'latest' ? ' ' + this.newSite.wpVersion : '') : ' ' + kind + (isLaravel && this.newSite.database !== 'sqlite' ? ' --database=' + this.newSite.database : '');
+                const from = isLaravel ? this.newSite.from : '';
+                const db = isLaravel ? this.newSite.database : '';
+                const fl = kind === 'wordpress' ? (this.newSite.wpVersion && this.newSite.wpVersion !== 'latest' ? ' ' + this.newSite.wpVersion : '') : ' ' + kind
+                    + (from ? ' --from=' + (/^[A-Za-z0-9@:\/._~+-]+$/.test(from) ? from : "'" + from.replace(/'/g, "'\\''") + "'") : '')
+                    + (db && (from || db !== 'sqlite') ? ' --database=' + db : '');
                 $id('addEcho').textContent = this.importFile ? 'cove import ' + nm + ' ' + this.importFile.name : 'cove add ' + nm + fl;
 
                 // Theme button tooltip tracks the mode it would switch to.
@@ -17325,7 +17373,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
             renderImportProgress() {
                 const imp = this.importing;
-                show($id('addProgress'), !!imp);
+                const settingUp = !imp && this.newSite.isLoading && this.newSite.kind === 'laravel' && !!this.newSite.from;
+                show($id('addProgress'), !!imp || settingUp);
+                if (settingUp) $id('addProgressText').textContent = 'setting up ' + this.newSite.from + ' — cloning or copying it, installing its Composer and npm packages, migrating, building the front end. A big app takes a few minutes.';
                 $id('addRow').classList.toggle('is-importing', !!imp);
                 if (imp) $id('addProgressText').textContent = imp.phase === 'uploading' ? 'uploading ' + imp.pct + '%…' : 'importing — creating the site, restoring files and database, rewriting URLs. A large archive takes a few minutes.';
                 const label = $id('createLabel');
@@ -17346,7 +17396,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // nothing at all — keeps the generated command identical to
                 // what a plain `cove add <name>` produces.
                 const wpVersion = kind === 'wordpress' ? this.newSite.wpVersion : isPlain ? '' : kind;
-                const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined, database: isLaravel ? this.newSite.database : undefined });
+                const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined, database: isLaravel ? this.newSite.database : undefined, from: isLaravel && this.newSite.from ? this.newSite.from : undefined });
                 if (add.success) {
                     // Optimistic insert: we already know every field the row
                     // template uses. No auto-refresh — the Caddy reload that
@@ -17366,13 +17416,17 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         modified_at: Math.floor(Date.now() / 1000),
                         isLoggingIn: false,
                     });
-                    this.showSnack('Site created.');
+                    // Setting up a project can finish with things left to do.
+                    if (Array.isArray(add.notes) && add.notes.length) this.showSnack('Site created. ' + add.notes.join(' '), false, { duration: 20000 });
+                    else this.showSnack('Site created.');
                     this.newSite.name = '';
                     $id('newSiteName').value = '';
                     this.newSite.wpVersion = 'latest';
                     $id('wpVersionSelect').value = 'latest';
                     this.newSite.database = 'sqlite';
                     $id('laravelDbSelect').value = 'sqlite';
+                    this.newSite.from = '';
+                    $id('laravelFrom').value = '';
                     this.adding = false;
                     this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
 
@@ -17840,7 +17894,15 @@ display_command_help() {
             echo "                 for subdomain mode (store.<name>.localhost) — subsites"
             echo "                 resolve and get HTTPS automatically, no extra setup."
             echo "  --database=<db>  Laravel only: sqlite (the default, as with 'laravel new'),"
-            echo "                 mysql or mariadb (a database on Cove's MariaDB)."
+            echo "                 mysql or mariadb (a database on Cove's MariaDB). With"
+            echo "                 --from, the one the project names unless given."
+            echo "  --from=<src>   Laravel: set up an existing project instead of a new app."
+            echo "                 A git URL (https://…, git@host:path) is cloned; a folder"
+            echo "                 is copied, the original left as it is. Then its Composer"
+            echo "                 and npm packages are installed, .env is written for"
+            echo "                 Cove, its database made and migrated, its front end built."
+            echo "  --branch=<b>   With a git URL: the branch or tag to check out."
+            echo "  --seed         Laravel: run the database seeders after the migrations."
             echo ""
             echo "Examples:"
             echo "  cove add mysite                        Latest WordPress."
@@ -17852,6 +17914,8 @@ display_command_help() {
             echo "  cove add mysite --multisite=subdomain  Subdomain multisite network."
             echo "  cove add myapp laravel                 Laravel on SQLite."
             echo "  cove add myapp laravel --database=mysql  Laravel on Cove's MariaDB."
+            echo "  cove add shop --from=git@github.com:acme/shop.git  An existing app, cloned."
+            echo "  cove add shop --from=~/Herd/shop --seed  An existing app, copied, seeded."
             ;;
         clone)
             echo "Usage: cove clone <source> <new-name>"
