@@ -349,7 +349,7 @@ cove_snapshot() {
                 gum style --foreground red "❌ Error: Which snapshot? cove snapshot $site_name restore <id>"
                 exit 1
             fi
-            echo "⏪ Restoring '$site_name.localhost' to $id…" >&2
+            echo "⏪ Restoring '$site_name.localhost' to ${id}…" >&2
             local safety
             safety=$(snapshot_restore "$site_name" "$id") || exit 1
             safety="${safety##*$'\n'}"
@@ -372,7 +372,7 @@ cove_snapshot() {
             if command -v zip >/dev/null 2>&1; then archive="${out:-$src/$site_name-$id.zip}"; else archive="${out:-$src/$site_name-$id.tar.gz}"; fi
             local tmp="$archive.tmp"
             rm -f "$tmp"
-            if [ "$format" != "json" ]; then echo "📦 Packing snapshot $id…"; fi
+            if [ "$format" != "json" ]; then echo "📦 Packing snapshot ${id}…"; fi
             if [[ "$archive" == *.zip ]]; then
                 ( umask 077; cd "$src" && zip -qr -X "$tmp" "$(snapshot_files .)" $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
             else
