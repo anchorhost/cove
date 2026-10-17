@@ -4349,21 +4349,25 @@ function cove_sqlite_statements($sql) {
 // Errors Laravel logged in the last day, in its newest storage/logs file.
 // Its stamps are in the app's timezone, which is UTC unless changed.
 function cove_recent_laravel_errors($site_path) {
-    $log = cove_laravel_log($site_path);
+    return cove_laravel_error_count(cove_laravel_log($site_path), time() - 86400);
+}
+
+// Errors (ERROR and worse) in a Laravel log since a time, read from its
+// last $tail bytes.
+function cove_laravel_error_count($log, $since, $tail = 2097152) {
     $mt = (int) @filemtime($log);
-    if (!$mt || $mt < time() - 86400) return 0;
+    if (!$mt || $mt < $since) return 0;
     $size = (int) @filesize($log);
     $fh = @fopen($log, 'rb');
     if (!$fh) return 0;
-    fseek($fh, max(0, $size - 2097152));
-    $text = (string) fread($fh, 2097152);
+    fseek($fh, max(0, $size - $tail));
+    $text = (string) fread($fh, $tail);
     fclose($fh);
     if (!preg_match_all('/^\[(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})[^\]]*\] [\w-]+\.(?:ERROR|CRITICAL|ALERT|EMERGENCY):/m', $text, $m)) return 0;
-    $cut = time() - 86400;
     $n = 0;
     foreach ($m[1] as $when) {
         $t = strtotime(str_replace('T', ' ', $when) . ' UTC');
-        if ($t && $t >= $cut) $n++;
+        if ($t && $t >= $since) $n++;
     }
     return $n;
 }
@@ -5080,6 +5084,109 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             fclose($fh);
             echo json_encode(['success' => true, 'log' => $log, 'truncated' => $size > $max]);
             exit;
+        case 'site_routes':
+        case 'site_migrations':
+        case 'site_schedule':
+        case 'site_artisan':
+        case 'site_laravel_op':
+            // --- Site page: a Laravel site's routes, migrations, schedule
+            // and artisan console, all through `cove artisan` so the site's
+            // pinned PHP is honoured. As with WP-CLI above, every argument is
+            // one escapeshellarg and nothing the browser sends meets a shell.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                echo json_encode(['success' => false, 'message' => 'Invalid site name.']);
+                exit;
+            }
+            if (!cove_site_is_laravel($sitedir . '/' . $site_name . '.localhost')) {
+                echo json_encode(['success' => false, 'message' => 'Not a Laravel site.']);
+                exit;
+            }
+            $__artisan = function (array $args) use ($user_home, $cove_path, $site_name) {
+                $cmd = 'HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path) . ' artisan ' . escapeshellarg($site_name);
+                foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string) $a);
+                $t0 = microtime(true);
+                exec($cmd . ' --no-ansi --no-interaction 2>&1 </dev/null', $lines, $code);
+                return [trim(preg_replace('/\x1b\[[0-9;]*m/', '', implode("\n", $lines))), (int) $code, round((microtime(true) - $t0) * 1000)];
+            };
+            // A --json listing; a deprecation notice from the app may come
+            // first, so the last line that parses wins.
+            $__artisan_json = function (array $args) use ($__artisan) {
+                [$out, $code, $ms] = $__artisan($args);
+                $data = json_decode($out, true);
+                if (!is_array($data)) {
+                    foreach (array_reverse(explode("\n", $out)) as $line) { $data = json_decode($line, true); if (is_array($data)) break; }
+                }
+                if (!is_array($data)) {
+                    echo json_encode(['success' => false, 'message' => $out !== '' ? $out : 'artisan failed (' . $code . ').']);
+                    exit;
+                }
+                return [$data, $ms];
+            };
+
+            if ($action === 'site_routes') {
+                [$data, $ms] = $__artisan_json(['route:list', '--json']);
+                $items = array_map(fn($r) => ['method' => $r['method'] ?? '', 'uri' => $r['uri'] ?? '', 'name' => $r['name'] ?? null, 'action' => $r['action'] ?? '', 'middleware' => array_values((array) ($r['middleware'] ?? [])), 'domain' => $r['domain'] ?? null, 'path' => $r['path'] ?? null], $data);
+                echo json_encode(['success' => true, 'items' => $items, 'ms' => $ms]);
+                exit;
+            }
+            if ($action === 'site_schedule') {
+                [$data, $ms] = $__artisan_json(['schedule:list', '--json']);
+                $items = array_map(fn($t) => ['command' => $t['command'] ?? '', 'description' => $t['description'] ?? null, 'expression' => $t['expression'] ?? '', 'next' => $t['next_due_date'] ?? null, 'next_human' => $t['next_due_date_human'] ?? null, 'timezone' => $t['timezone'] ?? null], $data);
+                echo json_encode(['success' => true, 'items' => $items, 'ms' => $ms]);
+                exit;
+            }
+            if ($action === 'site_migrations') {
+                // migrate:status has no --json: its rows are "name .. [batch] Ran"
+                // or "name .. Pending".
+                [$out, $code, $ms] = $__artisan(['migrate:status']);
+                $items = [];
+                foreach (explode("\n", $out) as $line) {
+                    if (preg_match('/^\s*(\S+)\s+\.+\s+(?:\[(\d+)\]\s+)?(Ran|Pending)\s*$/', $line, $m)) $items[] = ['name' => $m[1], 'batch' => $m[2] !== '' ? (int) $m[2] : null, 'ran' => $m[3] === 'Ran'];
+                }
+                if (!$items && $code !== 0) { echo json_encode(['success' => false, 'message' => $out !== '' ? $out : 'artisan failed (' . $code . ').']); exit; }
+                echo json_encode(['success' => true, 'items' => $items, 'ms' => $ms, 'note' => $items ? null : $out]);
+                exit;
+            }
+            if ($action === 'site_laravel_op') {
+                $ops = ['migrate' => ['migrate', '--force'], 'schedule_run' => ['schedule:run'], 'optimize_clear' => ['optimize:clear']];
+                $op = (string) ($input['op'] ?? '');
+                if (!isset($ops[$op])) { echo json_encode(['success' => false, 'message' => 'Unknown operation.']); exit; }
+                [$out, $code, $ms] = $__artisan($ops[$op]);
+                echo json_encode(['success' => $code === 0, 'message' => $out !== '' ? $out : ($code === 0 ? 'Done.' : 'artisan failed (' . $code . ').'), 'ms' => $ms]);
+                exit;
+            }
+            if ($action === 'site_artisan') {
+                // An artisan line from the console, split like the WP-CLI one.
+                $line = trim((string) ($input['args'] ?? ''));
+                $line = preg_replace('/^(php\s+)?artisan\s+/', '', $line);
+                if ($line === '' || strlen($line) > 4000) { echo json_encode(['success' => false, 'message' => 'Nothing to run.']); exit; }
+                $tokens = []; $cur = ''; $q = null; $has = false;
+                for ($i = 0, $n = strlen($line); $i < $n; $i++) {
+                    $ch = $line[$i];
+                    if ($q !== null) {
+                        if ($ch === $q) { $q = null; continue; }
+                        if ($ch === '\\' && $q === '"' && $i + 1 < $n) { $cur .= $line[++$i]; continue; }
+                        $cur .= $ch; continue;
+                    }
+                    if ($ch === '"' || $ch === "'") { $q = $ch; $has = true; continue; }
+                    if ($ch === '\\' && $i + 1 < $n) { $cur .= $line[++$i]; $has = true; continue; }
+                    if ($ch === ' ' || $ch === "\t" || $ch === "\n") { if ($cur !== '' || $has) { $tokens[] = $cur; $cur = ''; $has = false; } continue; }
+                    $cur .= $ch; $has = true;
+                }
+                if ($q !== null) { echo json_encode(['success' => false, 'message' => 'Unbalanced quote.']); exit; }
+                if ($cur !== '' || $has) $tokens[] = $cur;
+                if (!$tokens) { echo json_encode(['success' => false, 'message' => 'Nothing to run.']); exit; }
+                // Commands that wait on a terminal, or run until stopped.
+                $long = ['tinker', 'db', 'serve', 'dev', 'pail', 'queue:work', 'queue:listen', 'schedule:work', 'horizon', 'reverb:start', 'octane:start', 'octane:frankenphp'];
+                if (in_array($tokens[0], $long, true)) {
+                    echo json_encode(['success' => false, 'message' => 'artisan ' . $tokens[0] . ' waits on a terminal or runs until stopped, so it can\'t run here. Use a terminal: cove artisan ' . $site_name . ' ' . $tokens[0]]);
+                    exit;
+                }
+                [$out, $code, $ms] = $__artisan($tokens);
+                echo json_encode(['success' => true, 'output' => $out, 'code' => $code, 'ms' => $ms]);
+                exit;
+            }
+            exit;
         case 'site_plugins':
         case 'site_themes':
         case 'site_users':
@@ -5606,6 +5713,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             };
             $count_php($user_home . '/Cove/Logs/errors.log', '/Sites/' . $site_name . '.localhost/');
             $count_php($site_dir . '/public/wp-content/debug.log', null);
+            // A Laravel site keeps its errors in its own log.
+            if (cove_site_is_laravel($site_dir)) $php_errors += cove_laravel_error_count(cove_laravel_log($site_dir), (int) $cutoff, 12 * 1048576);
 
             $out = ['success' => true, 'range' => $range, 'requests' => $agg['requests'], 'bytes' => $agg['bytes'], 'status' => $agg['status'], 'kinds' => $agg['kinds'], 'php_errors' => $php_errors, 'first' => $agg['first'], 'last' => $agg['last'], 'last_cron' => $agg['last_cron'], 'log_size' => $size, 'scanned' => $scanned, 'complete' => $stopped || $scanned >= $size, 'has_log' => is_file($log)];
             if (!$light) {
@@ -7734,6 +7843,13 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .st-plugins, .st-themes { grid-template-columns: minmax(0, 1fr) auto auto auto minmax(9rem, auto); }
         .st-users { grid-template-columns: minmax(0, 1fr) auto auto auto; }
         .st-cron { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+        .st-routes { grid-template-columns: 7rem minmax(0, 1.3fr) minmax(0, 1fr); }
+        .st-migrations, .st-schedule { grid-template-columns: minmax(0, 1fr) auto auto; }
+        .st-routes .st-chip { justify-self: start; }
+        .st-routes .st-sub.st-act { text-align: right; }
+        .st-title a { color: inherit; text-decoration: none; }
+        .st-title a:hover { color: var(--accent); text-decoration: underline; }
+        .st-chip.st-pending { color: var(--warn); border-color: var(--warn); }
         .st-main { min-width: 0; display: flex; flex-direction: column; gap: 0.1rem; }
         .st-title { font-size: 0.88rem; color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .st-title.st-mono { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 400; }
@@ -8578,6 +8694,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <button type="button" class="mail-part" role="tab" data-tab="themes">themes</button>
                     <button type="button" class="mail-part" role="tab" data-tab="users">users</button>
                     <button type="button" class="mail-part" role="tab" data-tab="cron">cron</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="routes">routes</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="migrations">migrations</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="schedule">schedule</button>
                     <button type="button" class="mail-part" role="tab" data-tab="traffic">traffic</button>
                     <button type="button" class="mail-part" role="tab" data-tab="history">history</button>
                     <button type="button" class="mail-part" role="tab" data-tab="snapshots">snapshots</button>
@@ -8685,6 +8804,33 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <span class="mail-bar-note st-count"></span>
                     <button type="button" class="pill st-due" title="Run every event whose time has come">run all due</button>
                     <button type="button" class="pill st-refresh" title="Re-read the schedule">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading the schedule…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel" id="sitePanel-routes" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter by address, name, action or middleware…" spellcheck="false" autocomplete="off" aria-label="Filter routes">
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill st-optimize" title="artisan optimize:clear — the config, route, view and event caches">clear caches</button>
+                    <button type="button" class="pill st-refresh" title="Read the routes again">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading routes…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel" id="sitePanel-migrations" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter migrations…" spellcheck="false" autocomplete="off" aria-label="Filter migrations">
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill primary st-migrate" title="artisan migrate">run pending</button>
+                    <button type="button" class="pill st-refresh" title="Read the status again">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading migrations…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel" id="sitePanel-schedule" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter tasks…" spellcheck="false" autocomplete="off" aria-label="Filter scheduled tasks">
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill st-sched-run" title="artisan schedule:run — every task that is due now">run due now</button>
+                    <button type="button" class="pill st-refresh" title="Read the schedule again">refresh</button>
                 </div>
                 <ul class="st-list"><li class="loading st-loading">Reading the schedule…</li><li class="empty st-error" style="display: none;"></li></ul>
             </div>
@@ -10154,7 +10300,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const mail = this.siteMail[site.name] || 0;
                 const n = (v) => v >= 1000 ? (v / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : String(v);
                 return (mail ? '<span class="sl-sig mail" title="' + mail + ' unread message' + (mail === 1 ? '' : 's') + ' to @' + this.escapeHtml(site.name) + '.localhost"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="m2.5 4.5 5.5 4 5.5-4"/></svg>' + n(mail) + '</span>' : '')
-                    + (site.php_errors ? '<span class="sl-sig err" title="' + site.php_errors + ' PHP error' + (site.php_errors === 1 ? '' : 's') + ' in debug.log in the last 24 hours"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5 14 13H2Z"/><path d="M8 6.5v3M8 11.2v.1"/></svg>' + site.php_errors + '</span>' : '');
+                    + (site.php_errors ? '<span class="sl-sig err" title="' + site.php_errors + ' PHP error' + (site.php_errors === 1 ? '' : 's') + ' in ' + (site.type === 'Laravel' ? 'laravel.log' : 'debug.log') + ' in the last 24 hours"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5 14 13H2Z"/><path d="M8 6.5v3M8 11.2v.1"/></svg>' + site.php_errors + '</span>' : '');
             },
 
             siteFactsHtml(site) {
@@ -11220,7 +11366,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : null; }
                     else { this.logs.site = null; this.logs.source = 'errors'; }
                     this.setView('logs', { force: true });
-                } else if ((m = /^\/site\/([a-z0-9-]+)(?:\/(plugins|themes|users|cron|traffic|history|snapshots|cli))?$/i.exec(p))) {
+                } else if ((m = /^\/site\/([a-z0-9-]+)(?:\/(plugins|themes|users|cron|routes|migrations|schedule|traffic|history|snapshots|cli))?$/i.exec(p))) {
                     this.sitePage.name = m[1].toLowerCase();
                     this.sitePage.tab = m[2] ? m[2].toLowerCase() : 'overview';
                     this.setView('site', { force: true });
@@ -13114,9 +13260,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('spReveal').querySelector('.pill-label').textContent = this.revealLabel.toLowerCase();
                 $id('spPin').querySelector('.pill-label').textContent = this.isPinned(site.name) ? 'unpin' : 'pin to top';
                 // Tabs: WordPress only; a static site has just the overview.
-                if (!isWp && p.tab !== 'overview' && p.tab !== 'snapshots' && p.tab !== 'traffic' && p.tab !== 'history') { p.tab = 'overview'; this.syncUrl({ replace: true }); }
+                if (!this.siteTabsFor(site).includes(p.tab)) { p.tab = 'overview'; this.syncUrl({ replace: true }); }
                 show($id('siteTabs'), true);
-                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); show(b, isWp || ['overview', 'snapshots', 'traffic'].includes(b.dataset.tab) || (b.dataset.tab === 'history' && site.type !== 'Laravel')); });
+                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); show(b, this.siteTabsFor(site).includes(b.dataset.tab)); if (b.dataset.tab === 'cli') b.textContent = site.type === 'Laravel' ? 'artisan' : 'wp-cli'; });
                 for (const tb of this.siteTabs) show($id('sitePanel-' + tb), p.tab === tb);
                 this.renderSiteTab();
             },
@@ -13218,7 +13364,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     tile('requests', fmtN(d.requests), fmtN(k.page || 0) + ' pages · ' + fmtN(k.asset || 0) + ' assets'),
                     tile('page views', fmtN(k.page || 0), fmtN(k.admin || 0) + ' admin · ' + fmtN(k.rest || 0) + ' rest · ' + fmtN(k.ajax || 0) + ' ajax'),
                     tile('server errors', fmtN(errors), fmtN(d.status['4xx'] || 0) + ' × 4xx · ' + fmtN(d.status['3xx'] || 0) + ' × 3xx', errors ? 'is-bad' : ''),
-                    tile('php errors', fmtN(d.php_errors), 'error log + debug.log', d.php_errors ? 'is-warn' : ''),
+                    tile('php errors', fmtN(d.php_errors), 'error log + ' + (site && site.type === 'Laravel' ? 'laravel.log' : 'debug.log'), d.php_errors ? 'is-warn' : ''),
                     tile('response time', d.avg_ms != null ? esc(d.avg_ms) + ' ms' : '—', d.p95_ms != null ? 'p95 ' + esc(d.p95_ms) + ' ms · max ' + esc(d.max_ms) + ' ms' : ''),
                     tile('served', this.formatSize(d.bytes), (d.last_cron ? 'cron ran ' + (this.formatRelative(d.last_cron) === 'now' ? 'just now' : this.formatRelative(d.last_cron) + ' ago') : 'cron not seen')),
                     tile('mail sent', d.mail == null ? '—' : fmtN(d.mail), d.mail == null ? 'Mailpit did not answer' : 'by whole days'),
@@ -13423,7 +13569,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     + bit('5xx', d.status['5xx'], d.status['5xx'] ? 'is-bad' : '')
                     + bit('php errors', d.php_errors, d.php_errors ? 'is-warn' : '')
                     + (h.mail == null ? '' : bit('mail', h.mail))
-                    + (d.last_cron ? '<span class="fact" title="' + new Date(d.last_cron * 1000).toLocaleString() + '">cron ' + (this.formatRelative(d.last_cron) === 'now' ? 'just now' : this.formatRelative(d.last_cron) + ' ago') + '</span>' : '<span class="fact">cron not seen</span>');
+                    // WordPress's cron rides on page loads; Laravel's scheduler doesn't.
+                    + (site && site.type === 'Laravel' ? '' : d.last_cron ? '<span class="fact" title="' + new Date(d.last_cron * 1000).toLocaleString() + '">cron ' + (this.formatRelative(d.last_cron) === 'now' ? 'just now' : this.formatRelative(d.last_cron) + ' ago') + '</span>' : '<span class="fact">cron not seen</span>');
             },
 
             // --- Previews in the background ---------------------------------
@@ -13724,13 +13871,22 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // --- Site page tabs: plugins, themes, users, cron, wp-cli --------
             // Each tab is a WP-CLI listing fetched when first shown and kept
             // per site; row actions run one command and refetch.
-            get siteTabs() { return ['overview', 'plugins', 'themes', 'users', 'cron', 'traffic', 'history', 'snapshots', 'cli']; },
+            get siteTabs() { return ['overview', 'plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule', 'traffic', 'history', 'snapshots', 'cli']; },
+
+            // The tabs a site's page offers: WordPress's listings, Laravel's
+            // routes, migrations, schedule and artisan, or just the basics.
+            siteTabsFor(site) {
+                if (!site) return ['overview'];
+                if (site.type === 'Laravel') return ['overview', 'routes', 'migrations', 'schedule', 'traffic', 'snapshots', 'cli'];
+                if (this.isWpLike(site)) return ['overview', 'plugins', 'themes', 'users', 'cron', 'traffic', 'history', 'snapshots', 'cli'];
+                return ['overview', 'snapshots', 'traffic', 'history'];
+            },
 
             setSiteTab(tab) {
                 const p = this.sitePage;
                 tab = this.siteTabs.includes(tab) ? tab : 'overview';
                 const site = this.pageSite;
-                if (site && !this.isWpLike(site) && tab !== 'snapshots' && tab !== 'traffic' && tab !== 'history') tab = 'overview';
+                if (site && !this.siteTabsFor(site).includes(tab)) tab = 'overview';
                 p.tab = tab;
                 this.syncUrl();
                 this.renderSitePage();
@@ -13750,18 +13906,18 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const site = this.pageSite;
                 if (tab === 'traffic') { this.loadTraffic(opts); return; }
                 if (tab === 'overview') { this.loadSiteHealth(); return; }
-                if (!site || !['plugins', 'themes', 'users', 'cron', 'snapshots', 'history'].includes(tab)) return;
-                if (!this.isWpLike(site) && tab !== 'snapshots' && tab !== 'history') return;
+                if (!site || !['plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule', 'snapshots', 'history'].includes(tab)) return;
+                if (!this.siteTabsFor(site).includes(tab)) return;
                 const t = this.siteTabState(tab);
                 if (t.loadedFor === site.name && !opts.force) return;
                 if (t.loadedFor !== site.name) { t.items = []; t.loadedFor = null; t.filter = t.filterFor === site.name ? t.filter : ''; t.status = 'all'; t.arm = null; t.open = null; t.diff = null; }
                 t.loading = true; t.error = null;
                 this.renderSiteTab();
-                const action = { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron', snapshots: 'site_snapshots', history: 'site_history' }[tab];
+                const action = { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron', routes: 'site_routes', migrations: 'site_migrations', schedule: 'site_schedule', snapshots: 'site_snapshots', history: 'site_history' }[tab];
                 const res = await this.apiPost(action, { site_name: site.name, check: !!opts.check }, { quiet: true, timeoutMs: opts.check ? 180000 : 90000 });
                 if (this.sitePage.name !== site.name) return;
                 t.loading = false;
-                if (!res.success) t.error = res.message || 'wp-cli failed.';
+                if (!res.success) t.error = res.message || (site.type === 'Laravel' ? 'artisan failed.' : 'wp-cli failed.');
                 else { t.items = res.items || []; t.loadedFor = site.name; t.ms = res.ms || 0; t.extra = res; if (opts.check) t.checked = true; }
                 if (tab === 'history') {
                     const sv = res.saving;
@@ -13791,6 +13947,21 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (this.sitePage.name !== site.name) return;
                 const last = (res.message || '').split('\n').filter(Boolean).pop() || '';
                 this.showSnack(last.replace(/^(Success|Error|Warning): /, '') || (res.success ? 'Done.' : 'Failed.'), !res.success);
+                this.loadSiteTab({ force: true });
+            },
+
+            // One of Laravel's one-click artisan commands, then a refetch.
+            async laravelOp(tab, op) {
+                const site = this.pageSite;
+                const t = this.siteTabState(tab);
+                if (!site || t.busy[op]) return;
+                t.busy[op] = true;
+                this.renderSiteTab();
+                const res = await this.apiPost('site_laravel_op', { site_name: site.name, op }, { quiet: true, timeoutMs: 300000 });
+                delete t.busy[op];
+                if (this.sitePage.name !== site.name) return;
+                const lines = (res.message || '').split('\n').map(l => l.trim()).filter(Boolean);
+                this.showSnack((lines.filter(l => !/^[.\s]*$/.test(l)).pop() || (res.success ? 'Done.' : 'Failed.')).replace(/^(INFO|ERROR|WARN)\s+/, ''), !res.success);
                 this.loadSiteTab({ force: true });
             },
 
@@ -14261,19 +14432,20 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const input = $id('siteCliInput');
                 const line = input.value.trim();
                 if (!site || !line || c.running) return;
+                const kind = this.cliKind(site);
                 c.running = true; c.cmd = line;
                 c.history = [line].concat(c.history.filter(h => h !== line)).slice(0, 50);
                 c.histIdx = -1;
-                try { localStorage.setItem(this.historyKey('cove.cli.history'), JSON.stringify(c.history)); } catch (e) {}
+                try { localStorage.setItem(this.cliHistoryKey(kind), JSON.stringify(c.history)); } catch (e) {}
                 this.renderSiteCli();
-                const res = await this.apiPost('site_wp', { site_name: site.name, args: line }, { quiet: true, timeoutMs: 300000 });
+                const res = await this.apiPost(kind === 'artisan' ? 'site_artisan' : 'site_wp', { site_name: site.name, args: line }, { quiet: true, timeoutMs: 300000 });
                 c.running = false;
                 if (!res.success) { c.output = res.message || 'Failed.'; c.code = 1; c.ms = 0; }
                 else { c.output = res.output; c.code = res.code; c.ms = res.ms; c.notices = res.notices || 0; }
                 c.ran = line;
                 this.renderSiteCli();
                 // Listings the command may have changed are refetched next visit.
-                for (const tab of ['plugins', 'themes', 'users', 'cron']) { const t = this.sitePage.tabs[tab]; if (t) t.loadedFor = null; }
+                for (const tab of ['plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule']) { const t = this.sitePage.tabs[tab]; if (t) t.loadedFor = null; }
             },
 
             siteTabVisible(tab) {
@@ -14291,6 +14463,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     if (q) rows = rows.filter(u => (u.user_login + ' ' + u.display_name + ' ' + u.user_email + ' ' + u.roles).toLowerCase().includes(q));
                 } else if (tab === 'cron') {
                     if (q) rows = rows.filter(e => (e.hook + ' ' + e.recurrence).toLowerCase().includes(q));
+                } else if (tab === 'routes') {
+                    if (q) rows = rows.filter(r => (r.method + ' /' + r.uri + ' ' + (r.name || '') + ' ' + r.action + ' ' + (r.middleware || []).join(' ')).toLowerCase().includes(q));
+                } else if (tab === 'migrations') {
+                    if (q) rows = rows.filter(m => (m.name + (m.ran ? ' ran' : ' pending')).toLowerCase().includes(q));
+                } else if (tab === 'schedule') {
+                    if (q) rows = rows.filter(x => (x.command + ' ' + (x.description || '') + ' ' + x.expression).toLowerCase().includes(q));
                 } else if (tab === 'history') {
                     if (q) rows = rows.filter(s => { const sum = s.summary || {}; const comps = Array.isArray(sum.components) ? sum.components : []; return (s.id + ' ' + (s.note || '') + ' ' + (sum.summary || '') + ' ' + comps.map(c => c.slug + ' ' + (c.title || '')).join(' ')).toLowerCase().includes(q); });
                 }
@@ -14304,7 +14482,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (tab === 'cli') { this.renderSiteCli(); return; }
                 if (tab === 'traffic') { this.renderTraffic(); return; }
                 if (tab === 'overview') { this.renderSiteHealth(); return; }
-                if (!['plugins', 'themes', 'users', 'cron', 'snapshots', 'history'].includes(tab)) return;
+                if (!['plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule', 'snapshots', 'history'].includes(tab)) return;
                 const site = this.pageSite;
                 const t = this.siteTabState(tab);
                 const panel = $id('sitePanel-' + tab);
@@ -14335,10 +14513,16 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (check) { check.disabled = t.loading; check.textContent = t.loading && t.checking ? 'checking…' : 'check for updates'; }
                 const due = panel.querySelector('.st-due');
                 if (due) { due.disabled = !!t.busy['*']; due.textContent = t.busy['*'] ? 'running…' : 'run all due'; }
+                // Laravel's one-click artisan commands, busy while they run.
+                for (const [sel, op, idle, running] of [['.st-migrate', 'migrate', 'run pending', 'migrating…'], ['.st-sched-run', 'schedule_run', 'run due now', 'running…'], ['.st-optimize', 'optimize_clear', 'clear caches', 'clearing…']]) {
+                    const b = panel.querySelector(sel);
+                    if (b) { b.disabled = !!t.busy[op]; b.textContent = t.busy[op] ? running : idle; }
+                }
+                if (tab === 'migrations') { const b = panel.querySelector('.st-migrate'); if (b && !t.busy.migrate) b.disabled = !t.items.some(m => !m.ran); }
                 const count = panel.querySelector('.st-count');
                 if (!loaded) { count.textContent = savingText; return; }
                 const rows = this.siteTabVisible(tab);
-                const label = { plugins: 'plugin', themes: 'theme', users: 'user', cron: 'event', snapshots: 'snapshot', history: 'save' }[tab];
+                const label = { plugins: 'plugin', themes: 'theme', users: 'user', cron: 'event', routes: 'route', migrations: 'migration', schedule: 'task', snapshots: 'snapshot', history: 'save' }[tab];
                 const updates = (tab === 'plugins' || tab === 'themes') ? t.items.filter(i => i.update === 'available').length : 0;
                 count.textContent = (rows.length === t.items.length ? t.items.length : rows.length + ' of ' + t.items.length) + ' ' + label + (t.items.length === 1 ? '' : 's')
                     + (updates ? ' · ' + updates + ' update' + (updates === 1 ? '' : 's') : '')
@@ -14348,7 +14532,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const frag = document.createDocumentFragment();
                 const esc = (s) => this.escapeHtml(s == null ? '' : String(s));
                 const ms = site && site.multisite;
-                if (!rows.length) { const li = document.createElement('li'); li.className = 'st-empty'; li.textContent = t.items.length ? 'Nothing matches.' : (tab === 'history' ? 'No saves yet — press save now, or wait for tonight.' : 'Nothing here.'); frag.appendChild(li); }
+                const emptyText = { history: 'No saves yet — press save now, or wait for tonight.', schedule: 'Nothing scheduled. Tasks are defined in routes/console.php.', migrations: (t.extra && t.extra.note) || 'No migrations.' }[tab] || 'Nothing here.';
+                if (!rows.length) { const li = document.createElement('li'); li.className = 'st-empty'; li.textContent = t.items.length ? 'Nothing matches.' : emptyText; frag.appendChild(li); }
                 for (const it of rows) {
                     const li = document.createElement('li');
                     li.className = 'st-row st-' + tab;
@@ -14444,6 +14629,25 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             + '<span class="st-ver" title="' + esc(it.next_run_gmt || '') + ' UTC">' + (past ? 'due' : esc(it.next_run_relative || '')) + '</span>'
                             + '<span class="st-chip' + (it.recurrence === 'Non-repeating' ? ' st-none' : '') + '">' + esc(it.recurrence === 'Non-repeating' ? 'once' : it.recurrence) + '</span>'
                             + '<span class="st-actions">' + (busy ? '<span class="st-busy">' + (busy === 'delete' ? 'unscheduling…' : 'running…') + '</span>' : '<button type="button" class="pill st-run">run now</button>' + (armX ? '<button type="button" class="pill st-del armed st-cron-del">sure? unschedule</button>' : '')) + '</span>';
+                    } else if (tab === 'routes') {
+                        // A GET route with no parameters opens in a new tab.
+                        const uri = '/' + String(it.uri || '').replace(/^\//, '');
+                        const open = /GET/.test(it.method) && !/[{]/.test(uri) && !it.domain && site;
+                        const mw = (it.middleware || []).map(m => String(m).split('\\').pop()).join(', ');
+                        li.innerHTML = '<span class="st-chip">' + esc(String(it.method).replace('GET|HEAD', 'GET')) + '</span>'
+                            + '<div class="st-main"><span class="st-title st-mono">' + (open ? '<a href="' + esc(site.domain + (uri === '/' ? '/' : uri)) + '" target="_blank" rel="noopener">' + esc(uri) + '</a>' : esc(uri)) + '</span>'
+                            + '<span class="st-sub">' + esc([it.name, mw].filter(Boolean).join(' · ')) + '</span></div>'
+                            + '<span class="st-sub st-act" title="' + esc((it.action || '') + (it.path ? '\n' + it.path : '')) + '">' + esc(it.action === 'Closure' && it.path ? 'closure · ' + it.path : it.action) + '</span>';
+                    } else if (tab === 'migrations') {
+                        li.classList.toggle('is-off', !it.ran);
+                        li.innerHTML = '<div class="st-main"><span class="st-title st-mono">' + esc(it.name) + '</span></div>'
+                            + '<span class="st-ver">' + (it.batch != null ? 'batch ' + esc(it.batch) : '') + '</span>'
+                            + '<span class="st-chip' + (it.ran ? '' : ' st-pending') + '">' + (it.ran ? 'ran' : 'pending') + '</span>';
+                    } else if (tab === 'schedule') {
+                        li.innerHTML = '<div class="st-main"><span class="st-title st-mono">' + esc(it.command) + '</span>'
+                            + (it.description && it.description !== it.command ? '<span class="st-sub">' + esc(it.description) + '</span>' : '') + '</div>'
+                            + '<span class="st-ver" title="' + esc((it.next || '') + (it.timezone ? ' (' + it.timezone + ')' : '')) + '">' + esc(it.next_human || '') + '</span>'
+                            + '<span class="st-chip st-mono" title="cron expression">' + esc(it.expression) + '</span>';
                     }
                     frag.appendChild(li);
                 }
@@ -14463,10 +14667,30 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 }
             },
 
+            // The console runs WP-CLI, or artisan on a Laravel site; each
+            // keeps a history of its own.
+            cliKind(site) { return site && site.type === 'Laravel' ? 'artisan' : 'wp'; },
+
+            cliHistoryKey(kind) { return this.historyKey(kind === 'artisan' ? 'cove.artisan.history' : 'cove.cli.history'); },
+
             renderSiteCli() {
                 const c = this.sitePage.cli;
                 const site = this.pageSite;
-                $id('siteCliPrompt').textContent = 'cove wp ' + (site ? site.name : '') + ' ';
+                const kind = this.cliKind(site);
+                if (c.kind !== kind) {
+                    // Switching between a WordPress and a Laravel site.
+                    c.kind = kind;
+                    try { c.history = JSON.parse(localStorage.getItem(this.cliHistoryKey(kind)) || '[]'); } catch (e) { c.history = []; }
+                    c.histIdx = -1;
+                    c.ran = null;
+                    const examples = kind === 'artisan'
+                        ? ['about', 'route:list --except-vendor', 'migrate:status', 'make:model Post -m', 'db:show', 'config:show database', 'optimize:clear']
+                        : ['core version --extra', 'option get siteurl', 'plugin list --status=active', 'cache flush', 'transient delete --all', ['search-replace https://old.example https://new.example --dry-run', 'search-replace --dry-run'], ['eval \'echo wp_get_environment_type();\'', 'eval …']];
+                    $id('siteCliExamples').innerHTML = '<span>try</span>' + examples.map(x => { const [cmd, label] = Array.isArray(x) ? x : [x, x]; return '<button type="button" data-cmd="' + this.escapeHtml(cmd) + '">' + this.escapeHtml(label) + '</button>'; }).join('');
+                    $id('siteCliInput').placeholder = kind === 'artisan' ? 'route:list' : 'plugin list --status=active';
+                    $id('siteCliInput').setAttribute('aria-label', kind === 'artisan' ? 'artisan command' : 'WP-CLI command');
+                }
+                $id('siteCliPrompt').textContent = 'cove ' + kind + ' ' + (site ? site.name : '') + ' ';
                 $id('btnSiteCliRun').disabled = c.running;
                 $id('btnSiteCliRun').textContent = c.running ? 'running…' : 'run';
                 const out = $id('siteCliOut');
@@ -14475,19 +14699,23 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 show(out, true);
                 out.textContent = c.output === '' ? '(no output)' : c.output;
                 out.classList.toggle('is-error', c.code !== 0);
-                meta.textContent = '$ wp ' + c.ran + '  ·  exit ' + c.code + (c.ms ? ' · ' + (c.ms >= 1000 ? (c.ms / 1000).toFixed(1) + ' s' : c.ms + ' ms') : '') + (c.notices ? ' · ' + c.notices + ' PHP notice line' + (c.notices === 1 ? '' : 's') + ' hidden' : '');
+                meta.textContent = '$ ' + (kind === 'artisan' ? 'artisan ' : 'wp ') + c.ran + '  ·  exit ' + c.code + (c.ms ? ' · ' + (c.ms >= 1000 ? (c.ms / 1000).toFixed(1) + ' s' : c.ms + ' ms') : '') + (c.notices ? ' · ' + c.notices + ' PHP notice line' + (c.notices === 1 ? '' : 's') + ' hidden' : '');
             },
 
             bindSiteTabEvents() {
                 const p = this.sitePage;
-                try { p.cli.history = JSON.parse(localStorage.getItem(this.historyKey('cove.cli.history')) || '[]'); } catch (e) {}
+                try { p.cli.history = JSON.parse(localStorage.getItem(this.historyKey('cove.cli.history')) || '[]'); p.cli.kind = 'wp'; } catch (e) {}
                 $id('siteTabs').addEventListener('click', (e) => {
                     const b = e.target.closest('.mail-part');
                     if (b) this.setSiteTab(b.dataset.tab);
                 });
-                for (const tab of ['plugins', 'themes', 'users', 'cron', 'snapshots', 'history']) {
+                for (const tab of ['plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule', 'snapshots', 'history']) {
                     const panel = $id('sitePanel-' + tab);
                     const t = () => this.siteTabState(tab);
+                    for (const [sel, op] of [['.st-migrate', 'migrate'], ['.st-sched-run', 'schedule_run'], ['.st-optimize', 'optimize_clear']]) {
+                        const b = panel.querySelector(sel);
+                        if (b) b.addEventListener('click', () => this.laravelOp(tab, op));
+                    }
                     const filter = panel.querySelector('.st-filter');
                     if (filter) {
                         filter.addEventListener('input', () => { t().filter = filter.value; this.renderSiteTab(); });
