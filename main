@@ -4087,6 +4087,210 @@ function cove_laravel_mtime($site_path) {
     return $t ?: null;
 }
 
+// A cell for the database view: strings and NULL pass through; anything
+// that is not UTF-8 is shown as a hex prefix, and long text is cut so a 2 MB
+// serialized option doesn't ride along with every page.
+function cove_db_cell($v) {
+    if ($v === null) return null;
+    $v = (string) $v;
+    if (!mb_check_encoding($v, 'UTF-8')) return ['t' => 'bin', 'hex' => bin2hex(substr($v, 0, 48)), 'len' => strlen($v)];
+    if (strlen($v) > 2000) return ['t' => 'long', 'text' => mb_substr($v, 0, 2000), 'len' => strlen($v)];
+    return $v;
+}
+
+// The database view's actions for one SQLite file (a Laravel site's), over
+// PDO, answering in the same shape as the MariaDB side: tables, structure,
+// rows with search and sort, a cell, an edit, a delete, and the console.
+// Rows are addressed by the primary key, else the first unique index whose
+// columns are all NOT NULL; with neither, the grid is read-only.
+function cove_db_sqlite($action, $input, $file) {
+    $cap = 500;
+    try {
+        if (!class_exists('PDO') || !in_array('sqlite', PDO::getAvailableDrivers(), true)) throw new RuntimeException('This PHP has no pdo_sqlite.');
+        $pdo = new PDO('sqlite:' . $file, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5]);
+        $q = fn($id) => '"' . str_replace('"', '""', (string) $id) . '"';
+        $names = $pdo->query("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name")->fetchAll(PDO::FETCH_COLUMN);
+        $table = (string) ($input['table'] ?? '');
+        if (in_array($action, ['db_rows', 'db_cell', 'db_update', 'db_delete_row', 'db_structure'], true) && !in_array($table, $names, true)) throw new RuntimeException('No such table.');
+
+        $describe = function () use ($pdo, $q, $table) {
+            $cols = []; $pkpos = [];
+            foreach ($pdo->query('PRAGMA table_xinfo(' . $q($table) . ')')->fetchAll(PDO::FETCH_ASSOC) as $c) {
+                if ((int) $c['hidden'] === 1) continue;
+                $cols[] = ['name' => $c['name'], 'type' => $c['type'], 'null' => !(int) $c['notnull'], 'key' => (int) $c['pk'] > 0 ? 'PRI' : '', 'default' => $c['dflt_value'], 'extra' => (int) $c['hidden'] > 1 ? 'generated' : '', 'collation' => null, 'comment' => ''];
+                if ((int) $c['pk'] > 0) $pkpos[(int) $c['pk']] = $c['name'];
+            }
+            ksort($pkpos);
+            $pk = array_values($pkpos);
+            $indexes = [];
+            foreach ($pdo->query('PRAGMA index_list(' . $q($table) . ')')->fetchAll(PDO::FETCH_ASSOC) as $ix) {
+                $icols = array_map(fn($r) => $r['name'], $pdo->query('PRAGMA index_info(' . $q($ix['name']) . ')')->fetchAll(PDO::FETCH_ASSOC));
+                $indexes[] = ['name' => $ix['name'], 'unique' => (int) $ix['unique'] === 1, 'type' => $ix['origin'] === 'pk' ? 'PRIMARY' : 'BTREE', 'columns' => $icols];
+            }
+            if (!$pk) {
+                $notnull = array_map(fn($c) => $c['name'], array_filter($cols, fn($c) => !$c['null']));
+                foreach ($indexes as $ix) {
+                    if ($ix['unique'] && $ix['columns'] && !array_diff($ix['columns'], $notnull)) { $pk = $ix['columns']; break; }
+                }
+            }
+            return [$cols, $pk, $indexes];
+        };
+        $row_where = function ($pk, $key) use ($q) {
+            if (!$pk) throw new RuntimeException('This table has no primary key, so rows cannot be addressed.');
+            if (!is_array($key)) throw new RuntimeException('Missing row key.');
+            $parts = []; $params = [];
+            foreach ($pk as $c) {
+                if (!array_key_exists($c, $key)) throw new RuntimeException('Missing row key.');
+                if ($key[$c] === null) { $parts[] = $q($c) . ' IS NULL'; }
+                else { $parts[] = $q($c) . ' = ?'; $params[] = (string) $key[$c]; }
+            }
+            return [implode(' AND ', $parts), $params];
+        };
+
+        if ($action === 'db_tables') {
+            $types = $pdo->query("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')")->fetchAll(PDO::FETCH_KEY_PAIR);
+            $tables = [];
+            foreach ($names as $n) {
+                $rows = null;
+                try { $rows = (int) $pdo->query('SELECT COUNT(*) FROM ' . $q($n))->fetchColumn(); } catch (Throwable $e) {}
+                $tables[] = ['name' => $n, 'view' => ($types[$n] ?? '') === 'view', 'engine' => 'sqlite', 'rows' => $rows, 'bytes' => null, 'collation' => null];
+            }
+            return ['success' => true, 'tables' => $tables, 'wp' => null];
+        }
+        if ($action === 'db_structure') {
+            [$cols, $pk, $indexes] = $describe();
+            $st = $pdo->prepare('SELECT sql FROM sqlite_master WHERE name = ?');
+            $st->execute([$table]);
+            return ['success' => true, 'columns' => $cols, 'pk' => $pk, 'indexes' => $indexes, 'create' => (string) $st->fetchColumn()];
+        }
+        if ($action === 'db_rows') {
+            [$cols, $pk] = $describe();
+            $cnames = array_map(fn($c) => $c['name'], $cols);
+            $limit = max(10, min(500, (int) ($input['limit'] ?? 100)));
+            $start = max(0, (int) ($input['start'] ?? 0));
+            $where = ''; $params = [];
+            $needle = (string) ($input['q'] ?? '');
+            $col = (string) ($input['col'] ?? '');
+            if ($needle !== '') {
+                $like = '%' . $needle . '%';
+                if ($col !== '' && in_array($col, $cnames, true)) { $where = ' WHERE ' . $q($col) . ' LIKE ?'; $params[] = $like; }
+                else {
+                    $parts = [];
+                    foreach (array_slice($cnames, 0, 60) as $n) { $parts[] = 'CAST(' . $q($n) . ' AS TEXT) LIKE ?'; $params[] = $like; }
+                    $where = ' WHERE ' . implode(' OR ', $parts);
+                }
+            }
+            $order = '';
+            $sort = (string) ($input['sort'] ?? '');
+            $dir = ($input['dir'] ?? 'asc') === 'desc' ? 'DESC' : 'ASC';
+            if ($sort !== '' && in_array($sort, $cnames, true)) $order = ' ORDER BY ' . $q($sort) . ' ' . $dir;
+            elseif ($pk) $order = ' ORDER BY ' . implode(', ', array_map($q, $pk));
+            $from = ' FROM ' . $q($table);
+            $st = $pdo->prepare('SELECT COUNT(*)' . $from . $where);
+            $st->execute($params);
+            $total = (int) $st->fetchColumn();
+            $st = $pdo->prepare('SELECT ' . ($cnames ? implode(', ', array_map($q, $cnames)) : '*') . $from . $where . $order . ' LIMIT ' . $limit . ' OFFSET ' . $start);
+            $st->execute($params);
+            $rows = array_map(fn($r) => array_map('cove_db_cell', $r), $st->fetchAll(PDO::FETCH_NUM));
+            return ['success' => true, 'columns' => $cols, 'pk' => $pk, 'rows' => $rows, 'total' => $total, 'start' => $start, 'limit' => $limit];
+        }
+        if ($action === 'db_cell' || $action === 'db_update' || $action === 'db_delete_row') {
+            [$cols, $pk] = $describe();
+            [$w, $params] = $row_where($pk, $input['pk'] ?? null);
+            $from = ' FROM ' . $q($table) . ' WHERE ' . $w;
+            if ($action === 'db_delete_row') {
+                $st = $pdo->prepare('DELETE' . $from);
+                $st->execute($params);
+                return ['success' => true, 'affected' => $st->rowCount()];
+            }
+            $col = (string) ($input['col'] ?? '');
+            if (!in_array($col, array_map(fn($c) => $c['name'], $cols), true)) throw new RuntimeException('Unknown column.');
+            if ($action === 'db_cell') {
+                $st = $pdo->prepare('SELECT ' . $q($col) . $from . ' LIMIT 1');
+                $st->execute($params);
+                $r = $st->fetch(PDO::FETCH_NUM);
+                if (!$r) throw new RuntimeException('Row not found.');
+                if ($r[0] !== null && !mb_check_encoding((string) $r[0], 'UTF-8')) throw new RuntimeException('Binary values cannot be edited here.');
+                return ['success' => true, 'value' => $r[0] === null ? null : (string) $r[0]];
+            }
+            $isNull = !empty($input['null']);
+            $value = $isNull ? null : (string) ($input['value'] ?? '');
+            $st = $pdo->prepare('UPDATE ' . $q($table) . ' SET ' . $q($col) . ' = ' . ($isNull ? 'NULL' : '?') . ' WHERE ' . $w);
+            $st->execute($isNull ? $params : array_merge([$value], $params));
+            $affected = $st->rowCount();
+            // The row as it now is, keyed the way the grid keys it.
+            $key = $input['pk'];
+            if (!$isNull && in_array($col, $pk, true)) $key[$col] = $value;
+            [$w2, $p2] = $row_where($pk, $key);
+            $st = $pdo->prepare('SELECT ' . implode(', ', array_map(fn($c) => $q($c['name']), $cols)) . ' FROM ' . $q($table) . ' WHERE ' . $w2 . ' LIMIT 1');
+            $st->execute($p2);
+            $row = $st->fetch(PDO::FETCH_NUM);
+            return ['success' => true, 'affected' => $affected, 'row' => $row ? array_map('cove_db_cell', $row) : null];
+        }
+        if ($action === 'db_query') {
+            $sql = (string) ($input['sql'] ?? '');
+            if (trim($sql) === '') throw new RuntimeException('Nothing to run.');
+            $results = [];
+            $t0 = microtime(true);
+            foreach (cove_sqlite_statements($sql) as $stmt) {
+                try {
+                    $st = $pdo->prepare($stmt);
+                    $st->execute();
+                    if ($st->columnCount() > 0) {
+                        $cols = [];
+                        for ($k = 0; $k < $st->columnCount(); $k++) { $m = $st->getColumnMeta($k); $cols[] = $m['name'] ?? ('column ' . ($k + 1)); }
+                        $rows = []; $n = 0;
+                        while ($n < 100000 && ($r = $st->fetch(PDO::FETCH_NUM)) !== false) { if ($n++ < $cap) $rows[] = array_map('cove_db_cell', $r); }
+                        $results[] = ['type' => 'rows', 'columns' => $cols, 'rows' => $rows, 'total' => $n, 'truncated' => $n > $cap];
+                    } else {
+                        $results[] = ['type' => 'ok', 'affected' => $st->rowCount(), 'insert_id' => (int) $pdo->lastInsertId(), 'info' => ''];
+                    }
+                } catch (Throwable $e) {
+                    $results[] = ['type' => 'error', 'message' => $e->getMessage()];
+                    break;
+                }
+            }
+            return ['success' => true, 'results' => $results, 'ms' => round((microtime(true) - $t0) * 1000, 1)];
+        }
+        throw new RuntimeException('Unknown database action.');
+    } catch (Throwable $e) {
+        return ['success' => false, 'message' => $e->getMessage()];
+    }
+}
+
+// The console's SQL split into statements for SQLite, which runs one at a
+// time: semicolons inside quotes, identifiers and comments don't count, nor
+// those inside a CREATE TRIGGER until its END. Comment-only pieces go.
+function cove_sqlite_statements($sql) {
+    $out = []; $cur = ''; $n = strlen($sql); $i = 0;
+    while ($i < $n) {
+        $c = $sql[$i];
+        if ($c === "'" || $c === '"' || $c === '`' || $c === '[') {
+            $close = $c === '[' ? ']' : $c;
+            $j = $i + 1;
+            while ($j < $n) {
+                if ($sql[$j] === $close) {
+                    if ($close !== ']' && $j + 1 < $n && $sql[$j + 1] === $close) { $j += 2; continue; }
+                    break;
+                }
+                $j++;
+            }
+            $cur .= substr($sql, $i, $j - $i + 1);
+            $i = $j + 1;
+            continue;
+        }
+        if ($c === '-' && substr($sql, $i, 2) === '--') { $j = strpos($sql, "\n", $i); $j = $j === false ? $n : $j; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
+        if ($c === '/' && substr($sql, $i, 2) === '/*') { $j = strpos($sql, '*/', $i + 2); $j = $j === false ? $n : $j + 2; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
+        if ($c === ';' && (!preg_match('/^\s*CREATE\s+(TEMP\w*\s+)?TRIGGER\b/i', $cur) || preg_match('/\bEND\s*$/i', $cur))) {
+            $out[] = $cur; $cur = ''; $i++;
+            continue;
+        }
+        $cur .= $c; $i++;
+    }
+    $out[] = $cur;
+    return array_values(array_filter($out, fn($s) => trim(preg_replace('~--[^\n]*|/\*.*?\*/~s', '', $s)) !== ''));
+}
+
 // Errors Laravel logged in the last day, in its newest storage/logs file.
 // Its stamps are in the app's timezone, which is UTC unless changed.
 function cove_recent_laravel_errors($site_path) {
@@ -5648,6 +5852,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // rather than allow-listed so any schema a site created works.
             // During `cove demo` it signs in as the demo's own account, which
             // can open only the demo sites' databases (see demo_db_sync).
+            // A Laravel site on SQLite goes by "sqlite:<site>" (cove_db_sqlite).
+            if (strncmp((string) ($input['db'] ?? ''), 'sqlite:', 7) === 0) {
+                $__site = substr((string) $input['db'], 7);
+                $__sp = $sitedir . '/' . $__site . '.localhost';
+                if (!preg_match('/^[a-z0-9-]+$/', $__site) || cove_demo_hides($user_home, $__site) || !cove_site_is_laravel($__sp) || !is_file(cove_laravel_sqlite_path($__sp))) {
+                    echo json_encode(['success' => false, 'message' => 'No such database.']);
+                    exit;
+                }
+                echo json_encode(cove_db_sqlite($action, $input, cove_laravel_sqlite_path($__sp)));
+                exit;
+            }
             $__db_cfg = isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : [];
             if (cove_demo_sites($user_home) !== null) {
                 $__db_cfg = @parse_ini_file($user_home . '/Cove/demo-db') ?: [];
@@ -5670,13 +5885,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // JSON-safe cell values: strings and NULL pass through; anything
             // that is not UTF-8 is shown as a hex prefix, and long text is cut
             // so a 2 MB serialized option doesn't ride along with every page.
-            $__cell = function ($v) {
-                if ($v === null) return null;
-                $v = (string) $v;
-                if (!mb_check_encoding($v, 'UTF-8')) return ['t' => 'bin', 'hex' => bin2hex(substr($v, 0, 48)), 'len' => strlen($v)];
-                if (strlen($v) > 2000) return ['t' => 'long', 'text' => mb_substr($v, 0, 2000), 'len' => strlen($v)];
-                return $v;
-            };
+            $__cell = 'cove_db_cell';
             $__rows_of = function ($res) use ($__cell) {
                 $out = [];
                 while ($r = $res->fetch_row()) $out[] = array_map($__cell, $r);
@@ -5753,6 +5962,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if (in_array($r['name'], $__system, true)) continue;
                     if ($__demo_dbs !== null && !in_array($r['name'], $__demo_dbs, true)) continue;
                     $out[] = ['name' => $r['name'], 'tables' => $light ? null : (int) $r['tables_count'], 'bytes' => $light ? null : (int) $r['bytes']];
+                }
+                // Laravel sites on SQLite, as "sqlite:<site>".
+                foreach (is_dir($sitedir) ? scandir($sitedir) : [] as $item) {
+                    if (substr($item, -10) !== '.localhost' || cove_demo_hides($user_home, $item)) continue;
+                    $sp = $sitedir . '/' . $item;
+                    if (!cove_site_is_laravel($sp)) continue;
+                    $env = cove_laravel_env($sp);
+                    if (($env['DB_CONNECTION'] ?? 'sqlite') !== 'sqlite') continue;
+                    $f = cove_laravel_sqlite_path($sp, $env);
+                    if (!is_file($f)) continue;
+                    $n = null;
+                    if (!$light) {
+                        try { $n = (int) (new PDO('sqlite:' . $f))->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")->fetchColumn(); } catch (Throwable $e) {}
+                    }
+                    $out[] = ['name' => 'sqlite:' . substr($item, 0, -10), 'tables' => $n, 'bytes' => $light ? null : filesize($f)];
                 }
                 echo json_encode(['success' => true, 'databases' => $out, 'server' => $__db->server_info]);
                 exit;
@@ -11843,6 +12067,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.renderViewBack('dbBack', site);
                 const adminer = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) + (d.name ? '&db=' + encodeURIComponent(d.name) + (d.table ? '&select=' + encodeURIComponent(d.table) : '') : '');
                 $id('dbAdminerLink').href = adminer;
+                // Cove's Adminer signs in to MariaDB; an SQLite file stays here.
+                show($id('dbAdminerLink'), !String(d.name || '').startsWith('sqlite:'));
                 $id('dbAdminerLink').title = 'Open ' + (d.table ? d.table + ' in Adminer' : d.name ? d.name + ' in Adminer' : 'Adminer') + (site ? ' (' + site + '.localhost)' : '') + ' — exports, imports, schema changes, users';
             },
 
@@ -11903,7 +12129,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const sub = [];
                 if (site) sub.push('<a href="https://' + esc(site) + '.localhost' + PORT_SUFFIX + '" target="_blank" rel="noopener" style="color: var(--accent); text-decoration: none;">' + esc(site) + '.localhost</a>');
                 if (meta && meta.tables !== null) sub.push(meta.tables + ' table' + (meta.tables === 1 ? '' : 's') + ' · ' + this.formatSize(meta.bytes));
-                if (d.server) sub.push('MariaDB ' + esc(d.server.replace(/-MariaDB.*$/, '')));
+                if (String(d.name).startsWith('sqlite:')) sub.push('SQLite, the site\'s database file');
+                else if (d.server) sub.push('MariaDB ' + esc(d.server.replace(/-MariaDB.*$/, '')));
                 html += '<p class="db-ov-sub">' + sub.join(' · ') + '</p>';
                 if (d.tablesFor !== d.name) { html += '<div class="loading">Loading…</div>'; box.innerHTML = html; return; }
                 if (d.error) { html += '<div class="mail-msg-error">' + esc(d.error) + '</div>'; box.innerHTML = html; return; }
@@ -11924,7 +12151,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             + '</ul>';
                     }
                 } else if (d.tables.length) {
-                    html += '<p class="db-ov-sub">Not a WordPress database — pick a table on the left, or open the SQL console.</p>';
+                    const owner = site ? this.sites.find(x => x.name === site) : null;
+                    html += '<p class="db-ov-sub">' + (owner && owner.type === 'Laravel' ? 'The Laravel app\'s database' : 'Not a WordPress database') + ' — pick a table on the left, or open the SQL console.</p>';
                 } else {
                     html += '<p class="db-ov-sub">Empty database. The SQL console is the place to start.</p>';
                 }
