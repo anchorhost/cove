@@ -293,6 +293,11 @@ cove_install() {
             "Pick different"*)
                 prompt_custom_ports 8090 8453
                 ;;
+            *)
+                # Esc or Ctrl-C leaves gum choose with no answer.
+                echo "🚫 Installation cancelled."
+                exit 1
+                ;;
         esac
         port_choice_made=true
     fi
@@ -356,7 +361,7 @@ cove_install() {
                 gum style --foreground yellow \
                     "⚠️  Services may fail to bind on ${HTTP_PORT}/${HTTPS_PORT}."
                 ;;
-            "Cancel installation")
+            "Cancel installation"|*)
                 echo "🚫 Installation cancelled."
                 exit 1
                 ;;
@@ -382,8 +387,9 @@ cove_install() {
     # only fires when it's actually meaningful.
     if [ -d "$ADMINER_DIR" ]; then
         if ! $auto_yes && ! gum confirm "⚠️ Cove already appears to be installed at ~/Cove. Proceeding may overwrite some configurations. Continue?"; then
+            # Non-zero, so the installer that ran us doesn't report success.
             echo "🚫 Installation cancelled."
-            exit 0
+            exit 1
         fi
     fi
     

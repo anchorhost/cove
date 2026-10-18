@@ -267,18 +267,23 @@ fi
 echo_info "Handing off to Cove to complete the installation..."
 echo "--------------------------------------------------"
 
-# 'set -e' is active, so a non-zero exit from `cove install` will abort the
-# script before we reach the success messages below. This is important when
-# the user cancels from Cove's interactive prompts — we must not claim success
-# after the user has explicitly cancelled.
+# A non-zero exit from `cove install` (a failed step, or a prompt the user
+# declined) must stop us before the success message below: we must not
+# claim success after the user has explicitly cancelled.
 #
 # Redirect stdin from /dev/tty so interactive prompts (gum confirm/choose,
 # read) work when this installer is run via `curl | bash`, which would
 # otherwise hand the child a closed stdin and silently fail every prompt.
+COVE_INSTALL_RC=0
 if (exec < /dev/tty) 2>/dev/null; then
-    "$DESTINATION_PATH" install < /dev/tty
+    "$DESTINATION_PATH" install < /dev/tty || COVE_INSTALL_RC=$?
 else
-    "$DESTINATION_PATH" install
+    "$DESTINATION_PATH" install || COVE_INSTALL_RC=$?
+fi
+if [ "$COVE_INSTALL_RC" -ne 0 ]; then
+    echo "--------------------------------------------------"
+    echo "${RED}${BOLD}ERROR:${NC} Cove's setup didn't finish. Run 'cove install' to try again." >&2
+    exit "$COVE_INSTALL_RC"
 fi
 
 echo "--------------------------------------------------"
