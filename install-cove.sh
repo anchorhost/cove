@@ -121,6 +121,32 @@ setup_environment() {
     echo_error "This script currently only supports MacOS and Linux."
 }
 
+# Puts Homebrew on PATH for new terminals, as Homebrew's own "Next steps"
+# say to: its installer only prints them, and the shellenv eval'd here lasts
+# for this run alone, so the next terminal couldn't find brew or cove.
+persist_brew_shellenv() {
+    local line="eval \"\$($INSTALL_DIR/brew shellenv)\""
+    local profile=""
+    case "${SHELL:-}" in
+        */zsh*) profile="${ZDOTDIR:-$HOME}/.zprofile" ;;
+        */bash*) profile="$HOME/.bash_profile" ;;
+    esac
+    if [ -z "$profile" ]; then
+        echo_info "Add this line to your shell's startup file so new terminals find Homebrew and cove:"
+        echo "    $line"
+        return 0
+    fi
+    if grep -qsF "$INSTALL_DIR/brew shellenv" "$profile"; then
+        return 0
+    fi
+    if { echo; echo "$line"; } 2>/dev/null >> "$profile"; then
+        echo_info "Added Homebrew to your PATH for new terminals, in $profile."
+    else
+        echo "${YELLOW}${BOLD}WARNING:${NC} Couldn't write to $profile. Add this line to it so new terminals find Homebrew and cove:"
+        echo "    $line"
+    fi
+}
+
 # --- Pre-flight Checks & Dependency Management ---
 pre_flight_checks() {
     echo_info "Running pre-flight checks..."
@@ -132,7 +158,13 @@ pre_flight_checks() {
 
     # 2. Check for the detected package manager
     if ! command -v $PKG_MANAGER &> /dev/null; then
-        if [ "$OS" == "macos" ]; then
+        if [ "$OS" == "macos" ] && [ -x "$INSTALL_DIR/brew" ]; then
+            # Installed, but this shell was never set up for it (Homebrew's
+            # "Next steps" skipped): use it rather than install it again.
+            echo_info "Found Homebrew in $INSTALL_DIR, though it isn't on your PATH."
+            eval "$("$INSTALL_DIR/brew" shellenv)"
+            persist_brew_shellenv
+        elif [ "$OS" == "macos" ]; then
             # For MacOS, offer to install Homebrew
             echo "${YELLOW}${BOLD}CONFIRM:${NC} Homebrew is not installed, but it's required by Cove on MacOS."
             # Read the confirmation from the terminal, not this script's stdin —
@@ -149,11 +181,21 @@ pre_flight_checks() {
             echo # Move to a new line
             if [[ $REPLY =~ ^[Yy]$ ]]; then
                 echo_info "Installing Homebrew. This may take a few minutes..."
-                if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+                # Saved whole first: under `bash -c "$(curl …)"` a failed
+                # download runs an empty script, which "succeeds". Its stdin
+                # is the terminal (a reply above means we have one): Homebrew's
+                # installer turns non-interactive when stdin isn't a TTY, as
+                # under `curl | bash`, and then can't ask for the sudo password
+                # it needs on macOS.
+                local brew_installer="$TMP_WORK/homebrew-install.sh"
+                if ! curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$brew_installer"; then
+                    echo_error "Couldn't download Homebrew's installer. Please check your connection."
+                fi
+                if ! /bin/bash "$brew_installer" < /dev/tty || [ ! -x "$INSTALL_DIR/brew" ]; then
                     echo_error "Homebrew installation failed. Please install it manually and run this script again."
                 fi
-                echo_info "Temporarily configuring shell environment for Homebrew..."
-                eval "$($INSTALL_DIR/brew shellenv)"
+                eval "$("$INSTALL_DIR/brew" shellenv)"
+                persist_brew_shellenv
                 echo_success "Homebrew installed successfully."
             else
                 echo_error "Homebrew installation declined. Cannot proceed."
@@ -186,6 +228,10 @@ pre_flight_checks() {
 }
 
 # --- Main Installation Logic ---
+
+# Scratch space for downloads, removed however this script exits.
+TMP_WORK=$(mktemp -d "${TMPDIR:-/tmp}/cove-install.XXXXXX")
+trap 'rm -rf "$TMP_WORK"' EXIT
 
 # 1. Setup environment variables
 setup_environment
