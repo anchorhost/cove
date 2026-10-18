@@ -382,34 +382,46 @@ cove_install() {
         fi
     fi
     
-    # FrankenPHP uses its own universal installer.
-    # The upstream installer tries to write to /usr/local/bin and silently
-    # falls back to CWD when that fails — which happens on a fresh Apple
-    # Silicon Mac (Homebrew lives at /opt/homebrew/bin). To handle both,
-    # we run the installer from a tempdir and, if the binary ends up there
-    # instead of on PATH, move it into $BIN_DIR ourselves.
+    # FrankenPHP. On Linux, its upstream installer, which sets up the apt/dnf
+    # repository and falls back to a static binary saved in the working
+    # directory. On macOS, the release binary straight from GitHub (as
+    # cove_upgrade does): the upstream installer has no Intel Mac build in
+    # its list and exits there, though releases publish frankenphp-mac-x86_64,
+    # and it saves the download without --fail. Either way the binary may
+    # land in a tempdir rather than on PATH, so we move it into $BIN_DIR.
     if ! command -v frankenphp &> /dev/null; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: frankenphp"
-        echo "   - Using the official FrankenPHP installer..."
         local fp_tmpdir
         fp_tmpdir=$(mktemp -d)
-        if run_installer_script https://frankenphp.dev/install.sh "$fp_tmpdir"; then
-            hash -r
-            if ! command -v frankenphp &> /dev/null && [ -x "$fp_tmpdir/frankenphp" ]; then
-                $SUDO_CMD mv "$fp_tmpdir/frankenphp" "$BIN_DIR/frankenphp"
-                $SUDO_CMD chmod +x "$BIN_DIR/frankenphp"
-                hash -r
-            fi
-            rm -rf "$fp_tmpdir"
-            if command -v frankenphp &> /dev/null; then
-                echo "✅ FrankenPHP installed successfully."
-            else
-                gum style --foreground red "❌ FrankenPHP installer ran but the binary is not on PATH."
+        if [ "$OS" = "macos" ]; then
+            local fp_asset="frankenphp-mac-arm64"
+            [ "$(uname -m)" = "x86_64" ] && fp_asset="frankenphp-mac-x86_64"
+            echo "   - Downloading ${fp_asset} from FrankenPHP's latest release..."
+            if ! curl -L --fail --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${fp_asset}" -o "$fp_tmpdir/frankenphp"; then
+                rm -rf "$fp_tmpdir"
+                gum style --foreground red "❌ Failed to download FrankenPHP (${fp_asset})."
                 exit 1
             fi
+            chmod 755 "$fp_tmpdir/frankenphp"
         else
-            rm -rf "$fp_tmpdir"
-            gum style --foreground red "❌ The FrankenPHP download script failed."
+            echo "   - Using the official FrankenPHP installer..."
+            if ! run_installer_script https://frankenphp.dev/install.sh "$fp_tmpdir"; then
+                rm -rf "$fp_tmpdir"
+                gum style --foreground red "❌ The FrankenPHP download script failed."
+                exit 1
+            fi
+        fi
+        hash -r
+        if ! command -v frankenphp &> /dev/null && [ -x "$fp_tmpdir/frankenphp" ]; then
+            $SUDO_CMD mv "$fp_tmpdir/frankenphp" "$BIN_DIR/frankenphp"
+            $SUDO_CMD chmod +x "$BIN_DIR/frankenphp"
+            hash -r
+        fi
+        rm -rf "$fp_tmpdir"
+        if command -v frankenphp &> /dev/null; then
+            echo "✅ FrankenPHP installed successfully."
+        else
+            gum style --foreground red "❌ FrankenPHP was downloaded but isn't on PATH (expected it in $BIN_DIR)."
             exit 1
         fi
     else
