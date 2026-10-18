@@ -42,6 +42,19 @@
 
 ### 🔒 Security & Bug Fixes
 
+* **Intel Macs can install Cove again:** FrankenPHP's own install script has no Intel Mac build in its list and stopped there, so `cove install` failed on every Intel Mac. Cove now downloads the right build from FrankenPHP's GitHub release itself, on Apple Silicon too, and with `--fail`, so an error page is never saved as the binary.
+* **One missing PHP package no longer leaves out the rest on Linux:** the extensions FrankenPHP's packages lack (mysqli, PDO and its drivers, Redis and the rest) went in as one `apt`/`dnf` command, which refuses the whole list over one package a distribution doesn't have, and the install still said ✅. They now go in together or one at a time when that fails, and anything that couldn't be installed is named, with the command to try. The upgrade does the same.
+* **The installer's rough edges:**
+    * **A cancelled install no longer reports success:** declining a prompt, or pressing Esc on a menu, makes `cove install` exit with an error, and `install-cove.sh` says setup didn't finish instead of "installed successfully".
+    * **Downloads fail loudly:** gum, WP-CLI, Adminer and Homebrew's own installer are fetched with `--fail`, so an HTTP error page is never saved or run in their place. Adminer is downloaded beside the old copy and moved into place, so a failed download keeps the one you had.
+    * **Homebrew stays on PATH:** when the installer sets up Homebrew, it adds Homebrew's `shellenv` line to your shell profile (`~/.zprofile` or `~/.bash_profile`), so the next terminal finds `brew` and `cove`. Homebrew's installer now gets the terminal it needs to ask for your password under `curl | bash`. A Homebrew that is installed but not on PATH is used, not installed again.
+    * **The last words are the next step:** the installer ends with `cove add myblog` and the dashboard's address, and mentions opening a new terminal only when one is needed.
+    * **Certificate steps only when trust failed:** the "click Advanced and Proceed" notes and the manual `update-ca-certificates` steps printed even after the certificate authority was trusted. They now print only when it wasn't, and `cove trust` exits with an error then.
+    * **No systemd, no half-install:** on WSL without systemd, or a container whose init isn't systemd, the install used to stop at its first `systemctl`, after every package was in. It now stops before installing anything and says how to turn systemd on in WSL.
+    * **`install-cove.sh --main` installs main:** it used to install the last release, as `cove.sh` is only committed at release time. It now downloads the main branch, builds `cove.sh` from its source, and installs that.
+* **The Linux tray names PostgreSQL and Redis:** it showed them by their internal keys and counted them in "N of M services running", so a stopped Redis made Cove look partly down. They are named now and left out of the count, as in the macOS app.
+* **Reverb's install recovers from a failed download:** a first `cove laravel <site> reverb install` that failed partway through Composer had already pointed `.env` at Reverb, so a second try couldn't boot the app to finish. Broadcasting is now off for that step. When the front end then fails to build, Cove says so and points at the log instead of printing its usual hint.
+
 * **Snapshot ids in messages:** restoring or exporting a snapshot printed garbage in place of its id, because bash 3.2 (macOS's) read the first bytes of the ellipsis after it as part of the variable's name.
 
 ## [2.4] - 2026-10-12
