@@ -7,8 +7,10 @@ cove_artisan() {
         echo "Examples:"
         echo "  cove artisan myapp migrate"
         echo "  cove artisan myapp route:list"
-        echo "  cove artisan myapp queue:work"
-        echo "  cove artisan myapp help migrate    (cove reads --help itself)"
+        echo "  cove artisan myapp make:model Post -m"
+        echo "  cove artisan myapp migrate --help"
+        echo ""
+        echo "A queue worker or the scheduler that keeps running: cove laravel myapp queue on"
         [ -z "$site_name" ] && exit 1
         return
     fi

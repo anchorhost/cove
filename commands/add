@@ -42,7 +42,24 @@ cove_add() {
     local database=""
     local from="" branch="" seed=false
     shift
-    for arg in "$@"; do
+    # Value flags take --flag=value or --flag value. An unknown flag stops
+    # here: dropped silently, `--from ~/app` (no =) built a blank app.
+    local usage="Usage: cove add <name> [flavor] [--plain] [--minn] [--php=8.2] [--multisite[=subdomain]] [--database=sqlite|mysql|pgsql] [--from=<git URL or folder>] [--branch=<name>] [--seed]"
+    local arg val
+    while [ $# -gt 0 ]; do
+        arg="$1"; shift
+        case "$arg" in
+            --wp-version|--php|--database|--from|--branch)
+                if [ $# -eq 0 ] || [[ "$1" == -* ]]; then
+                    gum style --foreground red "❌ Error: $arg needs a value." "$usage"
+                    exit 1
+                fi
+                val="$1"; shift
+                arg="$arg=$val" ;;
+            # --multisite's mode, given apart, only when it's one of the two.
+            --multisite)
+                if [ "${1:-}" = "subdomain" ] || [ "${1:-}" = "subdirectory" ]; then arg="$arg=$1"; shift; fi ;;
+        esac
         case "$arg" in
             --plain)        plain_flag=true ;;
             --minn)         minn=true ;;
@@ -61,8 +78,16 @@ cove_add() {
                             if [[ "$from" != /* ]] && [ -e "$caller_dir/$from" ]; then from="$caller_dir/$from"; fi ;;
             --branch=*)     branch="${arg#*=}" ;;
             --seed)         seed=true ;;
-            -*)             ;;  # unknown flags ignored, as before
-            *)              [ -z "$flavor" ] && flavor="$arg" ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'." "$usage"
+                exit 1 ;;
+            *)
+                if [ -z "$flavor" ]; then
+                    flavor="$arg"
+                else
+                    gum style --foreground red "❌ Error: Unexpected '$arg' after '$flavor'." "$usage"
+                    exit 1
+                fi ;;
         esac
     done
 
@@ -217,7 +242,7 @@ cove_add() {
     full_hostname=$(basename "$site_dir")
 
     if [ -d "$site_dir" ]; then
-        echo "⚠️ Site '$full_hostname' already exists."
+        gum style --foreground red "❌ Error: Site '$full_hostname' already exists." "Open it: $(url_for "$full_hostname")" "Or pick another name (cove list shows the ones in use)."
         exit 1
     fi
     local owner
@@ -459,7 +484,7 @@ PHP
         local db_line="Database: SQLite, database/database.sqlite"
         [ "$database" != "sqlite" ] && db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's MariaDB ($database)"
         [ "$database" = "pgsql" ] && db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's PostgreSQL"
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") Installed" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "Queued jobs run once a worker is going: cove artisan $site_name queue:work"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") Installed" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "Queued jobs run once a worker is going: cove laravel $site_name queue on"
     fi
 }
 
