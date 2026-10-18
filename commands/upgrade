@@ -140,7 +140,7 @@ cove_upgrade() {
         install_path=$(command -v cove)
     fi
     if [ -z "$install_path" ]; then
-        install_path="/usr/local/bin/cove" # Fallback to default
+        install_path="$BIN_DIR/cove" # Where the installer puts it: /opt/homebrew/bin on Apple Silicon
     fi
 
     # 1. Download the latest script
