@@ -160,6 +160,7 @@ cove_login() {
         case "$arg" in
             --url=*) subsite_url="${arg#*=}" ;;
             --to=*) to="${arg#*=}" ;;
+            --user=*) user_identifier="${arg#*=}" ;;
             --plain|--url-only) plain=true ;;
             -*)
                 gum style --foreground red "❌ Error: Unknown option '$arg'."

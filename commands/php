@@ -112,7 +112,7 @@ cove_php() {
     fi
 
     # Unpin: back to FrankenPHP.
-    if [ "$requested" == "default" ]; then
+    if [ "$requested" == "default" ] || [ "$requested" == "unpin" ]; then
         if [ ! -f "$site_dir/php_version" ]; then
             echo "ℹ️  $site_name.localhost already uses Cove's default PHP."
             return 0
