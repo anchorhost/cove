@@ -192,7 +192,7 @@ lane_a() {
             res "$c" install PASS
         else
             res "$c" install FAIL
-            for k in add_latest add_pinned add_plain clone rename login login_rewrite delete status health mailpit mail mcp laravel logrotate reboot; do res "$c" "$k" SKIP; done
+            for k in add_latest add_pinned add_plain clone rename login login_rewrite delete status health mailpit mail mcp laravel logrotate reboot uninstall; do res "$c" "$k" SKIP; done
             return
         fi
 
@@ -443,6 +443,39 @@ LOGROTATE
             res "$c" reboot PASS
         else
             res "$c" reboot FAIL
+        fi
+
+        # `cove uninstall`, last as it takes Cove away (lanes B and C restore
+        # their own snapshot): half the distros keep ~/Cove, half --purge it.
+        local um=keep
+        case "$c" in *2204|*debian13|*rocky9) um=purge ;; esac
+        if cx "$c" env UM="$um" bash -s <<'UNINSTALL'
+fail() { echo "uninstall ($UM): $*" >&2; exit 1; }
+export PATH="/usr/local/bin:$PATH"
+if [ "$UM" = purge ]; then
+    cove uninstall --purge --yes || fail "cove uninstall --purge exited $?"
+else
+    cove uninstall --yes || fail "cove uninstall exited $?"
+fi
+hash -r
+command -v cove >/dev/null && fail "cove still on PATH"
+for u in cove.service cove-watchdog.timer cove-watchdog.service mailpit.service; do
+    [ -e "/etc/systemd/system/$u" ] && fail "$u left"
+done
+systemctl is-active --quiet cove.service && fail "cove.service still running"
+grep -qE '^127\.0\.0\.1[[:space:]]+cove\.localhost' /etc/hosts && fail "/etc/hosts line left"
+curl -sk -o /dev/null --max-time 5 https://alpha.localhost/ && fail "alpha still answering"
+if [ "$UM" = purge ]; then
+    [ -d /root/Cove ] && fail "~/Cove left"
+else
+    [ -d /root/Cove/Sites/alpha.localhost/public ] || fail "alpha's files gone"
+fi
+exit 0
+UNINSTALL
+        then
+            res "$c" uninstall PASS
+        else
+            res "$c" uninstall FAIL
         fi
     } >> "$L" 2>&1
 }

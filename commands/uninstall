@@ -1,0 +1,164 @@
+# `cove uninstall`: Cove's services, background jobs, menu bar app and
+# /etc/hosts lines go, then the cove command itself. The sites in ~/Cove and
+# their databases stay unless --purge, which deletes every site the way
+# `cove delete` does (files, MariaDB or PostgreSQL database, Redis keys) and
+# then ~/Cove. The packages Cove installed (MariaDB, Mailpit, FrankenPHP,
+# gum, WP-CLI, PostgreSQL, Redis) stay either way, since other things may use
+# them: the summary names them with the command that removes them.
+cove_uninstall() {
+    local purge=false dry_run=false yes=false arg
+    for arg in "$@"; do
+        case "$arg" in
+            --purge) purge=true ;;
+            --dry-run) dry_run=true ;;
+            --yes|-y) yes=true ;;
+            -h|--help) display_command_help uninstall; return 0 ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                echo "Usage: cove uninstall [--purge] [--dry-run] [--yes]"
+                exit 1 ;;
+        esac
+    done
+
+    # The copy to remove: this script when it's the installed `cove`, else the
+    # one on PATH. Never a cove.sh run from a checkout of the source.
+    local cove_bin=""
+    if [ "$(basename "$0")" = "cove" ]; then
+        cove_bin="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/cove"
+    fi
+    [ -f "$cove_bin" ] || cove_bin=$(command -v cove 2>/dev/null)
+    [ -n "$cove_bin" ] && [ -f "$cove_bin" ] || cove_bin="$BIN_DIR/cove"
+
+    local sites=() d
+    for d in "$SITES_DIR"/*.localhost; do
+        [ -d "$d" ] && sites+=("$(basename "$d" .localhost)")
+    done
+    local lan_agents=() f
+    if [ "$OS" = "macos" ]; then
+        for f in "$HOME"/Library/LaunchAgents/com.cove.*.lan.plist; do
+            [ -f "$f" ] && lan_agents+=("$f")
+        done
+    fi
+    local shares=()
+    for f in "$APP_DIR"/share/*; do
+        [ -f "$f" ] && shares+=("$(basename "$f")")
+    done
+    local hosts=() h
+    while IFS= read -r h; do
+        [ -n "$h" ] && grep -qE "^127\.0\.0\.1[[:space:]]+${h//./\\.}[[:space:]]*$" /etc/hosts 2>/dev/null && hosts+=("$h")
+    done < <(cove_required_hosts 2>/dev/null)
+
+    echo "Cove uninstall will:"
+    if $purge; then
+        echo "  • Delete all ${#sites[@]} sites: their files, databases and Redis keys"
+    fi
+    echo "  • Stop Cove's services (FrankenPHP, Mailpit, MariaDB, the watchdog, Laravel workers) and remove their service definitions"
+    [ ${#shares[@]} -gt 0 ] && echo "  • End ${#shares[@]} background share(s)"
+    [ ${#lan_agents[@]} -gt 0 ] && echo "  • Stop ${#lan_agents[@]} LAN (Bonjour) advertisement(s)"
+    menubar_is_enabled 2>/dev/null && echo "  • Remove the menu bar app"
+    [ ${#hosts[@]} -gt 0 ] && echo "  • Take Cove's ${#hosts[@]} line(s) out of /etc/hosts (cove.localhost, ${hosts[1]:-}…)"
+    if $purge; then
+        echo "  • Remove Cove's local certificate authority from the system's trust store"
+        echo "  • Delete $COVE_DIR (backups, snapshots, logs, settings)"
+    else
+        echo "  • Keep $COVE_DIR (${#sites[@]} sites, backups, snapshots) and the sites' databases"
+    fi
+    echo "  • Remove the cove command ($cove_bin)"
+
+    if $dry_run; then
+        echo ""
+        echo "Dry run: nothing was changed."
+        return 0
+    fi
+
+    if ! $yes; then
+        if [ ! -t 0 ]; then
+            gum style --foreground red "❌ Error: No terminal to confirm on." "Run it again with --yes to uninstall without asking."
+            exit 1
+        fi
+        echo ""
+        if $purge; then
+            local typed
+            typed=$(gum input --placeholder "Type delete to remove every site and $COVE_DIR")
+            if [ "$typed" != "delete" ]; then
+                echo "🚫 Uninstall cancelled."
+                exit 1
+            fi
+        elif ! gum confirm "Uninstall Cove?"; then
+            echo "🚫 Uninstall cancelled."
+            exit 1
+        fi
+    fi
+    echo ""
+
+    # Sites first, while MariaDB and PostgreSQL still answer. Each in a
+    # subshell, as cove_delete exits on an error.
+    local failed=() s
+    if $purge; then
+        for s in "${sites[@]}"; do
+            echo "🗑️  Deleting $s.localhost…"
+            ( cove_delete "$s" --force --no-reload ) >/dev/null 2>&1 || failed+=("$s")
+        done
+    fi
+
+    for s in "${shares[@]}"; do
+        ( cove_share "$s" stop ) >/dev/null 2>&1
+    done
+    if [ ${#lan_agents[@]} -gt 0 ]; then
+        echo "📡 Stopping LAN advertisements…"
+        for f in "${lan_agents[@]}"; do
+            launchctl unload "$f" &>/dev/null
+            rm -f "$f"
+        done
+    fi
+    if menubar_is_enabled 2>/dev/null; then
+        ( cove_menubar_disable ) 2>&1 | sed 's/^/   /'
+    fi
+
+    cove_disable
+    if [ "$OS" = "linux" ]; then
+        echo "   - Removing Cove's systemd units..."
+        local unit
+        for unit in cove-watchdog.timer cove-watchdog.service cove.service mailpit.service; do
+            $SUDO_CMD systemctl disable --now "$unit" &>/dev/null || true
+            $SUDO_CMD rm -f "/etc/systemd/system/$unit"
+        done
+        $SUDO_CMD systemctl daemon-reload &>/dev/null || true
+    fi
+
+    [ ${#hosts[@]} -gt 0 ] && prune_etc_hosts --all "${hosts[@]}"
+
+    if $purge; then
+        echo "🔐 Removing Cove's certificate authority from the trust store (may ask for your password)..."
+        "$CADDY_CMD" untrust &>/dev/null || $SUDO_CMD "$CADDY_CMD" untrust &>/dev/null \
+            || gum style --foreground yellow "   - ⚠️ Couldn't remove it; Keychain Access (macOS) or update-ca-certificates (Linux) can."
+        # Only ever the folder Cove made in this account's home.
+        if [ -n "$HOME" ] && [ "$COVE_DIR" = "$HOME/Cove" ] && [ -d "$COVE_DIR" ]; then
+            echo "🧹 Deleting $COVE_DIR..."
+            rm -rf "$COVE_DIR" 2>/dev/null || $SUDO_CMD rm -rf "$COVE_DIR"
+        fi
+    fi
+
+    # Last, the script that is running: bash keeps reading the open file.
+    if [ -f "$cove_bin" ]; then
+        rm -f "$cove_bin" 2>/dev/null || $SUDO_CMD rm -f "$cove_bin"
+    fi
+
+    echo ""
+    local done_lines=("✅ Cove is uninstalled.")
+    if $purge; then
+        [ ${#failed[@]} -gt 0 ] && done_lines+=("These sites couldn't be fully deleted: ${failed[*]}")
+    else
+        done_lines+=("Your sites are still in $COVE_DIR. Remove them with: rm -rf $COVE_DIR")
+    fi
+    done_lines+=("" "The packages Cove installed are still there, for anything else that uses them:")
+    if [ "$OS" = "macos" ]; then
+        done_lines+=("  brew uninstall gum mariadb mailpit wp-cli   (plus postgresql@17 and redis if Cove set them up)")
+        done_lines+=("  rm $(dirname "$cove_bin")/frankenphp")
+    else
+        done_lines+=("  sudo $PKG_MANAGER remove frankenphp 'php-zts-*' mariadb-server   (plus postgresql and redis if Cove set them up)")
+        done_lines+=("  sudo rm /usr/local/bin/mailpit /usr/local/bin/gum /usr/local/bin/wp")
+    fi
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "${done_lines[@]}"
+    [ ${#failed[@]} -eq 0 ]
+}

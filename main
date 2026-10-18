@@ -2327,8 +2327,13 @@ update_etc_hosts() {
 # checked again first: it is spliced into a sudo sed expression, and GNU
 # sed's `e` command runs a shell.
 prune_etc_hosts() {
-    local required host stale=() sed_args=()
-    required=$(cove_required_hosts 2>/dev/null)
+    local required="" host stale=() sed_args=()
+    # --all: every name given goes, needed or not (cove uninstall).
+    if [ "${1:-}" = "--all" ]; then
+        shift
+    else
+        required=$(cove_required_hosts 2>/dev/null)
+    fi
     for host in "$@"; do
         [ -n "$host" ] && [[ "$host" != \*.* ]] && validate_hostname "$host" || continue
         printf '%s\n' "$required" | grep -qxF "$host" && continue
@@ -18687,6 +18692,7 @@ show_general_help() {
     echo ""
     help_section "Cove itself"
     help_cmd install "Installs and configures Homebrew dependencies."
+    help_cmd uninstall "Removes Cove's services and command; keeps your sites unless --purge."
     help_cmd upgrade "Upgrades Cove to the latest available version."
     help_cmd version "Displays the current version of Cove."
     help_cmd demo "Show only a few sites (and a mailbox of their own) for recording a demo."
@@ -19408,6 +19414,21 @@ display_command_help() {
             echo "Flags:"
             echo "  --yes, -y    Skip the prompt shown when the local Adminer version can't be parsed."
             ;;
+        uninstall)
+            echo "Usage: cove uninstall [--purge] [--dry-run] [--yes]"
+            echo ""
+            echo "Removes Cove: stops its services and removes their definitions, ends background"
+            echo "shares and LAN advertisements, removes the menu bar app and Cove's /etc/hosts"
+            echo "lines, then the cove command itself. Your sites in ~/Cove and their databases"
+            echo "stay. The packages Cove installed (MariaDB, Mailpit, FrankenPHP, gum, WP-CLI,"
+            echo "PostgreSQL, Redis) stay too; the summary says how to remove them."
+            echo ""
+            echo "Flags:"
+            echo "  --purge     Also delete every site (files, databases, Redis keys), ~/Cove"
+            echo "              and Cove's local certificate authority. Asks you to type delete."
+            echo "  --dry-run   Show what would happen, and change nothing."
+            echo "  --yes, -y   Don't ask (needed without a terminal)."
+            ;;
         version)
             echo "Usage: cove version"
             echo ""
@@ -19802,6 +19823,10 @@ main() {
             ;;
         upgrade)
             cove_upgrade "$@"
+            ;;
+        uninstall)
+            check_dependencies
+            cove_uninstall "$@"
             ;;
         version)
             cove_version
