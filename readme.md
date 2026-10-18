@@ -10,10 +10,10 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
   * **Web Dashboard**: A built-in GUI at `https://cove.localhost` with five views. **Sites**, a summary of what your cove holds (plugins, themes, WordPress and PHP versions, disk) over a list grouped by when each site last changed, with filters like `plugin:woo` or `is:outdated`, pins, bulk actions, and one-click admin logins; **Mail**, an inbox of everything your sites send, scoped per site; **Databases**, a browser with in-place editing and a SQL console; **Logs**, PHP errors per site, `debug.log`, and access logs, live; and **Files**, a file manager and editor over each site's directory. Every view has a real URL.
   * **Automatic HTTPS**: Every site is served over HTTPS using Caddy's internal CA — no cert wrangling.
   * **WordPress & Static Sites**: Spin up a fresh WordPress install — any version, nightly, or a multisite network — a [Minn Engine](https://minn.run) site, or a plain static site with one command.
-  * **Laravel**: `cove add myapp laravel` creates a Laravel app the way `laravel new` does, on SQLite by default, on Cove's MariaDB with `--database=mysql` or on PostgreSQL with `--database=pgsql` (set up the first time it's asked for), its mail caught in Cove's mailbox; `cove add shop --from=<git URL or folder>` sets up an existing one instead, packages, database, migrations and front end included. `cove artisan` and `cove composer` run on the PHP the site serves with, `cove login` signs in through the app's own auth (`cove laravel myapp user add` gives a new app someone to sign in as), `cove laravel` keeps a queue worker and the scheduler running, and the dashboard has its users, routes, migrations, schedule, database, `laravel.log`, and an artisan console. Vite's `npm run dev` works as it is.
-  * **Per-site PHP**: Pin any site to an older PHP (`cove php mysite 8.2`); it runs on a native php-fpm behind the same Caddy, with TLS, logs, and URLs unchanged.
+  * **Laravel**: `cove add myapp laravel` creates a Laravel app the way `laravel new` does, on SQLite by default, on Cove's MariaDB with `--database=mysql` or on PostgreSQL with `--database=pgsql` (set up the first time it's asked for), its mail caught in Cove's mailbox; `cove add shop --from=<git URL or folder>` sets up an existing one instead, packages, database, migrations and front end included. `cove artisan` and `cove composer` run on the PHP the site serves with, `cove login` signs in through the app's own auth (`cove laravel myapp user add` gives a new app someone to sign in as), `cove laravel` keeps a queue worker, the scheduler and Reverb running, and the dashboard has its users, routes, migrations, schedule, database, `laravel.log`, and an artisan console. Vite's `npm run dev` works as it is.
+  * **Per-site PHP** (macOS): Pin any site to an older PHP (`cove php mysite 8.2`); it runs on Homebrew's native php-fpm behind the same Caddy, with TLS, logs, and URLs unchanged. On Linux every site runs on FrankenPHP's PHP.
   * **WordPress Migration**: Pull a remote site down via SSH (`cove pull`) or push a local site up (`cove push`), including a single tenant of a WP Freighter install (`--tenant`).
-  * **Database Management**: Browse and edit any table from the dashboard, run SQL with `⌘↵`, plus Adminer with passwordless auto-login for exports and schema work. `cove db backup` snapshots every site; `cove db list` shows credentials.
+  * **Database Management**: Browse and edit any table from the dashboard, run SQL with `⌘↵`, plus Adminer with passwordless auto-login for exports and schema work. `cove db backup` dumps every WordPress site's database; `cove db list` shows their credentials.
   * **Email Catching**: Built-in Mailpit catches every outgoing email so you never risk sending a test to a real inbox. Read it in the dashboard, filtered by site, with reset and login links lifted out of each message — and nothing is ever pruned.
   * **Logs, Parsed**: The shared PHP error log, each site's `debug.log`, Caddy access logs, and the service logs, read backwards in chunks so size never matters, with repeats folded and stack traces a click away.
   * **Traffic**: Each site's access log, read as requests, page views, errors, response times, and slowest requests, over a day, a week, or all of it, without any tracking script.
@@ -21,42 +21,54 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
   * **Snapshots**: `cove snapshot mysite` copies a site's files and database in about a second (copy-on-write clones on APFS, btrfs, xfs); restore puts one back and keeps the state it replaced, so nothing is lost.
   * **Plugins, Themes, Users, Cron**: Manage a site's plugins and themes, log in as any user, run cron events, or type WP-CLI, all from the site's page in the dashboard.
   * **Files, In Place**: Browse any site's directory from the dashboard, open a file in a plain-text editor and save with `⌘S`, preview images, create, rename, delete, download, and drop files or whole folders onto the listing to upload them.
-  * **Custom Ports**: Run Cove alongside Local, Studio, DevKinsta, or MAMP — pick alternative HTTP/HTTPS ports and Cove migrates stored WordPress URLs automatically.
+  * **Custom Ports**: Run Cove alongside Local, Studio, DevKinsta, or MAMP — pick alternative HTTP/HTTPS ports and Cove migrates stored WordPress URLs, and Laravel apps' `APP_URL`, automatically.
   * **LAN & Mobile Testing**: `cove lan` exposes sites to your phone via Bonjour/mDNS for iOS app sync.
   * **Tailscale Integration**: `cove tailscale enable` makes every site reachable from any device on your tailnet.
-  * **Instant Public Sharing**: `cove share` spins up a Cloudflare Tunnel so you can share a WIP site with a client in seconds.
+  * **Instant Public Sharing**: `cove share` spins up a Cloudflare Tunnel so you can share a WIP site with a client in seconds, in the foreground or in the background until `cove share <site> stop`.
   * **Hosts File Automation**: Cove manages `/etc/hosts` entries for you — no manual editing.
   * **Pretty Errors**: Whoops renders beautiful PHP error pages with stack traces and editor integration.
-  * **AI Agents (MCP)**: `claude mcp add cove -- cove mcp` gives Claude Code, Cursor, Codex, or any MCP client twenty-five tools over your sites: list, create and clone them, pin a PHP version, run WP-CLI or a Laravel app's artisan (read-only commands through tools of their own), keep a Laravel app's queue worker and scheduler running, list and add a Laravel app's users, get a one-time login link, check a page's status and errors, read PHP and access logs, read the mail a site sent (reset links lifted out), screenshot any page, save plugins and themes before editing them, and take or restore snapshots. No tool deletes a site or reaches a remote host; `wp` and `artisan` run code in the site you name, so approve them like a shell command.
+  * **AI Agents (MCP)**: `claude mcp add cove -- cove mcp` gives Claude Code, Cursor, Codex, or any MCP client twenty-five tools over your sites: list, create and clone them, pin a PHP version, run WP-CLI or a Laravel app's artisan (read-only commands through tools of their own), keep a Laravel app's queue worker, scheduler and Reverb running, list and add a Laravel app's users, get a one-time login link, check a page's status and errors, read PHP and access logs, read the mail a site sent (reset links lifted out), screenshot any page, save plugins and themes before editing them, and take or restore snapshots. No tool deletes a site or reaches a remote host; `wp` and `artisan` run code in the site you name, so approve them like a shell command.
   * **Demo Mode**: `cove demo mysite another` shows only those sites, with a mailbox of their own, across the dashboard, Adminer, and `cove list` while you record. `cove demo off` brings everything back.
-  * **Health Check**: `cove health` diagnoses crashes, OPcache pressure, and on-disk hygiene, and recommends fixes without changing anything.
+  * **Health Check**: `cove health` diagnoses crashes, OPcache pressure, on-disk hygiene, and what other machines can reach, and recommends fixes without changing anything.
   * **Menu Bar App**: `cove menubar enable` adds a tiny companion showing service status at a glance — a native menu bar app on macOS, a system tray app on Linux desktops — with start/stop, one-click site open or admin login, and quick links.
   * **Custom Caddy Rules**: Per-site directives for reverse proxies, auth, headers, or anything else Caddy supports.
 
 ## Core Technologies
 
   * **Web Server**: [Caddy](https://caddyserver.com/) / [FrankenPHP](https://frankenphp.dev/)
-  * **Database**: [MariaDB](https://mariadb.org/)
+  * **Database**: [MariaDB](https://mariadb.org/), plus [PostgreSQL](https://www.postgresql.org/) for Laravel sites that ask for it (optional, set up on first use)
+  * **Cache, sessions and queues**: [Redis](https://redis.io/) for Laravel sites that use it (optional, set up on first use)
   * **Email Catching**: [Mailpit](https://mailpit.axllent.org/)
   * **Error Handling**: [whoops](https://filp.github.io/whoops/)
+  * **PHP Packages**: [Composer](https://getcomposer.org/), Cove's own copy, for `cove composer` and Laravel projects
   * **CLI Beautification**: [`gum`](https://github.com/charmbracelet/gum)
-  * **Made for**: [WordPress](https://wordpress.org) and [`WP-CLI`](https://wp-cli.org/)
+  * **Made for**: [WordPress](https://wordpress.org) and [`WP-CLI`](https://wp-cli.org/), and [Laravel](https://laravel.com/)
 
 ## Installation
 
 Run the following in your terminal to install `cove`.
 
 ```bash
-bash <(curl -sL https://cove.run/install-cove.sh)
+bash <(curl -fsSL https://cove.run/install-cove.sh)
 ```
 
-On macOS, the installer will offer to install Homebrew first if it's not already present. On Linux, make sure `curl` is installed before running it.
+On macOS (Apple Silicon or Intel), the installer will offer to install Homebrew first if it's not already present. On Linux (Ubuntu, Debian, Fedora, Rocky Linux/RHEL), make sure `curl` is installed before running it.
 
-To preview an unreleased build from the `main` branch — useful for verifying a fix before it's tagged — pass `--main`:
+To preview an unreleased build from the `main` branch — useful for verifying a fix before it's tagged — pass `--main`. The installer downloads the main branch and builds `cove.sh` from its source:
 
 ```bash
-bash <(curl -sL https://cove.run/install-cove.sh) --main
+bash <(curl -fsSL https://cove.run/install-cove.sh) --main
 ```
+
+### Uninstalling
+
+```bash
+cove uninstall             # removes Cove, keeps ~/Cove and your sites' databases
+cove uninstall --dry-run   # shows what it would remove, changes nothing
+cove uninstall --purge     # also deletes every site, ~/Cove and the local CA
+```
+
+`cove uninstall` stops Cove's services and removes their definitions, ends background shares and LAN advertisements, removes the menu bar app, takes Cove's lines out of `/etc/hosts`, and removes the `cove` command. Your sites in `~/Cove` and their databases stay. `--purge` also deletes every site (files, databases and Redis keys), `~/Cove` and Cove's local certificate authority, after you type `delete`. The packages Cove installed (MariaDB, Mailpit, FrankenPHP, gum, WP-CLI, PostgreSQL, Redis) stay either way, since other things may use them; the summary at the end names the command that removes them. Without a terminal, pass `--yes`.
 
 ## 🚀 Quick Start
 
@@ -66,43 +78,44 @@ Once installed, this is the shortest path from zero to a working WordPress site:
 cove add myblog                # fresh WP install at https://myblog.localhost
 cove login myblog              # generates a one-time admin login URL
 cove list                      # shows every site Cove manages
-cove db backup                 # snapshots every site's database to .sql
+cove db backup                 # dumps every WordPress site's database to .sql
 ```
 
 Open `https://cove.localhost` in your browser to see the dashboard. It answers only on the machine running Cove (private addresses too under WSL2, and tailnet addresses over `cove tailscale`); shared sites are unaffected. Fresh installs trust Cove's local certificate authority automatically; if a browser still warns you, run `cove trust` once (see [Troubleshooting](#-troubleshooting)).
 
 ## 💻 Usage
 
-Cove provides a simple set of commands to manage your local environment.
+Cove provides a simple set of commands to manage your local environment. Wherever a site name goes, `shop` and `shop.localhost` both work.
 
 ### Site Management
 
 | Command | Description |
 | --- | --- |
-| `cove add <name> [flavor]` | Creates a new WordPress site (`<name>.localhost`). The optional flavor says what goes inside it: a version (`6.4.3`, `6.9-RC1`), `nightly`, `latest` (the default), `minn` for a Minn Engine site (the latest WordPress with the engine installed over it, WordPress's own files parked in `wp-parked/` for `wp minn eject`), `laravel` for a Laravel app (see below), or `plain` for a static site with no database. `--multisite` builds a subdirectory network, `--multisite=subdomain` a subdomain one (subsites get HTTPS automatically); `--php=<ver>` pins the PHP version. Every WordPress site is created with `WP_ENVIRONMENT_TYPE` set to `local` (so core and plugins that check `wp_get_environment_type()` treat it as a sandbox) and `WP_DEBUG_LOG` on, writing to `wp-content/debug.log`. A `laravel` site's folder is the project, so its `public/` is the webroot; it gets an SQLite database (Laravel's own default) or, with `--database=mysql` or `mariadb`, one on Cove's MariaDB, or with `--database=pgsql` one on PostgreSQL (see `cove postgres`), and its `.env` is set up with the site's https address and mail to Cove's mailbox. `--from=<git URL or folder>` sets up an existing Laravel project instead (a repository cloned, `--branch=` for a branch or tag; a folder copied, the original untouched): Composer and npm packages installed, `.env` written for Cove, the database it names made and migrated (`--seed` runs the seeders), the front end built. |
+| `cove add <name> [type]` | Creates a new WordPress site (`<name>.localhost`). The optional type says what goes inside it: a version (`6.4.3`, `6.9-RC1`), `nightly`, `latest` (the default), `minn` for a Minn Engine site (the latest WordPress with the engine installed over it, WordPress's own files parked in `wp-parked/` for `wp minn eject`), `laravel` for a Laravel app (see below), or `plain` for a static site with no database. `--wp-version=<ver>` is the same as giving the version as the type. `--multisite` builds a subdirectory network, `--multisite=subdomain` (or `--multisite-subdomain`) a subdomain one (subsites get HTTPS automatically); `--php=<ver>` pins the PHP version (macOS); `--no-reload` leaves the Caddy reload for later. Every WordPress site is created with `WP_ENVIRONMENT_TYPE` set to `local` (so core and plugins that check `wp_get_environment_type()` treat it as a sandbox) and `WP_DEBUG_LOG` on, writing to `wp-content/debug.log`. A `laravel` site's folder is the project, so its `public/` is the webroot; it gets an SQLite database (Laravel's own default) or, with `--database=mysql` or `mariadb`, one on Cove's MariaDB, or with `--database=pgsql` one on PostgreSQL (see `cove postgres`), and its `.env` is set up with the site's https address and mail to Cove's mailbox. `--from=<git URL or folder>` sets up an existing Laravel project instead (a repository cloned, `--branch=` for a branch or tag; a folder copied, the original untouched): Composer and npm packages installed, `.env` written for Cove, the database it names made and migrated (`--seed` runs the seeders), the front end built. Value flags take `--flag=value` or `--flag value` (`--from ~/Herd/shop`), and an unknown flag is an error. |
 | `cove clone <source> <new-name>` | Copies a site — files, database, and custom Caddy rules — under a new name, rewriting stored URLs to the new domain. Uses a copy-on-write clone on APFS and btrfs, so it's fast and the two copies share disk until one is written to. |
-| `cove delete <name> [--force]` | Deletes a site's directory and its associated database. |
+| `cove delete <name> [--yes]` | Deletes a site's folder, its database (MariaDB or PostgreSQL), its snapshots and custom Caddy rules, and a Laravel app's Redis keys. Zips in `~/Cove/Backups` stay. Asks first in a terminal; `--yes` (or `--force`) doesn't. |
 | `cove rename <old-name> <new-name>` | Renames a site, its directory, database, and runs `wp search-replace` so stored URLs (siteurl, home, serialized content) all update to the new domain. |
-| `cove list [--totals]` | Lists all sites managed by Cove, including each one's WordPress version. Use `--totals` to show disk usage. |
+| `cove list [--totals] [--format=json]` | Lists all sites managed by Cove, with each one's type (WordPress, Multisite, Minn, Laravel or Plain), WordPress version and PHP. Use `--totals` to show disk usage, `--format=json` for scripts. |
 | `cove core check` | Reports the WordPress version of every site, flagging releases wp.org marks outdated or insecure. |
 | `cove core update <site> [version]` | Updates a site's WordPress core to the latest release, or to a specific version (which may be a downgrade). Use `--all` to update every site that's behind. |
-| `cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>]` | Generates a one-time login link for a WordPress or Laravel site. On a multisite network, `--url` picks the subsite to log in to. A Laravel app signs in through its own auth guard as the user named (an id or email) or its first user, then lands on `--to`, its dashboard route, or home; the link works once, within five minutes, from this machine. A site copied in by hand whose stored URLs still name its live domain has them rewritten to its local address first (the database is saved to its `private/` folder). |
+| `cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>] [--plain]` | Generates a one-time login link for a WordPress or Laravel site; `--user=<user>` names the user too, and `--plain` prints only the link. On a multisite network, `--url` picks the subsite to log in to. A Laravel app signs in through its own auth guard as the user named (an id or email) or its first user, then lands on `--to`, its dashboard route, or home; the link works once, within five minutes, from this machine. A site copied in by hand whose stored URLs still name its live domain has them rewritten to its local address first (the database is saved to its `private/` folder). |
 | `cove network <site> [--format=json]` | Lists the sites on a multisite network: name, URL, and ID. |
 | `cove import <site> <archive.zip\|.tar.gz>` | Creates a new site from a backup archive — a Cove snapshot export, a Local export, or a host backup with a WordPress tree and a `.sql` dump anywhere inside — and rewrites its URLs. |
 | `cove backup <site> [--out=<file.zip>] [--keep]` | Files and database as one zip in `~/Cove/Backups/`, ready for `cove import`. |
 | `cove snapshot <site> [create\|list\|restore <id>\|delete <id>\|export <id>]` | Point-in-time copies of a site's files and database under `~/Cove/Snapshots/<site>/`, restorable in place; a restore snapshots the current state first so it can be undone. `--note="…"` labels one. |
-| `cove screenshot <site> [--out=<file.png>]` | Captures the site's front page with a headless Chromium-family browser; the dashboard shows the capture on the site's page. `--sweep [--max=N] [--idle-only]` refreshes stale previews in the background (the watchdog does this while the desktop is idle). |
+| `cove history <site> [save\|show <id>\|diff <id>\|rollback <id> …]` | A git record of a WordPress (or Minn Engine) site's plugins, themes and mu-plugins, saved nightly while the desktop is idle and whenever you ask (`save`). Each save lists what changed, with versions; `diff` shows the code an update changed, and `rollback <id> --plugin=<slug>` (or `--theme=`, `--all`) puts one back, saving the current state first. `--format=json` for scripts. |
+| `cove screenshot <site> [--out=<file.png>] [--path=/<page>]` | Captures the site's front page (or, with `--path` and `--out`, any page) with a headless Chromium-family browser; the dashboard shows the front page's capture on the site's page. `--sweep [--max=N] [--idle-only]` refreshes stale previews in the background (the watchdog does this while the desktop is idle). |
 | `cove wp <site> <args…>` | Runs WP-CLI inside a site from anywhere, on the PHP the site is pinned to: `cove wp mysite plugin list`. |
 | `cove artisan <site> <args…>` | Runs a Laravel site's artisan from anywhere, on the PHP the site serves with: `cove artisan myapp migrate`. |
 | `cove laravel <site> [queue\|schedule\|reverb] [on\|off]` | A Laravel site's queue worker (`artisan queue:listen`), scheduler (`artisan schedule:work`) and Reverb websocket server (`artisan reverb:start`, reached at `wss://<site>.localhost` through Caddy): one that is on keeps running, started again by the watchdog after a crash or a reboot. Output in the site's `logs/laravel-<worker>.log`. `reverb install` adds Reverb to an app, with Echo in its front end, and turns it on. |
 | `cove postgres [status\|install\|start\|stop\|psql [db]]` | The PostgreSQL that Laravel sites on `--database=pgsql` use: Homebrew's `postgresql@17` on macOS, the distribution's on Linux, set up the first time a site asks for it. Cove signs in as its own role, `cove_user`, with credentials in `~/Cove/config`. `psql` opens a shell as that role. |
 | `cove redis [status\|install\|start\|stop\|cli]` | The Redis that Laravel sites keep their cache, sessions or queue in: Homebrew's on macOS, the distribution's on Linux, set up when an app that uses it is set up with `cove add --from`, or with `install`. No password, loopback only; each site's keys carry its own `REDIS_PREFIX`. |
-| `cove laravel <site> users` / `user add <email> [--name=<name>] [--password=<pw>]` | Lists a Laravel app's users, or adds one (verified, with a made-up password unless one is given), through the user model its auth config names. `cove login <site> <email>` then signs in as them. |
+| `cove laravel <site> users` / `user add <email> [--name=<name>] [--password=<pw>]` | Lists a Laravel app's users, or adds one (verified, with a made-up password unless one is given), through the user model its auth config names. `users add` works too. `cove login <site> <email>` then signs in as them. |
 | `cove composer <site> <args…>` | Runs Composer in a site's folder on the PHP the site serves with, so platform checks and `@php` scripts agree with the site. Cove keeps its own `composer.phar`, checked against getcomposer.org's published SHA-256. |
 | `cove path <name>` | Outputs the full system path to a site's public directory. |
 | `cove url <name>` | Prints the full HTTPS URL for a site (including the port suffix when on alternative ports). |
-| `cove php [<site>] [<version>\|default]` | Per-site PHP version switching. Pinning routes a site through a native Homebrew `php@<version>` php-fpm behind Caddy; `default` returns it to FrankenPHP's bundled PHP. The pin travels with the site through clone and rename. |
-| `cove log [<site>] [-f]` | Shows error logs. Use `-f` to follow logs in real-time. The dashboard's **logs** view shows the same files parsed, filtered by level, and scoped per site. |
+| `cove php [<site>] [<version>\|default\|unpin]` | Per-site PHP version switching, on macOS with Homebrew only (on Linux every site runs on FrankenPHP's PHP). Pinning routes a site through a native Homebrew `php@<version>` php-fpm behind Caddy; `default` (or `unpin`) returns it to FrankenPHP's bundled PHP. WP-CLI, artisan and Composer follow the pin, and it travels with the site through clone and rename. |
+| `cove log [<site>] [--app\|--access] [-f]` | Without a site, the shared PHP error log. With one, the app's own log first (a Laravel app's newest `storage/logs/*.log`, or WordPress's `wp-content/debug.log`), then Caddy's access log; `--app` or `--access` shows just one. Use `-f` to follow logs in real-time. The dashboard's **logs** view shows the same files parsed, filtered by level, and scoped per site. |
 | `cove log rotate` | How long each log is kept, with sizes. Cove keeps every line of its own logs in `~/Cove/Logs` by default; `cove log rotate 50` moves a log past 50 MB to `<name>.log.1` (replacing the one before). `cove log rotate services <MB>\|off\|default` sets the restart-storm cap on FrankenPHP's and Mailpit's own output (50 MB by default, the last tenth kept). `cove log rotate access <MB>\|off\|default [--keep=N] [--days=N]` sets how Caddy rolls each site's access log (100 MB, 10 files, 90 days by default). |
 
 ### Migration
@@ -117,29 +130,38 @@ Cove provides a simple set of commands to manage your local environment.
 
 | Command | Description |
 | --- | --- |
-| `cove enable` | Starts the Caddy, MariaDB, and Mailpit background services. |
-| `cove disable` | Stops all Cove background services. |
-| `cove status` | Checks the status of all background services. |
+| `cove enable` | Starts the Caddy, MariaDB, and Mailpit background services, and the watchdog. PostgreSQL and Redis are optional and left alone (`cove postgres start`, `cove redis start`). |
+| `cove disable` | Stops Cove's background services and Laravel sites' workers. PostgreSQL and Redis are left alone. |
+| `cove status` | Checks the status of all background services. PostgreSQL and Redis show once a Laravel site has set them up, marked optional. `--porcelain` for scripts. |
 | `cove reload` | Regenerates the Caddyfile and reloads the Caddy server. |
-| `cove health` | Read-only diagnostic: service liveness, FrankenPHP process state and last exit, recent segfaults classified by cause, live OPcache pressure, and on-disk hygiene. Recommends fixes, changes nothing. |
+| `cove health` | Read-only diagnostic: service liveness, FrankenPHP process state and last exit, recent segfaults classified by cause, live OPcache pressure, on-disk hygiene, and network exposure (what other machines can reach). Recommends fixes, changes nothing. |
+| `cove opcache [show]` | The shared OPcache that FrankenPHP keeps for every site: its configured limits and the running server's live state (full or not, hits and misses). |
+| `cove opcache sites [--watch[=<sec>]] [--format=json]` | Splits the cache by site: files, MB, and how much was compiled again since the server started (dead weight until the next restart). `--watch` prints, per site, what was new and what was recompiled every minute (or every `<sec>`), with totals on Ctrl-C. |
+| `cove opcache exclude [list\|add\|remove\|apply]` | Keeps paths out of the cache (`~/Cove/opcache-exclude.txt`, read as `opcache.blacklist_filename`): `add mysite wp-content/cache`, `add '*' wp-content/cache` for every site, or an absolute path. A change restarts FrankenPHP after asking. |
+| `cove opcache set <mb> [--interned <mb>] [--files <n>]` | Resizes the cache in `~/Cove/php.ini` and restarts FrankenPHP after asking (`--yes` to skip the question, `--no-restart` to write only). |
+| `cove signals [status\|apply]` | Checks whether FrankenPHP's SIGSEGV handler is Go's own or the parallel extension's (which turns any PHP-thread fault into a server crash), and with `apply` puts Go's back through lldb or gdb. The watchdog applies it once per server start. |
 | `cove menubar <enable\|disable>` | Menu bar companion showing service status at a glance, with start/stop controls, a Sites menu (open a site, or log in to a WordPress site as admin), and quick links to the Dashboard, Adminer, and Mailpit. Native menu bar app on macOS (built locally with clang), system tray app on Linux desktops (python3 + GTK 3 + AyatanaAppIndicator3, offered via apt). Opt-in; no extra download. Originally by [Robby McCullough](https://github.com/RobbyMcCullough/cove-menubar). |
 
 ### Database
 
 | Command | Description |
 | --- | --- |
-| `cove db backup` | Creates a `.sql` backup for every WordPress site. |
+| `cove db backup` | Creates a `.sql` backup for every WordPress site, in each site's `private/` folder. |
 | `cove db list` | Shows database credentials for all WordPress sites. |
+| `cove db fix-collation <site> \| --all [--dry-run]` | Converts tables stamped with MariaDB 11.5+'s `uca1400` collations back to `utf8mb4_unicode_ci`, so dumps import on older MariaDB and MySQL hosts. |
 
-For browsing and editing, the dashboard's **databases** view lists every database with the site that owns it, opens WordPress databases on an overview (site URL, prefix, autoloaded option weight), and lets you page through any table, double-click a cell to edit it, and run SQL. Adminer at `https://db.cove.localhost` signs you in automatically for exports, imports, and schema changes.
+These are for WordPress sites. A Laravel site's database (SQLite, MariaDB or PostgreSQL) travels with `cove backup`, `cove snapshot`, clone and rename.
+
+For browsing and editing, the dashboard's **databases** view lists every database with the site that owns it (a Laravel site's SQLite file as `sqlite:<site>`, and PostgreSQL databases as `pgsql:<name>`), opens WordPress databases on an overview (site URL, prefix, autoloaded option weight), and lets you page through any table, double-click a cell to edit it, and run SQL. Adminer at `https://db.cove.localhost` signs you in automatically for exports, imports, and schema changes.
 
 ### Advanced Configuration
 
 | Command | Description |
 | --- | --- |
-| `cove ports [--http N --https N]` | Interactively reconfigure HTTP/HTTPS ports. Migrates every WordPress site's stored URLs via `wp search-replace` so existing sites keep working. Supports `--dry-run` and `--skip-urls`. |
+| `cove ports [--http=N] [--https=N]` | Interactively reconfigure HTTP/HTTPS ports (`--http N` works too). Migrates every WordPress site's stored URLs via `wp search-replace` so existing sites keep working, and moves Laravel sites' `APP_URL` (and `VITE_REVERB_PORT`) with them. Supports `--dry-run`, `--skip-urls`, and `--yes` to skip the confirmation. |
 | `cove memory [set <value>]` | Audits `memory_limit` across Cove's ini, the FrankenPHP web server, and every `php` on your PATH. `set 2G` bumps Cove's ini and offers to update each Homebrew/system ini. |
-| `cove directive <add\|update\|delete\|list> [site]` | Manages custom Caddyfile rules for a specific site. |
+| `cove directive add\|update <site> [rules \| --rules "…" \| --file <path>]` | Sets a site's custom Caddy rules (a reverse proxy, headers, auth), replacing any it had. Without rules it opens an editor in a terminal, or reads them from stdin: `cat rules.conf \| cove directive add mysite`. `cove directive <site> add` works too. |
+| `cove directive delete <site>` / `list` | Removes a site's rules, or lists every site's. |
 | `cove mappings <site> [add\|remove] [domain]` | Manages additional domain mappings for a site. A leading `*.` (quote it: `'*.mysite.localhost'`) answers on every subdomain. Also in the dashboard under a site's **Domains…** menu item. |
 | `cove twin <site> [add\|remove] [--domain=…] [--root=…] [--as-site=…]` | Serves another folder of a site, on the same database, at a domain of its own (`wp.<site>.localhost` by default). Built for Minn Engine's test sites, which keep a complete reference WordPress in `wp-reference/`: the engine answers at the site's address and WordPress at the twin's. `--as-site` adds a domain that answers as the site itself, for comparing the two request for request. |
 | `cove proxy <add\|list\|delete>` | Manages standalone reverse proxy entries in the Caddyfile. |
@@ -148,7 +170,7 @@ For browsing and editing, the dashboard's **databases** view lists every databas
 
 | Command | Description |
 | --- | --- |
-| `cove share [site]` | Creates a temporary public tunnel via Cloudflare (installs cloudflared on-demand). |
+| `cove share [site] [--background] [--format=json]` | Creates a temporary public tunnel via Cloudflare (installs cloudflared on-demand). It runs until Ctrl+C, or with `--background` (`--detach`, `-d`) returns at once and runs until `cove share <site> stop`. |
 | `cove lan <enable\|disable\|status\|trust> [site]` | Manages LAN access to sites for mobile app sync (Bonjour/mDNS). |
 | `cove tailscale <enable\|disable\|status>` | Exposes sites to your Tailscale network via port-based routing. |
 | `cove wsl-hosts` | (WSL only) Shows Windows hosts file setup instructions. |
@@ -157,14 +179,15 @@ For browsing and editing, the dashboard's **databases** view lists every databas
 
 | Command | Description |
 | --- | --- |
-| `cove install` | Installs and configures all required dependencies. |
+| `cove install` | Installs and configures all required dependencies: FrankenPHP, MariaDB, Mailpit, gum and WP-CLI, through Homebrew on macOS (FrankenPHP from its GitHub release) or apt/dnf on Linux. PostgreSQL and Redis are set up later, when a Laravel site needs them. |
+| `cove uninstall [--purge] [--dry-run] [--yes]` | Removes Cove's services, background shares, LAN advertisements, the menu bar app, Cove's `/etc/hosts` lines, and the `cove` command, keeping `~/Cove` and the databases. `--purge` also deletes every site, `~/Cove` and the local CA, after you type `delete`. See [Uninstalling](#uninstalling). |
 | `cove trust` | Installs Cove's local root certificate into the system trust store and every browser certificate database it can find: Chrome/Chromium/Brave/Edge's shared `~/.pki/nssdb`, Firefox profiles, snap and Flatpak browsers. Fresh installs run it automatically; re-run any time the root rotates. |
-| `cove upgrade` | Upgrades Cove, FrankenPHP, and Adminer to the latest versions, and refreshes the managed bits (Whoops, the login helper, the watchdog) across every site. |
+| `cove upgrade` | Upgrades Cove, FrankenPHP, and Adminer to the latest versions, and refreshes the managed bits (Whoops, the login helper, the watchdog). |
 | `cove version` | Displays the current version of Cove. |
 | `cove mcp` | Runs a Model Context Protocol server on stdin/stdout for AI agents (`claude mcp add cove -- cove mcp`). `cove mcp tools` lists its tools. |
 | `cove demo <site>… \| off` | Narrows Cove to the sites you name, for recording a demo: the dashboard, Adminer's database list, and `cove list` show only them, and mail goes to a mailbox of its own (other sites' mail is held and delivered by `cove demo off`). Nothing on disk changes. |
 
-*You can get help for any command by running `cove <command> --help`.*
+*You can get help for any command by running `cove help <command>` or `cove <command> --help`. After a site name, `--help` goes to the tool Cove runs: `cove wp mysite plugin list --help` is WP-CLI's help, and the same goes for `cove artisan` and `cove composer`.*
 
 ## Running Alongside Local, Studio, or DevKinsta
 
@@ -192,7 +215,7 @@ cove ports --http 8090 --https 8453     # switch to alternatives
 cove ports --dry-run                    # preview the effect of a port change
 ```
 
-When the HTTPS port changes, Cove walks every WordPress site under `~/Cove/Sites/` and runs `wp search-replace` to rewrite stored URLs (siteurl, home, serialized content, custom mappings) so existing sites keep working on the new port. Non-WordPress sites are skipped automatically.
+When the HTTPS port changes, Cove walks every WordPress site under `~/Cove/Sites/` and runs `wp search-replace` to rewrite stored URLs (siteurl, home, serialized content, custom mappings) so existing sites keep working on the new port. A Laravel site's `APP_URL` moves too (and `VITE_REVERB_PORT`, ready for the front end's next build) unless it was set to another address; plain sites need nothing.
 
 ## Proxying Local Services
 
@@ -243,18 +266,18 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
 ### Sites — `/`
 
   * Every site Cove manages, with its WordPress version (flagged when wp.org marks it insecure), PHP pin, disk usage, and last-modified time.
-  * Filter by name (press `/` from anywhere) or by type (click a `WP` / `STATIC` pill); sort by name, type, size, or last modified; pin the sites you are working on to the top.
+  * Filter by name (press `/` from anywhere) or by type (click a site's `WP`, `MINN`, `LARAVEL` or `STATIC` pill, or the **wordpress**, **minn**, **laravel** or **static** chip, or type `type:laravel`); sort by name, type, size, or last modified; pin the sites you are working on to the top.
   * `⌘K` opens a command palette that searches sites and commands from anywhere: `↵` opens a site's page, `⇧↵` the site itself, `⌘↵` a one-time admin login.
-  * Add sites from a form whose type field completes from WordPress, Plain, Minn Engine and Laravel, offering real WordPress versions (and, for Laravel, SQLite or MySQL), or drop a backup zip on the form to import one; delete with an undo window, or bulk-delete everything a filter matches — behind a dialog that lists the sites and asks for their number to be typed.
+  * Add sites from a form whose type field completes from WordPress, Plain, Minn Engine and Laravel, offering real WordPress versions (and, for Laravel, a git URL or folder to set up instead of a new app, and a database: `sqlite`, `mysql` on Cove's MariaDB, or `pgsql` on PostgreSQL), or drop a backup zip on the form to import one; delete with an undo window, or bulk-delete everything a filter matches — behind a dialog that lists the sites and asks for their number to be typed.
   * Click a row to open the site's page (below). Right-click any row for the menu: manage, open, one-time admin login, rename, reveal in Finder, browse files, database, PHP version, logs, mail, copy path, pin, delete.
-  * The `caddy`, `mariadb`, and `mailpit` dots in the top bar open a panel with each service's status, version, ports, and credentials.
+  * The `caddy`, `mariadb`, and `mailpit` dots in the top bar, plus `postgres` and `redis` once a Laravel site has set them up, open a panel with each service's status, version, ports, and credentials. While the nightly history sweep runs, a counter beside them shows how far it has got.
 
 ### Site — `/site/<name>`
 
   * One site on its own page: type, WordPress and PHP versions, size, last change, and path, with **open** and **log in to admin** beside them. A capture of the front page sits beside the tiles, taken by an installed Chrome, Chromium, Brave, Edge, Arc, or Vivaldi and refreshed when the site changes. Tiles lead to the site's files, database, mail, and logs; a **manage** row carries domains, PHP version, rename, reveal, copy path, backup zip, pin, and delete.
   * On a multisite network the page lists every site on it with its own **open** and **log in** — a one-time link minted for that subsite, so it lands on the subsite's `wp-admin`. The same is available from the terminal as `cove network <site>` and `cove login <site> --url=<subsite-url>`.
-  * Tabs, each with its own URL: **plugins** and **themes** (status, version, waiting updates, auto-update; activate, deactivate, update, delete — network-wide on a multisite; **check for updates** asks wp.org on demand), **users** (roles, email, registered, and a one-time **log in** as any user, whatever the role; network-wide on a multisite, landing subsite-only users on a site they belong to; an add form that creates a user with any of the site's roles, its password made up and shown once unless you type one), **cron** (every event with next run and recurrence, **run now**, **run all due**), **traffic** (requests, page views, errors, response times, bytes, cron, and mail from the site's access log, as tiles, a bar chart, top pages, slowest requests, 404s and 5xx, over 24 hours, 7 days, or the whole log), **snapshots** (take one with a note; restore, download as a zip, or delete any — a restore keeps a snapshot of the state it replaced), and **wp-cli** (a console: type, `↵`, output with exit code and timing, history on `↑`/`↓`). Every row on these tabs has a right-click menu with its actions, plus browse-files and copy shortcuts.
-  * A Laravel site's page has its own tabs instead: **routes** (method, address, name, middleware and action; a GET route without parameters opens in a new tab), **migrations** (ran or pending, with **run pending**), **schedule** (each task's next run and cron expression, with **run due now**), and **artisan** (the same console, running artisan). Its overview has a **workers** row that turns the queue worker and scheduler on and off, and **log in** signs in through the app's own users.
+  * A WordPress or Minn Engine site's tabs, each with its own URL: **plugins** and **themes** (status, version, waiting updates, auto-update; activate, deactivate, update, delete — network-wide on a multisite; **check for updates** asks wp.org on demand), **users** (roles, email, registered, and a one-time **log in** as any user, whatever the role; network-wide on a multisite, landing subsite-only users on a site they belong to; an add form that creates a user with any of the site's roles, its password made up and shown once unless you type one), **cron** (every event with next run and recurrence, **run now**, **run all due**), **traffic** (requests, page views, errors, response times, bytes, cron, and mail from the site's access log, as tiles, a bar chart, top pages, slowest requests, 404s and 5xx, over 24 hours, 7 days, or the whole log), **history** (the nightly saves of plugins, themes and mu-plugins, with what changed in each; **save now**, a diff, and an undo for any one of them or a rollback of everything to a save), **snapshots** (take one with a note; restore, download as a zip, or delete any — a restore keeps a snapshot of the state it replaced), and **wp-cli** (a console: type, `↵`, output with exit code and timing, history on `↑`/`↓`). Every row on these tabs has a right-click menu with its actions, plus browse-files and copy shortcuts.
+  * A Laravel site's page has its own tabs: **users** (the app's users, each with a one-time **log in**, and an add form above: an email, an optional name, and a password made up and shown once unless you type one), **routes** (method, address, name, middleware and action; a GET route without parameters opens in a new tab), **migrations** (ran or pending, with **run pending**), **schedule** (each task's next run and cron expression, with **run due now**), the same **traffic** and **snapshots**, and **artisan** (the same console, running artisan). Its overview has a **workers** row that turns the queue worker, the scheduler and, for an app with Reverb, its websocket server on and off, and **log in** signs in through the app's own users.
   * `Esc` returns to the list, `⌘↵` logs in.
 
 ### Mail — `/mail`, `/mail/<site>`
@@ -266,7 +289,7 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
 
 ### Databases — `/db`, `/db/<database>/<table>`
 
-  * Every database with the site that owns it, table counts, and sizes, including a Laravel site's SQLite file (as `sqlite:<site>`). A WordPress database opens on an overview: site URL, home, prefix, theme, post and user counts, and the largest autoloaded options.
+  * Every database with the site that owns it, table counts, and sizes, including a Laravel site's SQLite file (as `sqlite:<site>`) and the databases on Cove's PostgreSQL (as `pgsql:<name>`), once it is set up. A WordPress database opens on an overview: site URL, home, prefix, theme, post and user counts, and the largest autoloaded options.
   * Any table as a grid: column types in the header, click to sort, a search box for one column or all, paging. Tables with a primary key are editable in place — double-click a cell, `↵` saves, `Esc` cancels, `⌘⌫` writes `NULL` — and rows can be deleted.
   * A **structure** tab with columns, indexes, and the `CREATE TABLE`; a **sql** console that runs several statements at a time with `⌘↵`, shows results as grids or affected-row counts with timings, and keeps a history.
   * Adminer stays one click away, deep-linked to the open table, for exports, imports, schema changes, and users.
@@ -294,18 +317,18 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
 
 ## 🤖 Headless use (scripts and agents)
 
-Every command runs without a terminal. When stdin is not a TTY, confirmations default to yes where that is safe (`delete`, `push`, `directive delete`, `core update`, cloudflared install) and a prompt that cannot be avoided stops with a message naming the flag to pass instead. The flags to know:
+Every command runs without a terminal. When stdin is not a TTY, confirmations default to yes where that is safe (`delete`, `directive delete`, `proxy`, `ports`, `memory set`, `install`, `upgrade`, cloudflared install), a FrankenPHP restart is skipped unless you pass `--yes`, and a prompt that cannot be avoided stops with a message naming the flag to pass instead. The flags to know:
 
 | Need | Use |
 |---|---|
-| Confirm a destructive step | `--yes` on `delete`, `push`, `pull`, `core update`, `opcache set`, `memory set` |
+| Confirm a destructive step | `--yes` on `push`, `pull` (onto an existing site), `core update --all`, `uninstall`, and `opcache set` / `opcache exclude` (to restart FrankenPHP) |
 | Pick what a prompt would ask | `pull --ssh "user@host -p 22" --site <name> --path <dir>`, `push --site <name> --ssh …`, `proxy add <name> <domain> <target>`, `tailscale enable <hostname>`, `install --http 80 --https 443 --db-root-user … --db-root-pass …` |
-| Machine-readable output | `list --format=json`, `status --porcelain`, `login --plain`, `network --format=json`, `snapshot <site> list --format=json`, `share --format=json`, `backup --format=json` |
+| Machine-readable output | `list --format=json`, `status --porcelain`, `login --plain`, `network --format=json`, `snapshot <site> list --format=json`, `history <site> --format=json`, `share --format=json`, `backup --format=json`, `laravel <site> --format=json`, `laravel <site> users --format=json`, `opcache sites --format=json` |
 | A tunnel without a foreground process | `share <site> --background`, then `share <site> stop` |
-| Edit Caddy rules non-interactively | pipe them: `printf 'header X-Test 1\n' \| cove directive set <site>` |
+| Edit Caddy rules non-interactively | pass them, `cove directive add <site> "header X-Test 1"`, or pipe them: `printf 'header X-Test 1\n' \| cove directive add <site>` |
 | Anything sudo needs on Linux | run that command with `sudo` (`sudo cove upgrade`); `/etc/hosts` lines are skipped and reported when nothing can ask for a password |
 
-For agents that speak the Model Context Protocol, `cove mcp` is a server on stdin/stdout that wraps the same commands as tools: `list_sites`, `site_info`, `create_site`, `clone_site`, `set_php`, `login_link`, `wp_read` (WP-CLI commands that only read), `wp`, `screenshot` (the page comes back as an image), `check_page` (status, redirects, text and the error a failed page raised), `read_logs`, `read_mail` (a message's links come back as a list), `snapshot_create`, `snapshot_list`, `snapshot_restore`, `history_list`, `history_diff`, `history_save`, `history_rollback`, `health` and `status`. Add it with `claude mcp add cove -- cove mcp`, or in any client as a stdio server running `cove` with the argument `mcp`. It leaves out deleting sites, pull, push, sharing and Cove's own settings. `wp` runs WP-CLI, and so any PHP, inside the site you name, so approve it as you would a shell command; it refuses `--path`, `--ssh`, `--http`, `--require`, `--exec` and aliases, the commands that wipe a whole database, and the interactive ones. During `cove demo` the server sees only the demo's sites.
+For agents that speak the Model Context Protocol, `cove mcp` is a server on stdin/stdout that wraps the same commands as tools: `list_sites`, `site_info`, `create_site`, `clone_site`, `set_php`, `login_link`, `wp_read` (WP-CLI commands that only read), `wp`, `screenshot` (the page comes back as an image), `check_page` (status, redirects, text and the error a failed page raised), `artisan_read` (artisan commands that only read), `artisan`, `laravel_workers` (a Laravel app's queue worker, scheduler and Reverb), `laravel_users` (list or add a Laravel app's users), `read_logs`, `read_mail` (a message's links come back as a list), `snapshot_create`, `snapshot_list`, `snapshot_restore`, `history_list`, `history_diff`, `history_save`, `history_rollback`, `health` and `status`. Add it with `claude mcp add cove -- cove mcp`, or in any client as a stdio server running `cove` with the argument `mcp`. It leaves out deleting sites, pull, push, sharing and Cove's own settings. `wp` runs WP-CLI, and so any PHP, inside the site you name, so approve it as you would a shell command; it refuses `--path`, `--ssh`, `--http`, `--require`, `--exec` and aliases, the commands that wipe a whole database, and the interactive ones. `artisan` runs code in the site too: it refuses commands that wait on a terminal or run until stopped (`tinker`, `serve`, `queue:work`…) and the ones that wipe the database (`db:wipe`, `migrate:fresh`/`reset`/`refresh`). During `cove demo` the server sees only the demo's sites.
 
 The dashboard's API answers only from this machine, so agents run the CLI or `cove mcp`, not the API.
 
@@ -363,9 +386,11 @@ The `--dev` flag tells the installer to use the local `cove.sh` from the same di
 
 ### Supported Platforms
 
-- **macOS**: Intel and Apple Silicon (via Homebrew)
-- **Linux**: Ubuntu/Debian (apt) and Fedora/RHEL/CentOS (dnf)
+- **macOS**: Apple Silicon and Intel (via Homebrew; FrankenPHP comes from its GitHub release)
+- **Linux**: Ubuntu and Debian (apt), Fedora and Rocky Linux/RHEL (dnf), and distributions derived from them. Each release is tested on Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43 and Rocky Linux 9.
 - **WSL2**: Windows Subsystem for Linux (requires systemd enabled)
+
+Per-site PHP versions (`cove php`) need Homebrew, so they are macOS-only; on Linux every site runs on FrankenPHP's bundled PHP.
 
 ## 🩺 Troubleshooting
 
