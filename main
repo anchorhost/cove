@@ -1549,6 +1549,25 @@ linux_php_extension_packages() {
     esac
 }
 
+# Those packages installed: all in one go, or one at a time when that fails,
+# since apt and dnf refuse the whole list over one package a distro lacks
+# (php-zts-redis, say), which would leave out mysqli and WordPress with it.
+# Quiet; names what it couldn't install and returns 1 then.
+linux_install_php_extensions() {
+    local pkgs p missing=""
+    pkgs=$(linux_php_extension_packages)
+    [ -n "$pkgs" ] || return 0
+    # shellcheck disable=SC2086
+    $SUDO_CMD "$PKG_MANAGER" install -y $pkgs >/dev/null 2>&1 && return 0
+    for p in $pkgs; do
+        $SUDO_CMD "$PKG_MANAGER" install -y "$p" >/dev/null 2>&1 || missing="$missing $p"
+    done
+    [ -z "$missing" ] && return 0
+    gum style --foreground yellow "⚠️  These PHP extension packages couldn't be installed:$missing" \
+        "   Try: sudo $PKG_MANAGER install$missing   (then: sudo systemctl restart cove)"
+    return 1
+}
+
 # --- PostgreSQL ------------------------------------------------------------
 # For Laravel sites that ask for it, so not part of `cove install`: the
 # first site on it (--database=pgsql) or `cove postgres install` sets it up.
@@ -19579,12 +19598,8 @@ main() {
             # the web server loads them too.
             if [ "$OS" = "linux" ] && [ -n "$(linux_php_extension_packages)" ] \
                 && ! frankenphp php-cli -r 'exit(extension_loaded("pdo_sqlite") && extension_loaded("pdo_mysql") && extension_loaded("pdo_pgsql") && extension_loaded("redis") ? 0 : 1);' 2>/dev/null; then
-                echo "   - Installing PHP's PDO extensions (for Laravel sites)..."
-                if [ "$PKG_MANAGER" = "apt" ]; then
-                    $SUDO_CMD apt install -y $(linux_php_extension_packages) >/dev/null 2>&1 || true
-                else
-                    $SUDO_CMD dnf install -y $(linux_php_extension_packages) >/dev/null 2>&1 || true
-                fi
+                echo "   - Installing PHP's PDO and Redis extensions (for Laravel sites)..."
+                linux_install_php_extensions
                 if frankenphp php-cli -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);' 2>/dev/null && is_caddy_running; then
                     $SUDO_CMD systemctl restart cove.service
                     for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
