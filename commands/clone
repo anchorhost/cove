@@ -81,7 +81,7 @@ laravel_take_database() {
         if [ "$server" = "pgsql" ]; then
             ensure_postgres >&2 || return 1
         fi
-        new_db=$(cove_laravel_db_name "$new_name")
+        new_db=$(cove_db_name "$new_name")
         echo "   - Copying database '$db' to '$new_db'..." >&2
         cove_copy_database "$db" "$new_db" "$server" || return 1
         if ! COVE_ENV_SET="{\"DB_DATABASE\":$(cove_json_str "$new_db")}" laravel_env_set "$site_dir/.env"; then
@@ -155,6 +155,24 @@ cove_clone() {
     [ -f "$source_dir/public/wp-config.php" ] && is_wordpress=true
     site_is_laravel "$source_dir" && is_laravel=true
 
+    # A WordPress source's database is the one its wp-config.php names (a
+    # site added before 2.5 spells it with a trailing underscore). The
+    # copy's must be new: a failed import drops it.
+    local source_db="" new_db=""
+    if [ "$is_wordpress" = true ]; then
+        source_config
+        source_db=$( (cd "$source_dir/public" && $(get_wp_cmd "$source_dir") config get DB_NAME --skip-plugins --skip-themes 2>/dev/null </dev/null) )
+        new_db=$(cove_db_name "$new_name")
+        if [ -z "$source_db" ]; then
+            gum style --foreground red "❌ Error: Could not read DB_NAME from $source_name.localhost's wp-config.php."
+            exit 1
+        fi
+        if cove_db_exists "$new_db"; then
+            gum style --foreground red "❌ Error: A database named '$new_db' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+            exit 1
+        fi
+    fi
+
     echo "🧬 Cloning $source_name.localhost → $new_name.localhost"
 
     # --- Files ---
@@ -197,9 +215,6 @@ cove_clone() {
         local wp_cmd
         wp_cmd=$(get_wp_cmd "$new_dir")
 
-        local source_db new_db
-        source_db=$(echo "cove_$source_name" | tr -c '[:alnum:]_' '_')
-        new_db=$(echo "cove_$new_name" | tr -c '[:alnum:]_' '_')
 
         local temp_sql
         temp_sql=$(mktemp) || {

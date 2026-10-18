@@ -252,6 +252,16 @@ cove_add() {
         exit 1
     fi
 
+    # A WordPress site's database has to be a new one: a failed install
+    # drops it again on the way out.
+    if [ "$site_type" == "wordpress" ]; then
+        source_config
+        if cove_db_exists "$(cove_db_name "$site_name")"; then
+            gum style --foreground red "❌ Error: A database named '$(cove_db_name "$site_name")' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+            exit 1
+        fi
+    fi
+
     # Resolve the PHP pin before creating anything so a failed brew install
     # leaves no half-made site behind.
     if [ -n "$php_pin" ] && ! ensure_php_formula "$php_pin"; then
@@ -294,7 +304,7 @@ cove_add() {
     if [ "$site_type" == "wordpress" ]; then
         source_config
         local db_name
-        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        db_name=$(cove_db_name "$site_name")
 
         if [ -n "$wp_version" ]; then
             # Show the pairing rather than just the pinned version. Cove runs a
@@ -478,13 +488,13 @@ PHP
         conn=$(laravel_env_get "$site_dir" DB_CONNECTION)
         db_line="Database: SQLite, $(laravel_env_get "$site_dir" DB_DATABASE)"
         [ "$db_line" = "Database: SQLite, " ] && db_line="Database: SQLite, database/database.sqlite"
-        [ "$conn" = "sqlite" ] || db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's MariaDB ($conn)"
-        [ "$conn" = "pgsql" ] && db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's PostgreSQL"
+        [ "$conn" = "sqlite" ] || db_line="Database: $(cove_db_name "$site_name") on Cove's MariaDB ($conn)"
+        [ "$conn" = "pgsql" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's PostgreSQL"
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") set up from $from" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "What the tools printed: $site_dir/logs/laravel-setup.log" "${COVE_ADD_NOTES[@]}"
     elif [ "$site_type" == "laravel" ]; then
         local db_line="Database: SQLite, database/database.sqlite"
-        [ "$database" != "sqlite" ] && db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's MariaDB ($database)"
-        [ "$database" = "pgsql" ] && db_line="Database: $(cove_laravel_db_name "$site_name") on Cove's PostgreSQL"
+        [ "$database" != "sqlite" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's MariaDB ($database)"
+        [ "$database" = "pgsql" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's PostgreSQL"
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") Installed" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "Queued jobs run once a worker is going: cove laravel $site_name queue on"
     fi
 }
@@ -519,7 +529,7 @@ cove_add_laravel() {
 
     if [ "$database" != "sqlite" ]; then
         source_config
-        db_name=$(cove_laravel_db_name "$site_name")
+        db_name=$(cove_db_name "$site_name")
         # Never one that exists already: a failed install drops what it made.
         if ! cove_laravel_create_db "$db_name" "$server"; then
             rm -rf "$work"
@@ -810,7 +820,7 @@ cove_add_laravel_from() {
     if [ "$conn" != "sqlite" ]; then
         source_config
         [ "$conn" = "pgsql" ] && server="pgsql"
-        db_name=$(cove_laravel_db_name "$site_name")
+        db_name=$(cove_db_name "$site_name")
         cove_laravel_create_db "$db_name" "$server" || { db_name=""; _cove_from_fail; return 1; }
     fi
 

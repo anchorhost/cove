@@ -203,7 +203,7 @@ snapshot_restore() {
         # first when the snapshot just taken doesn't hold it, then made new.
         local db_name safety_dir
         ensure_postgres >&2 || return 1
-        db_name=$(cove_laravel_db_name "$site_name")
+        db_name=$(cove_db_name "$site_name")
         safety_dir="$SNAPSHOTS_DIR/$site_name/$safety"
         if [ ! -f "$safety_dir/db.sql" ] && cove_pg_db_exists "$db_name"; then
             if ! cove_pg_dump "$db_name" > "$safety_dir/db.sql" 2>/dev/null; then
@@ -234,7 +234,7 @@ snapshot_restore() {
             # Back into the database Cove keeps for this Laravel site. .env
             # may name another one now, in which case the snapshot just taken
             # doesn't hold this one: it gets a copy before it is replaced.
-            db_name=$(cove_laravel_db_name "$site_name")
+            db_name=$(cove_db_name "$site_name")
             local safety_dir="$SNAPSHOTS_DIR/$site_name/$safety" dump_cmd
             if [ ! -f "$safety_dir/db.sql" ] && cove_db_exists "$db_name" && dump_cmd=$(snapshot_dump_cmd); then
                 if ! MYSQL_PWD="$DB_PASSWORD" "$dump_cmd" -u"$DB_USER" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "$db_name" > "$safety_dir/db.sql" 2>/dev/null; then

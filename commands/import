@@ -163,7 +163,7 @@ cove_import_laravel() {
             rm -rf "$work"
             exit 1
         fi
-        db_name=$(cove_laravel_db_name "$site_name")
+        db_name=$(cove_db_name "$site_name")
         if cove_server_db_exists "$server" "$db_name"; then
             rm -rf "$work"
             gum style --foreground red "❌ Error: A database named '$db_name' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."

@@ -2028,11 +2028,26 @@ cove_json_str() {
     printf '"%s"' "${v//\"/\\\"}"
 }
 
-# The database Cove creates for a Laravel site that asks for MySQL or MariaDB.
-# Hyphens become underscores, as the Laravel installer does.
-cove_laravel_db_name() {
+# The database Cove creates for a new site, WordPress or Laravel (MariaDB or
+# PostgreSQL): cove_ and the name, hyphens as underscores, as the Laravel
+# installer does. A WordPress site added before 2.5 has one more underscore
+# on the end, and keeps it (see wp_cove_db).
+cove_db_name() {
     local n="cove_$1"
     echo "${n//-/_}"
+}
+
+# The database a WordPress site ($1 its folder, $2 its name) uses, from
+# wp-config.php, when it is the one Cove made for that name: cove_<name>, or
+# cove_<name>_ from before 2.5, when `echo … | tr` turned echo's newline into
+# a last underscore. Nothing (and status 1) for one it was pointed at by hand.
+wp_cove_db() {
+    local db
+    db=$(cd "$1/public" && $(get_wp_cmd "$1") config get DB_NAME --skip-plugins --skip-themes 2>/dev/null </dev/null)
+    case "$db" in
+        "$(cove_db_name "$2")"|"$(cove_db_name "$2")_") echo "$db" ;;
+        *) return 1 ;;
+    esac
 }
 
 # Is there a MariaDB database by this name? Needs source_config. Cove's
@@ -2048,7 +2063,7 @@ laravel_cove_db() {
     local site_dir="$1" site_name="$2" db
     laravel_db_server "$site_dir" >/dev/null || return 1
     db=$(laravel_env_get "$site_dir" DB_DATABASE)
-    [ -n "$db" ] && [ "$db" = "$(cove_laravel_db_name "$site_name")" ] || return 1
+    [ -n "$db" ] && [ "$db" = "$(cove_db_name "$site_name")" ] || return 1
     echo "$db"
 }
 
@@ -5614,10 +5629,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                     }
 
                     // The database name as WordPress actually uses it — read
-                    // from wp-config.php rather than recomputed, because
-                    // cove_add's `echo … | tr -c` folds echo's newline into a
-                    // trailing underscore (cove_mysite_), which a mimic would
-                    // have to reproduce forever.
+                    // from wp-config.php rather than recomputed, because a
+                    // site added before 2.5 has a trailing underscore
+                    // (cove_mysite_) that newer ones don't.
                     $db_name = preg_replace('/[^a-zA-Z0-9_]/', '_', 'cove_' . str_replace('.localhost', '', $item));
                     $cfg_file = $site_path . '/public/wp-config.php';
                     if (is_file($cfg_file)) {
