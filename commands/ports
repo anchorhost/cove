@@ -1,3 +1,37 @@
+# Laravel sites whose .env APP_URL is their own Cove address (on whatever
+# port), so it should follow a port change; one set by hand is left alone.
+laravel_sites_following_port() {
+    local d name url
+    for d in "$SITES_DIR"/*.localhost; do
+        site_is_laravel "$d" && [ -f "$d/.env" ] || continue
+        name=$(basename "$d" .localhost)
+        url=$(laravel_env_get "$d" APP_URL)
+        [[ "$url" =~ ^https://$name\.localhost(:[0-9]+)?/?$ ]] && echo "$name"
+    done
+}
+
+# Those sites' APP_URL on the new HTTPS port, and Reverb's VITE_REVERB_PORT
+# with it: the browser's half, which reaches it at the next front-end build.
+update_laravel_site_urls_for_port_change() {
+    local name d set rebuild=""
+    for name in $(laravel_sites_following_port); do
+        d="$SITES_DIR/$name.localhost"
+        set="{\"APP_URL\":\"$(url_for "$name.localhost")\""
+        if [ -n "$(laravel_env_get "$d" VITE_REVERB_PORT)" ]; then
+            set="$set,\"VITE_REVERB_PORT\":\"$HTTPS_PORT\""
+            rebuild="$rebuild $name"
+        fi
+        if COVE_ENV_SET="$set}" laravel_env_set "$d/.env"; then
+            laravel_artisan "$d" config:clear >/dev/null 2>&1 || true
+            echo "   • $name.localhost (Laravel): APP_URL → $(url_for "$name.localhost")"
+        fi
+    done
+    if [ -n "$rebuild" ]; then
+        echo "   Build the front end again so Reverb's browser settings follow (npm run build):$rebuild"
+    fi
+    return 0
+}
+
 cove_ports() {
     # -----------------------------------------------------------------
     #  cove ports
@@ -25,9 +59,17 @@ cove_ports() {
                 explicit_http="$2"
                 shift 2
                 ;;
+            --http=*)
+                explicit_http="${1#*=}"
+                shift
+                ;;
             --https)
                 explicit_https="$2"
                 shift 2
+                ;;
+            --https=*)
+                explicit_https="${1#*=}"
+                shift
                 ;;
             --skip-urls)
                 skip_urls=true
@@ -47,7 +89,7 @@ cove_ports() {
                 ;;
             *)
                 gum style --foreground red "❌ Unknown option: $1"
-                echo "Usage: cove ports [--http PORT] [--https PORT] [--skip-urls] [--dry-run] [--yes]"
+                echo "Usage: cove ports [--http=PORT] [--https=PORT] [--skip-urls] [--dry-run] [--yes]"
                 exit 1
                 ;;
         esac
@@ -173,6 +215,10 @@ cove_ports() {
         if ! $any_wp; then
             echo "(No WordPress sites to update.)"
         fi
+        local lv
+        for lv in $(laravel_sites_following_port); do
+            echo "   • ${lv}.localhost (Laravel): APP_URL → $(port_url_for "$lv.localhost" "$HTTPS_PORT")"
+        done
     elif $skip_urls; then
         echo ""
         gum style --faint "(--skip-urls: WordPress databases will NOT be updated)"
@@ -216,6 +262,7 @@ cove_ports() {
         echo ""
         echo "🔄 Updating WordPress site URLs..."
         update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT"
+        update_laravel_site_urls_for_port_change
     fi
 
     echo ""
