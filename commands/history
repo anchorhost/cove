@@ -830,8 +830,7 @@ cove_history() {
     fi
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir/public" ]; then
-        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
     local gitdir content
     gitdir=$(history_gitdir "$site_name")

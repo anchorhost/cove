@@ -29,8 +29,7 @@ cove_network() {
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
     if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
-        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name" "WordPress"
     fi
 
     local wp_cmd

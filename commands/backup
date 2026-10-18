@@ -33,8 +33,7 @@ cove_backup() {
         exit 1
     fi
     if [ ! -d "$SITES_DIR/$site_name.localhost/public" ]; then
-        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
 
     local backups_dir="$COVE_DIR/Backups"

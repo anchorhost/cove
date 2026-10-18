@@ -3391,6 +3391,29 @@ validate_site_name() {
     return 0
 }
 
+# A site's kind as people call it: Laravel, Minn, WordPress or plain.
+site_kind_label() {
+    local dir="$SITES_DIR/$1.localhost"
+    if site_is_laravel "$dir"; then echo "Laravel"
+    elif site_is_minn "$dir/public"; then echo "Minn"
+    elif [ -f "$dir/public/wp-config.php" ]; then echo "WordPress"
+    else echo "plain"
+    fi
+}
+
+# The error for a site a command can't use, then exit 1: there's none by
+# that name (and here's how to see what there is), or it's of another kind
+# than the command works on ($2, e.g. "WordPress"; empty for any site).
+site_not_found() {
+    local name="${1%.localhost}" want="${2:-}"
+    if [ -n "$want" ] && validate_site_name "$name" && [ -d "$SITES_DIR/$name.localhost" ]; then
+        gum style --foreground red "❌ Error: '$name.localhost' is a $(site_kind_label "$name") site; this works on $want sites."
+    else
+        gum style --foreground red "❌ Error: There's no site named '$name.localhost'." "See your sites with: cove list"
+    fi
+    exit 1
+}
+
 # Validate a hostname/domain label before it is written into the Caddyfile and
 # /etc/hosts (site mappings, proxy domains, the Tailscale hostname). Accepts a
 # bare hostname or IP — underscores included (dev hostnames, _domainkey-style
@@ -18856,7 +18879,9 @@ display_command_help() {
         delete)
             echo "Usage: cove delete <name> [--force]"
             echo ""
-            echo "Deletes a site's directory and associated WordPress database."
+            echo "Deletes a site's folder and its database (MariaDB or PostgreSQL), after"
+            echo "asking. Without a terminal to ask on (a script, the dashboard) it deletes"
+            echo "without asking."
             echo ""
             echo "Arguments:"
             echo "  <name>         The name of the site to delete."
@@ -19235,13 +19260,15 @@ display_command_help() {
             echo "under the same native PHP. Requires Homebrew on macOS."
             ;;
         log)
-            echo "Usage: cove log [site] [--follow]"
+            echo "Usage: cove log [site] [--app|--access] [--follow]"
             echo "       cove log rotate                     How long each log is kept, and sizes"
             echo "       cove log rotate <MB> | off           Cove's own logs (~/Cove/Logs)"
             echo "       cove log rotate services <MB> | off | default"
             echo "       cove log rotate access <MB> | off | default [--keep=<files>] [--days=<days>]"
             echo ""
-            echo "View logs for a site or the global error log."
+            echo "View logs for a site or the global error log. A site's own log comes first:"
+            echo "a Laravel app's storage/logs (laravel.log), WordPress's wp-content/debug.log."
+            echo "Then Caddy's access log for the site."
             echo ""
             echo "Cove keeps every line of its own logs unless asked otherwise: 'cove log rotate 50'"
             echo "moves a log past 50 MB to <name>.log.1, replacing the one before. The services'"
@@ -19254,6 +19281,8 @@ display_command_help() {
             echo "  [site]           The site name (optional). If omitted, shows global error log."
             echo ""
             echo "Options:"
+            echo "  --app            Only the app's own log."
+            echo "  --access         Only the access log."
             echo "  -f, --follow     Continuously follow log output (like tail -f)"
             echo ""
             echo "Examples:"

@@ -23,8 +23,7 @@ cove_artisan() {
 
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir" ] || ! site_is_laravel "$site_dir"; then
-        gum style --foreground red "❌ Error: Laravel site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name" "Laravel"
     fi
 
     write_php_tools || exit 1

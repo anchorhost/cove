@@ -117,8 +117,7 @@ cove_lan_enable() {
     local site_dir="$SITES_DIR/${site_name}.localhost"
     
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "Error: Site '${site_name}' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
     
     local lan_config="$site_dir/lan_config"

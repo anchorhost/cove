@@ -16,8 +16,7 @@ cove_rename() {
 
     local old_site_dir="$SITES_DIR/$old_name.localhost"
     if [ ! -d "$old_site_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$old_name.localhost' not found."
-        exit 1
+        site_not_found "$old_name"
     fi
 
     # Validate the new_name using the same rules as the 'add' command

@@ -217,12 +217,20 @@ cove_log() {
     fi
     local site_name=""
     local follow_flag=""
+    local which="all"    # all, app (the app's own log) or access (Caddy's)
 
     # Parse arguments
     for arg in "$@"; do
         case "$arg" in
             -f|--follow)
                 follow_flag="-f"
+                ;;
+            --app) which="app" ;;
+            --access) which="access" ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                echo "Usage: cove log [site] [--app|--access] [--follow]"
+                exit 1
                 ;;
             *)
                 if [[ -z "$site_name" ]]; then
@@ -252,36 +260,36 @@ cove_log() {
     fi
 
     # Normalize site name
-    local site_dir
-    if [[ "$site_name" == *.localhost ]]; then
-        site_dir="$SITES_DIR/$site_name"
-    else
-        site_dir="$SITES_DIR/${site_name}.localhost"
-        site_name="${site_name}.localhost"
-    fi
-
-    if [[ ! -d "$site_dir" ]]; then
-        echo "Site '$site_name' not found."
-        exit 1
-    fi
-
+    site_name="${site_name%.localhost}"
+    validate_site_name "$site_name" && [[ -d "$SITES_DIR/$site_name.localhost" ]] || site_not_found "$site_name"
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    site_name="$site_name.localhost"
     local logs_dir="$site_dir/logs"
-    if [[ ! -d "$logs_dir" ]]; then
-        echo "No logs directory found for '$site_name'."
-        exit 1
+
+    # The app's own log first, where its errors land: the newest file in a
+    # Laravel app's storage/logs (laravel.log, or laravel-<date>.log on the
+    # daily channel), or WordPress's wp-content/debug.log. Then Caddy's
+    # access logs.
+    local app_log=""
+    if site_is_laravel "$site_dir"; then
+        app_log=$(ls -t "$site_dir"/storage/logs/*.log 2>/dev/null | head -1)
+    elif [[ -f "$site_dir/public/wp-content/debug.log" ]]; then
+        app_log="$site_dir/public/wp-content/debug.log"
     fi
 
-    # Find available log files
-    local caddy_log="$logs_dir/caddy.log"
-    local caddy_lan_log="$logs_dir/caddy-lan.log"
-
-    # Determine which logs exist
     local available_logs=()
-    [[ -f "$caddy_log" ]] && available_logs+=("$caddy_log")
-    [[ -f "$caddy_lan_log" ]] && available_logs+=("$caddy_lan_log")
+    [[ "$which" != "access" && -n "$app_log" ]] && available_logs+=("$app_log")
+    if [[ "$which" != "app" ]]; then
+        [[ -f "$logs_dir/caddy.log" ]] && available_logs+=("$logs_dir/caddy.log")
+        [[ -f "$logs_dir/caddy-lan.log" ]] && available_logs+=("$logs_dir/caddy-lan.log")
+    fi
 
     if [[ ${#available_logs[@]} -eq 0 ]]; then
-        echo "No log files found for '$site_name'."
+        if [[ "$which" = "app" ]]; then
+            echo "Nothing logged by the app at $site_name yet."
+        else
+            echo "No log files found for '$site_name'."
+        fi
         exit 1
     fi
 
@@ -292,7 +300,7 @@ cove_log() {
         echo "Logs for $site_name (last 50 lines each):"
         for log in "${available_logs[@]}"; do
             echo ""
-            echo "--- $(basename "$log") ---"
+            echo "--- ${log#"$site_dir"/} ---"
             tail -50 "$log"
         done
     fi

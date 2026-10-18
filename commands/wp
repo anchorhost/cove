@@ -25,8 +25,7 @@ cove_wp() {
             gum style --foreground red "❌ Error: '$site_name.localhost' is a Laravel site." "Its command line is artisan: cove artisan $site_name <command>"
             exit 1
         fi
-        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name" "WordPress"
     fi
 
     local wp_cmd

@@ -197,8 +197,7 @@ cove_core() {
             if [ "$all" = false ]; then
                 local public_dir="$SITES_DIR/$site.localhost/public"
                 if [ ! -d "$SITES_DIR/$site.localhost" ]; then
-                    gum style --foreground red "❌ Error: Site '$site.localhost' not found."
-                    exit 1
+                    site_not_found "$site"
                 fi
                 if [ ! -f "$public_dir/wp-config.php" ]; then
                     gum style --foreground red "❌ Error: '$site.localhost' is not a WordPress site."

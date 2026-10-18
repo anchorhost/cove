@@ -202,8 +202,7 @@ cove_login() {
             cove_login_laravel "$site_name" "$user_identifier" "$to" "$plain"
             return
         fi
-        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name" "WordPress and Laravel"
     fi
 
     # --url picks a subsite of a multisite network: wp-cli then runs in that

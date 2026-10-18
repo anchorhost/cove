@@ -95,8 +95,7 @@ cove_php() {
     site_name="${site_name%.localhost}"
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
 
     # Show mode: no version argument.

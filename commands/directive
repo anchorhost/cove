@@ -44,8 +44,7 @@ cove_directive_add_or_update() {
     local custom_conf_file="$CUSTOM_CADDY_DIR/$site_hostname"
 
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$site_hostname' not found."
-        exit 1
+        site_not_found "$site_hostname"
     fi
 
     local existing_rules=""

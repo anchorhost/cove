@@ -64,8 +64,7 @@ cove_twin() {
     local site_host="$site_name.localhost"
     local site_dir="$SITES_DIR/$site_host"
     if [ ! -d "$site_dir/public" ]; then
-        gum style --foreground red "❌ Error: Site '$site_host' not found."
-        exit 1
+        site_not_found "$site_host"
     fi
 
     case "${action:-show}" in

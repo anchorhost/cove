@@ -83,8 +83,7 @@ cove_share() {
     local site_dir="$SITES_DIR/${site_name}.localhost"
     
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "Error: Site '${site_name}.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
     # Already shared in the background: say where, do not start a second tunnel.
     if [ -f "$share_dir/$site_name" ]; then

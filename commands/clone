@@ -121,8 +121,7 @@ cove_clone() {
 
     local source_dir="$SITES_DIR/$source_name.localhost"
     if [ ! -d "$source_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$source_name.localhost' not found."
-        exit 1
+        site_not_found "$source_name"
     fi
 
     # Same name rules as cove_add — a clone must produce a site add could have.

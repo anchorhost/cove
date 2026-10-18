@@ -268,8 +268,7 @@ cove_db_fix_collation() {
     else
         local site_dir="$SITES_DIR/$site_name.localhost"
         if [ ! -f "$site_dir/public/wp-config.php" ]; then
-            gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
-            exit 1
+            site_not_found "$site_name" "WordPress"
         fi
         site_dirs=("$site_dir")
     fi
