@@ -311,9 +311,13 @@ cove_upgrade() {
         
         if [ "$adminer_needs_upgrade" == "true" ]; then
             echo "🚀 Upgrading Adminer to version $latest_adminer_version..."
-            if curl -sL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file"; then
+            # Saved beside it and moved into place, so a failed download
+            # (--fail keeps an HTTP error page out) leaves the old one working.
+            if curl -fsSL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file.new" \
+                && mv -f "$adminer_file.new" "$adminer_file"; then
                 echo "✅ Adminer upgraded successfully."
             else
+                rm -f "$adminer_file.new"
                 echo "❌ Failed to download Adminer $latest_adminer_version."
             fi
         else
@@ -329,9 +333,11 @@ cove_upgrade() {
         fi
         if $do_download; then
             echo "🚀 Downloading Adminer $latest_adminer_version..."
-            if curl -sL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file"; then
+            if curl -fsSL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file.new" \
+                && mv -f "$adminer_file.new" "$adminer_file"; then
                 echo "✅ Adminer downloaded successfully."
             else
+                rm -f "$adminer_file.new"
                 echo "❌ Failed to download Adminer $latest_adminer_version."
             fi
         fi

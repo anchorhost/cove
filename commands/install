@@ -91,7 +91,7 @@ install_dependency() {
                     fi
                 fi
                 echo "   - Downloading and extracting tarball..."
-                if curl -sL "$binary_url" | tar -xz -C "$temp_dir"; then
+                if curl -fsSL "$binary_url" | tar -xz -C "$temp_dir"; then
                     # Find the binary in extracted contents
                     local binary_file
                     binary_file=$(find "$temp_dir" -name "$cmd_name" -type f -executable 2>/dev/null | head -1)
@@ -107,9 +107,10 @@ install_dependency() {
                     fi
                 fi
             else
-                # Direct binary download
+                # Direct binary download. --fail, or an HTTP error page
+                # would be installed as the command.
                 echo "   - Downloading binary..."
-                if curl -sL "$binary_url" -o "$temp_dir/$cmd_name"; then
+                if curl -fsSL "$binary_url" -o "$temp_dir/$cmd_name"; then
                     chmod +x "$temp_dir/$cmd_name"
                     if $SUDO_CMD mv "$temp_dir/$cmd_name" "$BIN_DIR/$cmd_name"; then
                         installed_successfully=true
@@ -539,7 +540,13 @@ INI
     # WP-CLI under FrankenPHP 1.13.0's php-cli (see ensure_cli_argv_fix).
     ensure_cli_argv_fix
     echo "🗃️ Downloading Adminer 6.0.0..."
-    curl -sL "https://github.com/vrana/adminer/releases/download/v6.0.0/adminer-6.0.0.php" -o "$ADMINER_DIR/adminer-core.php"
+    # Saved beside it and moved into place, so a failed download (--fail
+    # keeps an HTTP error page out) never replaces a working copy.
+    if ! { curl -fsSL "https://github.com/vrana/adminer/releases/download/v6.0.0/adminer-6.0.0.php" -o "$ADMINER_DIR/adminer-core.php.new" \
+        && mv -f "$ADMINER_DIR/adminer-core.php.new" "$ADMINER_DIR/adminer-core.php"; }; then
+        rm -f "$ADMINER_DIR/adminer-core.php.new"
+        gum style --foreground yellow "⚠️ Couldn't download Adminer: the database manager won't open until 'cove install' runs again."
+    fi
     # Entry point + theme assets. Keep in sync with cove_upgrade so upgraders
     # pick up index.php/head() and CSS/JS changes without a full reinstall.
     deploy_adminer_theme
