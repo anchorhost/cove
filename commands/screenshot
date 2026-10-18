@@ -170,7 +170,10 @@ cove_screenshot() {
             --max=*)    max="${arg#*=}" ;;
             --idle-only) idle_only=1 ;;
             -h|--help)
-                echo "Usage: cove screenshot <site> [--out=<file.png>] [--path=/<page>] [--width=1280] [--height=800]"
+                echo "Usage: cove screenshot <site> [--out=<file.png>] [--path=/<page>]"
+                echo "                              [--width=1280] [--height=800]"
+                echo "       cove screenshot --check"
+                echo "       cove screenshot --sweep [--max=N] [--idle-only]"
                 echo ""
                 echo "Captures the site's front page with a headless Chromium-family browser"
                 echo "(Chrome, Chromium, Brave, Edge, Arc, Vivaldi). Without --out the image"
@@ -203,7 +206,7 @@ cove_screenshot() {
     fi
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove screenshot <site> [--out=<file.png>]"
+        echo "Usage: cove screenshot <site> [--out=<file.png>] [--path=/<page>]"
         exit 1
     fi
     if ! validate_site_name "$site_name"; then

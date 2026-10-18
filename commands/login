@@ -164,7 +164,7 @@ cove_login() {
             --plain|--url-only) plain=true ;;
             -*)
                 gum style --foreground red "❌ Error: Unknown option '$arg'."
-                echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>]"
+                echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>] [--plain]"
                 exit 1
                 ;;
             *)
@@ -176,7 +176,7 @@ cove_login() {
     # 1. Validate that a site name was provided.
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>]"
+        echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>] [--plain]"
         exit 1
     fi
 

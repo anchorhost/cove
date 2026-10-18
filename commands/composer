@@ -6,6 +6,8 @@ cove_composer() {
         echo "Runs Composer in a site's folder, on the PHP the site serves with, so its"
         echo "platform checks and @php scripts see the same PHP as the site."
         echo "Cove keeps its own composer.phar in ~/Cove/App, fetched on first use."
+        echo "A --help after the site name is Composer's own."
+        echo ""
         echo "Examples:"
         echo "  cove composer myapp require laravel/sanctum"
         echo "  cove composer myapp update"

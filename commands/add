@@ -9,7 +9,8 @@ cove_add() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [flavor] [--plain] [--minn] [--php=8.2] [--multisite[=subdomain]] [--database=sqlite|mysql|pgsql] [--from=<git URL or folder>] [--seed]"
+        echo "Usage: cove add <name> [type] [--plain] [--minn[=<zip>]] [--wp-version=<ver>] [--php=<ver>] [--multisite[=subdomain]] [--database=sqlite|mysql|mariadb|pgsql] [--from=<git URL or folder>] [--branch=<name>] [--seed] [--no-reload]"
+        echo "See: cove add --help"
         exit 1
     fi
 
@@ -44,7 +45,7 @@ cove_add() {
     shift
     # Value flags take --flag=value or --flag value. An unknown flag stops
     # here: dropped silently, `--from ~/app` (no =) built a blank app.
-    local usage="Usage: cove add <name> [flavor] [--plain] [--minn] [--php=8.2] [--multisite[=subdomain]] [--database=sqlite|mysql|pgsql] [--from=<git URL or folder>] [--branch=<name>] [--seed]"
+    local usage="Usage: cove add <name> [type] [--plain] [--minn[=<zip>]] [--wp-version=<ver>] [--php=<ver>] [--multisite[=subdomain]] [--database=sqlite|mysql|mariadb|pgsql] [--from=<git URL or folder>] [--branch=<name>] [--seed] [--no-reload]   (cove add --help)"
     local arg val
     while [ $# -gt 0 ]; do
         arg="$1"; shift

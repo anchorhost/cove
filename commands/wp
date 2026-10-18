@@ -3,11 +3,15 @@ cove_wp() {
     if [ -z "$site_name" ] || [ "$site_name" == "--help" ] || [ "$site_name" == "-h" ]; then
         echo "Usage: cove wp <site> <wp-cli arguments…>"
         echo ""
-        echo "Runs WP-CLI inside a site from anywhere, on the PHP the site is pinned to."
+        echo "Runs WP-CLI inside a WordPress site from anywhere, on the PHP the site"
+        echo "runs on (its 'cove php' pin, if it has one). A --help after the site name"
+        echo "is WP-CLI's own."
+        echo ""
         echo "Examples:"
         echo "  cove wp mysite plugin list"
         echo "  cove wp mysite option get siteurl"
         echo "  cove wp mysite user create dev dev@mysite.localhost --role=editor"
+        echo "  cove wp mysite plugin list --help"
         [ -z "$site_name" ] && exit 1
         return
     fi

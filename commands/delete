@@ -2,7 +2,7 @@ cove_delete() {
     source_config
     local site_name="$1"
     if [ -z "$site_name" ]; then
-        gum style --foreground red "❌ Error: Which site? Usage: cove delete <name> [--force]" "See your sites with: cove list"
+        gum style --foreground red "❌ Error: Which site? Usage: cove delete <name> [--yes]" "See your sites with: cove list"
         exit 1
     fi
     # Reject traversal / metacharacters before the name reaches rm -rf and

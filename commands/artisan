@@ -3,14 +3,16 @@ cove_artisan() {
     if [ -z "$site_name" ] || [ "$site_name" == "--help" ] || [ "$site_name" == "-h" ]; then
         echo "Usage: cove artisan <site> <artisan arguments…>"
         echo ""
-        echo "Runs a Laravel site's artisan from anywhere, on the PHP the site serves with."
+        echo "Runs a Laravel site's artisan from anywhere, on the PHP the site serves"
+        echo "with. A --help after the site name is artisan's own."
+        echo ""
         echo "Examples:"
         echo "  cove artisan myapp migrate"
         echo "  cove artisan myapp route:list"
         echo "  cove artisan myapp make:model Post -m"
         echo "  cove artisan myapp migrate --help"
         echo ""
-        echo "A queue worker or the scheduler that keeps running: cove laravel myapp queue on"
+        echo "To keep a queue worker, the scheduler or Reverb running: cove laravel --help"
         [ -z "$site_name" ] && exit 1
         return
     fi
