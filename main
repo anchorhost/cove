@@ -1709,7 +1709,7 @@ ensure_postgres() {
 
 cove_pg_setup() {
     local formula="" pass hba
-    echo "🐘 Setting up PostgreSQL for Cove…"
+    echo "🐘 Setting up PostgreSQL for Cove (the first time takes a minute or two)…"
     if [ "$OS" = "macos" ]; then
         if cove_pg_ready 5432; then
             if ! cove_pg_admin_psql -c 'SELECT 1' >/dev/null 2>&1; then
@@ -1867,7 +1867,7 @@ ensure_redis() {
         echo "❌ Error: Redis isn't answering on 127.0.0.1:$(cove_redis_port). See: cove redis" >&2
         return 1
     fi
-    echo "🧰 Setting up Redis for Cove…"
+    echo "🧰 Setting up Redis for Cove (the first time takes a minute)…"
     if cove_redis_ready 6379; then
         echo "   - Using the Redis already running on 127.0.0.1:6379."
     elif [ "$OS" = "macos" ]; then

@@ -48,7 +48,8 @@ cove_postgres() {
             ;;
         psql)
             shift
-            ensure_postgres >/dev/null || exit 1
+            # Setup and start messages on stderr, apart from psql's own output.
+            ensure_postgres >&2 || exit 1
             local db="${1:-postgres}" psql
             [ $# -gt 0 ] && shift
             psql=$(cove_pg_tool psql) || exit 1
@@ -56,6 +57,16 @@ cove_postgres() {
             ;;
         -h|--help|help)
             echo "Usage: cove postgres [status|install|start|stop|psql [database]]"
+            echo ""
+            echo "The PostgreSQL server for Laravel sites made with --database=pgsql. Cove sets"
+            echo "it up the first time a site asks for it (Homebrew's postgresql@17 on macOS, the"
+            echo "distro's package on Linux), or uses one already running on 127.0.0.1:5432."
+            echo ""
+            echo "  status       Whether it runs, its version and its databases (the default)."
+            echo "  install      Sets it up now."
+            echo "  start, stop  Starts or stops it. PostgreSQL is optional, so cove enable and"
+            echo "               cove disable leave it alone."
+            echo "  psql [db]    A psql shell as Cove's role, on the database 'postgres' by default."
             ;;
         *)
             echo "Usage: cove postgres [status|install|start|stop|psql [database]]" >&2

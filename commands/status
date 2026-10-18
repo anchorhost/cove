@@ -102,8 +102,10 @@ cove_status() {
     echo "  Caddy Server: $caddy_status"
     echo "  MariaDB:      $mariadb_status"
     echo "  Mailpit:      $mailpit_status"
-    [ -n "$pg_status" ] && echo "  PostgreSQL:   $pg_status"
-    [ -n "$redis_status" ] && echo "  Redis:        $redis_status"
+    # Optional: started on demand by the sites that use them, and left
+    # alone by cove enable and disable.
+    [ -n "$pg_status" ] && echo "  PostgreSQL:   $pg_status (optional)"
+    [ -n "$redis_status" ] && echo "  Redis:        $redis_status (optional)"
     [ -n "$fpm_lines" ] && printf '%s' "$fpm_lines"
     echo ""
 
