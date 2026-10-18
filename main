@@ -1564,7 +1564,7 @@ linux_install_php_extensions() {
     done
     [ -z "$missing" ] && return 0
     gum style --foreground yellow "⚠️  These PHP extension packages couldn't be installed:$missing" \
-        "   Try: sudo $PKG_MANAGER install$missing   (then: sudo systemctl restart cove)"
+        "   Try: sudo $PKG_MANAGER install$missing   (then: cove enable)"
     return 1
 }
 
