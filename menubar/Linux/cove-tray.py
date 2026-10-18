@@ -58,7 +58,11 @@ LOG_FILE = os.path.join(LOGS_DIR, "menubar.log")
 REFRESH_SECONDS = 20
 UPDATE_CHECK_SECONDS = 86400
 CORE_SERVICES = ("caddy", "mariadb", "mailpit")
-SERVICE_NAMES = {"caddy": "Caddy", "mariadb": "MariaDB", "mailpit": "Mailpit"}
+# Started on demand by the Laravel sites that use them: listed, never counted,
+# so a stopped one doesn't make Cove look partly down (as in the macOS app).
+OPTIONAL_SERVICES = ("postgres", "redis")
+SERVICE_NAMES = {"caddy": "Caddy", "mariadb": "MariaDB", "mailpit": "Mailpit",
+                 "postgres": "PostgreSQL", "redis": "Redis"}
 URL_PATTERN = re.compile(r"https://[A-Za-z0-9.:/_?=&%~#+!@-]+")
 SITE_NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 
@@ -265,12 +269,13 @@ class CoveTray:
             return self.busy
         if not self.states_known:
             return "Cove status unavailable" if self.last_error else "Checking Cove…"
-        count = sum(1 for value in self.states.values() if value)
+        counted = [key for key in self.states if key not in OPTIONAL_SERVICES]
+        count = sum(1 for key in counted if self.states.get(key))
         if self.all_running():
             return "Cove is running"
         if count == 0:
             return "Cove is stopped"
-        return f"Cove: {count} of {len(self.states)} services running"
+        return f"Cove: {count} of {len(counted)} services running"
 
     def render(self):
         self.summary_item.set_label(self.summary_text())
@@ -319,7 +324,7 @@ class CoveTray:
             icon = "cove-logo-partial"
         elif all_up:
             icon = "cove-logo"
-        elif any(self.states.values()):
+        elif any(v for k, v in self.states.items() if k not in OPTIONAL_SERVICES):
             icon = "cove-logo-partial"
         else:
             icon = "cove-logo-stopped"
