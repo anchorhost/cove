@@ -432,22 +432,16 @@ cove_install() {
     # The DEB/RPM packages don't include all extensions by default
     if [ "$OS" = "linux" ]; then
         echo "📦 Installing FrankenPHP PHP extensions for WordPress and Laravel..."
-        if [ "$PKG_MANAGER" = "apt" ]; then
-            # Install required PHP extensions for WordPress via apt
-            $SUDO_CMD apt install -y $(linux_php_extension_packages) 2>/dev/null || true
-            echo "✅ FrankenPHP PHP extensions installed."
-        elif [ "$PKG_MANAGER" = "dnf" ]; then
-            # Install required PHP extensions for WordPress via dnf
-            $SUDO_CMD dnf install -y $(linux_php_extension_packages) 2>/dev/null || true
+        # Names any package it couldn't install, and fails then.
+        if linux_install_php_extensions; then
             echo "✅ FrankenPHP PHP extensions installed."
         fi
-        
+
         # Verify mysqli is available
         if ! frankenphp php-cli -r "echo implode(',', get_loaded_extensions());" 2>/dev/null | grep -qi mysqli; then
-            gum style --foreground yellow "⚠️ Warning: mysqli extension not found in FrankenPHP."
-            gum style --foreground yellow "   WordPress may not work correctly."
-            gum style --foreground yellow "   Try: sudo apt install php-zts-mysqli (for apt)"
-            gum style --foreground yellow "   Or:  sudo dnf install php-zts-mysqli (for dnf)"
+            gum style --foreground yellow "⚠️ Warning: mysqli extension not found in FrankenPHP." \
+                "   WordPress may not work correctly." \
+                "   Try: sudo $PKG_MANAGER install php-zts-mysqli"
         fi
 
         # Let FrankenPHP bind ports 80/443 as the user. Without this cap,
