@@ -311,7 +311,14 @@ laravel_workers_json() {
 
 cove_laravel() {
     local site_name="" kind="" state="" extra="" user_name="" user_password="${COVE_USER_PASSWORD:-}" format="table" no_reload=false arg
-    for arg in "$@"; do
+    while [ $# -gt 0 ]; do
+        arg="$1"; shift
+        # --name, --password and --format take their value after = or apart.
+        case "$arg" in
+            --format|--name|--password)
+                if [ $# -eq 0 ]; then gum style --foreground red "❌ Error: $arg needs a value."; exit 1; fi
+                arg="$arg=$1"; shift ;;
+        esac
         case "$arg" in
             --format=*) format="${arg#*=}" ;;
             --name=*) user_name="${arg#*=}" ;;
@@ -380,7 +387,9 @@ cove_laravel() {
     done
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove laravel <site> [queue|schedule] [on|off]"
+        echo "Usage: cove laravel <site> [queue|schedule|reverb] [on|off]"
+        echo "       cove laravel <site> users"
+        echo "       cove laravel <site> user add <email> [--name=<name>] [--password=<password>]"
         exit 1
     fi
     if ! validate_site_name "$site_name" || ! site_is_laravel "$SITES_DIR/$site_name.localhost"; then
@@ -389,6 +398,12 @@ cove_laravel() {
     fi
     local site_dir="$SITES_DIR/$site_name.localhost"
 
+    # "users add" means "user add"; anything else after "users" is a slip.
+    if [ "$kind" = "users" ] && [ "$state" = "add" ]; then kind="user"; fi
+    if [ "$kind" = "users" ] && [ -n "$state" ]; then
+        gum style --foreground red "❌ Error: Unexpected '$state' after users." "List them: cove laravel $site_name users" "Add one:   cove laravel $site_name user add <email>"
+        exit 1
+    fi
     if [ "$kind" = "users" ] || [ "$kind" = "user" ]; then
         local json
         if [ "$kind" = "user" ]; then
