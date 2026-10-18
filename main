@@ -19463,11 +19463,12 @@ display_command_help() {
         uninstall)
             echo "Usage: cove uninstall [--purge] [--dry-run] [--yes]"
             echo ""
-            echo "Removes Cove: stops its services and removes their definitions, ends background"
-            echo "shares and LAN advertisements, removes the menu bar app and Cove's /etc/hosts"
-            echo "lines, then the cove command itself. Your sites in ~/Cove and their databases"
-            echo "stay. The packages Cove installed (MariaDB, Mailpit, FrankenPHP, gum, WP-CLI,"
-            echo "PostgreSQL, Redis) stay too; the summary says how to remove them."
+            echo "Removes Cove: stops its services and takes them out of launchd or systemd,"
+            echo "ends background shares and LAN advertisements, removes the menu bar app and"
+            echo "Cove's /etc/hosts lines, then the cove command itself. Your sites in ~/Cove"
+            echo "and their databases stay. The packages Cove installed (MariaDB, Mailpit,"
+            echo "FrankenPHP, gum, WP-CLI, PostgreSQL, Redis) stay too; the summary says how to"
+            echo "remove them."
             echo ""
             echo "Flags:"
             echo "  --purge     Also delete every site (files, databases, Redis keys), ~/Cove"
@@ -19564,7 +19565,7 @@ main() {
         clone|rename|directive)
             [[ "${1:-}" =~ $site_re ]] && set -- "${1%.localhost}" "${@:2}"
             [[ "${2:-}" =~ $site_re ]] && set -- "$1" "${2%.localhost}" "${@:3}" ;;
-        db|lan|transfer)
+        core|db|lan|transfer)
             [[ "${2:-}" =~ $site_re ]] && set -- "$1" "${2%.localhost}" "${@:3}" ;;
     esac
 

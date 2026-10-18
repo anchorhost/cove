@@ -68,7 +68,7 @@ cove uninstall --dry-run   # shows what it would remove, changes nothing
 cove uninstall --purge     # also deletes every site, ~/Cove and the local CA
 ```
 
-`cove uninstall` stops Cove's services and removes their definitions, ends background shares and LAN advertisements, removes the menu bar app, takes Cove's lines out of `/etc/hosts`, and removes the `cove` command. Your sites in `~/Cove` and their databases stay. `--purge` also deletes every site (files, databases and Redis keys), `~/Cove` and Cove's local certificate authority, after you type `delete`. The packages Cove installed (MariaDB, Mailpit, FrankenPHP, gum, WP-CLI, PostgreSQL, Redis) stay either way, since other things may use them; the summary at the end names the command that removes them. Without a terminal, pass `--yes`.
+`cove uninstall` stops Cove's services and takes them out of launchd or systemd, ends background shares and LAN advertisements, removes the menu bar app, takes Cove's lines out of `/etc/hosts`, and removes the `cove` command. Your sites in `~/Cove` and their databases stay. `--purge` also deletes every site (files, databases and Redis keys), `~/Cove` and Cove's local certificate authority, after you type `delete`. The packages Cove installed (MariaDB, Mailpit, FrankenPHP, gum, WP-CLI, PostgreSQL, Redis) stay either way, since other things may use them; the summary at the end names the command that removes them. Without a terminal, pass `--yes`.
 
 ## 🚀 Quick Start
 

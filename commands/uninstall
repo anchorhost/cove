@@ -52,7 +52,7 @@ cove_uninstall() {
     if $purge; then
         echo "  • Delete all ${#sites[@]} sites: their files, databases and Redis keys"
     fi
-    echo "  • Stop Cove's services (FrankenPHP, Mailpit, MariaDB, the watchdog, Laravel workers) and remove their service definitions"
+    echo "  • Stop Cove's services (FrankenPHP, Mailpit, MariaDB, the watchdog, Laravel workers) and take them out of $([ "$OS" = macos ] && echo launchd || echo "systemd (their units removed)")"
     [ ${#shares[@]} -gt 0 ] && echo "  • End ${#shares[@]} background share(s)"
     [ ${#lan_agents[@]} -gt 0 ] && echo "  • Stop ${#lan_agents[@]} LAN (Bonjour) advertisement(s)"
     menubar_is_enabled 2>/dev/null && echo "  • Remove the menu bar app"

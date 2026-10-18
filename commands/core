@@ -207,6 +207,12 @@ cove_core() {
                     gum style --foreground red "❌ Error: '$site.localhost' runs Minn Engine, which has no WordPress core to update." "Update the engine with its own tools instead."
                     exit 1
                 fi
+                # --dry-run holds here too: it used to be read only by --all,
+                # so a single site was updated for real.
+                if [ "$dry_run" = true ]; then
+                    echo "🔎 Dry run — $site.localhost is on WordPress $(cove_wp_version "$public_dir" 2>/dev/null || echo "an unknown version") and would move to ${target:-the latest release}. Nothing changed."
+                    return 0
+                fi
                 source_config
                 echo "🔄 Updating WordPress core on $site.localhost..."
                 cove_core_update_one "$site" "$target"
@@ -251,6 +257,10 @@ cove_core() {
             fi
 
             if [ "$assume_yes" = false ]; then
+                if [ ! -t 0 ]; then
+                    gum style --foreground red "❌ Error: No terminal to confirm on." "Run it again with --yes to update $count site(s) without asking."
+                    return 1
+                fi
                 if ! gum confirm "Update $count site(s)?"; then
                     echo "Aborted."
                     return 1

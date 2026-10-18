@@ -480,7 +480,7 @@ function tools(): array {
     return [
         'list_sites' => [
             'title' => 'List sites',
-            'description' => "Every site in Cove: name, URL (https://<name>.localhost), type (WordPress, Minn, Plain), WordPress and PHP version, multisite, and its folder. A site's files are in <folder>/public.",
+            'description' => "Every site in Cove: name, URL (https://<name>.localhost), type (WordPress, Minn, Laravel, Plain), WordPress or Laravel and PHP version, multisite, and its folder. A site's files are in <folder>/public.",
             'inputSchema' => $obj(['filter' => ['type' => 'string', 'description' => 'Only sites whose name, type or WordPress version contains this.']]),
             'annotations' => $ro,
         ],
@@ -492,7 +492,7 @@ function tools(): array {
         ],
         'create_site' => [
             'title' => 'Create a site',
-            'description' => "Creates a new local site at https://<name>.localhost: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a Laravel application (as `laravel new` makes it, on SQLite unless database says mysql; or an existing project from a git URL or folder, set up to run: packages installed, .env written, database made and migrated, front end built), a plain static site, or a Minn Engine site. Takes up to a minute, or a few for an existing project.",
+            'description' => "Creates a new local site at https://<name>.localhost: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a Laravel application (as `laravel new` makes it, on SQLite unless database says mysql or pgsql; or an existing project from a git URL or folder, set up to run: packages installed, .env written, database made and migrated, front end built), a plain static site, or a Minn Engine site. Takes up to a minute, or a few for an existing project.",
             'inputSchema' => $obj([
                 'name' => ['type' => 'string', 'description' => 'Lowercase letters, numbers and hyphens, e.g. client-demo.'],
                 'type' => ['type' => 'string', 'enum' => ['wordpress', 'laravel', 'plain', 'minn'], 'description' => 'Default wordpress.'],
@@ -696,7 +696,7 @@ function tools(): array {
         ],
         'status' => [
             'title' => 'Cove status',
-            'description' => "Whether Cove's web server, MariaDB and Mailpit are answering, and where the dashboard, Adminer and Mailpit are.",
+            'description' => "Whether Cove's web server, MariaDB and Mailpit are answering (and PostgreSQL and Redis, once a Laravel site has had them set up), and where the dashboard, Adminer and Mailpit are.",
             'inputSchema' => $obj([]),
             'annotations' => $ro,
         ],
@@ -1212,11 +1212,17 @@ function call_tool(string $name, array $a): array {
                 "Web server (FrankenPHP) on :$https: " . $probe($https),
                 'MariaDB on :3306: ' . $probe(3306),
                 'Mailpit on :8025: ' . $probe(8025),
+            ];
+            // The optional servers, once a Laravel site has had them set up.
+            $pg = (int) ($cfg['PGSQL_PORT'] ?? 0) ?: 5432;
+            if (!empty($cfg['PGSQL_USER'])) $lines[] = "PostgreSQL on :$pg (optional): " . $probe($pg);
+            if (!empty($cfg['REDIS_PORT'])) $lines[] = 'Redis on :' . (int) $cfg['REDIS_PORT'] . ' (optional): ' . $probe((int) $cfg['REDIS_PORT']);
+            $lines = array_merge($lines, [
                 '',
                 'Dashboard: https://cove.localhost' . PORT_SUFFIX,
                 'Adminer: https://db.cove.localhost' . PORT_SUFFIX,
                 'Mailpit: https://mail.cove.localhost' . PORT_SUFFIX,
-            ];
+            ]);
             if (demo_sites() !== null) $lines[] = "\ncove demo is on: only " . implode(', ', demo_sites()) . ' can be used.';
             return text(implode("\n", $lines));
     }
