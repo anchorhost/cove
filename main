@@ -18882,8 +18882,8 @@ display_command_help() {
             echo "Opens an editor to add/edit rules which are then included in the main Caddyfile."
             echo
             echo "Subcommands:"
-            echo "  add                 Adds a rule to the Caddyfile for the specified site."
-            echo "  update              Updates a rule in the Caddyfile for the specified site."
+            echo "  add <name> [rules]  Adds rules to the Caddyfile for the specified site."
+            echo "  update <name> [rules]  Replaces the site's rules."
             echo "  delete <name>       Deletes custom rules from the Caddyfile for the specified site."
             echo "  list                Lists all custom directives for all managed sites."
             echo ""
@@ -18892,8 +18892,9 @@ display_command_help() {
             echo "  --file <path>       Read directives from a file instead of the editor."
             echo "  --force             Skip confirmation prompt (delete only)."
             echo ""
-            echo "Without --rules/--file, add/update opens an editor on a TTY and otherwise"
-            echo "reads from stdin, so this also works:"
+            echo "Without rules, --rules or --file, add/update opens an editor on a TTY and"
+            echo "otherwise reads from stdin, so these work too:"
+            echo "  cove directive add mysite \"header X-Robots-Tag noindex\""
             echo "  cat rules.conf | cove directive add mysite"
             ;;
         proxy)
@@ -19463,10 +19464,10 @@ main() {
     case "$command" in
         add|artisan|backup|composer|delete|history|import|laravel|log|login|mappings|network|path|php|screenshot|share|snapshot|twin|url|wp)
             [[ "${1:-}" =~ $site_re ]] && set -- "${1%.localhost}" "${@:2}" ;;
-        clone|rename)
+        clone|rename|directive)
             [[ "${1:-}" =~ $site_re ]] && set -- "${1%.localhost}" "${@:2}"
             [[ "${2:-}" =~ $site_re ]] && set -- "$1" "${2%.localhost}" "${@:3}" ;;
-        db|directive|lan|transfer)
+        db|lan|transfer)
             [[ "${2:-}" =~ $site_re ]] && set -- "$1" "${2%.localhost}" "${@:3}" ;;
     esac
 
@@ -19683,6 +19684,8 @@ main() {
             ;;
         directive)
             check_dependencies
+            # The site first (cove directive mysite add) reads the same.
+            case "${2:-}" in add|update|delete) set -- "$2" "$1" "${@:3}" ;; esac
             local action="$1"
             shift # Remove subcommand from argument list
             case "$action" in
@@ -19695,9 +19698,12 @@ main() {
                 list)
                     cove_directive_list "$@"
                     ;;
-                *)
+                "")
                     display_command_help "directive"
-                    exit 0
+                    ;;
+                *)
+                    gum style --foreground red "❌ Error: Unknown subcommand '$action'." "Use add, update, delete or list."
+                    exit 1
                     ;;
             esac
             ;;
