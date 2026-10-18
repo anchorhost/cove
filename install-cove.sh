@@ -16,6 +16,9 @@ SUDO_CMD="sudo"
 IS_WSL=false
 DEV_MODE=false
 MAIN_MODE=false
+# The PATH of the terminal that ran us, before any Homebrew shellenv below:
+# whether that terminal can run cove once we're done.
+ORIGINAL_PATH="$PATH"
 
 # --- Parse Arguments ---
 for arg in "$@"; do
@@ -259,6 +262,15 @@ build_cove_from_main() {
     mv "$src/cove.sh" "$out"
 }
 
+# Says to open a new terminal when the one that ran us can't find cove: its
+# PATH didn't hold $INSTALL_DIR (a Homebrew this script just set up).
+say_if_new_terminal_needed() {
+    case ":$ORIGINAL_PATH:" in
+        *":$INSTALL_DIR:"*) ;;
+        *) echo_info "Open a new terminal to use cove: this one's PATH doesn't include $INSTALL_DIR yet." ;;
+    esac
+}
+
 # --- Main Installation Logic ---
 
 # Scratch space for downloads, removed however this script exits.
@@ -361,10 +373,20 @@ fi
 if [ "$COVE_INSTALL_RC" -ne 0 ]; then
     echo "--------------------------------------------------"
     echo "${RED}${BOLD}ERROR:${NC} Cove's setup didn't finish. Run 'cove install' to try again." >&2
+    say_if_new_terminal_needed
     exit "$COVE_INSTALL_RC"
+fi
+
+# cove install may have moved Cove off 80/443 (a port in use): its URLs
+# carry the HTTPS port then, as `cove url` prints them.
+HTTPS_SUFFIX=""
+SAVED_HTTPS_PORT=$(grep '^HTTPS_PORT=' "$HOME/Cove/config" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "'\"")
+if [ -n "$SAVED_HTTPS_PORT" ] && [ "$SAVED_HTTPS_PORT" != "443" ]; then
+    HTTPS_SUFFIX=":$SAVED_HTTPS_PORT"
 fi
 
 echo "--------------------------------------------------"
 echo_success "Cove has been installed successfully!"
-echo_info "You can now use the 'cove' command from anywhere in your terminal."
-echo_info "You may need to restart your terminal for all changes to take effect."
+say_if_new_terminal_needed
+echo_info "Next, create your first site: cove add myblog"
+echo_info "It's served at https://myblog.localhost${HTTPS_SUFFIX}, and the dashboard is at https://cove.localhost${HTTPS_SUFFIX}."
