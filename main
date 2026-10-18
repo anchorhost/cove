@@ -12280,7 +12280,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     { id: 'wordpress', label: 'WordPress', hint: 'latest, nightly, or a version', dot: 'wp', words: ['wordpress', 'wp'] },
                     { id: 'plain', label: 'Plain', hint: 'static files, no database', dot: 'static', words: ['plain', 'static', 'html'] },
                     { id: 'minn', label: 'Minn Engine', hint: !m ? 'checking for a release…' : m.available ? (m.version ? 'release ' + m.version : 'the latest release') : 'no release yet', dot: 'minn', words: ['minn', 'engine'], disabled: !(m && m.available) },
-                    { id: 'laravel', label: 'Laravel', hint: 'on SQLite or MySQL', dot: 'laravel', words: ['laravel'] },
+                    { id: 'laravel', label: 'Laravel', hint: 'on SQLite, MySQL or PostgreSQL', dot: 'laravel', words: ['laravel'] },
                 ];
             },
 
