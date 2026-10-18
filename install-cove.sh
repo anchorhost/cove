@@ -227,6 +227,38 @@ pre_flight_checks() {
     fi
 }
 
+# Builds cove.sh from the main branch's source into $1. cove.sh itself is
+# only committed in release commits, so the copy on main is the last
+# release's: build it the way a release is, with main's compile.sh.
+build_cove_from_main() {
+    local out="$1" src="$TMP_WORK/src" tool
+    for tool in tar gzip; do
+        if ! command -v "$tool" &> /dev/null; then
+            # Minimal RHEL-family images ship without tar.
+            if [ "$OS" = "linux" ]; then
+                echo_info "Installing $tool (needed to unpack the source)..."
+                $SUDO_CMD $PKG_MANAGER install -y "$tool" > /dev/null 2>&1 || true
+            fi
+            command -v "$tool" &> /dev/null || echo_error "--main needs $tool to unpack the source. Please install it and run this script again."
+        fi
+    done
+
+    if ! curl -L --fail --progress-bar "$MAIN_TARBALL_URL" -o "$TMP_WORK/main.tar.gz"; then
+        echo_error "Failed to download from '$MAIN_TARBALL_URL'. Please check your connection."
+    fi
+    mkdir -p "$src"
+    if ! tar -xzf "$TMP_WORK/main.tar.gz" -C "$src" --strip-components=1; then
+        echo_error "Couldn't unpack the main branch's source."
+    fi
+    # The tarball carries the last release's cove.sh: remove it, so a build
+    # that fails can't leave it behind to be installed in its place.
+    rm -f "$src/cove.sh"
+    if ! (cd "$src" && bash ./compile.sh > /dev/null) || [ ! -s "$src/cove.sh" ]; then
+        echo_error "Couldn't build cove.sh from the main branch's source."
+    fi
+    mv "$src/cove.sh" "$out"
+}
+
 # --- Main Installation Logic ---
 
 # Scratch space for downloads, removed however this script exits.
@@ -241,11 +273,8 @@ pre_flight_checks
 
 # 3. Define installation paths
 EXECUTABLE_NAME="cove"
-if [ "$MAIN_MODE" = true ]; then
-    DOWNLOAD_URL="https://raw.githubusercontent.com/anchorhost/cove/main/cove.sh"
-else
-    DOWNLOAD_URL="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
-fi
+DOWNLOAD_URL="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
+MAIN_TARBALL_URL="https://codeload.github.com/anchorhost/cove/tar.gz/refs/heads/main"
 DESTINATION_PATH="$INSTALL_DIR/$EXECUTABLE_NAME"
 
 # Get the directory where this script is located (for --dev mode)
@@ -278,16 +307,19 @@ if [ "$DEV_MODE" = true ]; then
     fi
     echo_success "Local cove.sh installed to $DESTINATION_PATH"
 else
+    # Download (or build) to temp first, then move with sudo if needed. In
+    # our own mktemp dir, not a fixed /tmp name another account could
+    # create first.
+    TEMP_DOWNLOAD="$TMP_WORK/cove.sh"
     if [ "$MAIN_MODE" = true ]; then
-        echo_info "🧪 MAIN MODE: Downloading cove.sh from the main branch (unreleased)..."
+        echo_info "🧪 MAIN MODE: Building cove.sh from the main branch's source (unreleased)..."
+        build_cove_from_main "$TEMP_DOWNLOAD"
+        echo_success "Built cove.sh from the main branch."
     else
         echo_info "Downloading the latest version of Cove..."
-    fi
-
-    # Download to temp first, then move with sudo if needed
-    TEMP_DOWNLOAD="/tmp/cove.sh.download"
-    if ! curl -L --fail --progress-bar "$DOWNLOAD_URL" -o "$TEMP_DOWNLOAD"; then
-        echo_error "Failed to download from '$DOWNLOAD_URL'. Please check your connection."
+        if ! curl -L --fail --progress-bar "$DOWNLOAD_URL" -o "$TEMP_DOWNLOAD"; then
+            echo_error "Failed to download from '$DOWNLOAD_URL'. Please check your connection."
+        fi
     fi
 
     # Move to final destination (may require sudo on Linux)
