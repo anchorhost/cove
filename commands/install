@@ -200,32 +200,37 @@ cove_install() {
     echo "🚀 Starting Cove installation..."
 
     # --- WSL/Systemd Check ---
+    # MariaDB and FrankenPHP run as systemd services on Linux, so without
+    # systemd the install fails at its first `systemctl`, after every
+    # package is in. Stop before installing anything instead. No
+    # /run/systemd/system is systemd's own test for "not booted with it":
+    # WSL without systemd turned on, or a container whose init isn't systemd.
     if [ "$OS" == "linux" ]; then
-        if [ "$IS_WSL" = true ]; then
-            echo "🐧 WSL environment detected."
-            # Check if systemd is running
-            if ! pidof systemd >/dev/null 2>&1; then
-                echo ""
-                echo "⚠️  WARNING: systemd is not running in WSL."
-                echo "   Cove requires systemd for service management."
-                echo ""
-                echo "   To enable systemd in WSL2, add to /etc/wsl.conf:"
-                echo "   [boot]"
-                echo "   systemd=true"
-                echo ""
-                echo "   Then restart WSL with: wsl --shutdown"
-                echo ""
-                if $auto_yes; then
-                    echo "   (--yes set — continuing anyway.)"
-                else
-                    read -p "Do you want to continue anyway? (y/N) " -n 1 -r
-                    echo
-                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                        echo "🚫 Installation cancelled."
-                        exit 0
-                    fi
-                fi
+        [ "$IS_WSL" = true ] && echo "🐧 WSL environment detected."
+        if [ ! -d /run/systemd/system ]; then
+            local lines=("❌ Cove needs systemd, and this system isn't running it.")
+            if [ "$IS_WSL" = true ]; then
+                lines+=(
+                    "To turn it on in WSL, add these lines to /etc/wsl.conf:"
+                    "    [boot]"
+                    "    systemd=true"
+                    "Then run 'wsl --shutdown' in PowerShell, open this distro again,"
+                    "and run 'cove install' again."
+                )
+            else
+                lines+=(
+                    "Cove runs MariaDB and FrankenPHP as systemd services. In a container,"
+                    "start it with systemd as its init, or install Cove in a VM instead."
+                )
             fi
+            echo ""
+            # gum isn't installed yet on a first run.
+            if command -v gum >/dev/null 2>&1; then
+                gum style --border normal --border-foreground red --padding "0 1" "${lines[@]}" >&2
+            else
+                printf '%s\n' "${lines[@]}" >&2
+            fi
+            exit 1
         fi
     fi
 
