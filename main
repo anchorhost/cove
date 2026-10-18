@@ -19003,10 +19003,10 @@ display_command_help() {
         laravel)
             cove_laravel --help
             ;;
-        postgres)
+        postgres|postgresql|pgsql)
             cove_postgres --help
             ;;
-        redis)
+        redis|valkey)
             cove_redis --help
             ;;
         composer)
@@ -19421,9 +19421,20 @@ main() {
         COVE_CMD="$0"
     fi
 
-    # Check for a help flag anywhere in the arguments.
+    # `cove help` and `cove help <command>`, as people type them.
+    if [ "${1:-}" = "help" ]; then
+        if [ -n "${2:-}" ]; then display_command_help "$2"; else show_general_help; fi
+        exit 0
+    fi
+
+    # Check for a help flag anywhere in the arguments. For wp, artisan and
+    # composer only one straight after the command is Cove's: a later one
+    # belongs to WP-CLI, Artisan or Composer (cove wp mysite plugin list --help).
+    local arg_index=0
     for arg in "$@"; do
+        arg_index=$((arg_index + 1))
         if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+            case "$1" in wp|artisan|composer) [ "$arg_index" -gt 2 ] && break ;; esac
             local command_for_help="$1"
             # If the command is empty or a help flag, show general help.
             if [[ -z "$command_for_help" || "$command_for_help" == "--help" || "$command_for_help" == "-h" ]]; then
@@ -19444,6 +19455,20 @@ main() {
     fi
 
     shift # Remove command from argument list
+
+    # A site named as the browser shows it (shop.localhost) means shop. Only
+    # where the site goes, so a .localhost value later in the arguments
+    # (cove wp shop search-replace old.localhost new.localhost) is left be.
+    local site_re='^[a-z0-9-]+\.localhost$'
+    case "$command" in
+        add|artisan|backup|composer|delete|history|import|laravel|log|login|mappings|network|path|php|screenshot|share|snapshot|twin|url|wp)
+            [[ "${1:-}" =~ $site_re ]] && set -- "${1%.localhost}" "${@:2}" ;;
+        clone|rename)
+            [[ "${1:-}" =~ $site_re ]] && set -- "${1%.localhost}" "${@:2}"
+            [[ "${2:-}" =~ $site_re ]] && set -- "$1" "${2%.localhost}" "${@:3}" ;;
+        db|directive|lan|transfer)
+            [[ "${2:-}" =~ $site_re ]] && set -- "$1" "${2%.localhost}" "${@:3}" ;;
+    esac
 
     case "$command" in
         add)
