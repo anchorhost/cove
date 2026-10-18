@@ -662,7 +662,8 @@ INI
     # and the root cert to exist (Caddy generated it during the initial
     # cove_enable above). Idempotent — users can re-run via `cove trust`.
     echo ""
-    cove_trust
+    local ssl_trusted=false
+    cove_trust && ssl_trusted=true
 
     # If the user changed HTTPS ports during install AND there are pre-existing
     # WordPress sites in $SITES_DIR, migrate their stored URLs to the new port.
@@ -675,39 +676,52 @@ INI
         fi
     fi
 
-    # Show post-install guidance
-    echo ""
+    # Show post-install guidance: the ports when they aren't the defaults,
+    # and the certificate workarounds only when cove_trust above didn't
+    # succeed. After a successful trust, browsers show no warning to explain.
     if [ "$HTTPS_PORT" != "443" ]; then
+        echo ""
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
             "📋 First-Time Setup Notes" \
             "Cove is running on custom ports: HTTP ${HTTP_PORT} / HTTPS ${HTTPS_PORT}" \
             "Access the dashboard at: $(url_for cove.localhost)"
-    else
+    elif ! $ssl_trusted; then
+        echo ""
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
             "📋 First-Time Setup Notes"
     fi
-    echo ""
-    echo "  Your browser will show a certificate warning when accessing Cove sites."
-    echo "  This is normal for local development with self-signed certificates."
-    echo ""
-    echo "  Options to resolve:"
-    echo "    1. Click 'Advanced' and 'Proceed' to accept the certificate"
-    echo "    2. Or trust Caddy's root CA certificate system-wide (recommended)"
-    echo ""
-    if [ "$OS" == "macos" ]; then
-        echo "  On macOS, Caddy typically auto-trusts its CA. If not, the CA cert is at:"
-        echo "    ~/Library/Application Support/Caddy/pki/authorities/local/root.crt"
-    else
-        echo "  On Linux, the CA certificate is located at:"
-        echo "    ~/.local/share/caddy/pki/authorities/local/root.crt"
+    if ! $ssl_trusted; then
         echo ""
-        echo "  To trust it system-wide (Ubuntu/Debian):"
-        echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"
-        echo "    sudo update-ca-certificates"
+        echo "  Your browser will show a certificate warning when accessing Cove sites,"
+        echo "  because Cove's local root certificate isn't trusted yet."
         echo ""
-        echo "  For browser-only trust, import the certificate in your browser settings."
+        echo "  Options to resolve:"
+        echo "    1. Click 'Advanced' and 'Proceed' to accept the certificate"
+        echo "    2. Or trust Caddy's root CA certificate system-wide (recommended):"
+        echo "       run 'cove trust' once Cove is running, or follow the steps below"
+        echo ""
+        if [ "$OS" == "macos" ]; then
+            echo "  On macOS, the CA cert is at:"
+            echo "    ~/Library/Application Support/Caddy/pki/authorities/local/root.crt"
+            echo "  Open it in Keychain Access and set it to Always Trust."
+        else
+            echo "  On Linux, the CA certificate is located at:"
+            echo "    ~/.local/share/caddy/pki/authorities/local/root.crt"
+            echo ""
+            if [ "$PKG_MANAGER" = "dnf" ]; then
+                echo "  To trust it system-wide (Fedora/RHEL):"
+                echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /etc/pki/ca-trust/source/anchors/caddy.crt"
+                echo "    sudo update-ca-trust"
+            else
+                echo "  To trust it system-wide (Ubuntu/Debian):"
+                echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"
+                echo "    sudo update-ca-certificates"
+            fi
+            echo ""
+            echo "  For browser-only trust, import the certificate in your browser settings."
+        fi
     fi
-    
+
     if [ "$IS_WSL" = true ]; then
         echo ""
         gum style --foreground yellow "  WSL: Run 'cove wsl-hosts' for Windows hosts file setup instructions."

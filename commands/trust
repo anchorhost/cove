@@ -129,4 +129,6 @@ cove_trust() {
                 "Re-run 'cove trust' once Cove is running to try again."
         fi
     fi
+    # cove install prints the manual trust steps only when this failed.
+    return "$trust_rc"
 }
