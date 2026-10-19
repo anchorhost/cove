@@ -192,7 +192,7 @@ lane_a() {
             res "$c" install PASS
         else
             res "$c" install FAIL
-            for k in add_latest add_pinned add_plain clone rename login login_rewrite delete status health mailpit mail mcp laravel logrotate reboot uninstall; do res "$c" "$k" SKIP; done
+            for k in add_latest add_pinned add_plain add_from clone rename login login_rewrite delete status health mailpit mail mcp laravel logrotate reboot uninstall; do res "$c" "$k" SKIP; done
             return
         fi
 
@@ -212,6 +212,38 @@ lane_a() {
             res "$c" add_plain PASS
         else
             res "$c" add_plain FAIL
+        fi
+
+        # `cove add --from` with an archive: a .tar.gz whose files sit in one
+        # folder (stripped), a .zip (Cove's ZipArchive fallback where there's
+        # no unzip), one with ../ in it (refused, nothing made), and a clone
+        # that keeps the whole project, not just public/.
+        if cx "$c" bash -s <<'ADDFROM'
+fail() { echo "add_from: $*" >&2; exit 1; }
+d=$(mktemp -d); mkdir -p "$d/app/public"
+echo '<?php echo "from ok";' > "$d/app/public/index.php"; echo tool > "$d/app/tool"
+tar -czf "$d/app.tar.gz" -C "$d" app || fail "making the tarball"
+cove add fromt --from="$d/app.tar.gz" >/tmp/from.log 2>&1 || fail "cove add (tar.gz): $(tail -n 5 /tmp/from.log)"
+[ -f /root/Cove/Sites/fromt.localhost/tool ] || fail "the archive's top folder was not stripped"
+grep -q '^kind=archive' /root/Cove/Sites/fromt.localhost/cove-from || fail "no cove-from"
+[ "$(curl -sk --max-time 20 https://fromt.localhost/)" = "from ok" ] || fail "fromt does not serve its public/"
+mkzip() { if command -v python3 >/dev/null; then python3 -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1], 'w'); z.writestr(sys.argv[2], sys.argv[3]); z.close()" "$@"; else COVE_Z="$1" COVE_N="$2" COVE_C="$3" frankenphp php-cli -r '$z = new ZipArchive(); $z->open(getenv("COVE_Z"), ZipArchive::CREATE); $z->addFromString(getenv("COVE_N"), getenv("COVE_C")); exit($z->close() ? 0 : 1);'; fi; }
+mkzip "$d/s.zip" index.html "zip ok" || fail "making the zip"
+cove add fromz --from="$d/s.zip" >/tmp/fromz.log 2>&1 || fail "cove add (zip): $(tail -n 5 /tmp/fromz.log)"
+[ "$(curl -sk --max-time 20 https://fromz.localhost/)" = "zip ok" ] || fail "fromz does not serve the zip's index.html"
+mkzip "$d/evil.zip" ../evil.txt x || fail "making the bad zip"
+if cove add frome --from="$d/evil.zip" >/tmp/frome.log 2>&1; then fail "a zip with ../ was accepted"; fi
+[ ! -e /root/Cove/Sites/frome.localhost ] || fail "the refused zip left a site"
+[ ! -e /root/Cove/Sites/evil.txt ] || fail "the refused zip wrote outside its folder"
+cove clone fromt fromt2 >/dev/null 2>&1 || fail "cove clone"
+[ -f /root/Cove/Sites/fromt2.localhost/tool ] || fail "the clone left out the project outside public/"
+for s in fromt fromt2 fromz; do cove delete "$s" --force >/dev/null 2>&1 || fail "cove delete $s"; done
+exit 0
+ADDFROM
+        then
+            res "$c" add_from PASS
+        else
+            res "$c" add_from FAIL
         fi
 
         if cx "$c" cove clone alpha alpha2 && site_has "$c" alpha2 "Welcome to"; then
