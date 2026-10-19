@@ -1752,7 +1752,7 @@ cove_pg_setup() {
         fi
     else
         if ! cove_pg_tool pg_isready >/dev/null 2>&1 || ! systemctl list-unit-files postgresql.service >/dev/null 2>&1; then
-            echo "   - Installing PostgreSQL via $PKG_MANAGER…"
+            echo "   - Installing PostgreSQL via ${PKG_MANAGER}…"
             if [ "$PKG_MANAGER" = "apt" ]; then
                 $SUDO_CMD apt-get update -qq >/dev/null 2>&1
                 $SUDO_CMD env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql >/dev/null 2>&1
@@ -1878,7 +1878,7 @@ ensure_redis() {
         config_set REDIS_FORMULA redis
         pkg_service start redis >/dev/null 2>&1
     else
-        echo "   - Installing Redis via $PKG_MANAGER…"
+        echo "   - Installing Redis via ${PKG_MANAGER}…"
         if [ "$PKG_MANAGER" = "apt" ]; then
             $SUDO_CMD apt-get update -qq >/dev/null 2>&1
             $SUDO_CMD env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq redis-server >/dev/null 2>&1
@@ -19424,7 +19424,8 @@ display_command_help() {
         path)
             echo "Usage: cove path <name>"
             echo ""
-            echo "Outputs the full path to the specified site's directory."
+            echo "Outputs the full path to the site's public/ folder, the one it serves."
+            echo "A Laravel app, or one from 'cove add --from', is the folder above it."
             echo ""
             echo "Arguments:"
             echo "  <name>         The name of the site."
