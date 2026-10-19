@@ -2038,23 +2038,32 @@ cove_json_str() {
 # The database Cove creates for a new site, WordPress or Laravel (MariaDB or
 # PostgreSQL): cove_ and the name, hyphens as underscores, as the Laravel
 # installer does. A WordPress site added before 2.5 has one more underscore
-# on the end, and keeps it (see wp_cove_db).
+# on the end, and keeps it (see cove_db_is_sites).
 cove_db_name() {
     local n="cove_$1"
     echo "${n//-/_}"
 }
 
-# The database a WordPress site ($1 its folder, $2 its name) uses, from
-# wp-config.php, when it is the one Cove made for that name: cove_<name>, or
+# The database a WordPress site's wp-config.php names ($1 the site folder);
+# nothing when it can't be read.
+wp_site_db() {
+    (cd "$1/public" && $(get_wp_cmd "$1") config get DB_NAME --skip-plugins --skip-themes 2>/dev/null </dev/null)
+}
+
+# Is $1 the database Cove made for WordPress site $2? cove_<name>, or
 # cove_<name>_ from before 2.5, when `echo … | tr` turned echo's newline into
-# a last underscore. Nothing (and status 1) for one it was pointed at by hand.
+# a last underscore. One wp-config.php was pointed at by hand isn't.
+cove_db_is_sites() {
+    [ -n "$1" ] && { [ "$1" = "$(cove_db_name "$2")" ] || [ "$1" = "$(cove_db_name "$2")_" ]; }
+}
+
+# The database a WordPress site ($1 its folder, $2 its name) uses when it is
+# the one Cove made for it (see cove_db_is_sites); nothing and status 1 if not.
 wp_cove_db() {
     local db
-    db=$(cd "$1/public" && $(get_wp_cmd "$1") config get DB_NAME --skip-plugins --skip-themes 2>/dev/null </dev/null)
-    case "$db" in
-        "$(cove_db_name "$2")"|"$(cove_db_name "$2")_") echo "$db" ;;
-        *) return 1 ;;
-    esac
+    db=$(wp_site_db "$1")
+    cove_db_is_sites "$db" "$2" || return 1
+    echo "$db"
 }
 
 # Is there a MariaDB database by this name? Needs source_config. Cove's

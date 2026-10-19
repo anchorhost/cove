@@ -173,11 +173,17 @@ cove_core() {
                     --all)              all=true ;;
                     --dry-run)          dry_run=true ;;
                     --yes|-y|--force)   assume_yes=true ;;
-                    -*)                 ;;
+                    # A typo stops it: --dryrun going ahead as an update
+                    # is the one mistake this mustn't make.
+                    -*)
+                        gum style --foreground red "❌ Error: Unknown option '$arg'."
+                        echo "Usage: cove core update <site> [version] [--dry-run]"
+                        echo "       cove core update --all [--dry-run] [--yes]"
+                        exit 1 ;;
                     *)
-                        # Same grammar as `cove add`: a bare token that starts
-                        # with a digit is a version, anything else is a site.
-                        if [[ "$arg" == [0-9]* ]]; then target="$arg"; else site="$arg"; fi ;;
+                        # A version has a dot (6.4, 6.9-RC1); site names
+                        # can't, so 3d-shop is a site.
+                        if [[ "$arg" =~ ^[0-9]+\.[0-9] ]]; then target="$arg"; else site="${arg%.localhost}"; fi ;;
                 esac
             done
 
@@ -210,7 +216,18 @@ cove_core() {
                 # --dry-run holds here too: it used to be read only by --all,
                 # so a single site was updated for real.
                 if [ "$dry_run" = true ]; then
-                    echo "🔎 Dry run — $site.localhost is on WordPress $(cove_wp_version "$public_dir" 2>/dev/null || echo "an unknown version") and would move to ${target:-the latest release}. Nothing changed."
+                    local to="$target"
+                    if [ -z "$to" ]; then
+                        cove_wpver_refresh >/dev/null 2>&1
+                        to=$(grep -oE '"version":"[^"]+","status":"latest"' "$COVE_WPVER_CACHE" 2>/dev/null | head -1 | cut -d'"' -f4)
+                    fi
+                    local now
+                    now=$(cove_wp_version "$public_dir" 2>/dev/null)
+                    if [ -n "$to" ] && [ "$now" = "$to" ]; then
+                        echo "🔎 Dry run — $site.localhost is already on WordPress $now, so there's nothing to update. Nothing changed."
+                    else
+                        echo "🔎 Dry run — $site.localhost is on WordPress ${now:-an unknown version} and would move to ${to:-the latest release}. Nothing changed."
+                    fi
                     return 0
                 fi
                 source_config

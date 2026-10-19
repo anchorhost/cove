@@ -9,6 +9,12 @@ cove_rename() {
         exit 1
     fi
 
+    if [ $# -gt 2 ]; then
+        gum style --foreground red "❌ Error: Unknown option '$3'."
+        echo "Usage: cove rename <old-name> <new-name>"
+        exit 1
+    fi
+
     if [ "$old_name" == "$new_name" ]; then
          gum style --foreground red "❌ Error: The new name must be different from the old name."
          exit 1
@@ -66,8 +72,8 @@ cove_rename() {
         wp_cmd=$(get_wp_cmd "$new_site_dir")
         
         # The database follows the name only when it is the one Cove made
-        # (either spelling, see wp_cove_db); one wp-config.php was pointed at
-        # by hand stays as it is.
+        # (either spelling, see cove_db_is_sites); one wp-config.php was
+        # pointed at by hand stays as it is.
         local old_db_name="" new_db_name
         new_db_name=$(cove_db_name "$new_name")
         if old_db_name=$(wp_cove_db "$new_site_dir" "$old_name"); then

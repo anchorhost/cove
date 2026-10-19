@@ -103,8 +103,15 @@ cove_clone() {
     local new_name="$2"
     local no_reload_flag=false
 
-    for arg in "$@"; do
-        [ "$arg" == "--no-reload" ] && no_reload_flag=true
+    local arg
+    for arg in "${@:3}"; do
+        case "$arg" in
+            --no-reload) no_reload_flag=true ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                echo "Usage: cove clone <source> <new-name>"
+                exit 1 ;;
+        esac
     done
 
     # --- Validation ---

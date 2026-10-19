@@ -21,10 +21,16 @@ cove_delete() {
 
     local force_delete=false
     local no_reload=false
-    for arg in "$@"; do
+    local arg
+    for arg in "${@:2}"; do
         case "$arg" in
             --force|--yes|-y) force_delete=true ;;
             --no-reload) no_reload=true ;;
+            # Anything else stops it: a delete can't be undone, so a typo
+            # (or a --dry-run it doesn't have) mustn't go ahead as one.
+            *)
+                gum style --foreground red "❌ Error: Unknown option '$arg'." "Usage: cove delete <name> [--yes]" "It asks before deleting anything unless you add --yes."
+                exit 1 ;;
         esac
     done
     # Non-interactive callers (dashboard shell_exec, scripted cleanup) have no
@@ -61,21 +67,29 @@ cove_delete() {
     laravel_workers_hold "$site_name"
     laravel_workers_stop_site "$site_name"
     if [ -f "$site_dir/public/wp-config.php" ]; then
-        local db_name wp_cmd
-        wp_cmd=$(get_wp_cmd "$site_dir")
-        # Prefer the DB actually named in wp-config.php. Deriving cove_<name>
-        # blindly (as before) would orphan the real database for any site whose
-        # DB_NAME was changed — and could drop an unrelated database that
-        # happened to match the derived name. Fall back to the derived name only
-        # if wp-config can't be read: whichever of its two spellings is there
-        # (see wp_cove_db).
-        db_name=$( (cd "$site_dir/public" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        # Only the database Cove made for the site (either spelling, see
+        # cove_db_is_sites): one wp-config.php was pointed at by hand may be
+        # another site's, or one you use elsewhere. When wp-config.php can't
+        # be read, whichever of Cove's two spellings is there.
+        local db_name
+        db_name=$(wp_site_db "$site_dir")
         if [ -z "$db_name" ]; then
             db_name=$(cove_db_name "$site_name")
             cove_db_exists "$db_name" || db_name="${db_name}_"
+        elif ! cove_db_is_sites "$db_name" "$site_name"; then
+            echo "🗄️ Keeping database '$db_name': wp-config.php names it, and it isn't one Cove made for this site."
+            db_name=""
         fi
-        echo "🗄️ Deleting database: $db_name"
-        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        if [ -n "$db_name" ]; then
+            echo "🗄️ Deleting database: $db_name"
+            # The files stay when it can't be dropped: without them, nothing
+            # would lead back to the database.
+            if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"; then
+                laravel_workers_release "$site_name"
+                gum style --foreground red "❌ Error: Could not delete the database '$db_name', so the site stays as it is." "Is MariaDB running? See: cove status"
+                exit 1
+            fi
+        fi
     elif site_is_laravel "$site_dir"; then
         # Only the database Cove made for the site: one .env was pointed at
         # by hand may be shared, or someone else's.
@@ -87,8 +101,10 @@ cove_delete() {
             echo "🗄️ Deleting database: $db_name"
             if [ "$server" = "pgsql" ] && ! ensure_postgres >/dev/null; then
                 gum style --foreground yellow "⚠️  PostgreSQL isn't running, so '$db_name' stays. Drop it later: cove postgres psql, then DROP DATABASE $db_name;"
-            else
-                cove_server_db_drop "$server" "$db_name"
+            elif ! cove_server_db_drop "$server" "$db_name"; then
+                laravel_workers_release "$site_name"
+                gum style --foreground red "❌ Error: Could not delete the database '$db_name', so the site stays as it is." "Is $([ "$server" = pgsql ] && echo PostgreSQL || echo MariaDB) running? See: cove status"
+                exit 1
             fi
         fi
     fi
