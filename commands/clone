@@ -22,7 +22,7 @@ cove_copy_tree() {
     cp -R "$src" "$dst"
 }
 
-# Copies a Laravel site's folder ($1 → $2): the whole project, without
+# Copies a project site's folder ($1 → $2): the whole project, without
 # Cove's own files (COVE_SITE_OWN) or what a restore left half-done.
 cove_copy_project() {
     local src="$1" dst="$2" entry name
@@ -176,13 +176,14 @@ cove_clone() {
     echo "🧬 Cloning $source_name.localhost → $new_name.localhost"
 
     # --- Files ---
-    # Only public/ is cloned, or a Laravel site's whole project. logs/ is the
+    # Only public/ is cloned, or a project site's whole folder (Laravel, or
+    # an app `cove add --from` brought in). logs/ is the
     # source's own request history and would be actively misleading under a
     # new hostname, so the clone starts with an empty one.
     mkdir -p "$new_dir"
     echo "   - Copying files..."
     local copied=true
-    if [ "$is_laravel" = true ]; then
+    if site_is_project "$source_dir"; then
         cove_copy_project "$source_dir" "$new_dir" || copied=false
     else
         cove_copy_tree "$source_dir/public" "$new_dir/public" || copied=false

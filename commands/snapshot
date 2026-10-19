@@ -98,11 +98,15 @@ snapshot_create() {
         rm -f "$dest/.dump-err"
         chmod 600 "$dest/db.sql"
         wp_version=$(sed -n "s/^\$wp_version = '\([^']*\)';/\1/p" "$public_dir/wp-includes/version.php" 2>/dev/null | head -n 1)
-    elif [ "$want" = "project" ] || site_is_laravel "$site_dir"; then
+    elif [ "$want" = "project" ] || site_is_project "$site_dir"; then
         # The whole project; an SQLite database rides along inside it. A
-        # MariaDB one is dumped only when it is the one Cove made.
-        kind="laravel"
-        laravel_ver=$(laravel_version "$site_dir")
+        # Laravel app's MariaDB one is dumped only when it is the one Cove
+        # made. Another app (from `cove add --from`) is its folder alone.
+        kind="project"
+        if site_is_laravel "$site_dir"; then
+            kind="laravel"
+            laravel_ver=$(laravel_version "$site_dir")
+        fi
         local dump_cmd db_name
         if db_name=$(laravel_cove_db "$site_dir" "$site_name") && [ "$(laravel_db_server "$site_dir")" = "pgsql" ]; then
             # PostgreSQL's: plain SQL from pg_dump; meta says which server.
@@ -145,7 +149,7 @@ snapshot_create() {
 
     echo "   Copying files…" >&2
     local copied=true
-    if [ "$kind" = "laravel" ]; then
+    if [ "$kind" = "laravel" ] || [ "$kind" = "project" ]; then
         cove_copy_project "$site_dir" "$dest/project" || copied=false
     else
         cove_copy_tree "$public_dir" "$dest/public" || copied=false
