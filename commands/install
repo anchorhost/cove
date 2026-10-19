@@ -153,13 +153,13 @@ cove_install() {
                 auto_yes=true
                 shift
                 ;;
-            --http) explicit_http="$2"; shift 2 ;;
+            --http) [ $# -ge 2 ] || { echo "❌ Error: --http needs a value." >&2; exit 1; }; explicit_http="$2"; shift 2 ;;
             --http=*) explicit_http="${1#*=}"; shift ;;
-            --https) explicit_https="$2"; shift 2 ;;
+            --https) [ $# -ge 2 ] || { echo "❌ Error: --https needs a value." >&2; exit 1; }; explicit_https="$2"; shift 2 ;;
             --https=*) explicit_https="${1#*=}"; shift ;;
-            --db-root-user) db_root_user="$2"; shift 2 ;;
+            --db-root-user) [ $# -ge 2 ] || { echo "❌ Error: --db-root-user needs a value." >&2; exit 1; }; db_root_user="$2"; shift 2 ;;
             --db-root-user=*) db_root_user="${1#*=}"; shift ;;
-            --db-root-pass) db_root_pass="$2"; shift 2 ;;
+            --db-root-pass) [ $# -ge 2 ] || { echo "❌ Error: --db-root-pass needs a value." >&2; exit 1; }; db_root_pass="$2"; shift 2 ;;
             --db-root-pass=*) db_root_pass="${1#*=}"; shift ;;
             -h|--help)
                 display_command_help install

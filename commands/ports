@@ -17,7 +17,9 @@ update_laravel_site_urls_for_port_change() {
     for name in $(laravel_sites_following_port); do
         d="$SITES_DIR/$name.localhost"
         set="{\"APP_URL\":\"$(url_for "$name.localhost")\""
-        if [ -n "$(laravel_env_get "$d" VITE_REVERB_PORT)" ]; then
+        # Only Reverb as Cove set it up, behind the site's own address: an
+        # app running its own on localhost:8080 keeps that port.
+        if [ -n "$(laravel_env_get "$d" VITE_REVERB_PORT)" ] && [ "$(laravel_env_get "$d" VITE_REVERB_HOST)" = "$name.localhost" ]; then
             set="$set,\"VITE_REVERB_PORT\":\"$HTTPS_PORT\""
             rebuild="$rebuild $name"
         fi
@@ -56,6 +58,12 @@ cove_ports() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --http)
+                # The port can follow as the next word; at the end of the
+                # line, shift 2 would fail and loop for ever.
+                if [ $# -lt 2 ]; then
+                    gum style --foreground red "❌ Error: --http needs a port, e.g. --http=8080."
+                    exit 1
+                fi
                 explicit_http="$2"
                 shift 2
                 ;;
@@ -64,6 +72,12 @@ cove_ports() {
                 shift
                 ;;
             --https)
+                # The port can follow as the next word; at the end of the
+                # line, shift 2 would fail and loop for ever.
+                if [ $# -lt 2 ]; then
+                    gum style --foreground red "❌ Error: --https needs a port, e.g. --https=8080."
+                    exit 1
+                fi
                 explicit_https="$2"
                 shift 2
                 ;;

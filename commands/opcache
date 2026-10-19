@@ -534,9 +534,9 @@ cove_opcache() {
             --watch=*) watch="${1#*=}"; shift ;;
             --top=*) top="${1#*=}"; shift ;;
             --format=*) format="${1#*=}"; shift ;;
-            --interned) interned="$2"; shift 2 ;;
+            --interned) [ $# -ge 2 ] || { gum style --foreground red "❌ --interned needs a value."; exit 1; }; interned="$2"; shift 2 ;;
             --interned=*) interned="${1#*=}"; shift ;;
-            --files) files="$2"; shift 2 ;;
+            --files) [ $# -ge 2 ] || { gum style --foreground red "❌ --files needs a value."; exit 1; }; files="$2"; shift 2 ;;
             --files=*) files="${1#*=}"; shift ;;
             --no-restart) no_restart=true; shift ;;
             -y|--yes) auto_yes=true; shift ;;
