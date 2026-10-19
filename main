@@ -1958,6 +1958,13 @@ site_is_laravel() {
     [ -f "$1/artisan" ] && [ -f "$1/bootstrap/app.php" ] && [ -f "$1/public/index.php" ]
 }
 
+# A site whose folder is a whole project rather than just public/: a Laravel
+# app, or any app `cove add --from` brought in (it leaves cove-from, where it
+# came from). Clone and snapshot copy all of such a folder.
+site_is_project() {
+    site_is_laravel "$1" || [ -f "$1/cove-from" ]
+}
+
 # The Laravel version a site runs, read from the framework's own constant
 # rather than by booting the app. Nothing when vendor/ isn't installed.
 laravel_version() {
@@ -5913,11 +5920,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // A Laravel site's database: sqlite (the default) or mysql; with
                 // an existing project, nothing means the one it names.
                 $database = $flavor === 'laravel' && in_array($input['database'] ?? '', ['sqlite', 'mysql', 'mariadb', 'pgsql'], true) ? '--database=' . $input['database'] : '';
-                // An existing project to set up: a git URL or a folder, which
+                // An existing project to set up: a git URL, a folder or an
+                // archive (a Laravel app, or any app as a plain site), which
                 // the CLI checks; here only that it is one line of text.
-                $from = $flavor === 'laravel' ? trim((string) ($input['from'] ?? '')) : '';
+                $from = ($flavor === 'laravel' || $flavor === 'plain') ? trim((string) ($input['from'] ?? '')) : '';
                 if ($from !== '' && (strlen($from) > 500 || $from[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $from))) {
-                    $response['message'] = "That isn't a git URL or a folder.";
+                    $response['message'] = "That isn't a git URL, a folder or an archive.";
                     break;
                 }
                 $command = sprintf('HOME=%s %s add %s %s %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $flavor !== '' ? escapeshellarg($flavor) : '', $database !== '' ? escapeshellarg($database) : '', $from !== '' ? escapeshellarg('--from=' . $from) : '');
@@ -11393,8 +11401,15 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const isLaravel = kind === 'laravel';
                 show($id('laravelDbSelect'), isLaravel);
                 $id('laravelDbSelect').disabled = this.newSite.isLoading;
-                show($id('laravelFrom'), isLaravel);
-                $id('laravelFrom').disabled = this.newSite.isLoading;
+                // Laravel or plain can start from an existing app.
+                const fromInput = $id('laravelFrom');
+                show(fromInput, isLaravel || kind === 'plain');
+                fromInput.disabled = this.newSite.isLoading;
+                fromInput.placeholder = isLaravel ? 'new app, or a git URL or folder to set up' : 'empty, or an app: git URL, folder or .zip';
+                fromInput.title = isLaravel
+                    ? 'Empty for a new app. A git URL is cloned and a folder copied, then its packages installed, its database made and migrated, and its front end built'
+                    : 'Empty for a static site. A git URL is cloned, a folder copied, a .zip or .tar.gz (a file or an https:// link) unpacked, and its public/ served. Nothing in it is run';
+                fromInput.setAttribute('aria-label', isLaravel ? 'An existing Laravel project: a git URL or a folder' : 'An existing app: a git URL, a folder or an archive');
                 $id('laravelDbOwn').hidden = !this.newSite.from;
                 $id('btnCreate').disabled = !this.newSite.name || this.newSite.isLoading;
                 show($id('createSpinner'), this.newSite.isLoading);
@@ -11402,7 +11417,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.renderImportProgress();
                 // The same, from a terminal.
                 const nm = this.newSite.name || 'mysite';
-                const from = isLaravel ? this.newSite.from : '';
+                const from = (isLaravel || kind === 'plain') ? this.newSite.from : '';
                 const db = isLaravel ? this.newSite.database : '';
                 const fl = kind === 'wordpress' ? (this.newSite.wpVersion && this.newSite.wpVersion !== 'latest' ? ' ' + this.newSite.wpVersion : '') : ' ' + kind
                     + (from ? ' --from=' + (/^[A-Za-z0-9@:\/._~+-]+$/.test(from) ? from : "'" + from.replace(/'/g, "'\\''") + "'") : '')
@@ -18301,9 +18316,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
             renderImportProgress() {
                 const imp = this.importing;
-                const settingUp = !imp && this.newSite.isLoading && this.newSite.kind === 'laravel' && !!this.newSite.from;
+                const settingUp = !imp && this.newSite.isLoading && (this.newSite.kind === 'laravel' || this.newSite.kind === 'plain') && !!this.newSite.from;
                 show($id('addProgress'), !!imp || settingUp);
-                if (settingUp) $id('addProgressText').textContent = 'setting up ' + this.newSite.from + ' — cloning or copying it, installing its Composer and npm packages, migrating, building the front end. A big app takes a few minutes.';
+                if (settingUp) $id('addProgressText').textContent = this.newSite.kind === 'laravel'
+                    ? 'setting up ' + this.newSite.from + ' — cloning or copying it, installing its Composer and npm packages, migrating, building the front end. A big app takes a few minutes.'
+                    : 'setting up ' + this.newSite.from + ' — cloning, copying or downloading it.';
                 $id('addRow').classList.toggle('is-importing', !!imp);
                 if (imp) $id('addProgressText').textContent = imp.phase === 'uploading' ? 'uploading ' + imp.pct + '%…' : 'importing — creating the site, restoring files and database, rewriting URLs. A large archive takes a few minutes.';
                 const label = $id('createLabel');
@@ -18324,7 +18341,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // nothing at all — keeps the generated command identical to
                 // what a plain `cove add <name>` produces.
                 const wpVersion = kind === 'wordpress' ? this.newSite.wpVersion : isPlain ? '' : kind;
-                const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined, database: isLaravel ? this.newSite.database : undefined, from: isLaravel && this.newSite.from ? this.newSite.from : undefined });
+                const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined, database: isLaravel ? this.newSite.database : undefined, from: (isLaravel || isPlain) && this.newSite.from ? this.newSite.from : undefined });
                 if (add.success) {
                     // Optimistic insert: we already know every field the row
                     // template uses. No auto-refresh — the Caddy reload that
@@ -18844,11 +18861,15 @@ display_command_help() {
             echo "                 (on Cove's PostgreSQL, set up the first time; see"
             echo "                 'cove postgres'). With --from, the one the project names"
             echo "                 unless given."
-            echo "  --from=<src>   Laravel: set up an existing project instead of a new app."
-            echo "                 A git URL (https://…, git@host:path) is cloned; a folder"
-            echo "                 is copied, the original left as it is. Then its Composer"
-            echo "                 and npm packages are installed, .env is written for"
-            echo "                 Cove, its database made and migrated, its front end built."
+            echo "  --from=<src>   Set up an existing app instead of a new site. A git URL"
+            echo "                 (https://…, git@host:path) is cloned; a folder is copied,"
+            echo "                 the original left as it is; a .zip or .tar.gz (a file, or"
+            echo "                 an https:// link such as a GitHub release asset) is"
+            echo "                 downloaded and unpacked. A Laravel app then gets its"
+            echo "                 Composer and npm packages, a .env for Cove, its database"
+            echo "                 made and migrated, its front end built. Any other app is"
+            echo "                 served from its public/ (or the cove.json 'webroot'); the"
+            echo "                 site folder is the project. Nothing in it is run."
             echo "  --branch=<b>   With a git URL: the branch or tag to check out."
             echo "  --seed         Laravel: run the database seeders after the migrations."
             echo "  --no-reload    Don't reload Caddy afterwards (for scripts that add"
@@ -18867,6 +18888,7 @@ display_command_help() {
             echo "  cove add myapp laravel --database=pgsql  Laravel on PostgreSQL."
             echo "  cove add shop --from=git@github.com:acme/shop.git  An existing app, cloned."
             echo "  cove add shop --from=~/Herd/shop --seed  An existing app, copied, seeded."
+            echo "  cove add tools --from=https://example.com/releases/tools.zip  An app from a release."
             ;;
         clone)
             echo "Usage: cove clone <source> <new-name>"

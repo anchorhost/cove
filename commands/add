@@ -9,7 +9,7 @@ cove_add() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [type] [--plain] [--minn[=<zip>]] [--wp-version=<ver>] [--php=<ver>] [--multisite[=subdomain]] [--database=sqlite|mysql|mariadb|pgsql] [--from=<git URL or folder>] [--branch=<name>] [--seed] [--no-reload]"
+        echo "Usage: cove add <name> [type] [--plain] [--minn[=<zip>]] [--wp-version=<ver>] [--php=<ver>] [--multisite[=subdomain]] [--database=sqlite|mysql|mariadb|pgsql] [--from=<folder, git URL or archive>] [--branch=<name>] [--seed] [--no-reload]"
         echo "See: cove add --help"
         exit 1
     fi
@@ -45,7 +45,7 @@ cove_add() {
     shift
     # Value flags take --flag=value or --flag value. An unknown flag stops
     # here: dropped silently, `--from ~/app` (no =) built a blank app.
-    local usage="Usage: cove add <name> [type] [--plain] [--minn[=<zip>]] [--wp-version=<ver>] [--php=<ver>] [--multisite[=subdomain]] [--database=sqlite|mysql|mariadb|pgsql] [--from=<git URL or folder>] [--branch=<name>] [--seed] [--no-reload]   (cove add --help)"
+    local usage="Usage: cove add <name> [type] [--plain] [--minn[=<zip>]] [--wp-version=<ver>] [--php=<ver>] [--multisite[=subdomain]] [--database=sqlite|mysql|mariadb|pgsql] [--from=<folder, git URL or archive>] [--branch=<name>] [--seed] [--no-reload]   (cove add --help)"
     local arg val
     while [ $# -gt 0 ]; do
         arg="$1"; shift
@@ -124,9 +124,13 @@ cove_add() {
         fi
     fi
 
-    # An existing project is a Laravel one: it's the only kind --from brings in.
+    # --from brings in an existing project. `laravel --from=` and `plain
+    # --from=` say which kind it is; without a type, Cove looks once it has
+    # the files: a Laravel app is set up as one, any other app is served from
+    # its public/ (see cove_add_app_from).
+    local from_detect=false
     if [ -n "$from" ] && [ -z "$flavor" ] && [ "$plain_flag" = false ] && [ "$minn" = false ]; then
-        flavor="laravel"
+        from_detect=true
     fi
 
     # Resolve the flavor into a site type + an optional pinned version.
@@ -155,6 +159,8 @@ cove_add() {
             gum style --foreground red "❌ Error: Unknown option '$flavor'." "Expected a WordPress version (6.4.3), 'nightly', 'latest', 'minn', 'laravel', or 'plain'."
             exit 1 ;;
     esac
+    # Decided once the project is staged; nothing WordPress happens before.
+    [ "$from_detect" = true ] && site_type="from"
 
     # A Laravel application is its own kind of site: no WordPress to pin,
     # network or hand to Minn Engine.
@@ -174,6 +180,8 @@ cove_add() {
         # Laravel's own default, as `laravel new` has it; an existing project
         # brings its own unless --database overrides it.
         [ -n "$database" ] || [ -n "$from" ] || database="sqlite"
+    fi
+    if [ "$site_type" == "laravel" ] || [ "$from_detect" = true ]; then
         case "$database" in
             ""|sqlite|mysql|mariadb) ;;
             # PostgreSQL is set up the first time a site asks for it.
@@ -185,8 +193,15 @@ cove_add() {
     elif [ -n "$database" ]; then
         gum style --foreground red "❌ Error: --database is for Laravel sites." "WordPress sites always get a MariaDB database; try 'cove add $site_name laravel --database=$database'."
         exit 1
-    elif [ -n "$from" ] || [ "$seed" = true ]; then
-        gum style --foreground red "❌ Error: --from and --seed are for Laravel sites." "A WordPress site from elsewhere comes in with: cove import $site_name <backup.zip>, or cove pull."
+    elif [ "$seed" = true ]; then
+        gum style --foreground red "❌ Error: --seed is for Laravel sites."
+        exit 1
+    elif [ -n "$from" ] && [ "$site_type" != "plain" ] && [ "$plain_flag" = false ]; then
+        gum style --foreground red "❌ Error: --from brings in an app: Laravel, or any app with a public/ folder." "A WordPress site from elsewhere comes in with: cove import $site_name <backup.zip>, or cove pull."
+        exit 1
+    fi
+    if [ "$from_detect" = true ] && [ -n "$multisite_mode" ]; then
+        gum style --foreground red "❌ Error: Cannot combine --multisite with --from." "Multisite is a WordPress network; --from brings in an app."
         exit 1
     fi
     if [ -n "$branch" ] && [ -z "$from" ]; then
@@ -268,6 +283,20 @@ cove_add() {
         exit 1
     fi
 
+    # A project for --from is staged before anything is created, too: a
+    # failed clone or download, or a bad archive, leaves no site behind.
+    if [ -n "$from" ]; then
+        cove_from_stage "$site_name" "$from" "$branch" || exit 1
+        trap "rm -rf '$COVE_FROM_WORK'" EXIT
+        if [ "$from_detect" = true ]; then
+            if site_is_laravel "$COVE_FROM_STAGE"; then site_type="laravel"; else site_type="plain"; fi
+        fi
+        if [ "$site_type" == "plain" ] && { [ -n "$database" ] || [ "$seed" = true ]; }; then
+            gum style --foreground red "❌ Error: --database and --seed are for Laravel apps, and $from isn't one."
+            exit 1
+        fi
+    fi
+
     # The engine is fetched and checked before anything is created, so a
     # missing release or a bad zip costs nothing.
     local minn_work=""
@@ -278,6 +307,8 @@ cove_add() {
 
     if [ "$minn" = true ]; then
         echo "➕ Creating Minn Engine site: $full_hostname"
+    elif [ "$site_type" == "plain" ] && [ -n "$from" ]; then
+        echo "➕ Creating app site: $full_hostname"
     else
         echo "➕ Creating $site_type site: $full_hostname"
     fi
@@ -285,6 +316,8 @@ cove_add() {
         cove_add_laravel_from "$site_name" "$site_dir" "$from" "$branch" "$database" "$php_pin" "$seed" || exit 1
     elif [ "$site_type" == "laravel" ]; then
         cove_add_laravel "$site_name" "$site_dir" "$database" "$php_pin" "$seed" || exit 1
+    elif [ "$site_type" == "plain" ] && [ -n "$from" ]; then
+        cove_add_app_from "$site_name" "$site_dir" "$from" "$branch" "$php_pin" || exit 1
     fi
     mkdir -p "$site_dir/public" "$site_dir/logs"
     if [ -n "$php_pin" ]; then
@@ -293,7 +326,7 @@ cove_add() {
         echo "$php_pin" > "$site_dir/php_version"
     fi
 
-    if [ "$site_type" == "plain" ]; then
+    if [ "$site_type" == "plain" ] && [ -z "$from" ]; then
         write_plain_site_landing "$site_dir/public"
     fi
 
@@ -491,6 +524,10 @@ PHP
         [ "$conn" = "sqlite" ] || db_line="Database: $(cove_db_name "$site_name") on Cove's MariaDB ($conn)"
         [ "$conn" = "pgsql" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's PostgreSQL"
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") set up from $from" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "What the tools printed: $site_dir/logs/laravel-setup.log" "${COVE_ADD_NOTES[@]}"
+    elif [ "$site_type" == "plain" ] && [ -n "$from" ]; then
+        local next_line=""
+        [ -n "$COVE_ADD_NEXT" ] && next_line="Next, in the site folder: $COVE_ADD_NEXT"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ App set up from $from" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" ${next_line:+"$next_line"} "${COVE_ADD_NOTES[@]}"
     elif [ "$site_type" == "laravel" ]; then
         local db_line="Database: SQLite, database/database.sqlite"
         [ "$database" != "sqlite" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's MariaDB ($database)"
@@ -662,35 +699,32 @@ cove_find_node() {
     export PATH
 }
 
-# An existing Laravel project as a site: `cove add <name> laravel --from=<git
-# URL or folder>`. A repository is cloned, or a folder copied without its
-# vendor/ and node_modules/ (installed again for this machine), into a folder
-# under ~/Cove/cache. There Composer installs the packages and .env is set
-# up for Cove: from .env.example when there is none, the https address, mail
-# to Cove's mailbox, and the database the project names (or --database=):
-# SQLite in its file, or a new database on Cove's MariaDB. All of that has to
-# work, or nothing is kept. Then it moves into place, and the rest happens
-# there, where a failure is reported but the site stays for you to fix: an
-# app key if there is none, the migrations (seeders too with --seed), the
-# storage link, and the front end, built with the package manager its lock
-# file names. Notes for the summary go into COVE_ADD_NOTES; everything the
-# tools printed into the site's logs/laravel-setup.log.
-cove_add_laravel_from() {
-    local site_name="$1" site_dir="$2" source="$3" branch="$4" database="$5" php_pin="$6" seed="$7"
-    local full_hostname="$site_name.localhost"
-    local php="$COVE_TOOLS_DIR/php" native="" prefix db_name="" server="mariadb" kind src="" work stage log conn was set mail_from k v
-    COVE_ADD_NOTES=()
+# Brings an existing project into ~/Cove/cache for `cove add --from`, before
+# anything is created: a folder is copied, a repository cloned, an archive
+# (.zip, .tar.gz, .tgz or .tar: a file, or an https:// address) downloaded and
+# unpacked. An archive whose entries are all inside one folder (a GitHub
+# release, `git archive --prefix`) loses that folder. Sets COVE_FROM_WORK,
+# COVE_FROM_STAGE (the project), COVE_FROM_KIND (folder|git|archive),
+# COVE_FROM_SRC (a folder's real path) and COVE_FROM_LOG, so it must not run
+# in $(…). Nothing in the project runs here.
+cove_from_stage() {
+    local site_name="$1" source="$2" branch="$3"
+    local kind="" src="" work stage log archive="" ext=""
+    COVE_FROM_WORK="" COVE_FROM_STAGE="" COVE_FROM_KIND="" COVE_FROM_SRC="" COVE_FROM_LOG=""
 
-    # A folder is copied; anything else has to be a repository's address.
     # macOS keeps Documents, Desktop and Downloads from apps it hasn't been
     # told to trust, Cove's web server among them: started from the
     # dashboard, a project there can't be read.
     local private=""
     case "$source" in "$HOME/Documents"*|"$HOME/Desktop"*|"$HOME/Downloads"*) [ "$OS" = "macos" ] && private=1 ;; esac
-    if [ -n "$private" ] && { [ ! -d "$source" ] || ! ls "$source" >/dev/null 2>&1; }; then
+    if [ -n "$private" ] && { [ ! -e "$source" ] || ! ls "$source" >/dev/null 2>&1; }; then
         gum style --foreground red "❌ Error: Cove can't read $source." "If it's there, macOS is keeping it from Cove: Documents, Desktop and Downloads are private to the apps you allow. Run this in Terminal instead:" "  cove add $site_name --from=$source"
         return 1
     fi
+    case "$source" in
+        *.zip|*.ZIP) ext=zip ;;
+        *.tar.gz|*.tgz|*.tar) ext=tar ;;
+    esac
     if [ -d "$source" ]; then
         kind=folder
         src=$(cd "$source" && pwd -P) || return 1
@@ -698,8 +732,13 @@ cove_add_laravel_from() {
             gum style --foreground red "❌ Error: $source is a Cove site already." "Copy a site with: cove clone <site> $site_name"
             return 1
         fi
-        if ! site_is_laravel "$src"; then
-            gum style --foreground red "❌ Error: $source isn't a Laravel project." "Expected artisan, bootstrap/app.php and public/index.php in it."
+    elif [ -f "$source" ] && [ -n "$ext" ]; then
+        kind=archive
+    elif [[ "$source" =~ ^https?://[^[:space:]?#]+\.(zip|ZIP|tar\.gz|tgz|tar)([?#][^[:space:]]*)?$ ]]; then
+        kind=archive
+        [[ "$source" == *.zip* || "$source" == *.ZIP* ]] && ext=zip || ext=tar
+        if [[ "$source" != https://* ]]; then
+            gum style --foreground red "❌ Error: An archive is downloaded over https:// only." "$source"
             return 1
         fi
     elif [[ "$source" =~ ^(https?|ssh|git|file)://[^[:space:]]+$ ]] || [[ "$source" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^[:space:]]+$ ]]; then
@@ -709,12 +748,12 @@ cove_add_laravel_from() {
             return 1
         fi
     else
-        gum style --foreground red "❌ Error: --from is a folder or a git repository's address." "There is no folder '$source', and it isn't an https://, ssh:// or git@host:path address."
+        gum style --foreground red "❌ Error: --from is a folder, a git repository's address, or an archive." "There is no folder '$source', and it isn't an https://, ssh:// or git@host:path address, or a .zip / .tar.gz file or https:// link."
         return 1
     fi
     if [ -n "$branch" ]; then
         if [ "$kind" != git ]; then
-            gum style --foreground red "❌ Error: --branch is for a repository; a folder is copied as it is."
+            gum style --foreground red "❌ Error: --branch is for a repository; a folder or an archive is used as it is."
             return 1
         fi
         if ! [[ "$branch" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]]; then
@@ -723,21 +762,11 @@ cove_add_laravel_from() {
         fi
     fi
 
-    ensure_composer || return 1
-    if [ -n "$php_pin" ]; then
-        prefix=$(php_fpm_prefix_for "$php_pin")
-        [ -n "$prefix" ] && [ -x "$prefix/bin/php" ] && native="$prefix/bin/php"
-    fi
     mkdir -p "$COVE_DIR/cache" || return 1
-    work=$(mktemp -d "$COVE_DIR/cache/laravel-from-$site_name.XXXXXX") || return 1
+    work=$(mktemp -d "$COVE_DIR/cache/from-$site_name.XXXXXX") || return 1
     stage="$work/app"
-    log="$work/laravel-setup.log"
+    log="$work/setup.log"
     : > "$log"
-    _cove_from_fail() {
-        [ -n "$db_name" ] && cove_server_db_drop "$server" "$db_name"
-        rm -rf "$work"
-        return 1
-    }
 
     if [ "$kind" = git ]; then
         echo "   - Cloning ${source}…"
@@ -760,33 +789,267 @@ cove_add_laravel_from() {
         ) >>"$log" 2>&1; then
             gum style --foreground red "❌ Error: git could not clone $source:"
             tail -n 8 "$log" | sed 's/^/   /'
-            _cove_from_fail
+            rm -rf "$work"
             return 1
         fi
-        if ! site_is_laravel "$stage"; then
-            gum style --foreground red "❌ Error: $source isn't a Laravel project." "Expected artisan, bootstrap/app.php and public/index.php at the top of the repository."
-            _cove_from_fail
-            return 1
-        fi
-    else
-        echo "   - Copying $src (vendor/ and node_modules/ are installed fresh)…"
-        # Everything at the top but vendor/ and node_modules/, named one by
-        # one: an --exclude pattern also matches deeper folders on macOS's
-        # tar (resources/views/vendor, public/vendor). Both sides' errors
-        # count, so an unreadable file doesn't make a quiet partial copy.
+    elif [ "$kind" = folder ]; then
+        # A Laravel project's vendor/ and node_modules/ are installed again
+        # for this machine, so they stay behind, named one by one: an
+        # --exclude pattern also matches deeper folders on macOS's tar
+        # (resources/views/vendor, public/vendor). Any other project is
+        # copied whole. Both sides' errors count, so an unreadable file
+        # doesn't make a quiet partial copy.
         local rc_read rc_write
-        mkdir "$stage" || { _cove_from_fail; return 1; }
-        (cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name vendor ! -name node_modules -print0 | COPYFILE_DISABLE=1 tar --null -cf - -T -) 2>>"$log" \
-            | (cd "$stage" && tar -xpf -) 2>>"$log"
+        if site_is_laravel "$src"; then
+            echo "   - Copying $src (vendor/ and node_modules/ are installed fresh)…"
+        else
+            echo "   - Copying $src…"
+        fi
+        mkdir "$stage" || { rm -rf "$work"; return 1; }
+        if site_is_laravel "$src"; then
+            (cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name vendor ! -name node_modules -print0 | COPYFILE_DISABLE=1 tar --null -cf - -T -) 2>>"$log" \
+                | (cd "$stage" && tar -xpf -) 2>>"$log"
+        else
+            (cd "$src" && COPYFILE_DISABLE=1 tar -cf - .) 2>>"$log" | (cd "$stage" && tar -xpf -) 2>>"$log"
+        fi
         rc_read=${PIPESTATUS[0]} rc_write=${PIPESTATUS[1]}
         if [ "$rc_read" -ne 0 ] || [ "$rc_write" -ne 0 ]; then
             gum style --foreground red "❌ Error: Could not copy $src." "$(tail -n 3 "$log")"
-            _cove_from_fail
+            rm -rf "$work"
             return 1
         fi
-        # Vite's dev-server marker: copied, it would point every page at a
-        # server that isn't running.
-        rm -f "$stage/public/hot"
+    else
+        archive="$work/download.$ext"
+        if [ -f "$source" ]; then
+            cp "$source" "$archive" || { rm -rf "$work"; return 1; }
+        else
+            echo "   - Downloading ${source}…"
+            # https all the way, redirects included (GitHub's release links
+            # redirect to its CDN), and nothing past 2 GB.
+            if ! curl -fsSL --proto '=https' --proto-redir '=https' --max-filesize 2147483648 --retry 2 -o "$archive" "$source" 2>>"$log"; then
+                gum style --foreground red "❌ Error: Could not download $source." "$(tail -n 2 "$log")"
+                rm -rf "$work"
+                return 1
+            fi
+        fi
+        # Every entry has to stay inside the folder it unpacks into: no
+        # absolute paths, no .. anywhere.
+        local names
+        if [ "$ext" = zip ]; then
+            if command -v unzip >/dev/null 2>&1; then
+                names=$(unzip -Z1 "$archive" 2>>"$log")
+            else
+                # Paths by environment, not $argv: FrankenPHP 1.13.0's
+                # php-cli shifts $argv (see ensure_cli_argv_fix).
+                names=$(COVE_ZIP="$archive" $(cove_php_cmd) -r '$z = new ZipArchive(); if ($z->open(getenv("COVE_ZIP")) !== true) exit(1); for ($i = 0; $i < $z->numFiles; $i++) echo $z->getNameIndex($i), "\n";' 2>>"$log")
+            fi
+        else
+            names=$(tar -tf "$archive" 2>>"$log")
+        fi
+        if [ $? -ne 0 ] || [ -z "$names" ]; then
+            gum style --foreground red "❌ Error: $source isn't an archive Cove can open."
+            rm -rf "$work"
+            return 1
+        fi
+        if printf '%s\n' "$names" | grep -qE '^/|(^|/)\.\.(/|$)|\\'; then
+            gum style --foreground red "❌ Error: $source has files that would land outside its own folder (an absolute path or ..), so it isn't unpacked."
+            rm -rf "$work"
+            return 1
+        fi
+        mkdir "$work/x" || { rm -rf "$work"; return 1; }
+        local rc
+        if [ "$ext" = zip ]; then
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -q "$archive" -d "$work/x" >>"$log" 2>&1
+            else
+                COVE_ZIP="$archive" COVE_DEST="$work/x" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->extractTo(getenv("COVE_DEST")) ? 0 : 1);' >>"$log" 2>&1
+            fi
+        else
+            tar -xf "$archive" -C "$work/x" >>"$log" 2>&1
+        fi
+        rc=$?
+        rm -f "$archive"
+        if [ "$rc" -ne 0 ]; then
+            gum style --foreground red "❌ Error: Could not unpack $source." "$(tail -n 3 "$log")"
+            rm -rf "$work"
+            return 1
+        fi
+        # One folder holding everything (macOS's __MACOSX and .DS_Store
+        # aside) is the project itself.
+        local entry top="" count=0
+        for entry in "$work/x"/* "$work/x"/.[!.]* "$work/x"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            case "${entry##*/}" in __MACOSX|.DS_Store) rm -rf "$entry"; continue ;; esac
+            count=$((count + 1))
+            top="$entry"
+        done
+        if [ "$count" -eq 1 ] && [ -d "$top" ] && [ ! -L "$top" ]; then
+            mv "$top" "$stage" && rm -rf "$work/x"
+        else
+            mv "$work/x" "$stage"
+        fi || { rm -rf "$work"; return 1; }
+    fi
+
+    COVE_FROM_WORK="$work" COVE_FROM_STAGE="$stage" COVE_FROM_KIND="$kind" COVE_FROM_SRC="$src" COVE_FROM_LOG="$log"
+}
+
+# Where a site came from, kept as <site>/cove-from (and what makes it a
+# project for clone and snapshot). A URL's user:password@ is left out.
+cove_from_record() {
+    local dest="$1" source="$2" kind="$3" branch="$4"
+    [ "$kind" = folder ] && source="$COVE_FROM_SRC"
+    source=$(printf '%s' "$source" | sed -E 's#^([a-z]+://)[^/@]*@#\1#')
+    {
+        echo "kind=$kind"
+        echo "source=$source"
+        [ -n "$branch" ] && echo "branch=$branch"
+        echo "added=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$dest/cove-from"
+}
+
+# Lists Cove's own files in a project's .git/info/exclude (this copy's alone,
+# never a .gitignore the project tracks), so they never become changes in it.
+cove_from_git_exclude() {
+    local dir="$1" ignore="$1/.git/info/exclude"
+    [ -d "$dir/.git" ] || return 0
+    mkdir -p "$dir/.git/info"
+    if ! grep -qs '^# Cove: this site' "$ignore"; then
+        printf '\n# Cove: this site'"'"'s own files (access logs, backups, settings)\n%s\n' "$(printf '/%s\n' $COVE_SITE_OWN cove-from)" >> "$ignore"
+    elif ! grep -qx '/cove-from' "$ignore"; then
+        echo '/cove-from' >> "$ignore"
+    fi
+}
+
+# Any app other than Laravel, brought in by `cove add <name> --from=…` (or
+# `plain --from=`): served from its public/, as every Cove site is. A
+# cove.json at the top can say more, and is read, never run:
+#   webroot  the folder to serve when it isn't public/ (public/ becomes a link)
+#   php      the oldest PHP it runs on; a newer Cove PHP is fine
+#   next     one line to show in the summary, e.g. "./myapp setup"
+# A project with no public/ but an index.php or index.html at the top is all
+# webroot, so it moves into public/. Notes go into COVE_ADD_NOTES and the
+# next step into COVE_ADD_NEXT.
+cove_add_app_from() {
+    local site_name="$1" site_dir="$2" source="$3" branch="$4" php_pin="$5"
+    local stage="$COVE_FROM_STAGE" work="$COVE_FROM_WORK" log="$COVE_FROM_LOG"
+    local webroot="public" min_php="" facts k v entry
+    COVE_ADD_NOTES=() COVE_ADD_NEXT=""
+
+    if [ -f "$stage/cove.json" ]; then
+        if ! facts=$(COVE_JSON="$stage/cove.json" $(cove_php_cmd) -r '
+            $j = json_decode((string) file_get_contents(getenv("COVE_JSON")), true);
+            if (!is_array($j)) exit(1);
+            foreach (["webroot", "php", "next"] as $k) {
+                if (isset($j[$k]) && is_string($j[$k])) echo $k, "\t", str_replace(["\r", "\n", "\t"], " ", $j[$k]), "\n";
+            }' 2>>"$log"); then
+            gum style --foreground red "❌ Error: $source has a cove.json that isn't valid JSON."
+            rm -rf "$work"
+            return 1
+        fi
+        while IFS=$'\t' read -r k v; do
+            case "$k" in
+                webroot) webroot="${v%/}" ;;
+                php) min_php="$v" ;;
+                next) COVE_ADD_NEXT="${v:0:200}" ;;
+            esac
+        done <<< "$facts"
+        if [ -z "$webroot" ] || [[ "$webroot" == /* ]] || [[ "/$webroot/" == *"/../"* ]] || [[ "/$webroot/" == *"/./"* ]] || [ ! -d "$stage/$webroot" ]; then
+            gum style --foreground red "❌ Error: cove.json's webroot '$webroot' isn't a folder inside the project."
+            rm -rf "$work"
+            return 1
+        fi
+    fi
+
+    if [ "$webroot" != "public" ]; then
+        if [ -e "$stage/public" ] || [ -L "$stage/public" ]; then
+            gum style --foreground red "❌ Error: cove.json names '$webroot' as the webroot, but the project has a public/ too." "Cove serves a site's public/; remove one of them."
+            rm -rf "$work"
+            return 1
+        fi
+        ln -s "$webroot" "$stage/public" || { rm -rf "$work"; return 1; }
+    elif [ ! -d "$stage/public" ]; then
+        if [ -f "$stage/index.php" ] || [ -f "$stage/index.html" ]; then
+            mkdir "$stage/.cove-public" || { rm -rf "$work"; return 1; }
+            for entry in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
+                [ -e "$entry" ] || [ -L "$entry" ] || continue
+                case "${entry##*/}" in .cove-public|.git) continue ;; esac
+                mv "$entry" "$stage/.cove-public/" || { rm -rf "$work"; return 1; }
+            done
+            mv "$stage/.cove-public" "$stage/public" || { rm -rf "$work"; return 1; }
+        else
+            gum style --foreground red "❌ Error: $source has no public/ folder for Cove to serve." "Cove serves a site's public/. A project without one needs an index.php or index.html at the top, or a cove.json naming its webroot: {\"webroot\": \"web\"}"
+            rm -rf "$work"
+            return 1
+        fi
+    fi
+
+    if [ -n "$min_php" ] && [ -z "$php_pin" ]; then
+        local cur
+        cur=$(normalize_php_version "$(frankenphp_php_version)")
+        min_php=$(normalize_php_version "$min_php")
+        if [ -n "$min_php" ] && [ -n "$cur" ] && [ "$(printf '%s\n' "$min_php" "$cur" | sort -V | head -1)" != "$min_php" ]; then
+            COVE_ADD_NOTES+=("⚠️  It needs PHP $min_php or newer, and Cove runs $cur.")
+        fi
+    fi
+
+    cove_from_git_exclude "$stage"
+    cove_from_record "$stage" "$source" "$COVE_FROM_KIND" "$branch"
+
+    cd ~/ || true
+    if [ -d "$site_dir" ] && [ -z "$(ls -A "$site_dir" | grep -vx logs)" ]; then
+        rm -rf "$site_dir"
+    fi
+    if [ -e "$site_dir" ] || ! mv "$stage" "$site_dir"; then
+        gum style --foreground red "❌ Error: Could not move the app into $site_dir."
+        rm -rf "$work"
+        return 1
+    fi
+    mkdir -p "$site_dir/logs"
+    rm -rf "$work"
+    [ -n "$php_pin" ] && echo "$php_pin" > "$site_dir/php_version"
+    return 0
+}
+
+# An existing Laravel project as a site: `cove add <name> laravel --from=<git
+# URL, folder or archive>`, or plain `--from=` when what it brings is Laravel.
+# cove_from_stage has already put it under ~/Cove/cache (a folder without its
+# vendor/ and node_modules/, installed again for this machine). There
+# Composer installs the packages and .env is set
+# up for Cove: from .env.example when there is none, the https address, mail
+# to Cove's mailbox, and the database the project names (or --database=):
+# SQLite in its file, or a new database on Cove's MariaDB. All of that has to
+# work, or nothing is kept. Then it moves into place, and the rest happens
+# there, where a failure is reported but the site stays for you to fix: an
+# app key if there is none, the migrations (seeders too with --seed), the
+# storage link, and the front end, built with the package manager its lock
+# file names. Notes for the summary go into COVE_ADD_NOTES; everything the
+# tools printed into the site's logs/laravel-setup.log.
+cove_add_laravel_from() {
+    local site_name="$1" site_dir="$2" source="$3" branch="$4" database="$5" php_pin="$6" seed="$7"
+    local full_hostname="$site_name.localhost"
+    local php="$COVE_TOOLS_DIR/php" native="" prefix db_name="" server="mariadb" kind src="" work stage log conn was set mail_from k v
+    COVE_ADD_NOTES=()
+
+    # The project is already staged (cove_from_stage) in COVE_FROM_STAGE.
+    kind="$COVE_FROM_KIND" src="$COVE_FROM_SRC" work="$COVE_FROM_WORK" stage="$COVE_FROM_STAGE" log="$COVE_FROM_LOG"
+    _cove_from_fail() {
+        [ -n "$db_name" ] && cove_server_db_drop "$server" "$db_name"
+        rm -rf "$work"
+        return 1
+    }
+    if ! site_is_laravel "$stage"; then
+        gum style --foreground red "❌ Error: $source isn't a Laravel project." "Expected artisan, bootstrap/app.php and public/index.php at the top. Any other app comes in with: cove add $site_name --from=$source"
+        _cove_from_fail
+        return 1
+    fi
+    # Vite's dev-server marker: copied, it would point every page at a
+    # server that isn't running.
+    [ "$kind" = folder ] && rm -f "$stage/public/hot"
+
+    ensure_composer || { _cove_from_fail; return 1; }
+    if [ -n "$php_pin" ]; then
+        prefix=$(php_fpm_prefix_for "$php_pin")
+        [ -n "$prefix" ] && [ -x "$prefix/bin/php" ] && native="$prefix/bin/php"
     fi
     if ! grep -q '"laravel/framework"' "$stage/composer.json" 2>/dev/null; then
         gum style --foreground red "❌ Error: $source has no laravel/framework in its composer.json."
@@ -879,8 +1142,11 @@ cove_add_laravel_from() {
     local ignore=".gitignore"
     if [ -d .git ]; then mkdir -p .git/info; ignore=".git/info/exclude"; fi
     if ! grep -qs '^# Cove: this site' "$ignore"; then
-        printf '\n# Cove: this site'"'"'s own files (access logs, backups, settings)\n%s\n' "$(printf '/%s\n' $COVE_SITE_OWN)" >> "$ignore"
+        printf '\n# Cove: this site'"'"'s own files (access logs, backups, settings)\n%s\n' "$(printf '/%s\n' $COVE_SITE_OWN cove-from)" >> "$ignore"
+    elif ! grep -qx '/cove-from' "$ignore"; then
+        echo '/cove-from' >> "$ignore"
     fi
+    cove_from_record "$stage" "$source" "$kind" "$branch"
 
     cd ~/ || true
     if [ -d "$site_dir" ] && [ -z "$(ls -A "$site_dir" | grep -vx logs)" ]; then

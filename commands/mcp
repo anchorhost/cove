@@ -492,12 +492,12 @@ function tools(): array {
         ],
         'create_site' => [
             'title' => 'Create a site',
-            'description' => "Creates a new local site at https://<name>.localhost: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a Laravel application (as `laravel new` makes it, on SQLite unless database says mysql or pgsql; or an existing project from a git URL or folder, set up to run: packages installed, .env written, database made and migrated, front end built), a plain static site, or a Minn Engine site. Takes up to a minute, or a few for an existing project.",
+            'description' => "Creates a new local site at https://<name>.localhost: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a Laravel application (as `laravel new` makes it, on SQLite unless database says mysql or pgsql; or an existing project from a git URL or folder, set up to run: packages installed, .env written, database made and migrated, front end built), a plain static site (or, with from, any other app served from its public/, nothing in it run), or a Minn Engine site. Takes up to a minute, or a few for an existing project.",
             'inputSchema' => $obj([
                 'name' => ['type' => 'string', 'description' => 'Lowercase letters, numbers and hyphens, e.g. client-demo.'],
                 'type' => ['type' => 'string', 'enum' => ['wordpress', 'laravel', 'plain', 'minn'], 'description' => 'Default wordpress.'],
                 'database' => ['type' => 'string', 'enum' => ['sqlite', 'mysql', 'mariadb', 'pgsql'], 'description' => 'Laravel only: sqlite (the default for a new app), a database on Cove\'s MariaDB, or pgsql on Cove\'s PostgreSQL (set up the first time, which takes a few minutes). With from: the one the project names, unless given.'],
-                'from' => ['type' => 'string', 'description' => 'Laravel only: an existing project to set up instead of a new app, a git URL (https://…, git@host:path) or a folder (copied; the original is left alone).'],
+                'from' => ['type' => 'string', 'description' => 'Laravel or plain: an existing project to set up instead of a new one, a git URL (https://…, git@host:path), a folder (copied; the original is left alone) or an archive (.zip or .tar.gz, a file or an https:// link).'],
                 'branch' => ['type' => 'string', 'description' => 'With a git URL in from: the branch or tag to check out.'],
                 'seed' => ['type' => 'boolean', 'description' => 'Laravel only: run the database seeders after the migrations.'],
                 'wp_version' => ['type' => 'string', 'description' => 'A WordPress version such as 6.8.3, or nightly. Default latest.'],
@@ -770,7 +770,15 @@ function call_tool(string $name, array $a): array {
             if (is_dir(SITES . "/$name.localhost")) throw new ToolError("There is already a site named '$name'.");
             $args = ['add', $name];
             $type = (string) ($a['type'] ?? 'wordpress');
-            if ($type === 'plain') $args[] = '--plain';
+            if ($type === 'plain') {
+                $args[] = '--plain';
+                $from = trim((string) ($a['from'] ?? ''));
+                if ($from !== '') {
+                    if (strlen($from) > 500 || $from[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $from)) throw new ToolError('from is a git URL, a folder or an archive.');
+                    $args[] = '--from=' . $from;
+                    if (!empty($a['branch'])) $args[] = '--branch=' . $a['branch'];
+                } elseif (!empty($a['branch'])) throw new ToolError('branch goes with a git URL in from.');
+            }
             elseif ($type === 'minn') $args[] = '--minn';
             elseif ($type === 'laravel') {
                 $args[] = 'laravel';
@@ -788,7 +796,8 @@ function call_tool(string $name, array $a): array {
                 if (!empty($a['seed'])) $args[] = '--seed';
             }
             elseif ($type !== 'wordpress') throw new ToolError("type is wordpress, laravel, plain or minn.");
-            if ($type !== 'laravel' && (!empty($a['from']) || !empty($a['seed']))) throw new ToolError('from and seed are for Laravel sites.');
+            if ($type !== 'laravel' && $type !== 'plain' && !empty($a['from'])) throw new ToolError('from is for Laravel or plain sites.');
+            if ($type !== 'laravel' && !empty($a['seed'])) throw new ToolError('seed is for Laravel sites.');
             if ($type !== 'laravel' && !empty($a['database'])) throw new ToolError('database is for Laravel sites; WordPress always gets MariaDB.');
             if (!empty($a['wp_version'])) {
                 if (!preg_match('/^(latest|nightly|\d+\.\d+(\.\d+)?([-.][a-zA-Z0-9.]+)?)$/', (string) $a['wp_version'])) throw new ToolError('wp_version is a version such as 6.8.3, or latest or nightly.');
