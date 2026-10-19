@@ -16,7 +16,8 @@ cove_import() {
                 echo ""
                 echo "A Cove backup of a Laravel site (cove backup, or a snapshot export)"
                 echo "becomes a Laravel site: its project, its database, and its .env set up"
-                echo "for this machine and the new name."
+                echo "for this machine and the new name. One of any other app (from"
+                echo "cove add --from) or of a plain site comes back as it was."
                 return
                 ;;
             -*)
@@ -57,6 +58,12 @@ cove_import() {
     # A Cove backup of a Laravel site: project/ beside db.sql and meta.
     if archive_has_laravel_project "$archive"; then
         cove_import_laravel "$site_name" "$archive" "$no_reload" "$php_pin"
+        return
+    fi
+    # One of any other app (cove add --from) or a plain site.
+    local cove_kind
+    if cove_kind=$(archive_cove_site_kind "$archive"); then
+        cove_import_app "$site_name" "$archive" "$cove_kind" "$no_reload" "$php_pin"
         return
     fi
 
@@ -106,6 +113,112 @@ archive_has_laravel_project() {
     esac
 }
 
+# What a Cove backup that is neither WordPress nor Laravel holds: "app" (an
+# app from cove add --from: project/ beside meta) or "plain" (a plain site:
+# public/ beside meta, with no database or WordPress). Status 1 for anything
+# else, which import then reads as WordPress.
+archive_cove_site_kind() {
+    local names
+    case "$1" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                names=$(unzip -Z1 "$1" 2>/dev/null)
+            else
+                names=$(COVE_ZIP="$1" $(cove_php_cmd) -r '$z = new ZipArchive(); if ($z->open(getenv("COVE_ZIP")) !== true) exit(1); for ($i = 0; $i < $z->numFiles; $i++) echo $z->getNameIndex($i), "\n";' 2>/dev/null)
+            fi ;;
+        *) names=$(tar -tzf "$1" 2>/dev/null) ;;
+    esac
+    names=$(printf '%s\n' "$names" | sed 's#^\./##')
+    printf '%s\n' "$names" | grep -qx 'meta' || return 1
+    if printf '%s\n' "$names" | grep -q '^project/'; then
+        echo app
+    elif printf '%s\n' "$names" | grep -q '^public/' && ! printf '%s\n' "$names" | grep -qxE 'db\.sql|public/wp-(config|settings)\.php'; then
+        echo plain
+    else
+        return 1
+    fi
+}
+
+# A site from a Cove backup of an app (its project moves into place whole,
+# as cove add --from would leave it) or of a plain site (its public/). Nothing
+# in it is run, and it is held to --from's rules: no links out of it, none of
+# Cove's own names at its top.
+cove_import_app() {
+    local site_name="$1" archive="$2" kind="$3" no_reload="$4" php_pin="$5"
+    local site_dir="$SITES_DIR/$site_name.localhost" work names rc protected_name owner src from_src
+    for protected_name in $PROTECTED_NAMES; do
+        if [ "$site_name" == "$protected_name" ]; then
+            gum style --foreground red "❌ Error: '$site_name' is a reserved name. Choose another."
+            exit 1
+        fi
+    done
+    if owner=$(cove_domain_owner "$site_name.localhost"); then
+        gum style --foreground red "❌ Error: '$site_name.localhost' already answers as $owner."
+        exit 1
+    fi
+    if [ -n "$php_pin" ]; then
+        php_pin=$(normalize_php_version "$php_pin")
+        if [ -z "$php_pin" ]; then
+            gum style --foreground red "❌ Error: Invalid PHP version." "Use a version like 8.3 or php@8.3."
+            exit 1
+        fi
+        ensure_php_formula "$php_pin" || exit 1
+    fi
+
+    echo "📦 Importing $(basename "$archive"), $([ "$kind" = app ] && echo "an app" || echo "a plain site"), into '$site_name.localhost'…"
+    case "$archive" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then names=$(unzip -Z1 "$archive" 2>/dev/null); else names=""; fi ;;
+        *) names=$(tar -tzf "$archive" 2>/dev/null) ;;
+    esac
+    if printf '%s\n' "$names" | grep -qE '^/|(^|/)\.\.(/|$)|\\'; then
+        gum style --foreground red "❌ Error: The archive has files that would land outside its own folder (an absolute path or ..), so it isn't unpacked."
+        exit 1
+    fi
+    mkdir -p "$COVE_DIR/cache" || exit 1
+    work=$(mktemp -d "$COVE_DIR/cache/import-$site_name.XXXXXX") || exit 1
+    COVE_IMPORT_WORK="$work"
+    trap 'rm -rf "$COVE_IMPORT_WORK"' EXIT
+    echo "   - Unpacking…"
+    case "$archive" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -o -q "$archive" -d "$work" </dev/null
+            else
+                COVE_ZIP="$archive" COVE_DEST="$work" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->extractTo(getenv("COVE_DEST")) ? 0 : 1);'
+            fi ;;
+        *) tar -xzf "$archive" -C "$work" ;;
+    esac
+    rc=$?
+    src="$work/project"
+    [ "$kind" = plain ] && src="$work/public"
+    if [ "$rc" -ne 0 ] || [ ! -d "$src" ] || [ -L "$src" ]; then
+        gum style --foreground red "❌ Error: Could not unpack the archive's $([ "$kind" = app ] && echo project || echo "public/ folder")."
+        exit 1
+    fi
+    local outside
+    outside=$(cove_links_outside "$src")
+    if [ -n "$outside" ]; then
+        gum style --foreground red "❌ Error: The archive has links that point outside the site, so it isn't used:" "$outside"
+        exit 1
+    fi
+    if [ "$kind" = app ]; then
+        cove_from_check_names "$src" "The archive" || exit 1
+        mv "$src" "$site_dir" || { gum style --foreground red "❌ Error: Could not move the app into $site_dir."; exit 1; }
+    else
+        mkdir -p "$site_dir" && mv "$src" "$site_dir/public" || { rm -rf "$site_dir"; gum style --foreground red "❌ Error: Could not move the site into $site_dir."; exit 1; }
+    fi
+    rm -rf "$work"
+    mkdir -p "$site_dir/logs"
+    [ -n "$php_pin" ] && echo "$php_pin" > "$site_dir/php_version"
+
+    if [ "$no_reload" = false ]; then
+        cove_reload
+    fi
+    from_src=$(sed -n 's/^source=//p' "$site_dir/cove-from" 2>/dev/null)
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Imported into $site_name.localhost" "$(url_for "$site_name.localhost")" "Folder: $site_dir" ${from_src:+"First added from: $from_src"}
+}
+
 # A site from a Cove backup of a Laravel site. The project moves into place
 # whole; a MariaDB dump goes into the database Cove makes for the new name;
 # .env is pointed at this machine's Cove (database credentials, the mail
@@ -139,7 +252,7 @@ cove_import_laravel() {
     case "$archive" in
         *.zip)
             if command -v unzip >/dev/null 2>&1; then
-                unzip -q "$archive" -d "$work"
+                unzip -o -q "$archive" -d "$work" </dev/null
             else
                 COVE_ZIP="$archive" COVE_DEST="$work" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->extractTo(getenv("COVE_DEST")) ? 0 : 1);'
             fi ;;

@@ -286,8 +286,11 @@ cove_add() {
     # A project for --from is staged before anything is created, too: a
     # failed clone or download, or a bad archive, leaves no site behind.
     if [ -n "$from" ]; then
-        cove_from_stage "$site_name" "$from" "$branch" || exit 1
-        trap "rm -rf '$COVE_FROM_WORK'" EXIT
+        # Set first, so a Ctrl-C during a long download leaves nothing in
+        # ~/Cove/cache (COVE_FROM_WORK is known once the folder exists).
+        trap 'rm -rf "$COVE_FROM_WORK"' EXIT
+        cove_from_stage "$site_name" "$from" "$branch" "$([ "$site_type" = plain ] && echo keep-deps)" || exit 1
+        cove_from_check_names "$COVE_FROM_STAGE" "$from" || exit 1
         if [ "$from_detect" = true ]; then
             if site_is_laravel "$COVE_FROM_STAGE"; then site_type="laravel"; else site_type="plain"; fi
         fi
@@ -706,9 +709,11 @@ cove_find_node() {
 # release, `git archive --prefix`) loses that folder. Sets COVE_FROM_WORK,
 # COVE_FROM_STAGE (the project), COVE_FROM_KIND (folder|git|archive),
 # COVE_FROM_SRC (a folder's real path) and COVE_FROM_LOG, so it must not run
-# in $(…). Nothing in the project runs here.
+# in $(…). Nothing in the project runs here. $4 keep-deps copies a folder's
+# vendor/ and node_modules/ too, for an app that isn't going to be set up as
+# Laravel. A repository's or an archive's links have to stay inside it.
 cove_from_stage() {
-    local site_name="$1" source="$2" branch="$3"
+    local site_name="$1" source="$2" branch="$3" keep_deps="$4"
     local kind="" src="" work stage log archive="" ext=""
     COVE_FROM_WORK="" COVE_FROM_STAGE="" COVE_FROM_KIND="" COVE_FROM_SRC="" COVE_FROM_LOG=""
 
@@ -732,11 +737,17 @@ cove_from_stage() {
             gum style --foreground red "❌ Error: $source is a Cove site already." "Copy a site with: cove clone <site> $site_name"
             return 1
         fi
+        # A folder holding ~/Cove (your home, say) would be copied into
+        # itself, through the cache folder the copy goes to.
+        if [[ "$(cd "$COVE_DIR" && pwd -P)/" == "$src/"* ]]; then
+            gum style --foreground red "❌ Error: $source holds Cove's own folder ($COVE_DIR), so it can't be copied in." "Point --from at the project's own folder."
+            return 1
+        fi
     elif [ -f "$source" ] && [ -n "$ext" ]; then
         kind=archive
     elif [[ "$source" =~ ^https?://[^[:space:]?#]+\.(zip|ZIP|tar\.gz|tgz|tar)([?#][^[:space:]]*)?$ ]]; then
         kind=archive
-        [[ "$source" == *.zip* || "$source" == *.ZIP* ]] && ext=zip || ext=tar
+        case "${BASH_REMATCH[1]}" in zip|ZIP) ext=zip ;; *) ext=tar ;; esac
         if [[ "$source" != https://* ]]; then
             gum style --foreground red "❌ Error: An archive is downloaded over https:// only." "$source"
             return 1
@@ -764,6 +775,7 @@ cove_from_stage() {
 
     mkdir -p "$COVE_DIR/cache" || return 1
     work=$(mktemp -d "$COVE_DIR/cache/from-$site_name.XXXXXX") || return 1
+    COVE_FROM_WORK="$work"
     stage="$work/app"
     log="$work/setup.log"
     : > "$log"
@@ -799,14 +811,15 @@ cove_from_stage() {
         # (resources/views/vendor, public/vendor). Any other project is
         # copied whole. Both sides' errors count, so an unreadable file
         # doesn't make a quiet partial copy.
-        local rc_read rc_write
-        if site_is_laravel "$src"; then
-            echo "   - Copying $src (vendor/ and node_modules/ are installed fresh)…"
+        local rc_read rc_write skip_deps=false
+        [ "$keep_deps" != keep-deps ] && site_is_laravel "$src" && skip_deps=true
+        if $skip_deps; then
+            echo "   - Copying ${src} (vendor/ and node_modules/ are installed fresh)…"
         else
-            echo "   - Copying $src…"
+            echo "   - Copying ${src}…"
         fi
         mkdir "$stage" || { rm -rf "$work"; return 1; }
-        if site_is_laravel "$src"; then
+        if $skip_deps; then
             (cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name vendor ! -name node_modules -print0 | COPYFILE_DISABLE=1 tar --null -cf - -T -) 2>>"$log" \
                 | (cd "$stage" && tar -xpf -) 2>>"$log"
         else
@@ -860,7 +873,9 @@ cove_from_stage() {
         local rc
         if [ "$ext" = zip ]; then
             if command -v unzip >/dev/null 2>&1; then
-                unzip -q "$archive" -d "$work/x" >>"$log" 2>&1
+                # -o: a name twice (or twice but for case, on macOS) would
+                # otherwise stop to ask, with no one there to answer.
+                unzip -o -q "$archive" -d "$work/x" >>"$log" 2>&1 </dev/null
             else
                 COVE_ZIP="$archive" COVE_DEST="$work/x" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->extractTo(getenv("COVE_DEST")) ? 0 : 1);' >>"$log" 2>&1
             fi
@@ -890,7 +905,52 @@ cove_from_stage() {
         fi || { rm -rf "$work"; return 1; }
     fi
 
+    # A link out of the project would have Cove serve what it points at
+    # (public -> your home), so a download or a clone has none. A folder of
+    # your own is copied as it is.
+    if [ "$kind" != folder ]; then
+        local outside
+        outside=$(cove_links_outside "$stage" 2>>"$log")
+        if [ -n "$outside" ]; then
+            gum style --foreground red "❌ Error: $source has links that point outside the project, so it isn't used:" "$outside"
+            rm -rf "$work"
+            return 1
+        fi
+    fi
+
     COVE_FROM_WORK="$work" COVE_FROM_STAGE="$stage" COVE_FROM_KIND="$kind" COVE_FROM_SRC="$src" COVE_FROM_LOG="$log"
+}
+
+# The links in a project ($1) that lead outside it, up to three, one per line
+# as "path -> target"; nothing when there are none. A dangling one counts
+# when it names an absolute path.
+cove_links_outside() {
+    COVE_STAGE="$1" $(cove_php_cmd) -r '
+        $root = realpath(getenv("COVE_STAGE"));
+        $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
+        foreach ($it as $f) {
+            if (!$f->isLink()) continue;
+            $to = realpath($f->getPathname());
+            $link = (string) readlink($f->getPathname());
+            $out = $to === false ? $link !== "" && $link[0] === "/" : $to !== $root && strpos($to, $root . "/") !== 0;
+            if ($out) echo substr($f->getPathname(), strlen($root) + 1), " -> ", $link, "\n";
+        }' | head -n 3
+}
+
+# A project's top-level names that Cove keeps for a site's own files
+# (COVE_SITE_OWN). A file by one of them would be read as Cove's settings for
+# the site (lan_config puts it on the network), so the project is refused.
+# Folders named logs, private or history are fine: Cove only adds to them.
+cove_from_check_names() {
+    local stage="$1" source="$2" name
+    for name in $COVE_SITE_OWN; do
+        [ -e "$stage/$name" ] || [ -L "$stage/$name" ] || continue
+        case "$name" in
+            logs|private|history) [ -d "$stage/$name" ] && [ ! -L "$stage/$name" ] && continue ;;
+        esac
+        gum style --foreground red "❌ Error: $source has '$name' at its top, a name Cove keeps for a site's own settings." "Rename it in the project, then add it again."
+        return 1
+    done
 }
 
 # Where a site came from, kept as <site>/cove-from (and what makes it a
@@ -932,7 +992,7 @@ cove_from_git_exclude() {
 cove_add_app_from() {
     local site_name="$1" site_dir="$2" source="$3" branch="$4" php_pin="$5"
     local stage="$COVE_FROM_STAGE" work="$COVE_FROM_WORK" log="$COVE_FROM_LOG"
-    local webroot="public" min_php="" facts k v entry
+    local webroot="public" webroot_given=false min_php="" facts k v entry
     COVE_ADD_NOTES=() COVE_ADD_NEXT=""
 
     if [ -f "$stage/cove.json" ]; then
@@ -948,12 +1008,12 @@ cove_add_app_from() {
         fi
         while IFS=$'\t' read -r k v; do
             case "$k" in
-                webroot) webroot="${v%/}" ;;
+                webroot) webroot="${v%/}" webroot_given=true ;;
                 php) min_php="$v" ;;
                 next) COVE_ADD_NEXT="${v:0:200}" ;;
             esac
         done <<< "$facts"
-        if [ -z "$webroot" ] || [[ "$webroot" == /* ]] || [[ "/$webroot/" == *"/../"* ]] || [[ "/$webroot/" == *"/./"* ]] || [ ! -d "$stage/$webroot" ]; then
+        if $webroot_given && { [ -z "$webroot" ] || [[ "$webroot" == /* ]] || [[ "/$webroot/" == *"/../"* ]] || [[ "/$webroot/" == *"/./"* ]] || [ ! -d "$stage/$webroot" ]; }; then
             gum style --foreground red "❌ Error: cove.json's webroot '$webroot' isn't a folder inside the project."
             rm -rf "$work"
             return 1
@@ -968,11 +1028,13 @@ cove_add_app_from() {
         fi
         ln -s "$webroot" "$stage/public" || { rm -rf "$work"; return 1; }
     elif [ ! -d "$stage/public" ]; then
+        # Everything moves, .git too, so the repository stays whole (Cove
+        # never serves a dotfile). Cove's own files then sit outside it.
         if [ -f "$stage/index.php" ] || [ -f "$stage/index.html" ]; then
             mkdir "$stage/.cove-public" || { rm -rf "$work"; return 1; }
             for entry in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
                 [ -e "$entry" ] || [ -L "$entry" ] || continue
-                case "${entry##*/}" in .cove-public|.git) continue ;; esac
+                case "${entry##*/}" in .cove-public) continue ;; esac
                 mv "$entry" "$stage/.cove-public/" || { rm -rf "$work"; return 1; }
             done
             mv "$stage/.cove-public" "$stage/public" || { rm -rf "$work"; return 1; }
@@ -982,6 +1044,19 @@ cove_add_app_from() {
             return 1
         fi
     fi
+
+    # WordPress isn't an app to serve as it is: its wp-config.php names the
+    # database of wherever it came from, which Cove would then treat as this
+    # site's own.
+    if [ -f "$stage/public/wp-config.php" ] || [ -f "$stage/public/wp-settings.php" ]; then
+        gum style --foreground red "❌ Error: $source is WordPress, and --from brings in apps." "A WordPress site from elsewhere comes in with: cove import $site_name <backup.zip>, or cove pull." "A new one: cove add $site_name"
+        rm -rf "$work"
+        return 1
+    fi
+
+    for entry in private history; do
+        [ -d "$stage/$entry" ] && COVE_ADD_NOTES+=("⚠️  Its $entry/ folder is left out of clones and snapshots: Cove keeps its own files under that name.")
+    done
 
     if [ -n "$min_php" ] && [ -z "$php_pin" ]; then
         local cur

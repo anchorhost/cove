@@ -9463,7 +9463,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         <option value="latest">latest</option>
                         <option value="nightly">nightly</option>
                     </select>
-                    <input type="text" id="laravelFrom" placeholder="new app, or a git URL or folder to set up" spellcheck="false" autocomplete="off" aria-label="An existing Laravel project: a git URL or a folder" title="Empty for a new app. A git URL is cloned and a folder copied, then its packages installed, its database made and migrated, and its front end built" style="display: none;">
+                    <input type="text" id="laravelFrom" placeholder="new app, or a git URL, folder or archive to set up" spellcheck="false" autocomplete="off" aria-label="An existing Laravel project: a git URL, a folder or an archive" title="Empty for a new app. A git URL is cloned and a folder copied, then its packages installed, its database made and migrated, and its front end built" style="display: none;">
                     <select class="wp-version" id="laravelDbSelect" title="Laravel's database: SQLite, Laravel's own default; MySQL on Cove's MariaDB; or PostgreSQL, set up the first time a site asks for it" aria-label="Laravel's database" style="display: none;">
                         <option value="" id="laravelDbOwn" hidden>its own db</option>
                         <option value="sqlite">sqlite</option>
@@ -11414,11 +11414,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const fromInput = $id('laravelFrom');
                 show(fromInput, isLaravel || kind === 'plain');
                 fromInput.disabled = this.newSite.isLoading;
-                fromInput.placeholder = isLaravel ? 'new app, or a git URL or folder to set up' : 'empty, or an app: git URL, folder or .zip';
+                fromInput.placeholder = isLaravel ? 'new app, or a git URL, folder or archive to set up' : 'empty, or an app: git URL, folder or archive';
                 fromInput.title = isLaravel
-                    ? 'Empty for a new app. A git URL is cloned and a folder copied, then its packages installed, its database made and migrated, and its front end built'
-                    : 'Empty for a static site. A git URL is cloned, a folder copied, a .zip or .tar.gz (a file or an https:// link) unpacked, and its public/ served. Nothing in it is run';
-                fromInput.setAttribute('aria-label', isLaravel ? 'An existing Laravel project: a git URL or a folder' : 'An existing app: a git URL, a folder or an archive');
+                    ? 'Empty for a new app. A git URL is cloned, a folder copied or an archive unpacked, then its packages installed, its database made and migrated, and its front end built'
+                    : 'Empty for a static site. A git URL is cloned, a folder copied, a .zip, .tar.gz, .tgz or .tar (a file or an https:// link) unpacked, and its public/ served. Nothing in it is run';
+                fromInput.setAttribute('aria-label', isLaravel ? 'An existing Laravel project: a git URL, a folder or an archive' : 'An existing app: a git URL, a folder or an archive');
                 $id('laravelDbOwn').hidden = !this.newSite.from;
                 $id('btnCreate').disabled = !this.newSite.name || this.newSite.isLoading;
                 show($id('createSpinner'), this.newSite.isLoading);
@@ -18872,13 +18872,14 @@ display_command_help() {
             echo "                 unless given."
             echo "  --from=<src>   Set up an existing app instead of a new site. A git URL"
             echo "                 (https://…, git@host:path) is cloned; a folder is copied,"
-            echo "                 the original left as it is; a .zip or .tar.gz (a file, or"
-            echo "                 an https:// link such as a GitHub release asset) is"
-            echo "                 downloaded and unpacked. A Laravel app then gets its"
+            echo "                 the original left as it is; a .zip, .tar.gz, .tgz or .tar"
+            echo "                 (a file, or an https:// link such as a GitHub release"
+            echo "                 asset) is downloaded and unpacked. A Laravel app then gets its"
             echo "                 Composer and npm packages, a .env for Cove, its database"
             echo "                 made and migrated, its front end built. Any other app is"
             echo "                 served from its public/ (or the cove.json 'webroot'); the"
             echo "                 site folder is the project. Nothing in it is run."
+            echo "                 WordPress from elsewhere comes in with 'cove import'."
             echo "  --branch=<b>   With a git URL: the branch or tag to check out."
             echo "  --seed         Laravel: run the database seeders after the migrations."
             echo "  --no-reload    Don't reload Caddy afterwards (for scripts that add"

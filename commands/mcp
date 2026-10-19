@@ -492,12 +492,12 @@ function tools(): array {
         ],
         'create_site' => [
             'title' => 'Create a site',
-            'description' => "Creates a new local site at https://<name>.localhost: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a Laravel application (as `laravel new` makes it, on SQLite unless database says mysql or pgsql; or an existing project from a git URL or folder, set up to run: packages installed, .env written, database made and migrated, front end built), a plain static site (or, with from, any other app served from its public/, nothing in it run), or a Minn Engine site. Takes up to a minute, or a few for an existing project.",
+            'description' => "Creates a new local site at https://<name>.localhost: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a Laravel application (as `laravel new` makes it, on SQLite unless database says mysql or pgsql; or an existing project from a git URL, folder or archive, set up to run: packages installed, .env written, database made and migrated, front end built), a plain static site (or, with from, any other app served from its public/, nothing in it run), or a Minn Engine site. Takes up to a minute, or a few for an existing project.",
             'inputSchema' => $obj([
                 'name' => ['type' => 'string', 'description' => 'Lowercase letters, numbers and hyphens, e.g. client-demo.'],
                 'type' => ['type' => 'string', 'enum' => ['wordpress', 'laravel', 'plain', 'minn'], 'description' => 'Default wordpress.'],
                 'database' => ['type' => 'string', 'enum' => ['sqlite', 'mysql', 'mariadb', 'pgsql'], 'description' => 'Laravel only: sqlite (the default for a new app), a database on Cove\'s MariaDB, or pgsql on Cove\'s PostgreSQL (set up the first time, which takes a few minutes). With from: the one the project names, unless given.'],
-                'from' => ['type' => 'string', 'description' => 'Laravel or plain: an existing project to set up instead of a new one, a git URL (https://…, git@host:path), a folder (copied; the original is left alone) or an archive (.zip or .tar.gz, a file or an https:// link).'],
+                'from' => ['type' => 'string', 'description' => 'Laravel or plain: an existing project to set up instead of a new one, a git URL (https://…, git@host:path), a folder (copied; the original is left alone) or an archive (.zip, .tar.gz, .tgz or .tar: a file or an https:// link). Not WordPress: that comes in with cove import.'],
                 'branch' => ['type' => 'string', 'description' => 'With a git URL in from: the branch or tag to check out.'],
                 'seed' => ['type' => 'boolean', 'description' => 'Laravel only: run the database seeders after the migrations.'],
                 'wp_version' => ['type' => 'string', 'description' => 'A WordPress version such as 6.8.3, or nightly. Default latest.'],
@@ -789,7 +789,7 @@ function call_tool(string $name, array $a): array {
                 }
                 $from = trim((string) ($a['from'] ?? ''));
                 if ($from !== '') {
-                    if (strlen($from) > 500 || $from[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $from)) throw new ToolError('from is a git URL or a folder.');
+                    if (strlen($from) > 500 || $from[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $from)) throw new ToolError('from is a git URL, a folder or an archive.');
                     $args[] = '--from=' . $from;
                     if (!empty($a['branch'])) $args[] = '--branch=' . $a['branch'];
                 } elseif (!empty($a['branch'])) throw new ToolError('branch goes with a git URL in from.');
@@ -814,7 +814,9 @@ function call_tool(string $name, array $a): array {
             [$out, , $code] = cove($args, true);
             $out = clean($out);
             if ($code !== 0 || !is_dir(SITES . "/$name.localhost/public")) throw new ToolError(cut($out) ?: 'cove add failed.');
-            $reply = 'Created ' . url_of($name) . "\nFiles: " . SITES . "/$name.localhost" . ($type === 'laravel' ? ' (the Laravel project; public/ is the webroot)' : '/public');
+            // An app from `from` is the whole folder, its public/ served.
+            $project = $type === 'laravel' || is_file(SITES . "/$name.localhost/cove-from");
+            $reply = 'Created ' . url_of($name) . "\nFiles: " . SITES . "/$name.localhost" . ($project ? ' (the project; public/ is the webroot)' : '/public');
             if (preg_match('~https://\S*wp-login\.php\S*~', $out, $m)) $reply .= "\nOne-time admin login: " . $m[0];
             $lines = explode("\n", $out);
             return text($reply . "\n\n" . implode("\n", array_slice($lines, -25)));
