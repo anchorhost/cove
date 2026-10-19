@@ -19917,7 +19917,8 @@ main() {
             cove_upgrade "$@"
             ;;
         uninstall)
-            check_dependencies
+            # Not gated on the dependencies: a Cove that never finished
+            # installing has to come out too.
             cove_uninstall "$@"
             ;;
         version)

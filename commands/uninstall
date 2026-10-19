@@ -1,12 +1,62 @@
+# Takes Cove's local root certificate out of the system's trust store by its
+# file, which works with the web server stopped (asked without one, untrust
+# fetches it from the running server's admin API), then out of the browsers'
+# certificate databases on Linux, where `cove trust` put it as "Cove Local
+# Authority".
+cove_untrust_root() {
+    local root="" ok=false db
+    if [ "$OS" = "macos" ]; then
+        root="$HOME/Library/Application Support/Caddy/pki/authorities/local/root.crt"
+    else
+        root="${XDG_DATA_HOME:-$HOME/.local/share}/caddy/pki/authorities/local/root.crt"
+        [ -f "$root" ] || root=$(find /usr/local/share/ca-certificates -maxdepth 1 -name 'Caddy_Local_Authority*.crt' 2>/dev/null | head -1)
+    fi
+    if command -v "$CADDY_CMD" >/dev/null 2>&1 || [ -x "$CADDY_CMD" ]; then
+        if [ -n "$root" ] && [ -f "$root" ]; then
+            { "$CADDY_CMD" untrust --cert "$root" &>/dev/null || $SUDO_CMD "$CADDY_CMD" untrust --cert "$root" &>/dev/null; } && ok=true
+        else
+            { "$CADDY_CMD" untrust &>/dev/null || $SUDO_CMD "$CADDY_CMD" untrust &>/dev/null; } && ok=true
+        fi
+    fi
+    if [ "$OS" = "linux" ] && command -v certutil >/dev/null 2>&1; then
+        while IFS= read -r db; do
+            [ -n "$db" ] && certutil -D -d sql:"$(dirname "$db")" -n "Cove Local Authority" &>/dev/null
+        done < <(find "$HOME/.pki" "$HOME/.mozilla/firefox" "$HOME/snap" "$HOME/.var/app" -name 'cert9.db' 2>/dev/null)
+    fi
+    $ok
+}
+
 # `cove uninstall`: Cove's services, background jobs, menu bar app and
 # /etc/hosts lines go, then the cove command itself. The sites in ~/Cove and
 # their databases stay unless --purge, which deletes every site the way
-# `cove delete` does (files, MariaDB or PostgreSQL database, Redis keys) and
-# then ~/Cove. The packages Cove installed (MariaDB, Mailpit, FrankenPHP,
-# gum, WP-CLI, PostgreSQL, Redis) stay either way, since other things may use
-# them: the summary names them with the command that removes them.
+# `cove delete` does (files, the MariaDB or PostgreSQL database Cove made for
+# it, Redis keys) and then ~/Cove. The packages Cove installed (MariaDB,
+# Mailpit, FrankenPHP, gum, WP-CLI, PostgreSQL, Redis) stay either way, since
+# other things may use them: the summary names them with the command that
+# removes them.
 cove_uninstall() {
     local purge=false dry_run=false yes=false arg
+    # A Cove that never finished installing may have no gum: plain text and
+    # prompts stand in for it, so it can still be taken out.
+    if ! command -v gum >/dev/null 2>&1; then
+        gum() {
+            local a
+            case "$1" in
+                style)
+                    shift
+                    while [ $# -gt 0 ]; do
+                        case "$1" in
+                            --*=*) shift ;;
+                            --*) shift; [ $# -gt 0 ] && shift ;;
+                            *) printf '%s\n' "$1"; shift ;;
+                        esac
+                    done ;;
+                confirm) printf '%s [y/N] ' "$2" >&2; read -r a; [[ "$a" == [Yy]* ]] ;;
+                input) printf '%s: ' "${3:-}" >&2; read -r a; printf '%s\n' "$a" ;;
+            esac
+        }
+    fi
+
     for arg in "$@"; do
         case "$arg" in
             --purge) purge=true ;;
@@ -50,7 +100,7 @@ cove_uninstall() {
 
     echo "Cove uninstall will:"
     if $purge; then
-        echo "  • Delete all ${#sites[@]} sites: their files, databases and Redis keys"
+        echo "  • Delete all ${#sites[@]} sites: their files, the databases Cove made for them, and their Redis keys"
     fi
     echo "  • Stop Cove's services (FrankenPHP, Mailpit, MariaDB, the watchdog, Laravel workers) and take them out of $([ "$OS" = macos ] && echo launchd || echo "systemd (their units removed)")"
     [ ${#shares[@]} -gt 0 ] && echo "  • End ${#shares[@]} background share(s)"
@@ -91,14 +141,51 @@ cove_uninstall() {
     fi
     echo ""
 
-    # Sites first, while MariaDB and PostgreSQL still answer. Each in a
-    # subshell, as cove_delete exits on an error.
-    local failed=() s
-    if $purge; then
+    # Sites first, while MariaDB and PostgreSQL answer: started here when
+    # they're down, as a database that can't be dropped would be left with
+    # nothing to find it by. Each delete runs in a subshell, as cove_delete
+    # exits on an error, and counts only when the folder and the database
+    # Cove made for it are both gone. A WordPress database wp-config.php was
+    # pointed at by hand isn't Cove's, so it stays and is named at the end.
+    local failed=() kept_dbs=() s sd db server hand
+    if $purge && [ ${#sites[@]} -gt 0 ]; then
+        source_config
+        if ! mariadb_wait_ready 1; then
+            echo "🗄️ Starting MariaDB to delete the sites' databases…"
+            if [ "$OS" = "macos" ]; then
+                start_macos_mariadb &>/dev/null
+            else
+                $SUDO_CMD systemctl start "$(get_mariadb_service_name)" &>/dev/null
+            fi
+            if ! mariadb_wait_ready 20; then
+                gum style --foreground red "❌ Error: MariaDB isn't answering, so the sites' databases can't be deleted. Nothing was changed." "Start it with: cove enable. Then run cove uninstall --purge again."
+                exit 1
+            fi
+        fi
+        cove_pg_configured && ensure_postgres >/dev/null 2>&1
         for s in "${sites[@]}"; do
             echo "🗑️  Deleting $s.localhost…"
-            ( cove_delete "$s" --force --no-reload ) >/dev/null 2>&1 || failed+=("$s")
+            sd="$SITES_DIR/$s.localhost" db="" server=mariadb hand=""
+            if [ -f "$sd/public/wp-config.php" ]; then
+                db=$(wp_site_db "$sd")
+                if [ -n "$db" ] && ! cove_db_is_sites "$db" "$s"; then hand="$db"; db=""; fi
+            elif site_is_laravel "$sd" && db=$(laravel_cove_db "$sd" "$s"); then
+                server=$(laravel_db_server "$sd")
+            else
+                db=""
+            fi
+            if ! ( cove_delete "$s" --force --no-reload ) >/dev/null 2>&1 || [ -d "$sd" ] \
+                || { [ -n "$db" ] && [ "$server" = pgsql ] && ! cove_pg_ready; } \
+                || { [ -n "$db" ] && cove_server_db_exists "$server" "$db"; }; then
+                failed+=("$s")
+            fi
+            [ -n "$hand" ] && kept_dbs+=("$hand")
         done
+        # Cove stays to try again with: its config holds the database password.
+        if [ ${#failed[@]} -gt 0 ]; then
+            gum style --foreground red "❌ These sites couldn't be fully deleted: ${failed[*]}" "Cove is still installed. See what stops one with: cove delete <site>" "Then run cove uninstall --purge again."
+            exit 1
+        fi
     fi
 
     for s in "${shares[@]}"; do
@@ -115,6 +202,14 @@ cove_uninstall() {
         ( cove_menubar_disable ) 2>&1 | sed 's/^/   /'
     fi
 
+    # Before the web server stops, so a certificate file that has gone
+    # missing can still be asked of it.
+    if $purge; then
+        echo "🔐 Removing Cove's certificate authority from the trust store (may ask for your password)..."
+        cove_untrust_root \
+            || gum style --foreground yellow "   - ⚠️ Couldn't remove it; Keychain Access (macOS) or update-ca-certificates (Linux) can."
+    fi
+
     cove_disable
     if [ "$OS" = "linux" ]; then
         echo "   - Removing Cove's systemd units..."
@@ -123,15 +218,15 @@ cove_uninstall() {
             $SUDO_CMD systemctl disable --now "$unit" &>/dev/null || true
             $SUDO_CMD rm -f "/etc/systemd/system/$unit"
         done
+        # Install masked the frankenphp package's own unit to keep it off
+        # ports 80 and 443; the package is the user's again.
+        $SUDO_CMD systemctl unmask frankenphp.service &>/dev/null || true
         $SUDO_CMD systemctl daemon-reload &>/dev/null || true
     fi
 
     [ ${#hosts[@]} -gt 0 ] && prune_etc_hosts --all "${hosts[@]}"
 
     if $purge; then
-        echo "🔐 Removing Cove's certificate authority from the trust store (may ask for your password)..."
-        "$CADDY_CMD" untrust &>/dev/null || $SUDO_CMD "$CADDY_CMD" untrust &>/dev/null \
-            || gum style --foreground yellow "   - ⚠️ Couldn't remove it; Keychain Access (macOS) or update-ca-certificates (Linux) can."
         # Only ever the folder Cove made in this account's home.
         if [ -n "$HOME" ] && [ "$COVE_DIR" = "$HOME/Cove" ] && [ -d "$COVE_DIR" ]; then
             echo "🧹 Deleting $COVE_DIR..."
@@ -147,18 +242,19 @@ cove_uninstall() {
     echo ""
     local done_lines=("✅ Cove is uninstalled.")
     if $purge; then
-        [ ${#failed[@]} -gt 0 ] && done_lines+=("These sites couldn't be fully deleted: ${failed[*]}")
+        [ ${#kept_dbs[@]} -gt 0 ] && done_lines+=("These databases weren't made by Cove, so they stay in MariaDB: ${kept_dbs[*]}")
     else
-        done_lines+=("Your sites are still in $COVE_DIR. Remove them with: rm -rf $COVE_DIR")
+        done_lines+=("Your sites are still in $COVE_DIR, and their databases in MariaDB." "rm -rf $COVE_DIR removes the files; the databases stay until you drop them.")
     fi
     done_lines+=("" "The packages Cove installed are still there, for anything else that uses them:")
     if [ "$OS" = "macos" ]; then
+        local fp
+        fp=$(command -v frankenphp 2>/dev/null)
         done_lines+=("  brew uninstall gum mariadb mailpit wp-cli   (plus postgresql@17 and redis if Cove set them up)")
-        done_lines+=("  rm $(dirname "$cove_bin")/frankenphp")
+        [ -n "$fp" ] && done_lines+=("  $([ -w "$(dirname "$fp")" ] || echo "sudo ")rm $fp")
     else
         done_lines+=("  sudo $PKG_MANAGER remove frankenphp 'php-zts-*' mariadb-server   (plus postgresql and redis if Cove set them up)")
         done_lines+=("  sudo rm /usr/local/bin/mailpit /usr/local/bin/gum /usr/local/bin/wp")
     fi
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "${done_lines[@]}"
-    [ ${#failed[@]} -eq 0 ]
 }
