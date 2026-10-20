@@ -142,46 +142,51 @@ cove_db_list() {
             exit(1);
         }
 
+        // The settings straight from wp-config.php, as wp-cli and Cove write
+        // them: define( NAME, value ) with either quote. Only a site that
+        // works them out some other way (getenv, say) costs a wp-cli run;
+        // three per site used to take most of a minute on a big machine.
+        function wpConst(string $cfg, string $name): ?string {
+            $re = "/define\\s*\\(\\s*[\x27\"]" . $name . "[\x27\"]\\s*,\\s*(?:\x27((?:[^\x27\\\\]|\\\\.)*)\x27|\"((?:[^\"\\\\]|\\\\.)*)\")\\s*\\)/";
+            if (!preg_match($re, $cfg, $m)) return null;
+            $v = isset($m[2]) && $m[2] !== "" ? $m[2] : $m[1];
+            return strtr($v, ["\\\x27" => "\x27", "\\\"" => "\"", "\\\\" => "\\"]);
+        }
+        function wpCli(string $public_dir, string $name): ?string {
+            $out = shell_exec("cd " . escapeshellarg($public_dir) . " && " . getenv("WP_INVOKER") . " config get " . $name . " --skip-plugins --skip-themes --quiet 2>/dev/null");
+            return $out === null ? null : trim($out);
+        }
+
+        // The size of every database, in one query.
+        $sizes = [];
+        $res = $mysqli->query("SELECT table_schema, SUM(data_length + index_length) FROM information_schema.TABLES GROUP BY table_schema");
+        foreach ($res->fetch_all() as $row) $sizes[$row[0]] = (int) $row[1];
+
         $sites_info = [];
         foreach (scandir($sites_dir) as $item) {
             $public_dir = $sites_dir . "/" . $item . "/public";
-            if (is_file($public_dir . "/wp-config.php")) {
-                $site_name = str_replace(".localhost", "", $item);
-                $public_dir_esc = escapeshellarg($public_dir);
-                $cmd_suffix = " --skip-plugins --skip-themes --quiet 2>/dev/null";
-                
-                $name_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_NAME" . $cmd_suffix);
-                if (is_null($name_raw)) { continue; }
-                $site_db_name = trim($name_raw);
-                if (empty($site_db_name)) { continue; }
+            if (!is_file($public_dir . "/wp-config.php")) continue;
+            $site_name = str_replace(".localhost", "", $item);
+            $cfg = (string) @file_get_contents($public_dir . "/wp-config.php");
+            $site_db_name = wpConst($cfg, "DB_NAME") ?? wpCli($public_dir, "DB_NAME");
+            if ($site_db_name === null || $site_db_name === "") continue;
 
-                $site_db_user = "N/A";
-                $site_db_pass = "N/A";
-                $size_str = "N/A";
-
-                if (!str_contains(strtolower($site_db_name), "sqlite")) {
-                    $user_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_USER" . $cmd_suffix);
-                    if (!is_null($user_raw)) { $site_db_user = trim($user_raw); }
-
-                    $pass_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_PASSWORD" . $cmd_suffix);
-                    if (!is_null($pass_raw)) { $site_db_pass = trim($pass_raw); }
-                    
-                    $stmt = $mysqli->prepare("SELECT SUM(data_length + index_length) as size FROM information_schema.TABLES WHERE table_schema = ?");
-                    $stmt->bind_param("s", $site_db_name);
-                    $stmt->execute();
-                    $size_bytes = $stmt->get_result()->fetch_assoc()["size"] ?? 0;
-                    $stmt->close();
-                    $size_str = formatSize((int)$size_bytes);
-                }
-
-                $sites_info[] = [
-                    "name" => $site_name,
-                    "db_name" => $site_db_name,
-                    "db_user" => $site_db_user,
-                    "db_pass" => $site_db_pass,
-                    "size" => $size_str,
-                ];
+            $site_db_user = "N/A";
+            $site_db_pass = "N/A";
+            $size_str = "N/A";
+            if (!str_contains(strtolower($site_db_name), "sqlite")) {
+                $site_db_user = wpConst($cfg, "DB_USER") ?? wpCli($public_dir, "DB_USER") ?? "N/A";
+                $site_db_pass = wpConst($cfg, "DB_PASSWORD") ?? wpCli($public_dir, "DB_PASSWORD") ?? "N/A";
+                $size_str = formatSize($sizes[$site_db_name] ?? 0);
             }
+
+            $sites_info[] = [
+                "name" => $site_name,
+                "db_name" => $site_db_name,
+                "db_user" => $site_db_user,
+                "db_pass" => $site_db_pass,
+                "size" => $size_str,
+            ];
         }
 
         if (empty($sites_info)) { exit; }
