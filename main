@@ -8370,7 +8370,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .add-drop-text u { text-decoration-color: var(--text-faint); }
         .add-drop-file { display: inline-flex; align-items: center; gap: 0.2rem; padding: 0.15rem 0.25rem 0.15rem 0.6rem; border-radius: var(--radius-pill); background: var(--pill-wp-bg); color: var(--pill-wp-fg); font-size: 0.72rem; white-space: nowrap; }
         .add-progress { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); padding: 0 0 0.6rem; }
-        .add-row.is-importing .add-type, .add-row.is-importing .wp-version, .add-row.has-import .add-type, .add-row.has-import .wp-version { display: none; }
+        .add-row.is-importing .add-type, .add-row.has-import .add-type { display: none; }
         /* Indeterminate progress stripe across the top while cove add is
            running — site creation takes 5-10s so we need a clear "working"
            cue beyond just the button text swap. Solid accent block slides
@@ -8408,8 +8408,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .add-type .sl-menu button.is-active { background: var(--panel-hover); }
         .add-type .sl-menu button:disabled { cursor: default; opacity: 0.5; }
         .add-type-empty { padding: 0.45rem 0.65rem; font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-faint); }
-        .add-row select.wp-version { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.85rem; padding: 0.5rem 0.7rem; border-radius: var(--radius-md); flex: none; cursor: pointer; }
-        .add-row select.wp-version:focus { outline: 0; border-color: var(--accent); }
+        .add-row #wpVersion input[type="text"] { width: 8rem; }
+        .add-row #laravelDb input[type="text"] { width: 9.5rem; }
+        .add-row #wpVersion .sl-menu, .add-row #laravelDb .sl-menu { min-width: 15rem; }
+        /* A long list (WordPress versions, a table's columns) scrolls. */
+        .add-type .sl-menu.is-long { max-height: 20rem; overflow-y: auto; }
 
         /* ---- Sites view ------------------------------------------------
            A harbour band (the summary, over a contour chart), a sticky
@@ -8944,8 +8947,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .db-main > div { min-height: 0; }
         #dbTable, #dbSql { flex: 1; display: flex; flex-direction: column; min-height: 0; }
         .db-bar { flex: none; }
-        .db-rows-search { display: flex; align-items: center; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--input-bg); overflow: hidden; }
-        .db-rows-search select { background: transparent; border: 0; border-right: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.28rem 0.4rem; max-width: 150px; cursor: pointer; }
+        .db-rows-search { display: flex; align-items: center; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--input-bg); }
+        .db-rows-search .add-type { align-self: stretch; display: flex; border-right: 1px solid var(--panel-border); }
+        .db-rows-search .add-type input { background: transparent; border: 0; color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.28rem 1.5rem 0.28rem 0.5rem; width: 128px; outline: 0; cursor: pointer; }
+        .db-rows-search .add-type input:focus { color: var(--text); cursor: text; }
+        .db-rows-search .add-type-chev, .db-sql-actions .add-type-chev { right: 0.45rem; width: 10px; height: 10px; margin-top: -5px; }
+        .db-rows-search .add-type .sl-menu { left: -1px; right: auto; min-width: 16rem; }
         .db-rows-search input { background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.76rem; padding: 0.28rem 0.55rem; width: 180px; outline: 0; }
         .db-rows-search:focus-within { border-color: var(--accent); }
         /* Grid: the wrap scrolls both ways, the header sticks, and every
@@ -9003,7 +9010,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .db-sql-editor textarea::placeholder { color: var(--text-faint); }
         .db-sql-actions { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 1.5rem 0.7rem; }
         .db-sql-actions .mail-bar-note { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .db-sql-actions select { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.3rem 0.5rem; border-radius: var(--radius-md); max-width: 220px; cursor: pointer; }
+        .db-sql-actions .add-type input { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.3rem 1.5rem 0.3rem 0.5rem; border-radius: var(--radius-md); width: 9rem; outline: 0; cursor: pointer; }
+        .db-sql-actions .add-type input:focus { border-color: var(--accent); color: var(--text); cursor: text; }
+        .db-sql-actions .add-type input:disabled { cursor: default; opacity: 0.5; }
+        .db-sql-actions .add-type .sl-menu { left: auto; right: 0; max-width: min(36rem, 80vw); max-height: 20rem; overflow-y: auto; }
         .db-kbd { opacity: 0.7; font-size: 0.7em; margin-left: 0.2rem; }
         .db-sql-results { flex: 1; overflow: auto; min-height: 0; }
         .db-sql-result { border-bottom: 1px solid var(--panel-border); }
@@ -9543,21 +9553,21 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 <form id="addForm">
                     <input type="text" id="newSiteName" placeholder="site-name" required>
                     <div class="add-type" id="addType">
-                        <input type="text" id="addTypeInput" role="combobox" aria-label="Site type" aria-autocomplete="list" aria-expanded="false" aria-controls="addTypeList" autocomplete="off" spellcheck="false" value="WordPress" title="What the site is: type a few letters, ↑↓ to choose, ↵ to pick">
+                        <input type="text" role="combobox" aria-label="Site type" aria-autocomplete="list" aria-expanded="false" aria-controls="addTypeList" autocomplete="off" spellcheck="false" value="WordPress" title="What the site is: type a few letters, ↑↓ to choose, ↵ to pick">
                         <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
                         <div class="sl-menu" id="addTypeList" role="listbox" aria-label="Site types" style="display: none;"></div>
                     </div>
-                    <select class="wp-version" id="wpVersionSelect" title="Which WordPress: the latest release, nightly, or a version" aria-label="WordPress version">
-                        <option value="latest">latest</option>
-                        <option value="nightly">nightly</option>
-                    </select>
+                    <div class="add-type" id="wpVersion">
+                        <input type="text" role="combobox" aria-label="WordPress version" aria-autocomplete="list" aria-expanded="false" aria-controls="wpVersionList" autocomplete="off" spellcheck="false" title="Which WordPress: latest, nightly, or a version. Type a few digits, ↑↓ to choose, ↵ to pick">
+                        <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                        <div class="sl-menu is-long" id="wpVersionList" role="listbox" aria-label="WordPress versions" style="display: none;"></div>
+                    </div>
                     <input type="text" id="laravelFrom" placeholder="new app, or a git URL, folder or archive to set up" spellcheck="false" autocomplete="off" aria-label="An existing Laravel project: a git URL, a folder or an archive" title="Empty for a new app. A git URL is cloned and a folder copied, then its packages installed, its database made and migrated, and its front end built" style="display: none;">
-                    <select class="wp-version" id="laravelDbSelect" title="Laravel's database: SQLite, Laravel's own default; MySQL on Cove's MariaDB; or PostgreSQL, set up the first time a site asks for it" aria-label="Laravel's database" style="display: none;">
-                        <option value="" id="laravelDbOwn" hidden>its own db</option>
-                        <option value="sqlite">sqlite</option>
-                        <option value="mysql">mysql</option>
-                        <option value="pgsql">pgsql</option>
-                    </select>
+                    <div class="add-type" id="laravelDb" style="display: none;">
+                        <input type="text" role="combobox" aria-label="Laravel's database" aria-autocomplete="list" aria-expanded="false" aria-controls="laravelDbList" autocomplete="off" spellcheck="false" title="Laravel's database: SQLite, Laravel's own default; MySQL on Cove's MariaDB; or PostgreSQL, set up the first time a site asks for it">
+                        <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                        <div class="sl-menu" id="laravelDbList" role="listbox" aria-label="Databases" style="display: none;"></div>
+                    </div>
                     <button class="pill primary" type="submit" id="btnCreate" disabled>
                         <span class="btn-spinner" id="createSpinner" aria-hidden="true" style="display: none;"></span>
                         <span id="createLabel">create</span>
@@ -9847,7 +9857,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                                 <button type="button" class="mail-part" role="tab" data-part="structure">structure</button>
                             </div>
                             <div class="db-rows-search" id="dbRowsSearch">
-                                <select id="dbRowsCol" title="Column to search" aria-label="Column to search"><option value="">any column</option></select>
+                                <div class="add-type" id="dbRowsCol">
+                                    <input type="text" role="combobox" aria-label="Column to search" aria-autocomplete="list" aria-expanded="false" aria-controls="dbRowsColList" autocomplete="off" spellcheck="false" title="Column to search: type a few letters, ↑↓ to choose, ↵ to pick">
+                                    <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                                    <div class="sl-menu is-long" id="dbRowsColList" role="listbox" aria-label="Columns" style="display: none;"></div>
+                                </div>
                                 <input type="text" id="dbRowsFilter" placeholder="contains…" spellcheck="false" autocomplete="off" aria-label="Filter rows">
                             </div>
                             <span class="mail-bar-note" id="dbRowsNote"></span>
@@ -9864,7 +9878,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             <textarea id="dbSqlText" spellcheck="false" autocapitalize="off" autocorrect="off" rows="6" placeholder="SELECT option_name, LENGTH(option_value) AS bytes FROM wp_options WHERE autoload = 'yes' ORDER BY bytes DESC LIMIT 20"></textarea>
                             <div class="db-sql-actions">
                                 <span class="mail-bar-note" id="dbSqlNote"></span>
-                                <select id="dbSqlHistory" title="Previous queries" aria-label="Previous queries"><option value="">history</option></select>
+                                <div class="add-type" id="dbSqlHistory">
+                                    <input type="text" role="combobox" aria-label="Previous queries" aria-autocomplete="list" aria-expanded="false" aria-controls="dbSqlHistoryList" autocomplete="off" spellcheck="false" title="Previous queries: type a few letters to find one, ↵ to load it">
+                                    <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                                    <div class="sl-menu" id="dbSqlHistoryList" role="listbox" aria-label="Previous queries" style="display: none;"></div>
+                                </div>
                                 <button type="button" class="pill primary" id="btnDbRun">run <span class="db-kbd">⌘↵</span></button>
                             </div>
                         </div>
@@ -10135,7 +10153,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <input id="userAddLogin" type="text" placeholder="username (optional)" title="Left blank, the part of the email before the @" maxlength="60" spellcheck="false" autocomplete="off" aria-label="The new user's username">
                     <input id="userAddName" type="text" placeholder="name (optional)" maxlength="191" spellcheck="false" autocomplete="off" aria-label="The new user's name">
                     <div class="add-type st-role" id="userRole">
-                        <input type="text" id="userRoleInput" role="combobox" aria-label="The new user's role" aria-autocomplete="list" aria-expanded="false" aria-controls="userRoleList" autocomplete="off" spellcheck="false" title="The new user's role: type a few letters, ↑↓ to choose, ↵ to pick">
+                        <input type="text" role="combobox" aria-label="The new user's role" aria-autocomplete="list" aria-expanded="false" aria-controls="userRoleList" autocomplete="off" spellcheck="false" title="The new user's role: type a few letters, ↑↓ to choose, ↵ to pick">
                         <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
                         <div class="sl-menu" id="userRoleList" role="listbox" aria-label="Roles" style="display: none;"></div>
                     </div>
@@ -10586,6 +10604,128 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         const $id = (id) => document.getElementById(id);
         const show = (el, on) => { if (el) el.style.display = on ? '' : 'none'; };
 
+        // A field that completes from a list: the dashboard's own <select>.
+        // A few letters narrow it (a word of the name first, then anywhere),
+        // ↑↓ move, ↵ or Tab pick, Esc puts the field back. The markup is a
+        // .add-type holding an input[role=combobox], the chevron and an
+        // .sl-menu[role=listbox]. opts:
+        //   items()      [{id, label, hint?, dot?, words?, disabled?}]
+        //   value()      the id the closed field shows (null for an action list)
+        //   pick(id)     called with the id chosen
+        //   free(q)      an item for typed text the list doesn't hold, or null
+        //   empty(q)     the line shown when nothing matches
+        //   placeholder  what an empty closed field says
+        //   action       picking runs something, so leaving the field never picks
+        const combo = (rootId, opts) => {
+            const root = $id(rootId), input = root.querySelector('input'), list = root.querySelector('.sl-menu');
+            const st = { open: false, q: '', index: 0 };
+            const esc = (v) => String(v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+            const words = (x) => (x.words || []).concat(x.label.toLowerCase().split(/\s+/), String(x.id).toLowerCase().split(/[\s_-]+/));
+            const matches = () => {
+                const all = opts.items(), q = st.q.trim().toLowerCase();
+                if (!q) return all;
+                const starts = all.filter(x => words(x).some(w => w.startsWith(q)));
+                // A name that starts with it first: "sub" is Subscriber, then EDD Subscriber.
+                starts.sort((a, b) => b.label.toLowerCase().startsWith(q) - a.label.toLowerCase().startsWith(q));
+                const found = starts.concat(all.filter(x => !starts.includes(x) && (x.label.toLowerCase().includes(q) || String(x.id).toLowerCase().includes(q))));
+                const extra = opts.free && !all.some(x => x.label.toLowerCase() === q) ? opts.free(st.q.trim()) : null;
+                return extra ? [extra].concat(found) : found;
+            };
+            // Moves the highlight by d (0: onto the first that can be picked).
+            const step = (d) => {
+                const m = matches();
+                if (!m.length) return;
+                let i = d ? st.index : -1, tries = m.length;
+                do { i = (i + (d || 1) + m.length) % m.length; } while (m[i].disabled && --tries > 0);
+                st.index = i;
+            };
+            const render = () => {
+                const all = opts.items(), v = opts.value();
+                const current = all.find(x => x.id === v);
+                const shown = current ? current.label : (v == null ? '' : String(v));
+                show(list, st.open);
+                root.classList.toggle('is-open', st.open);
+                input.setAttribute('aria-expanded', st.open ? 'true' : 'false');
+                input.placeholder = (st.open && shown) || opts.placeholder || '';
+                if (!st.open) {
+                    input.value = shown;
+                    input.removeAttribute('aria-activedescendant');
+                    return;
+                }
+                const m = matches();
+                st.index = Math.max(0, Math.min(st.index, m.length - 1));
+                list.innerHTML = m.length
+                    ? m.map((x, i) => '<button type="button" role="option" tabindex="-1" id="' + rootId + '-opt-' + i + '" data-i="' + i + '"' + (i === st.index ? ' class="is-active"' : '') + ' aria-selected="' + (x.id === v) + '"' + (x.disabled ? ' disabled' : '') + '><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg>' + (x.dot ? '<i class="sl-tdot ' + x.dot + '" aria-hidden="true"></i>' : '') + esc(x.label) + (x.hint ? '<small>' + esc(x.hint) + '</small>' : '') + '</button>').join('')
+                    : '<div class="add-type-empty">' + esc(opts.empty ? opts.empty(st.q.trim()) : 'nothing matches') + '</div>';
+                const active = list.querySelector('.is-active');
+                if (!active) { input.removeAttribute('aria-activedescendant'); return; }
+                input.setAttribute('aria-activedescendant', active.id);
+                // Keep the highlight in view as ↑↓ move it through a long list.
+                if (active.offsetTop < list.scrollTop) list.scrollTop = active.offsetTop - 4;
+                else if (active.offsetTop + active.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = active.offsetTop + active.offsetHeight - list.clientHeight + 4;
+            };
+            // Opening empties the field, with the current choice as its
+            // placeholder, so the first letter typed starts the search.
+            const open = () => {
+                const all = opts.items();
+                Object.assign(st, { open: true, q: '', index: Math.max(0, all.findIndex(x => x.id === opts.value())) });
+                if (all[st.index] && all[st.index].disabled) step(0);
+                input.value = '';
+                list.scrollTop = 0;
+                render();
+            };
+            const close = () => { st.open = false; st.q = ''; render(); };
+            const choose = (x) => {
+                if (!x || x.disabled) return false;
+                st.open = false;
+                st.q = '';
+                opts.pick(x.id);
+                render();
+                return true;
+            };
+            input.addEventListener('focus', open);
+            input.addEventListener('click', () => { if (!st.open) open(); });
+            input.addEventListener('input', () => {
+                Object.assign(st, { open: true, q: input.value });
+                step(0);
+                render();
+            });
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    if (!st.open) { open(); return; }
+                    step(e.key === 'ArrowDown' ? 1 : -1);
+                    render();
+                } else if (e.key === 'Enter' || e.key === 'Tab') {
+                    // A closed field lets Enter submit the form as usual.
+                    if (!st.open) return;
+                    if (e.key === 'Enter') e.preventDefault();
+                    if (!choose(matches()[st.index])) close();
+                } else if (e.key === 'Escape' && st.open) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    close();
+                }
+            });
+            // Leaving the field with something typed picks what it highlights
+            // (a whole name first), as ↵ would, so a click on the form's
+            // button mid-search uses the choice on screen. An action list
+            // only closes.
+            input.addEventListener('blur', () => {
+                if (!st.open) return;
+                const q = st.q.trim().toLowerCase(), m = matches();
+                const x = q && !opts.action && (m.find(y => y.label.toLowerCase() === q || String(y.id).toLowerCase() === q) || m[st.index]);
+                if (!choose(x)) close();
+            });
+            // Keep the field focused while an option is clicked.
+            list.addEventListener('mousedown', (e) => e.preventDefault());
+            list.addEventListener('click', (e) => {
+                const b = e.target.closest('[data-i]');
+                if (b && !b.disabled) choose(matches()[Number(b.dataset.i)]);
+            });
+            return { render, input, get isOpen() { return st.open; } };
+        };
+
         const app = {
             // Respect the OS theme preference on first visit, dark otherwise.
             // themePref is what the user chose ('light' | 'dark' | 'system');
@@ -10650,8 +10790,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             phpApplying: {},
             // kind: wordpress | plain | minn | laravel (the add form's type field).
             newSite: { name: '', kind: 'wordpress', wpVersion: 'latest', database: 'sqlite', from: '', isLoading: false },
-            addType: { open: false, q: '', index: 0 },
-            userRole: { open: false, q: '', index: 0, value: 'administrator' },
+            userRole: { value: 'administrator' },
             minnRelease: null,
             // Populated lazily the first time the add row opens — no reason
             // to hit wp.org on a page load that never creates a site. Stays
@@ -11234,8 +11373,6 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.render();
                 });
                 this.bindAddType();
-                $id('wpVersionSelect').addEventListener('change', (e) => { this.newSite.wpVersion = e.target.value; this.renderChrome(); });
-                $id('laravelDbSelect').addEventListener('change', (e) => { this.newSite.database = e.target.value; this.renderChrome(); });
                 // An existing project brings its own database unless one is
                 // picked; a new app starts on SQLite.
                 $id('laravelFrom').addEventListener('input', (e) => {
@@ -11243,7 +11380,6 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.newSite.from = e.target.value.trim();
                     if (!had && this.newSite.from && this.newSite.database === 'sqlite') this.newSite.database = '';
                     if (had && !this.newSite.from && this.newSite.database === '') this.newSite.database = 'sqlite';
-                    $id('laravelDbSelect').value = this.newSite.database;
                     this.renderChrome();
                 });
                 $id('addForm').addEventListener('submit', (e) => { e.preventDefault(); this.addSite(); });
@@ -11488,16 +11624,13 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 show(addRow, this.adding);
                 addRow.classList.toggle('is-creating', this.newSite.isLoading);
                 $id('newSiteName').disabled = this.newSite.isLoading;
-                $id('addTypeInput').disabled = this.newSite.isLoading;
-                this.renderAddType();
                 // WordPress asks which version; Laravel, which database.
                 const kind = this.newSite.kind;
-                const sel = $id('wpVersionSelect');
-                show(sel, kind === 'wordpress');
-                sel.disabled = this.newSite.isLoading;
                 const isLaravel = kind === 'laravel';
-                show($id('laravelDbSelect'), isLaravel);
-                $id('laravelDbSelect').disabled = this.newSite.isLoading;
+                show($id('wpVersion'), kind === 'wordpress');
+                show($id('laravelDb'), isLaravel);
+                for (const c of [this.addTypeCombo, this.wpVersionCombo, this.laravelDbCombo]) if (c) c.input.disabled = this.newSite.isLoading;
+                this.renderAddFields();
                 // Laravel or plain can start from an existing app.
                 const fromInput = $id('laravelFrom');
                 show(fromInput, isLaravel || kind === 'plain');
@@ -11507,7 +11640,6 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     ? 'Empty for a new app. A git URL is cloned, a folder copied or an archive unpacked, then its packages installed, its database made and migrated, and its front end built'
                     : 'Empty for a static site. A git URL is cloned, a folder copied, a .zip, .tar.gz, .tgz or .tar (a file or an https:// link) unpacked, and its public/ served. Nothing in it is run';
                 fromInput.setAttribute('aria-label', isLaravel ? 'An existing Laravel project: a git URL, a folder or an archive' : 'An existing app: a git URL, a folder or an archive');
-                $id('laravelDbOwn').hidden = !this.newSite.from;
                 $id('btnCreate').disabled = !this.newSite.name || this.newSite.isLoading;
                 show($id('createSpinner'), this.newSite.isLoading);
                 $id('createLabel').textContent = this.newSite.isLoading ? 'creating…' : (this.importFile ? 'create & import' : 'create');
@@ -12367,16 +12499,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     const res = await fetch('/api.php?action=wp_versions');
                     const data = await res.json();
                     if (Array.isArray(data)) {
+                        // 'latest' and 'nightly' come first; real versions after.
                         this.wpVersions = data;
-                        // 'latest' and 'nightly' are hard-coded first options;
-                        // real versions append after them.
-                        const sel = $id('wpVersionSelect');
-                        for (const v of data) {
-                            const opt = document.createElement('option');
-                            opt.value = v.version;
-                            opt.textContent = v.version + (v.status === 'insecure' ? ' — insecure' : '');
-                            sel.appendChild(opt);
-                        }
+                        if (this.wpVersionCombo && this.wpVersionCombo.isOpen) this.wpVersionCombo.render();
                     }
                 } catch (e) { /* offline — 'latest' still works */ }
             },
@@ -12392,13 +12517,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     const data = await res.json();
                     this.minnRelease = { available: !!(data && data.available), version: (data && data.version) || null };
                 } catch (e) { this.minnRelease = { available: false, version: null }; /* offline — WordPress still works */ }
-                if (this.addType.open) this.renderAddType();
+                if (this.addTypeCombo && this.addTypeCombo.isOpen) this.addTypeCombo.render();
             },
 
-            // --- The add form's site type -----------------------------------
-            // A field that completes from the kinds `cove add` makes, WordPress
-            // by default: a few letters (or wp, static) narrow the list, ↑↓
-            // move, ↵ or Tab pick, Esc puts the field back. Minn Engine can be
+            // --- The add form's fields -------------------------------------
+            // The site type completes from the kinds `cove add` makes,
+            // WordPress by default (wp or static find theirs too). Minn can be
             // picked once it has a release, as `cove add --minn` needs one.
             get siteKinds() {
                 const m = this.minnRelease;
@@ -12410,116 +12534,52 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 ];
             },
 
-            // Kinds a word of which starts with the typed text come first
-            // ("la" is Laravel before pLAin), then any that merely contain it.
-            addTypeMatches() {
-                const q = this.addType.q.trim().toLowerCase();
-                if (!q) return this.siteKinds;
-                const starts = this.siteKinds.filter(k => k.words.some(w => w.startsWith(q)));
-                return starts.concat(this.siteKinds.filter(k => !starts.includes(k) && k.label.toLowerCase().includes(q)));
+            // WordPress: latest, nightly, the versions wordpress.org lists,
+            // or any other typed in (`cove add` takes x.y, x.y.z or x.y-RC1).
+            get wpVersionChoices() {
+                const latest = this.wpVersions.find(v => v.status === 'latest');
+                return [
+                    { id: 'latest', label: 'latest', hint: latest ? latest.version : 'the newest release' },
+                    { id: 'nightly', label: 'nightly', hint: 'development build' },
+                ].concat(this.wpVersions.map(v => ({ id: v.version, label: v.version, hint: v.status === 'insecure' ? 'insecure' : '' })));
             },
 
-            // Moves the highlight by step (0: onto the first that can be picked).
-            addTypeStep(step) {
-                const kinds = this.addTypeMatches(), t = this.addType;
-                if (!kinds.length) return;
-                let i = step ? t.index : -1, tries = kinds.length;
-                do { i = (i + (step || 1) + kinds.length) % kinds.length; } while (kinds[i].disabled && --tries > 0);
-                t.index = i;
-            },
-
-            // Opening empties the field, with the current type as its
-            // placeholder, so the first letter typed starts the search.
-            openAddType() {
-                const t = this.addType, input = $id('addTypeInput');
-                t.open = true;
-                t.q = '';
-                t.index = Math.max(0, this.siteKinds.findIndex(k => k.id === this.newSite.kind));
-                input.value = '';
-                this.renderAddType();
-            },
-
-            closeAddType() {
-                this.addType.open = false;
-                this.addType.q = '';
-                this.renderAddType();
-            },
-
-            pickAddType(id) {
-                const k = this.siteKinds.find(x => x.id === id);
-                if (!k || k.disabled) return false;
-                this.newSite.kind = id;
-                this.addType.open = false;
-                this.addType.q = '';
-                this.render();
-                return true;
-            },
-
-            renderAddType() {
-                const t = this.addType, input = $id('addTypeInput'), list = $id('addTypeList');
-                const current = this.siteKinds.find(k => k.id === this.newSite.kind);
-                show(list, t.open);
-                $id('addType').classList.toggle('is-open', t.open);
-                input.setAttribute('aria-expanded', t.open ? 'true' : 'false');
-                input.placeholder = t.open && current ? current.label : '';
-                if (!t.open) {
-                    input.value = current ? current.label : '';
-                    input.removeAttribute('aria-activedescendant');
-                    return;
-                }
-                const kinds = this.addTypeMatches();
-                t.index = Math.max(0, Math.min(t.index, kinds.length - 1));
-                list.innerHTML = kinds.length
-                    ? kinds.map((k, i) => '<button type="button" role="option" tabindex="-1" id="addTypeOpt-' + k.id + '" data-kind="' + k.id + '"' + (i === t.index ? ' class="is-active"' : '') + ' aria-selected="' + (k.id === this.newSite.kind) + '"' + (k.disabled ? ' disabled' : '') + '><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg><i class="sl-tdot ' + k.dot + '" aria-hidden="true"></i>' + k.label + '<small>' + this.escapeHtml(k.hint) + '</small></button>').join('')
-                    : '<div class="add-type-empty">no such type: wordpress, plain, minn or laravel</div>';
-                if (kinds[t.index]) input.setAttribute('aria-activedescendant', 'addTypeOpt-' + kinds[t.index].id);
-                else input.removeAttribute('aria-activedescendant');
+            // Laravel: an existing project may keep the database it names.
+            get laravelDbChoices() {
+                return (this.newSite.from ? [{ id: '', label: 'its own db', hint: 'whatever its .env names' }] : []).concat([
+                    { id: 'sqlite', label: 'sqlite', hint: "Laravel's default" },
+                    { id: 'mysql', label: 'mysql', hint: "on Cove's MariaDB" },
+                    { id: 'pgsql', label: 'pgsql', hint: 'PostgreSQL, set up on first use' },
+                ]);
             },
 
             bindAddType() {
-                const input = $id('addTypeInput'), list = $id('addTypeList');
-                input.addEventListener('focus', () => this.openAddType());
-                input.addEventListener('click', () => { if (!this.addType.open) this.openAddType(); });
-                input.addEventListener('input', () => {
-                    this.addType.open = true;
-                    this.addType.q = input.value;
-                    this.addTypeStep(0);
-                    this.renderAddType();
+                this.addTypeCombo = combo('addType', {
+                    items: () => this.siteKinds,
+                    value: () => this.newSite.kind,
+                    pick: (id) => { this.newSite.kind = id; this.render(); },
+                    empty: () => 'no such type: wordpress, plain, minn or laravel',
                 });
-                input.addEventListener('keydown', (e) => {
-                    const t = this.addType;
-                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-                        e.preventDefault();
-                        if (!t.open) { this.openAddType(); return; }
-                        this.addTypeStep(e.key === 'ArrowDown' ? 1 : -1);
-                        this.renderAddType();
-                    } else if (e.key === 'Enter' || e.key === 'Tab') {
-                        // A closed field lets Enter submit the form as usual.
-                        if (!t.open) return;
-                        const k = this.addTypeMatches()[t.index];
-                        if (e.key === 'Enter') e.preventDefault();
-                        if (k && !k.disabled) this.pickAddType(k.id);
-                        else if (e.key === 'Tab') this.closeAddType();
-                    } else if (e.key === 'Escape' && t.open) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        this.closeAddType();
-                    }
+                this.wpVersionCombo = combo('wpVersion', {
+                    items: () => this.wpVersionChoices,
+                    value: () => this.newSite.wpVersion,
+                    pick: (id) => { this.newSite.wpVersion = id; this.renderChrome(); },
+                    free: (q) => /^\d+(\.\d+){1,2}(-[A-Za-z0-9.]+)?$/.test(q) ? { id: q, label: q, hint: 'not in the list' } : null,
+                    empty: (q) => 'no version “' + q + '”',
                 });
-                // Leaving the field: a whole name typed counts as picked.
-                input.addEventListener('blur', () => {
-                    const t = this.addType;
-                    if (!t.open) return;
-                    const q = t.q.trim().toLowerCase();
-                    const k = q && this.siteKinds.find(x => !x.disabled && (x.label.toLowerCase() === q || x.words.includes(q)));
-                    if (!k || !this.pickAddType(k.id)) this.closeAddType();
+                this.laravelDbCombo = combo('laravelDb', {
+                    items: () => this.laravelDbChoices,
+                    value: () => this.newSite.database,
+                    pick: (id) => { this.newSite.database = id; this.renderChrome(); },
+                    empty: () => 'sqlite, mysql or pgsql',
                 });
-                // Keep the field focused while an option is clicked.
-                list.addEventListener('mousedown', (e) => e.preventDefault());
-                list.addEventListener('click', (e) => {
-                    const b = e.target.closest('[data-kind]');
-                    if (b && !b.disabled) this.pickAddType(b.dataset.kind);
-                });
+            },
+
+            renderAddFields() {
+                if (!this.addTypeCombo) return;
+                this.addTypeCombo.render();
+                this.wpVersionCombo.render();
+                this.laravelDbCombo.render();
             },
 
             // --- The add-user form's role (WordPress) -----------------------
@@ -12535,116 +12595,21 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     .map(r => ({ id: String(r.role), label: String(r.name || r.role) }));
             },
 
-            userRoleMatches() {
-                const q = this.userRole.q.trim().toLowerCase();
-                const roles = this.userRoles;
-                if (!q) return roles;
-                const words = (r) => r.label.toLowerCase().split(/\s+/).concat(r.id.toLowerCase().split(/[_-]+/), [r.id.toLowerCase()]);
-                const starts = roles.filter(r => words(r).some(w => w.startsWith(q)));
-                // A name that starts with it first: "sub" is Subscriber, then EDD Subscriber.
-                starts.sort((a, b) => b.label.toLowerCase().startsWith(q) - a.label.toLowerCase().startsWith(q));
-                return starts.concat(roles.filter(r => !starts.includes(r) && (r.label.toLowerCase().includes(q) || r.id.toLowerCase().includes(q))));
-            },
-
-            openUserRole() {
-                const r = this.userRole;
-                r.open = true;
-                r.q = '';
-                r.index = Math.max(0, this.userRoles.findIndex(x => x.id === r.value));
-                $id('userRoleInput').value = '';
-                this.renderUserRole();
-            },
-
-            closeUserRole() {
-                this.userRole.open = false;
-                this.userRole.q = '';
-                this.renderUserRole();
-            },
-
-            pickUserRole(id) {
-                if (!this.userRoles.some(x => x.id === id)) return false;
-                Object.assign(this.userRole, { value: id, open: false, q: '' });
-                this.renderUserRole();
-                return true;
+            bindUserRole() {
+                this.userRoleCombo = combo('userRole', {
+                    items: () => this.userRoles.map(x => ({ ...x, hint: x.id !== x.label.toLowerCase() ? x.id : '' })),
+                    value: () => this.userRole.value,
+                    pick: (id) => { this.userRole.value = id; },
+                    empty: (q) => 'no role matches “' + q + '”',
+                    placeholder: 'role',
+                });
             },
 
             renderUserRole() {
-                const r = this.userRole, input = $id('userRoleInput'), list = $id('userRoleList');
-                const roles = this.userRoles;
+                const r = this.userRole, roles = this.userRoles;
                 // A role picked on another site that this one doesn't have.
                 if (!roles.some(x => x.id === r.value)) r.value = roles.some(x => x.id === 'administrator') ? 'administrator' : (roles[0] ? roles[0].id : '');
-                const current = roles.find(x => x.id === r.value);
-                show(list, r.open);
-                $id('userRole').classList.toggle('is-open', r.open);
-                input.setAttribute('aria-expanded', r.open ? 'true' : 'false');
-                input.placeholder = r.open && current ? current.label : 'role';
-                if (!r.open) {
-                    input.value = current ? current.label : '';
-                    input.removeAttribute('aria-activedescendant');
-                    return;
-                }
-                const matches = this.userRoleMatches();
-                r.index = Math.max(0, Math.min(r.index, matches.length - 1));
-                const e = (s) => this.escapeHtml(s);
-                list.innerHTML = matches.length
-                    ? matches.map((x, i) => '<button type="button" role="option" tabindex="-1" id="userRoleOpt-' + i + '" data-role="' + e(x.id) + '"' + (i === r.index ? ' class="is-active"' : '') + ' aria-selected="' + (x.id === r.value) + '"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg>' + e(x.label) + (x.id !== x.label.toLowerCase() ? '<small>' + e(x.id) + '</small>' : '') + '</button>').join('')
-                    : '<div class="add-type-empty">no role matches “' + e(r.q.trim()) + '”</div>';
-                const active = list.querySelector('.is-active');
-                if (!active) { input.removeAttribute('aria-activedescendant'); return; }
-                input.setAttribute('aria-activedescendant', active.id);
-                // Keep the highlight in view as ↑↓ move it through a long list.
-                if (active.offsetTop < list.scrollTop) list.scrollTop = active.offsetTop - 4;
-                else if (active.offsetTop + active.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = active.offsetTop + active.offsetHeight - list.clientHeight + 4;
-            },
-
-            bindUserRole() {
-                const input = $id('userRoleInput'), list = $id('userRoleList');
-                const step = (d) => {
-                    const n = this.userRoleMatches().length;
-                    if (n) this.userRole.index = (this.userRole.index + d + n) % n;
-                };
-                input.addEventListener('focus', () => this.openUserRole());
-                input.addEventListener('click', () => { if (!this.userRole.open) this.openUserRole(); });
-                input.addEventListener('input', () => {
-                    Object.assign(this.userRole, { open: true, q: input.value, index: 0 });
-                    this.renderUserRole();
-                });
-                input.addEventListener('keydown', (e) => {
-                    const r = this.userRole;
-                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-                        e.preventDefault();
-                        if (!r.open) { this.openUserRole(); return; }
-                        step(e.key === 'ArrowDown' ? 1 : -1);
-                        this.renderUserRole();
-                    } else if (e.key === 'Enter' || e.key === 'Tab') {
-                        // A closed field lets Enter submit the form as usual.
-                        if (!r.open) return;
-                        const m = this.userRoleMatches()[r.index];
-                        if (e.key === 'Enter') e.preventDefault();
-                        if (!m || !this.pickUserRole(m.id)) this.closeUserRole();
-                    } else if (e.key === 'Escape' && r.open) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        this.closeUserRole();
-                    }
-                });
-                // Leaving the field with something typed picks what it
-                // highlights (a whole name or slug first), as ↵ would; a
-                // click on add user mid-search then adds the role shown, never
-                // a silent Administrator.
-                input.addEventListener('blur', () => {
-                    const r = this.userRole;
-                    if (!r.open) return;
-                    const q = r.q.trim().toLowerCase();
-                    const m = q && (this.userRoles.find(x => x.label.toLowerCase() === q || x.id.toLowerCase() === q) || this.userRoleMatches()[r.index]);
-                    if (!m || !this.pickUserRole(m.id)) this.closeUserRole();
-                });
-                // Keep the field focused while an option is clicked.
-                list.addEventListener('mousedown', (e) => e.preventDefault());
-                list.addEventListener('click', (e) => {
-                    const b = e.target.closest('[data-role]');
-                    if (b) this.pickUserRole(b.dataset.role);
-                });
+                if (this.userRoleCombo) this.userRoleCombo.render();
             },
 
             formatSize(bytes) {
@@ -14006,9 +13971,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 show($id('dbGridWrap'), d.part === 'rows');
                 show($id('dbStructure'), d.part === 'structure');
                 // Column picker for the filter
-                const sel = $id('dbRowsCol');
-                const want = ['<option value="">any column</option>'].concat(r.columns.map(c => '<option value="' + this.escapeHtml(c.name) + '"' + (r.col === c.name ? ' selected' : '') + '>' + this.escapeHtml(c.name) + '</option>')).join('');
-                if (sel.innerHTML !== want) sel.innerHTML = want;
+                this.dbColCombo.render();
                 const note = $id('dbRowsNote');
                 if (d.part === 'rows') {
                     note.textContent = r.error ? r.error : (!r.pk.length && r.columns.length ? 'read-only — no primary key' : (r.columns.length ? 'double-click a cell to edit' : ''));
@@ -14082,9 +14045,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (this.view !== 'db' || !d.sql) return;
                 $id('dbSqlNote').textContent = d.name ? 'runs against ' + d.name : 'no database selected — qualify tables as database.table';
                 const hist = this.dbHistory;
-                const sel = $id('dbSqlHistory');
-                sel.innerHTML = '<option value="">history</option>' + hist.map((h, i) => '<option value="' + i + '">' + esc(h.replace(/\s+/g, ' ').slice(0, 60)) + '</option>').join('');
-                sel.disabled = hist.length === 0;
+                this.dbHistoryCombo.input.disabled = hist.length === 0;
+                this.dbHistoryCombo.render();
                 const run = $id('btnDbRun');
                 run.disabled = c.running;
                 run.innerHTML = c.running ? 'running…' : 'run <span class="db-kbd">⌘↵</span>';
@@ -14176,7 +14138,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     if (e.key === 'Enter') { e.preventDefault(); clearTimeout(this.db.rows.timer); this.loadDbRows(); }
                     if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.db.rows.q = ''; rowsFilter.value = ''; rowsFilter.blur(); this.db.rows.start = 0; this.loadDbRows(); }
                 });
-                $id('dbRowsCol').addEventListener('change', (e) => { this.db.rows.col = e.target.value; if (this.db.rows.q) { this.db.rows.start = 0; this.loadDbRows(); } });
+                this.dbColCombo = combo('dbRowsCol', {
+                    items: () => [{ id: '', label: 'any column' }].concat(this.db.rows.columns.map(c => ({ id: c.name, label: c.name, hint: c.type }))),
+                    value: () => this.db.rows.col,
+                    pick: (id) => { this.db.rows.col = id; if (this.db.rows.q) { this.db.rows.start = 0; this.loadDbRows(); } },
+                    empty: (q) => 'no column “' + q + '”',
+                });
                 $id('btnDbRowsRefresh').addEventListener('click', () => { this.db.structure = null; this.loadDbRows(); });
                 $id('btnDbNewer').addEventListener('click', () => this.dbPage(-1));
                 $id('btnDbOlder').addEventListener('click', () => this.dbPage(1));
@@ -14218,11 +14185,18 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
                 $id('btnDbRun').addEventListener('click', () => this.runDbSql());
                 $id('dbSqlText').addEventListener('input', (e) => { this.db.console.text = e.target.value; });
-                $id('dbSqlHistory').addEventListener('change', (e) => {
-                    const h = this.dbHistory[Number(e.target.value)];
-                    if (h !== undefined) { $id('dbSqlText').value = h; this.db.console.text = h; }
-                    e.target.value = '';
-                    $id('dbSqlText').focus();
+                // Searches every word of the queries, not just what fits on a line.
+                this.dbHistoryCombo = combo('dbSqlHistory', {
+                    items: () => this.dbHistory.map((h, i) => ({ id: String(i), label: h.replace(/\s+/g, ' ').slice(0, 60), words: h.toLowerCase().split(/[\s,()=.`'"]+/) })),
+                    value: () => null,
+                    pick: (id) => {
+                        const h = this.dbHistory[Number(id)];
+                        if (h !== undefined) { $id('dbSqlText').value = h; this.db.console.text = h; }
+                        $id('dbSqlText').focus();
+                    },
+                    empty: (q) => 'no query has “' + q + '”',
+                    placeholder: 'history',
+                    action: true,
                 });
             },
 
@@ -18464,9 +18438,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.newSite.name = '';
                     $id('newSiteName').value = '';
                     this.newSite.wpVersion = 'latest';
-                    $id('wpVersionSelect').value = 'latest';
                     this.newSite.database = 'sqlite';
-                    $id('laravelDbSelect').value = 'sqlite';
                     this.newSite.from = '';
                     $id('laravelFrom').value = '';
                     this.adding = false;
