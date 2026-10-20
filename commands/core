@@ -305,16 +305,7 @@ cove_core() {
             fi
             ;;
         *)
-            echo "Usage: cove core <check|update>"
-            echo ""
-            echo "  cove core check                    Report the WordPress version of every site."
-            echo "  cove core update <site> [version]  Update one site to the latest, or to a version."
-            echo "  cove core update --all             Update every site that is behind."
-            echo ""
-            echo "Flags:"
-            echo "  --all          Apply to every WordPress site."
-            echo "  --dry-run      List what would change without touching anything."
-            echo "  --yes, -y      Skip the confirmation prompt."
+            cove_unknown_subcommand core "$sub" "check update"
             ;;
     esac
 }

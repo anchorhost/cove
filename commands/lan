@@ -318,16 +318,7 @@ cove_lan() {
             cove_lan_trust "$@"
             ;;
         *)
-            echo "Usage: cove lan <subcommand>"
-            echo ""
-            echo "Manage LAN access to Cove sites for mobile app sync."
-            echo ""
-            echo "Subcommands:"
-            echo "  enable <site>    Enable LAN access for a site"
-            echo "  disable <site>   Disable LAN access for a site"
-            echo "  status           Show which sites have LAN access enabled"
-            echo "  trust            Instructions for trusting Caddy's CA on mobile"
-            exit 0
+            cove_unknown_subcommand lan "$action" "enable disable status trust"
             ;;
     esac
 }

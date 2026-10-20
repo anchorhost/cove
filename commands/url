@@ -9,8 +9,8 @@ cove_url() {
     #  Basic validation – the command requires exactly one argument.
     # -------------------------------------------------------------
     if [ -z "$site_name" ]; then
-        gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove url <site>"
+        gum style --foreground red "❌ Error: A site name is required." >&2
+        echo "Usage: cove url <site>" >&2
         exit 1
     fi
 

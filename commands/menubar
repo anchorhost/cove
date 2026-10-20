@@ -318,30 +318,22 @@ cove_menubar() {
         disable)
             cove_menubar_disable
             ;;
-        *)
-            echo "Usage: cove menubar <subcommand>"
-            echo ""
-            echo "Manage the menu bar companion app (a native menu bar app on macOS,"
-            echo "a system tray app on Linux desktops). Shows service status at a"
-            echo "glance and can start/stop Cove, open or log in to sites, and open"
-            echo "the Dashboard, Adminer, Mailpit, and logs."
-            echo ""
-            echo "Subcommands:"
-            echo "  enable     Build, install, and launch the menu bar app (also updates it)"
-            echo "  disable    Quit and remove the menu bar app"
-            echo ""
+        "")
+            # The help, then whether the app is on now.
+            display_command_help menubar
             if [ "$OS" == "macos" ] || { [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; }; then
                 local installed
                 installed=$(menubar_installed_version)
+                echo ""
                 if menubar_is_enabled; then
                     echo "Currently: enabled (v${installed:-unknown})"
                 else
                     echo "Currently: disabled"
                 fi
-                echo ""
             fi
-            echo "Once enabled, 'cove upgrade' keeps the app up to date automatically."
-            exit 0
+            ;;
+        *)
+            cove_unknown_subcommand menubar "$action" "enable disable"
             ;;
     esac
 }

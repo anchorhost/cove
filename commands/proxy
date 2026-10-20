@@ -243,28 +243,7 @@ cove_proxy() {
             cove_proxy_delete "$@"
             ;;
         *)
-            echo "Usage: cove proxy <subcommand>"
-            echo ""
-            echo "Manage standalone reverse proxy entries in the Caddyfile."
-            echo "These are top-level server blocks, useful for exposing local services"
-            echo "via Tailscale or other external domains."
-            echo ""
-            echo "Subcommands:"
-            echo "  add <name> <domain> <target>   Add a new reverse proxy entry"
-            echo "  list                           List all proxy entries"
-            echo "  delete <name>                  Delete a proxy entry"
-            echo ""
-            echo "Flags:"
-            echo "  --no-tls   Disable TLS for this proxy (add only)"
-            echo "  --force    Skip confirmation prompts (add overwrite, delete)"
-            echo ""
-            echo "Examples:"
-            echo "  cove proxy add opencode myhost.tailnet.ts.net 127.0.0.1:4096"
-            echo "  cove proxy add api api.example.com localhost:3000 --no-tls"
-            echo "  cove proxy add api api.example.com localhost:3000 --force"
-            echo "  cove proxy list"
-            echo "  cove proxy delete opencode --force"
-            exit 0
+            cove_unknown_subcommand proxy "$action" "add list ls delete rm"
             ;;
     esac
 }

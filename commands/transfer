@@ -1567,9 +1567,7 @@ cove_transfer() {
             transfer_local probe "$target" ${extra[@]+"${extra[@]}"}
             ;;
         *)
-            echo "Usage: cove transfer probe [site] [--tenant=<id>]"
-            echo ""
-            echo "Reports which tools the backup/restore engine will use here."
+            cove_unknown_subcommand transfer "$sub" "probe"
             ;;
     esac
 }

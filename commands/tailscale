@@ -156,29 +156,7 @@ cove_tailscale() {
             cove_tailscale_status
             ;;
         *)
-            echo "Usage: cove tailscale <subcommand>"
-            echo ""
-            echo "Expose all Cove sites to your Tailscale network via port-based routing."
-            echo "This allows devices on your Tailnet (like your iPhone) to access"
-            echo "your local development sites."
-            echo ""
-            echo "Your Tailscale hostname is automatically detected when you run 'enable'."
-            echo "Each site gets a unique port (starting at 9001), so you can access them at:"
-            echo "  https://<your-tailscale-hostname>:<port>"
-            echo ""
-            echo "Subcommands:"
-            echo "  enable     Enable Tailscale access (auto-detects hostname)."
-            echo "             --dashboard also shares the Cove dashboard and Adminer,"
-            echo "             which can run commands on this machine."
-            echo "  disable    Disable Tailscale access"
-            echo "  status     Show current Tailscale configuration and URLs"
-            echo ""
-            echo "Examples:"
-            echo "  cove tailscale enable"
-            echo "  cove tailscale enable --dashboard"
-            echo "  cove tailscale status"
-            echo "  cove tailscale disable"
-            exit 0
+            cove_unknown_subcommand tailscale "$action" "enable disable status"
             ;;
     esac
 }

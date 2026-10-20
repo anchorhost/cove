@@ -3440,12 +3440,100 @@ site_kind_label() {
 # The error for a site a command can't use, then exit 1: there's none by
 # that name (and here's how to see what there is), or it's of another kind
 # than the command works on ($2, e.g. "WordPress"; empty for any site).
+# On stderr, so `cd "$(cove path typo)"` and a --format=json reader never
+# take it for the answer.
 site_not_found() {
-    local name="${1%.localhost}" want="${2:-}"
+    local name="${1%.localhost}" want="${2:-}" close d
     if [ -n "$want" ] && validate_site_name "$name" && [ -d "$SITES_DIR/$name.localhost" ]; then
-        gum style --foreground red "❌ Error: '$name.localhost' is a $(site_kind_label "$name") site; this works on $want sites."
+        gum style --foreground red "❌ Error: '$name.localhost' is a $(site_kind_label "$name") site; this works on $want sites." >&2
     else
-        gum style --foreground red "❌ Error: There's no site named '$name.localhost'." "See your sites with: cove list"
+        local names=()
+        for d in "$SITES_DIR"/*.localhost; do [ -d "$d" ] && names+=("$(basename "$d" .localhost)"); done
+        close=$(cove_closest "$name" ${names[@]+"${names[@]}"} | sed 's/$/.localhost/' | paste -sd, - | sed 's/,/, /g')
+        if [ -n "$close" ]; then
+            gum style --foreground red "❌ Error: There's no site named '$name.localhost'." "Did you mean: $close" >&2
+        else
+            gum style --foreground red "❌ Error: There's no site named '$name.localhost'." "See your sites with: cove list" >&2
+        fi
+    fi
+    exit 1
+}
+
+# Every command `cove` takes, for suggesting one when a name is mistyped.
+COVE_COMMANDS="add artisan backup clone composer core db delete demo directive disable enable health help history import install lan laravel list log login mappings mcp memory menubar network opcache path php ports postgres proxy pull push redis reload rename screenshot share signals snapshot status tailscale transfer trust twin uninstall upgrade url version wp wsl-hosts"
+
+# The words among $2… nearest to $1 as a slip of the keyboard would make
+# them: up to three, nearest first, one per line. Near is one edit for a word
+# of up to four letters and two for a longer one (a swapped pair of letters
+# counts as one), or a word that starts with it (three letters or more).
+cove_closest() {
+    local want="$1"
+    shift
+    [ -n "$want" ] && [ $# -gt 0 ] || return 0
+    printf '%s\n' "$@" | awk -v w="$want" '
+        function dist(a, b,    la, lb, i, j, c, t, d) {
+            la = length(a); lb = length(b)
+            for (i = 0; i <= la; i++) d[i, 0] = i
+            for (j = 0; j <= lb; j++) d[0, j] = j
+            for (i = 1; i <= la; i++) {
+                for (j = 1; j <= lb; j++) {
+                    c = (substr(a, i, 1) != substr(b, j, 1))
+                    t = d[i - 1, j] + 1
+                    if (d[i, j - 1] + 1 < t) t = d[i, j - 1] + 1
+                    if (d[i - 1, j - 1] + c < t) t = d[i - 1, j - 1] + c
+                    if (i > 1 && j > 1 && substr(a, i, 1) == substr(b, j - 1, 1) && substr(a, i - 1, 1) == substr(b, j, 1) && d[i - 2, j - 2] + 1 < t) t = d[i - 2, j - 2] + 1
+                    d[i, j] = t
+                }
+            }
+            return d[la, lb]
+        }
+        $0 != "" && $0 != w {
+            max = length(w) <= 4 ? 1 : 2
+            n = dist(w, $0)
+            if (n <= max) print n "\t" $0
+            else if (length(w) >= 3 && index($0, w) == 1) print (max + 1) "\t" $0
+        }' | sort -n -k1,1 | head -n 3 | cut -f2
+}
+
+# An error on stderr that needs no gum, for paths that run before Cove's
+# tools are known to be there.
+cove_err() {
+    if command -v gum >/dev/null 2>&1; then
+        gum style --foreground red "$1" >&2
+    else
+        echo "$1" >&2
+    fi
+    [ $# -gt 1 ] && printf '%s\n' "${@:2}" >&2
+    return 0
+}
+
+# A command `cove` doesn't have ($1): the nearest one when it's a slip, and
+# where the list is. Exits 1.
+cove_unknown_command() {
+    local close
+    close=$(cove_closest "$1" $COVE_COMMANDS | head -n 1)
+    if [ -n "$close" ]; then
+        cove_err "❌ Error: Unknown command '$1'." "Did you mean: cove $close" "See every command with: cove help"
+    else
+        cove_err "❌ Error: Unknown command '$1'." "See every command with: cove help"
+    fi
+    exit 1
+}
+
+# A subcommand of $1 that it doesn't have ($2), from the ones it does ($3, a
+# space-separated list): the nearest when it's a slip, then exit 1. None at
+# all shows the command's help instead.
+cove_unknown_subcommand() {
+    local cmd="$1" sub="$2" subs="$3" close
+    if [ -z "$sub" ]; then
+        display_command_help "$cmd"
+        exit 0
+    fi
+    close=$(cove_closest "$sub" $subs | head -n 1)
+    if [ -n "$close" ]; then
+        cove_err "❌ Error: Unknown subcommand '$sub' for cove $cmd." "Did you mean: cove $cmd $close" "See them all with: cove help $cmd"
+    else
+        cove_err "❌ Error: Unknown subcommand '$sub' for cove $cmd." "See them all with: cove help $cmd"
     fi
     exit 1
 }
@@ -19529,10 +19617,7 @@ display_command_help() {
             echo "Displays the current version of Cove."
             ;;
         *)
-            echo "Error: Unknown command '$cmd'"
-            echo ""
-            show_general_help
-            exit 1
+            cove_unknown_command "$cmd"
             ;;
     esac
 }
@@ -19822,8 +19907,7 @@ main() {
                     cove_db_fix_collation "$@"
                     ;;
                 *)
-                    display_command_help "db"
-                    exit 0
+                    cove_unknown_subcommand db "$action" "backup list fix-collation"
                     ;;
             esac
             ;;
@@ -19847,8 +19931,7 @@ main() {
                     display_command_help "directive"
                     ;;
                 *)
-                    gum style --foreground red "❌ Error: Unknown subcommand '$action'." "Use add, update, delete or list."
-                    exit 1
+                    cove_unknown_subcommand directive "$action" "add update delete list"
                     ;;
             esac
             ;;
@@ -19923,14 +20006,11 @@ main() {
             # installing has to come out too.
             cove_uninstall "$@"
             ;;
-        version)
+        version|--version|-v|-V)
             cove_version
             ;;
         *)
-            echo "Error: Unknown command '$command'"
-            echo ""
-            show_general_help
-            exit 1
+            cove_unknown_command "$command"
             ;;
     esac
 }
