@@ -11062,6 +11062,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         return;
                     }
 
+                    // The shared right-click menu, open over any view.
+                    if (e.key === 'Escape' && this.tabCtx.open) { this.closeTabCtx(); return; }
+
                     if (this.view === 'files') {
                         this.filesKeydown(e, typing);
                         return;
@@ -11069,7 +11072,6 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
                     if (this.view === 'site') {
                         if (e.key === 'Escape') {
-                            if (this.tabCtx.open) { this.closeTabCtx(); return; }
                             if (this.siteDeleteConfirm) { this.closeSiteDeleteConfirm(); return; }
                             if (this.bulkConfirm) { this.closeBulkConfirm(); return; }
                         if (this.phpModal.open) { this.closePhpModal(); return; }
@@ -13048,7 +13050,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
                 if (isDown || isUp) { e.preventDefault(); this.mailMove(isDown ? 1 : -1); return true; }
                 if (typing) return false; // the search box handles its own Esc
-                if (this.showDbModal || this.ctxMenu.open) return false;
+                if (this.showDbModal || this.ctxMenu.open || this.tabCtx.open) return false;
                 if ((e.key === 'Backspace' || e.key === 'Delete') && m.selectedId) {
                     e.preventDefault();
                     this.mailDelete([m.selectedId]);
@@ -13165,6 +13167,38 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 m.selectedId = null; m.msg = null; m.renderedId = null; m.items = [];
                 this.showSnack(q ? 'Matching mail deleted.' : 'Inbox emptied.');
                 this.loadMail();
+            },
+
+            // The right-click menu for one message in the list.
+            mailCtxItems(it) {
+                const site = this.mailSiteOf(it), from = it.From && it.From.Address;
+                const items = [
+                    { label: 'Open', key: '↵', run: () => this.openMail(it.ID) },
+                    { label: it.Read ? 'Mark as unread' : 'Mark as read', key: 'u', run: () => this.mailSetRead([it.ID], !it.Read) },
+                    { sep: true },
+                ];
+                if (site && this.mail.site !== site) items.push({ label: 'Only mail for ' + site, run: () => this.setMailSite(site) });
+                if (from) items.push({ label: 'Mail from this sender', run: () => {
+                    this.mail.query = 'from:' + from;
+                    $id('mailSearch').value = this.mail.query;
+                    this.mail.start = 0;
+                    this.loadMail();
+                } });
+                if (site && this.sites.some(x => x.name === site)) items.push({ label: 'Go to ' + site, run: () => this.openSitePage(site) });
+                if (items[items.length - 1].sep !== true) items.push({ sep: true });
+                if (from) items.push({ label: 'Copy sender', run: () => this.copyText(from, 'Sender copied') });
+                items.push({ label: 'Copy subject', run: () => this.copyText(it.Subject || '', 'Subject copied') });
+                items.push({ label: 'Download .eml', run: () => {
+                    const a = document.createElement('a');
+                    a.href = '/mail-api/v1/message/' + encodeURIComponent(it.ID) + '/raw';
+                    a.download = ((it.Subject || '').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || it.ID) + '.eml';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                } });
+                items.push({ sep: true });
+                items.push({ label: 'Delete', key: '⌫', danger: true, run: () => this.mailDelete([it.ID]) });
+                return items;
             },
 
             mailAddrLabel(a) {
@@ -13496,6 +13530,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     const chip = e.target.closest('.mail-site');
                     if (chip) { this.setMailSite(chip.textContent); return; }
                     this.openMail(row.dataset.id);
+                });
+                $id('mailList').addEventListener('contextmenu', (e) => {
+                    const row = e.target.closest('.mail-row');
+                    const it = row && this.mail.items.find(x => x.ID === row.dataset.id);
+                    if (it) this.openTabCtx(e, it.Subject || '(no subject)', this.mailCtxItems(it));
                 });
                 $id('mailParts').addEventListener('click', (e) => {
                     const b = e.target.closest('.mail-part');
