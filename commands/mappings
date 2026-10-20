@@ -84,9 +84,11 @@ cove_mappings() {
                 prune_etc_hosts "$domain"
             else
                 gum style --foreground red "❌ Error: Mapping '$domain' not found."
+                exit 1
             fi
         else
-             gum style --foreground red "❌ Error: No mappings exist for this site."
+            gum style --foreground red "❌ Error: No mappings exist for this site."
+            exit 1
         fi
         return 0
     fi

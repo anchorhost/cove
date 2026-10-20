@@ -395,4 +395,7 @@ cove_health() {
         gum style --foreground green "✅ All healthy."
     fi
     echo ""
+    # Something critical fails the command, so a script can tell; warnings
+    # alone don't.
+    [ "$crit" -eq 0 ]
 }

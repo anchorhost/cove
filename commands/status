@@ -127,5 +127,7 @@ cove_status() {
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
             "⚠️  Some services are stopped." \
             "Run 'cove enable' to start them."
+        # So a script can tell (--porcelain stays 0: the menu bar reads it).
+        return 1
     fi
 }
