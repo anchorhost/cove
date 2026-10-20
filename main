@@ -19660,12 +19660,18 @@ main() {
 
     # Check for a help flag anywhere in the arguments. For wp, artisan and
     # composer only one straight after the command is Cove's: a later one
-    # belongs to WP-CLI, Artisan or Composer (cove wp mysite plugin list --help).
+    # belongs to WP-CLI, Artisan or Composer (cove wp mysite plugin list --help),
+    # as one after `cove redis cli` or `cove postgres psql` does to those.
     local arg_index=0
     for arg in "$@"; do
         arg_index=$((arg_index + 1))
         if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
-            case "$1" in wp|artisan|composer) [ "$arg_index" -gt 2 ] && break ;; esac
+            case "$1" in
+                wp|artisan|composer) [ "$arg_index" -gt 2 ] && break ;;
+                # Past `cli` or `psql`, it's redis-cli's or psql's own.
+                redis|valkey) [ "${2:-}" = cli ] && [ "$arg_index" -gt 2 ] && break ;;
+                postgres|postgresql|pgsql) [ "${2:-}" = psql ] && [ "$arg_index" -gt 2 ] && break ;;
+            esac
             local command_for_help="$1"
             # If the command is empty or a help flag, show general help.
             if [[ -z "$command_for_help" || "$command_for_help" == "--help" || "$command_for_help" == "-h" ]]; then

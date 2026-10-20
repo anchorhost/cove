@@ -50,8 +50,9 @@ cove_postgres() {
             shift
             # Setup and start messages on stderr, apart from psql's own output.
             ensure_postgres >&2 || exit 1
-            local db="${1:-postgres}" psql
-            [ $# -gt 0 ] && shift
+            # A database first, if one is named; flags (--help, -c …) go to psql.
+            local db="postgres" psql
+            if [ $# -gt 0 ] && [[ "$1" != -* ]]; then db="$1"; shift; fi
             psql=$(cove_pg_tool psql) || exit 1
             PGPASSWORD="$(config_get PGSQL_PASSWORD)" exec "$psql" -h 127.0.0.1 -p "$(cove_pg_port)" -U "$(config_get PGSQL_USER)" -d "$db" "$@"
             ;;

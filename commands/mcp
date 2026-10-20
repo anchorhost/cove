@@ -1394,6 +1394,13 @@ cove_mcp() {
     local list=0
     [ "${1:-}" = "tools" ] && list=1
     [ "$list" = 1 ] && echo "Tools 'cove mcp' offers an agent:"
+    # Typed into a terminal, it would sit waiting for a client's JSON with
+    # no word of why; say so on stderr, which the protocol doesn't use.
+    if [ "$list" = 0 ] && [ -t 0 ]; then
+        echo "cove mcp is a server for an AI agent, and is waiting for one on stdin." >&2
+        echo "Add it to Claude Code with: claude mcp add cove -- cove mcp" >&2
+        echo "See what it offers: cove mcp tools. Press Ctrl+C to stop." >&2
+    fi
     # stdout is the protocol from here on: nothing else may write to it.
     COVE_MCP_BIN="$self" COVE_MCP_VERSION="$COVE_VERSION" COVE_MCP_DIR="$COVE_DIR" \
         COVE_MCP_SITES="$SITES_DIR" COVE_MCP_PORT_SUFFIX="$(https_port_suffix)" COVE_MCP_LIST="$list" \
