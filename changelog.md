@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [2.5] - 2026-10-20
+
+Cove runs Laravel now. `cove add myapp laravel` makes a new app the way `laravel new` does, and `cove add shop --from=<git URL, folder or zip>` sets up an existing project (packages, `.env`, database, front end) or serves any other app from its `public/`. SQLite, MariaDB or PostgreSQL, Redis, queue workers, the scheduler and Reverb are a command away, and a Laravel site's page has routes, migrations, schedule, users and artisan tabs. `cove uninstall` removes Cove and keeps your sites unless you say `--purge`, `cove opcache sites` shows what each site holds in FrankenPHP's shared cache, and the command line suggests what you meant, says what to do next and returns exit codes scripts can trust. It also fixes `cove upgrade` on Linux, which could run stray code once it had replaced itself.
 
 ### ✨ New Features
 
