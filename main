@@ -1987,9 +1987,13 @@ laravel_env_get() {
 
 # Sets keys in a Laravel site's .env. $1 is the file; COVE_ENV_SET in the
 # environment is a JSON object of key → value, where null comments the key
-# out. A commented key is uncommented, and a new one goes after the last line
-# of its group (MAIL_… after MAIL_…). Values travel by environment, never on
-# a command line, because one of them is the database password.
+# out. phpdotenv takes the last uncommented line for a key, so that is the
+# one set, and any earlier uncommented ones are commented out (null comments
+# out every one: a DATABASE_URL left live further down would point the app,
+# and its migrations, somewhere else). With no live line, a commented one is
+# uncommented, and a new key goes after the last line of its group (MAIL_…
+# after MAIL_…). Values travel by environment, never on a command line,
+# because one of them is the database password.
 laravel_env_set() {
     write_php_tools || return 1
     COVE_ENV_FILE="$1" "$COVE_TOOLS_DIR/php" -r '
@@ -2004,18 +2008,20 @@ laravel_env_set() {
         };
         foreach ($set as $key => $value) {
             $pattern = "~^\\s*(#\\s*)?" . preg_quote($key, "~") . "\\s*=~";
-            $hit = false;
+            $live = []; $commented = null;
             foreach ($lines as $i => $line) {
                 if (!preg_match($pattern, $line, $m)) continue;
-                if ($value === null) {
-                    if (empty($m[1])) $lines[$i] = "# " . ltrim($line);
-                } else {
-                    $lines[$i] = $key . "=" . $quote((string) $value);
-                }
-                $hit = true;
-                break;
+                if (empty($m[1])) $live[] = $i;
+                elseif ($commented === null) $commented = $i;
             }
-            if ($hit || $value === null) continue;
+            $last = $value === null ? null : array_pop($live);
+            foreach ($live as $i) $lines[$i] = "# " . ltrim($lines[$i]);
+            if ($value === null) continue;
+            $at = $last ?? $commented;
+            if ($at !== null) {
+                $lines[$at] = $key . "=" . $quote((string) $value);
+                continue;
+            }
             $group = preg_quote(strstr($key, "_", true) . "_", "~");
             $at = count($lines);
             foreach ($lines as $i => $line) {
@@ -3447,8 +3453,16 @@ site_not_found() {
     if [ -n "$want" ] && validate_site_name "$name" && [ -d "$SITES_DIR/$name.localhost" ]; then
         gum style --foreground red "❌ Error: '$name.localhost' is a $(site_kind_label "$name") site; this works on $want sites." >&2
     else
-        local names=()
-        for d in "$SITES_DIR"/*.localhost; do [ -d "$d" ] && names+=("$(basename "$d" .localhost)"); done
+        # While `cove demo` limits what Cove shows (~/Cove/demo, a site a
+        # line), only those sites are offered.
+        local names=() demo=""
+        [ -f "$COVE_DIR/demo" ] && demo=$'\n'"$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/\.localhost$//' "$COVE_DIR/demo")"$'\n'
+        for d in "$SITES_DIR"/*.localhost; do
+            [ -d "$d" ] || continue
+            d="${d##*/}"; d="${d%.localhost}"
+            if [ -n "$demo" ]; then case "$demo" in *$'\n'"$d"$'\n'*) ;; *) continue ;; esac; fi
+            names+=("$d")
+        done
         close=$(cove_closest "$name" ${names[@]+"${names[@]}"} | sed 's/$/.localhost/' | paste -sd, - | sed 's/,/, /g')
         if [ -n "$close" ]; then
             gum style --foreground red "❌ Error: There's no site named '$name.localhost'." "Did you mean: $close" >&2
@@ -4876,6 +4890,53 @@ function cove_laravel_mtime($site_path) {
     return $t ?: null;
 }
 
+// `cove artisan` or `cove wp` for the dashboard, with no shell in between:
+// the output (stderr with stdout), the exit code, and why it was stopped
+// ('time' or 'size', else false). With $limit (seconds) it is stopped when
+// that runs out, since a command that waits on a terminal or runs until
+// stopped (a custom one, or one the consoles' lists miss) would otherwise
+// hold a PHP worker for good. macOS has no `timeout`, so the deadline is
+// kept here, and the whole tree is stopped: cove hands off to php, which
+// may start children of its own.
+function cove_run_limited(array $argv, array $env, $limit = 0) {
+    $proc = proc_open($argv, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes, null, $env);
+    if (!is_resource($proc)) return ['Could not run cove.', 127, false];
+    stream_set_blocking($pipes[1], false);
+    $out = '';
+    $stopped = false;
+    $deadline = $limit > 0 ? microtime(true) + $limit : null;
+    while (!feof($pipes[1])) {
+        $left = $deadline === null ? 60 : $deadline - microtime(true);
+        if ($left <= 0) { $stopped = 'time'; break; }
+        $r = [$pipes[1]]; $w = null; $x = null;
+        if (@stream_select($r, $w, $x, (int) $left, (int) (fmod($left, 1) * 1e6)) === false) break;
+        $chunk = fread($pipes[1], 65536);
+        if ($chunk !== false) $out .= $chunk;
+        // Output past 8 MB is a runaway loop, not something to read.
+        if (strlen($out) > 8 * 1024 * 1024) { $stopped = 'size'; break; }
+    }
+    if ($stopped) {
+        // The tree first (pgrep -P, child by child), then TERM to all of it,
+        // and KILL to whatever is still there two seconds on.
+        $tree = [];
+        $walk = function ($pid) use (&$walk, &$tree) {
+            $tree[] = $pid;
+            exec('pgrep -P ' . (int) $pid . ' 2>/dev/null', $kids);
+            foreach ($kids as $k) if ((int) $k > 0) $walk((int) $k);
+        };
+        $walk((int) proc_get_status($proc)['pid']);
+        exec('kill -TERM ' . implode(' ', $tree) . ' 2>/dev/null');
+        for ($i = 0; $i < 20 && proc_get_status($proc)['running']; $i++) usleep(100000);
+        exec('kill -KILL ' . implode(' ', $tree) . ' 2>/dev/null');
+    }
+    fclose($pipes[1]);
+    // proc_close's code is lost once proc_get_status has seen the exit, so
+    // the code comes from there.
+    do { $st = proc_get_status($proc); if ($st['running']) usleep(20000); } while ($st['running']);
+    proc_close($proc);
+    return [$out, $stopped ? 124 : (int) $st['exitcode'], $stopped];
+}
+
 // A cell for the database view: strings and NULL pass through; anything
 // that is not UTF-8 is shown as a hex prefix, and long text is cut so a 2 MB
 // serialized option doesn't ride along with every page.
@@ -4919,14 +4980,20 @@ function cove_db_sqlite($action, $input, $file) {
             ksort($pkpos);
             $pk = array_values($pkpos);
             $indexes = [];
+            $keys = [];
             foreach ($pdo->query('PRAGMA index_list(' . $q($table) . ')')->fetchAll(PDO::FETCH_ASSOC) as $ix) {
                 $icols = array_map(fn($r) => $r['name'], $pdo->query('PRAGMA index_info(' . $q($ix['name']) . ')')->fetchAll(PDO::FETCH_ASSOC));
                 $indexes[] = ['name' => $ix['name'], 'unique' => (int) $ix['unique'] === 1, 'type' => $ix['origin'] === 'pk' ? 'PRIMARY' : 'BTREE', 'columns' => $icols];
+                // A row key needs an index unique across the whole table, on
+                // plain columns: not a partial one (WHERE …), which is unique
+                // only among the rows it covers, nor one on an expression
+                // (its part has no column name).
+                if ((int) $ix['unique'] === 1 && empty($ix['partial']) && $icols && !in_array(null, $icols, true)) $keys[] = $icols;
             }
             if (!$pk) {
                 $notnull = array_map(fn($c) => $c['name'], array_filter($cols, fn($c) => !$c['null']));
-                foreach ($indexes as $ix) {
-                    if ($ix['unique'] && $ix['columns'] && !array_diff($ix['columns'], $notnull)) { $pk = $ix['columns']; break; }
+                foreach ($keys as $k) {
+                    if (!array_diff($k, $notnull)) { $pk = $k; break; }
                 }
             }
             return [$cols, $pk, $indexes];
@@ -5133,15 +5200,20 @@ function cove_db_pgsql($action, $input, $db, $cfg) {
                 WHERE a.attrelid = to_regclass(format('%I.%I', current_schema(), ?::text)) AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum");
             $st->execute([$table]);
             $rows = $st->fetchAll(PDO::FETCH_NUM);
-            $st = $pdo->prepare("SELECT ic.relname, i.indisunique, i.indisprimary, am.amname, json_agg(a.attname ORDER BY array_position(i.indkey::int2[], a.attnum)), pg_get_indexdef(i.indexrelid)
+            $st = $pdo->prepare("SELECT ic.relname, i.indisunique, i.indisprimary, am.amname, json_agg(a.attname ORDER BY array_position(i.indkey::int2[], a.attnum)), pg_get_indexdef(i.indexrelid), i.indpred IS NULL AND i.indexprs IS NULL
                 FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid JOIN pg_am am ON am.oid = ic.relam JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-                WHERE i.indrelid = to_regclass(format('%I.%I', current_schema(), ?::text)) GROUP BY ic.relname, i.indisunique, i.indisprimary, am.amname, i.indexrelid ORDER BY i.indisprimary DESC, ic.relname");
+                WHERE i.indrelid = to_regclass(format('%I.%I', current_schema(), ?::text)) GROUP BY ic.relname, i.indisunique, i.indisprimary, am.amname, i.indexrelid, i.indpred IS NULL AND i.indexprs IS NULL ORDER BY i.indisprimary DESC, ic.relname");
             $st->execute([$table]);
-            $indexes = []; $pk = []; $defs = [];
+            $indexes = []; $pk = []; $defs = []; $keys = [];
             foreach ($st->fetchAll(PDO::FETCH_NUM) as $ix) {
                 $cols = json_decode((string) $ix[4], true) ?: [];
                 $indexes[] = ['name' => $ix[0], 'unique' => (bool) $ix[1], 'type' => $ix[2] ? 'PRIMARY' : strtoupper($ix[3]), 'columns' => $cols];
                 if ($ix[2]) $pk = $cols; else $defs[] = $ix[5];
+                // A row key needs an index unique across the whole table, on
+                // plain columns: not a partial one (WHERE …), unique only
+                // among the rows it covers, nor one with an expression, whose
+                // part the column list above leaves out.
+                if (!$ix[2] && $ix[1] && $ix[6] && $cols) $keys[] = $cols;
             }
             $cols = [];
             foreach ($rows as $c) {
@@ -5150,8 +5222,8 @@ function cove_db_pgsql($action, $input, $db, $cfg) {
             }
             if (!$pk) {
                 $notnull = array_map(fn($c) => $c['name'], array_filter($cols, fn($c) => !$c['null']));
-                foreach ($indexes as $ix) {
-                    if ($ix['unique'] && $ix['columns'] && !array_diff($ix['columns'], $notnull)) { $pk = $ix['columns']; break; }
+                foreach ($keys as $k) {
+                    if (!array_diff($k, $notnull)) { $pk = $k; break; }
                 }
             }
             return [$cols, $pk, $indexes, $defs];
@@ -6141,12 +6213,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['success' => false, 'message' => 'Not a Laravel site.']);
                 exit;
             }
-            $__artisan = function (array $args) use ($user_home, $cove_path, $site_name) {
-                $cmd = 'HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path) . ' artisan ' . escapeshellarg($site_name);
-                foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string) $a);
+            // A wide terminal: without one artisan lays its tables out for 80
+            // columns, and migrate:status drops the dot leader on a long
+            // migration name. $limit as cove_run_limited's.
+            $__artisan = function (array $args, $limit = 0) use ($user_home, $cove_path, $site_name) {
+                $env = getenv();
+                $env['HOME'] = $user_home;
+                $env['COLUMNS'] = '250';
                 $t0 = microtime(true);
-                exec($cmd . ' --no-ansi --no-interaction 2>&1 </dev/null', $lines, $code);
-                return [trim(preg_replace('/\x1b\[[0-9;]*m/', '', implode("\n", $lines))), (int) $code, round((microtime(true) - $t0) * 1000)];
+                [$out, $code, $stopped] = cove_run_limited(array_merge([$cove_path, 'artisan', $site_name], array_map('strval', $args), ['--no-ansi', '--no-interaction']), $env, $limit);
+                return [trim(preg_replace('/\x1b\[[0-9;]*m/', '', $out)), (int) $code, round((microtime(true) - $t0) * 1000), $stopped];
             };
             // A --json listing; a deprecation notice from the app may come
             // first, so the last line that parses wins.
@@ -6177,11 +6253,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             if ($action === 'site_migrations') {
                 // migrate:status has no --json: its rows are "name .. [batch] Ran"
-                // or "name .. Pending".
+                // or "name .. Pending", the dots left out when the name fills
+                // the line.
                 [$out, $code, $ms] = $__artisan(['migrate:status']);
                 $items = [];
                 foreach (explode("\n", $out) as $line) {
-                    if (preg_match('/^\s*(\S+)\s+\.+\s+(?:\[(\d+)\]\s+)?(Ran|Pending)\s*$/', $line, $m)) $items[] = ['name' => $m[1], 'batch' => $m[2] !== '' ? (int) $m[2] : null, 'ran' => $m[3] === 'Ran'];
+                    if (preg_match('/^\s*(\S+)\s+(?:\.+\s+)?(?:\[(\d+)\]\s+)?(Ran|Pending)\s*$/', $line, $m)) $items[] = ['name' => $m[1], 'batch' => $m[2] !== '' ? (int) $m[2] : null, 'ran' => $m[3] === 'Ran'];
                 }
                 if (!$items && $code !== 0) { echo json_encode(['success' => false, 'message' => $out !== '' ? $out : 'artisan failed (' . $code . ').']); exit; }
                 echo json_encode(['success' => true, 'items' => $items, 'ms' => $ms, 'note' => $items ? null : $out]);
@@ -6259,11 +6336,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
             }
             if ($action === 'site_laravel_op') {
-                $ops = ['migrate' => ['migrate', '--force'], 'schedule_run' => ['schedule:run'], 'optimize_clear' => ['optimize:clear']];
+                // Clearing caches is the four file caches one by one, not
+                // optimize:clear: that also runs cache:clear, which for an app
+                // caching in Redis flushes the database every Cove Laravel
+                // site shares (they keep apart by prefix, not by database).
+                $ops = ['migrate' => [['migrate', '--force']], 'schedule_run' => [['schedule:run']], 'optimize_clear' => [['config:clear'], ['route:clear'], ['view:clear'], ['event:clear']]];
                 $op = (string) ($input['op'] ?? '');
                 if (!isset($ops[$op])) { echo json_encode(['success' => false, 'message' => 'Unknown operation.']); exit; }
-                [$out, $code, $ms] = $__artisan($ops[$op]);
-                echo json_encode(['success' => $code === 0, 'message' => $out !== '' ? $out : ($code === 0 ? 'Done.' : 'artisan failed (' . $code . ').'), 'ms' => $ms]);
+                $outs = []; $code = 0; $ms = 0;
+                foreach ($ops[$op] as $args) {
+                    [$out, $code, $took] = $__artisan($args);
+                    $ms += $took;
+                    if ($out !== '') $outs[] = $out;
+                    if ($code !== 0) { $outs[] = 'artisan ' . $args[0] . ' failed (' . $code . ').'; break; }
+                }
+                // The dashboard shows the last line, which for the four
+                // would name only the event cache.
+                if ($code === 0 && $op === 'optimize_clear') $outs[] = 'Cleared the config, route, view and event caches.';
+                echo json_encode(['success' => $code === 0, 'message' => $outs ? implode("\n", $outs) : 'Done.', 'ms' => $ms]);
                 exit;
             }
             if ($action === 'site_artisan') {
@@ -6290,9 +6380,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // Commands that wait on a terminal, or run until stopped.
                 // Artisan takes any unambiguous abbreviation (serv, q:w) and
                 // ignores case, so a name matches when each of its :-parts
-                // begins its counterpart's.
-                $long = ['tinker', 'db', 'serve', 'dev', 'pail', 'queue:work', 'queue:listen', 'schedule:work', 'horizon', 'reverb:start', 'octane:start', 'octane:frankenphp'];
-                $g = explode(':', strtolower($tokens[0]));
+                // begins its counterpart's. The command is the first word
+                // that isn't an option, since artisan takes its own (-v,
+                // --no-ansi, -q) ahead of it, or --env's value.
+                $long = ['tinker', 'db', 'serve', 'dev', 'pail', 'queue:work', 'queue:listen', 'schedule:work', 'horizon', 'reverb:start', 'octane:start', 'octane:frankenphp', 'pulse:check', 'pulse:work', 'inertia:start-ssr', 'nightwatch:agent'];
+                $command = '';
+                for ($i = 0, $n = count($tokens); $i < $n; $i++) {
+                    if ($tokens[$i] === '--env') { $i++; continue; }
+                    if ($tokens[$i] !== '' && $tokens[$i][0] !== '-') { $command = $tokens[$i]; break; }
+                }
+                $g = explode(':', strtolower($command));
                 foreach ($long as $name) {
                     $p = explode(':', $name);
                     if (count($p) !== count($g)) continue;
@@ -6303,7 +6400,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         exit;
                     }
                 }
-                [$out, $code, $ms] = $__artisan($tokens);
+                // Stopped after four minutes, before the dashboard's own five
+                // run out, so whatever it printed still comes back.
+                [$out, $code, $ms, $stopped] = $__artisan($tokens, 240);
+                if ($stopped) $out .= ($out !== '' ? "\n\n" : '') . ($stopped === 'time' ? 'Stopped after 4 minutes.' : 'Stopped: it printed more than 8 MB.') . ' Run it in a terminal instead: cove artisan ' . $site_name . ' …';
                 echo json_encode(['success' => true, 'output' => $out, 'code' => $code, 'ms' => $ms]);
                 exit;
             }
@@ -6330,14 +6430,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['success' => false, 'message' => 'Not a WordPress site.']);
                 exit;
             }
-            $__wp = function (array $args) use ($user_home, $cove_path, $site_name) {
-                $cmd = 'HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path) . ' wp ' . escapeshellarg($site_name);
-                foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string) $a);
+            // $limit as cove_run_limited's.
+            $__wp = function (array $args, $limit = 0) use ($user_home, $cove_path, $site_name) {
+                $env = getenv();
+                $env['HOME'] = $user_home;
                 $t0 = microtime(true);
-                exec($cmd . ' 2>&1', $lines, $code);
+                [$out, $code, $stopped] = cove_run_limited(array_merge([$cove_path, 'wp', $site_name], array_map('strval', $args)), $env, $limit);
                 // WP-CLI colours its errors even without a TTY in some builds.
-                $out = preg_replace('/\x1b\[[0-9;]*m/', '', implode("\n", $lines));
-                return [$out, (int) $code, round((microtime(true) - $t0) * 1000)];
+                $out = rtrim(preg_replace('/\x1b\[[0-9;]*m/', '', $out));
+                return [$out, (int) $code, round((microtime(true) - $t0) * 1000), $stopped];
             };
             // PHP's own notices (a plugin, or wp-cli itself on a new PHP)
             // arrive on the same stream; they would bury every listing and
@@ -6551,14 +6652,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($q !== null) { echo json_encode(['success' => false, 'message' => 'Unbalanced quote.']); exit; }
                 if ($cur !== '' || $has) $tokens[] = $cur;
                 if (!$tokens) { echo json_encode(['success' => false, 'message' => 'Nothing to run.']); exit; }
-                $first = $tokens[0];
-                if (in_array($first, ['shell', 'db', 'server'], true) && ($first !== 'db' || in_array($tokens[1] ?? '', ['cli', 'shell'], true) || count($tokens) === 1)) {
+                // The command is the first two words that aren't options,
+                // since WP-CLI takes its own (--quiet, --url=…) ahead of it.
+                $words = array_values(array_filter($tokens, fn($t) => $t === '' || $t[0] !== '-'));
+                $first = $words[0] ?? '';
+                if (in_array($first, ['shell', 'db', 'server'], true) && ($first !== 'db' || in_array($words[1] ?? '', ['cli', 'shell'], true) || count($words) === 1)) {
                     echo json_encode(['success' => false, 'message' => 'Interactive commands (wp shell, wp db cli, wp server) have no terminal here.']);
                     exit;
                 }
                 $tokens[] = '--no-color';
-                [$out, $code, $ms] = $__wp($tokens);
+                // Stopped after four minutes, as artisan's console is.
+                [$out, $code, $ms, $stopped] = $__wp($tokens, 240);
                 [$out, $dropped] = $__wp_clean($out);
+                if ($stopped) $out .= ($out !== '' ? "\n\n" : '') . ($stopped === 'time' ? 'Stopped after 4 minutes.' : 'Stopped: it printed more than 8 MB.') . ' Run it in a terminal instead: cove wp ' . $site_name . ' …';
                 echo json_encode(['success' => true, 'output' => $out, 'code' => $code, 'ms' => $ms, 'notices' => $dropped]);
                 exit;
             }
@@ -7060,12 +7166,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $mapping_verb = $action === 'add_mapping' ? 'add' : 'remove';
             // Either direction regenerates the Caddyfile and reloads the Caddy
             // serving this dashboard, so the response can be dropped and the
-            // UI retries. The CLI is idempotent on both sides ("already
-            // mapped" and "not found" both exit 0), which makes that safe.
+            // UI retries. An add the first try made exits 0 ("already
+            // mapped"), but a remove it made exits 1 ("not found", or "no
+            // mappings" for the last one), so here that counts as done: the
+            // domain is gone either way.
             exec(sprintf('HOME=%s %s mappings %s %s %s 2>&1',
                 escapeshellarg($user_home), escapeshellarg($cove_path),
                 escapeshellarg($site_name), $mapping_verb, escapeshellarg($domain)), $map_out, $map_rc);
             $map_text = implode("\n", $map_out);
+            if ($map_rc !== 0 && $mapping_verb === 'remove' && preg_match('/Mapping \'.*\' not found|No mappings exist/', $map_text)) $map_rc = 0;
             if ($map_rc !== 0) {
                 $msg = $mapping_verb === 'add' ? 'Could not add domain.' : 'Could not remove domain.';
                 if (stripos($map_text, 'Invalid domain') !== false) $msg = 'Invalid domain.';
@@ -10176,7 +10285,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 <div class="st-toolbar">
                     <input class="filter-input st-filter" type="text" placeholder="filter by address, name, action or middleware…" spellcheck="false" autocomplete="off" aria-label="Filter routes">
                     <span class="mail-bar-note st-count"></span>
-                    <button type="button" class="pill st-optimize" title="artisan optimize:clear — the config, route, view and event caches">clear caches</button>
+                    <button type="button" class="pill st-optimize" title="artisan config:clear, route:clear, view:clear and event:clear. Not cache:clear, which on Redis empties the cache database every Cove Laravel site shares">clear caches</button>
                     <button type="button" class="pill st-refresh" title="Read the routes again">refresh</button>
                 </div>
                 <ul class="st-list"><li class="loading st-loading">Reading routes…</li><li class="empty st-error" style="display: none;"></li></ul>
@@ -13050,7 +13159,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (e.metaKey || e.ctrlKey || e.altKey) return false;
                 const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
                 const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
-                if (isDown || isUp) { e.preventDefault(); this.mailMove(isDown ? 1 : -1); return true; }
+                if (isDown || isUp) {
+                    // A right-click menu names the message it was opened on,
+                    // which the arrows move away from: close it.
+                    e.preventDefault();
+                    this.closeTabCtx();
+                    this.mailMove(isDown ? 1 : -1);
+                    return true;
+                }
                 if (typing) return false; // the search box handles its own Esc
                 if (this.showDbModal || this.ctxMenu.open || this.tabCtx.open) return false;
                 if ((e.key === 'Backspace' || e.key === 'Delete') && m.selectedId) {
@@ -13171,12 +13287,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.loadMail();
             },
 
-            // The right-click menu for one message in the list.
+            // The right-click menu for one message in the list. No key hints:
+            // u and ⌫ act on the selected message, not the right-clicked one,
+            // and are ignored while the menu is open.
             mailCtxItems(it) {
                 const site = this.mailSiteOf(it), from = it.From && it.From.Address;
                 const items = [
-                    { label: 'Open', key: '↵', run: () => this.openMail(it.ID) },
-                    { label: it.Read ? 'Mark as unread' : 'Mark as read', key: 'u', run: () => this.mailSetRead([it.ID], !it.Read) },
+                    { label: 'Open', run: () => this.openMail(it.ID) },
+                    { label: it.Read ? 'Mark as unread' : 'Mark as read', run: () => this.mailSetRead([it.ID], !it.Read) },
                     { sep: true },
                 ];
                 if (site && this.mail.site !== site) items.push({ label: 'Only mail for ' + site, run: () => this.setMailSite(site) });
@@ -13199,7 +13317,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     a.remove();
                 } });
                 items.push({ sep: true });
-                items.push({ label: 'Delete', key: '⌫', danger: true, run: () => this.mailDelete([it.ID]) });
+                items.push({ label: 'Delete', danger: true, run: () => this.mailDelete([it.ID]) });
                 return items;
             },
 
@@ -15494,14 +15612,13 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.renderSiteWorkers();
                 const res = await this.apiPost('site_laravel_workers', kind ? { site_name: site.name, kind, state } : { site_name: site.name }, { quiet: true, timeoutMs: 60000 });
                 w.busy = null;
+                // Reverb's websocket route is Caddy's: reloaded in the
+                // background, and owed even if another page is showing by now.
+                if (kind === 'reverb' && res.success) this.apiPost('reload_server', {}, { quiet: true });
                 if (this.sitePage.name !== site.name) return;
                 if (res.workers) { w.for = site.name; w.data = res.workers; }
                 if (!res.success) this.showSnack(res.message || 'Could not change the worker.', true);
-                else if (kind === 'reverb') {
-                    // Its websocket route is Caddy's: reloaded in the background.
-                    this.apiPost('reload_server', {}, { quiet: true });
-                    if (state === 'on') this.showSnack('Reverb is on at wss://' + site.name + '.localhost. Build the front end again (npm run build), or run npm run dev, so Echo uses it.', false, { duration: 12000 });
-                }
+                else if (kind === 'reverb' && state === 'on') this.showSnack('Reverb is on at wss://' + site.name + '.localhost. Build the front end again (npm run build), or run npm run dev, so Echo uses it.', false, { duration: 12000 });
                 this.renderSiteWorkers();
             },
 
@@ -16315,8 +16432,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     try { c.history = JSON.parse(localStorage.getItem(this.cliHistoryKey(kind)) || '[]'); } catch (e) { c.history = []; }
                     c.histIdx = -1;
                     c.ran = null;
+                    // No optimize:clear among them: its cache:clear empties
+                    // the Redis cache every Cove Laravel site shares.
                     const examples = kind === 'artisan'
-                        ? ['about', 'route:list --except-vendor', 'migrate:status', 'make:model Post -m', 'db:show', 'config:show database', 'optimize:clear']
+                        ? ['about', 'route:list --except-vendor', 'migrate:status', 'make:model Post -m', 'db:show', 'config:show database', 'config:clear']
                         : ['core version --extra', 'option get siteurl', 'plugin list --status=active', 'cache flush', 'transient delete --all', ['search-replace https://old.example https://new.example --dry-run', 'search-replace --dry-run'], ['eval \'echo wp_get_environment_type();\'', 'eval …']];
                     $id('siteCliExamples').innerHTML = '<span>try</span>' + examples.map(x => { const [cmd, label] = Array.isArray(x) ? x : [x, x]; return '<button type="button" data-cmd="' + this.escapeHtml(cmd) + '">' + this.escapeHtml(label) + '</button>'; }).join('');
                     $id('siteCliInput').placeholder = kind === 'artisan' ? 'route:list' : 'plugin list --status=active';
@@ -19870,14 +19989,24 @@ main() {
             # Linux installs before Laravel support lack PDO (Laravel's only
             # way to its database), and those before PostgreSQL and Redis
             # their drivers: install them, then restart FrankenPHP once so
-            # the web server loads them too.
-            if [ "$OS" = "linux" ] && [ -n "$(linux_php_extension_packages)" ] \
-                && ! frankenphp php-cli -r 'exit(extension_loaded("pdo_sqlite") && extension_loaded("pdo_mysql") && extension_loaded("pdo_pgsql") && extension_loaded("redis") ? 0 : 1);' 2>/dev/null; then
-                echo "   - Installing PHP's PDO and Redis extensions (for Laravel sites)..."
-                linux_install_php_extensions
-                if frankenphp php-cli -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);' 2>/dev/null && is_caddy_running; then
-                    $SUDO_CMD systemctl restart cove.service
-                    for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
+            # the web server loads them too. mysqli and PDO's SQLite and
+            # MySQL drivers are tried on every upgrade until they load, but
+            # pdo_pgsql and phpredis only once (PHP_EXTRAS_TRIED): some
+            # distributions don't package them, and retrying the list one
+            # package at a time, with the same warning, on every upgrade
+            # would buy nothing. `cove add` names the package a site needs.
+            if [ "$OS" = "linux" ] && [ -n "$(linux_php_extension_packages)" ]; then
+                local ext_core='extension_loaded("mysqli") && extension_loaded("pdo_sqlite") && extension_loaded("pdo_mysql")'
+                local ext_extra='extension_loaded("pdo_pgsql") && extension_loaded("redis")'
+                if ! frankenphp php-cli -r "exit($ext_core ? 0 : 1);" 2>/dev/null \
+                    || { [ -z "$(config_get PHP_EXTRAS_TRIED)" ] && ! frankenphp php-cli -r "exit($ext_extra ? 0 : 1);" 2>/dev/null; }; then
+                    echo "   - Installing PHP's PDO and Redis extensions (for Laravel sites)..."
+                    linux_install_php_extensions
+                    config_set PHP_EXTRAS_TRIED 1
+                    if frankenphp php-cli -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);' 2>/dev/null && is_caddy_running; then
+                        $SUDO_CMD systemctl restart cove.service
+                        for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
+                    fi
                 fi
             fi
             if [ "$OS" = "linux" ] && fix_cove_service_home; then
