@@ -184,9 +184,10 @@ CUSTOM_CADDY_DIR="$APP_DIR/directives"
 # Per-site PHP version switching (native php-fpm behind FrankenPHP).
 RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
+OPCACHE_EXCLUDE_FILE="$COVE_DIR/opcache-exclude.txt"  # cove opcache exclude
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="2.4"
+COVE_VERSION="2.5"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -202,7 +203,7 @@ MU_PLUGIN_VERSION="0.8.0"
 # compares it against the installed copy (the bundle's
 # CFBundleShortVersionString on macOS, the VERSION file on Linux) to decide
 # whether an enabled menu bar needs a rebuild. Opt-in: never auto-installed.
-MENUBAR_VERSION="1.3"
+MENUBAR_VERSION="1.4"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -719,8 +720,69 @@ if (!empty($_SERVER['COVE_TWIN_OF']) && isset($_SERVER['HTTP_HOST'])
     define('WP_HOME', 'https://' . $_SERVER['HTTP_HOST']);
     define('WP_SITEURL', 'https://' . $_SERVER['HTTP_HOST']);
 }
+// A Laravel site (artisan beside the webroot) has error pages and handlers
+// of its own, and its own copy of Whoops: Cove's would load ahead of the
+// app's, and its shutdown handler would print a second page after Laravel's.
+$__cove_laravel = isset($_SERVER['DOCUMENT_ROOT']) && is_file(dirname($_SERVER['DOCUMENT_ROOT']) . '/artisan');
 
-spl_autoload_register(function ($class) {
+// `cove login` for a Laravel site: boots the app as index.php would, with
+// one route of Cove's that signs the user in through the app's default
+// guard (its own user model and session), then redirects: to the path the
+// link names, the app's dashboard route, or home.
+function cove_laravel_sign_in($base, $who, $to) {
+    $site = preg_replace('/\.localhost$/', '', basename($base));
+    require $base . '/vendor/autoload.php';
+    $app = require $base . '/bootstrap/app.php';
+    // A path on this site only: never //host or /\host, which browsers take
+    // as another site.
+    if (!preg_match('#^/(?![/\\\\])#', $to)) $to = '';
+    $route = function ($app) use ($who, $to, $site) {
+        if ($app['router']->getRoutes()->getByName('cove.login')) return;
+        $app['router']->middleware('web')->name('cove.login')->get('/__cove/login/{token}', function () use ($who, $to, $site) {
+            $text = function ($msg, $code) { return response($msg . "\n", $code)->header('Content-Type', 'text/plain; charset=utf-8'); };
+            $guard = \Illuminate\Support\Facades\Auth::guard();
+            if (!method_exists($guard, 'login') || !method_exists($guard, 'getProvider')) return $text("This app's default auth guard doesn't sign in with a session, so Cove can't log in to it.", 501);
+            $provider = $guard->getProvider();
+            $user = null;
+            if (method_exists($provider, 'createModel')) {
+                $model = $provider->createModel();
+                $query = $model->newQuery();
+                if ($who === '') $user = $query->orderBy($model->getKeyName())->first();
+                elseif (ctype_digit($who)) $user = $query->whereKey($who)->first();
+                else $user = $query->where('email', $who)->first();
+            } elseif ($who !== '' && ctype_digit($who)) {
+                $user = $provider->retrieveById($who);
+            } elseif ($who !== '') {
+                $user = $provider->retrieveByCredentials(['email' => $who]);
+            }
+            if (!$user) return $text($who === '' ? "This app has no users yet. Add one on the site's users tab in Cove, or: cove laravel $site user add you@example.com" : "No user '$who' in this app.", 404);
+            $guard->login($user);
+            request()->session()->regenerate();
+            if ($to === '') {
+                $to = '/';
+                foreach (['dashboard', 'filament.admin.pages.dashboard', 'home'] as $name) {
+                    if (\Illuminate\Support\Facades\Route::has($name)) { $to = route($name, [], false); break; }
+                }
+            }
+            return redirect()->to($to);
+        });
+    };
+    // Added before the app's own routes load, so a catch-all of theirs can't
+    // answer first; and again after, if a route cache replaced them all.
+    $app->booting($route);
+    $app->booted($route);
+    if (method_exists($app, 'handleRequest')) {
+        $app->handleRequest(\Illuminate\Http\Request::capture());
+    } else {
+        $kernel = $app->make(\Illuminate\Contracts\Http\Kernel::class);
+        $request = \Illuminate\Http\Request::capture();
+        $response = $kernel->handle($request);
+        $response->send();
+        $kernel->terminate($request, $response);
+    }
+}
+
+if (!$__cove_laravel) spl_autoload_register(function ($class) {
     $prefix = 'Whoops\\';
     $base_dir = __DIR__ . '/whoops/src/Whoops/';
     
@@ -754,6 +816,39 @@ foreach (['HTTP_X_COVE_SHARE', 'HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 
     }
 }
 unset($__cove_ra, $__cove_h);
+if ($__cove_laravel) {
+    // Laravel's debug page is for this machine too. Anyone else gets its
+    // plain error page: APP_DEBUG set here wins over .env, which Laravel
+    // reads without overwriting what the environment already has.
+    if (!$__cove_local) {
+        $_SERVER['APP_DEBUG'] = $_ENV['APP_DEBUG'] = 'false';
+        putenv('APP_DEBUG=false');
+        // A cached config (artisan optimize, config:cache) would keep the
+        // debug setting it was cached with: point Laravel at a cache that
+        // can't exist (nothing lives under /dev/null), so it reads config.
+        $_SERVER['APP_CONFIG_CACHE'] = $_ENV['APP_CONFIG_CACHE'] = '/dev/null/cove-no-config-cache.php';
+        putenv('APP_CONFIG_CACHE=/dev/null/cove-no-config-cache.php');
+    } elseif (preg_match('#^/__cove/login/([0-9a-f]{32})$#', (string) parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH), $__cove_m)) {
+        // A one-time sign-in from `cove login` (cove_login_laravel): the
+        // token is taken, whatever happens next, then the app signs in.
+        $__cove_file = dirname(__DIR__) . '/cache/laravel-login/' . $__cove_m[1];
+        // Only the request that removes the file may use it.
+        $__cove_t = is_file($__cove_file) ? json_decode((string) @file_get_contents($__cove_file), true) : null;
+        if (!@unlink($__cove_file)) $__cove_t = null;
+        $__cove_site = preg_replace('/\.localhost$/', '', basename(dirname($_SERVER['DOCUMENT_ROOT'])));
+        if (!is_array($__cove_t) || ($__cove_t['site'] ?? '') !== $__cove_site || (int) ($__cove_t['expires'] ?? 0) < time()) {
+            http_response_code(410);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo "This sign-in link has expired or was already used. Make another with: cove login $__cove_site\n";
+            exit;
+        }
+        cove_laravel_sign_in(dirname($_SERVER['DOCUMENT_ROOT']), (string) ($__cove_t['user'] ?? ''), (string) ($__cove_t['to'] ?? ''));
+        exit;
+    }
+    unset($__cove_laravel, $__cove_local);
+    return;
+}
+unset($__cove_laravel);
 if (!$__cove_local) {
     unset($__cove_local);
     // Keep what Whoops did for these levels below: swallow them. Otherwise a
@@ -1337,19 +1432,791 @@ get_wp_cmd() {
 # one (and the binary is there), else FrankenPHP's php-cli. Optional $1: a
 # site dir.
 cove_php_cmd() {
-    local site_dir="$1"
-    if [ -n "$site_dir" ]; then
-        local pinned prefix
-        pinned=$(site_php_version "$site_dir")
-        if [ -n "$pinned" ]; then
-            prefix=$(php_fpm_prefix_for "$pinned")
-            if [ -n "$prefix" ] && [ -x "$prefix/bin/php" ]; then
-                echo "$prefix/bin/php"
-                return 0
-            fi
-        fi
+    local native
+    native=$(cove_native_php_for "$1")
+    if [ -n "$native" ]; then
+        echo "$native"
+        return 0
     fi
     echo "$(command -v frankenphp) php-cli"
+}
+
+# A site's pinned native php binary; nothing when the site is unpinned or
+# that PHP isn't installed. Optional $1: a site dir.
+cove_native_php_for() {
+    local site_dir="$1" pinned prefix
+    [ -n "$site_dir" ] || return 0
+    pinned=$(site_php_version "$site_dir")
+    [ -n "$pinned" ] || return 0
+    prefix=$(php_fpm_prefix_for "$pinned")
+    if [ -n "$prefix" ] && [ -x "$prefix/bin/php" ]; then
+        echo "$prefix/bin/php"
+    fi
+}
+
+# --- php and Composer for tools that run PHP themselves -------------------
+# Composer's @php scripts and artisan's own subprocesses run PHP_BINARY, and
+# under `frankenphp php-cli` that is frankenphp itself, which takes no -d: it
+# exits 255 without a word, and Composer passes -d to every @php script.
+# $COVE_TOOLS_DIR/php is a php that works there. It drops leading -d settings
+# (Cove's php.ini comes in through PHPRC) and runs php-cli, or the native php
+# a pinned site runs on when COVE_PHP_BIN names one, flags and all.
+# $COVE_TOOLS_DIR/composer runs Cove's own composer.phar on it.
+COVE_TOOLS_DIR="$APP_DIR/bin"
+COMPOSER_PHAR="$APP_DIR/composer.phar"
+
+write_php_tools() {
+    local frankenphp_bin
+    frankenphp_bin=$(command -v frankenphp 2>/dev/null) || frankenphp_bin="$CADDY_CMD"
+    mkdir -p "$COVE_TOOLS_DIR" || return 1
+    # The php below goes by its own name, which an argv fix from before it
+    # did wouldn't recognise: Composer would read its own path as a command.
+    grep -qs 'PHP_BINARY' "$APP_DIR/cli-argv-fix.php" || ensure_cli_argv_fix >/dev/null
+    cat > "$COVE_TOOLS_DIR/php.tmp" << EOM
+#!/bin/bash
+# Generated by Cove (write_php_tools in main). A php for Composer and artisan.
+if [ -n "\$COVE_PHP_BIN" ] && [ -x "\$COVE_PHP_BIN" ]; then
+    exec "\$COVE_PHP_BIN" "\$@"
+fi
+while [ \$# -gt 0 ]; do
+    case "\$1" in
+        -d) shift; [ \$# -gt 0 ] && shift ;;
+        -d?*) shift ;;
+        *) break ;;
+    esac
+done
+export PHPRC="\${PHPRC:-$PHP_INI_FILE}"
+# Named as this file, PHP's PHP_BINARY constant is this file too, not
+# frankenphp (which takes no script path): artisan test starts PHPUnit
+# with it.
+exec -a "$COVE_TOOLS_DIR/php" "$frankenphp_bin" php-cli "\$@"
+EOM
+    cat > "$COVE_TOOLS_DIR/composer.tmp" << EOM
+#!/bin/bash
+# Generated by Cove (write_php_tools in main). Composer on Cove's PHP; its
+# @php scripts find the same php through PHP_BINARY.
+export PHP_BINARY="$COVE_TOOLS_DIR/php"
+exec "$COVE_TOOLS_DIR/php" "$COMPOSER_PHAR" "\$@"
+EOM
+    chmod 755 "$COVE_TOOLS_DIR/php.tmp" "$COVE_TOOLS_DIR/composer.tmp" \
+        && mv -f "$COVE_TOOLS_DIR/php.tmp" "$COVE_TOOLS_DIR/php" \
+        && mv -f "$COVE_TOOLS_DIR/composer.tmp" "$COVE_TOOLS_DIR/composer"
+}
+
+cove_sha256() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    fi
+}
+
+# The tools above, plus Cove's composer.phar: the latest stable release,
+# checked against the SHA-256 getcomposer.org publishes beside it. Fetched
+# once; `cove composer <site> self-update` keeps it current after that.
+# Progress and errors go to stderr.
+ensure_composer() {
+    write_php_tools || return 1
+    [ -s "$COMPOSER_PHAR" ] && return 0
+    local tmp want got
+    tmp=$(mktemp "$APP_DIR/.composer.phar.XXXXXX") || return 1
+    echo "⬇️  Downloading Composer..." >&2
+    if ! curl -fsSL "https://getcomposer.org/download/latest-stable/composer.phar" -o "$tmp" \
+        || ! want=$(curl -fsSL "https://getcomposer.org/download/latest-stable/composer.phar.sha256"); then
+        rm -f "$tmp"
+        echo "❌ Error: Could not download Composer from getcomposer.org." >&2
+        return 1
+    fi
+    want=$(printf '%s' "$want" | awk '{print $1}')
+    got=$(cove_sha256 "$tmp")
+    if [ -z "$got" ] || [ "$got" != "$want" ]; then
+        rm -f "$tmp"
+        echo "❌ Error: The Composer download did not match the checksum getcomposer.org publishes." >&2
+        return 1
+    fi
+    chmod 755 "$tmp" && mv -f "$tmp" "$COMPOSER_PHAR"
+}
+
+# The php-zts extension packages FrankenPHP's Linux packages leave out:
+# mysqli for WordPress, PDO with its SQLite, MySQL and PostgreSQL drivers
+# and phpredis for Laravel, and what both use besides. apt spells the PDO
+# drivers with a hyphen, dnf with an underscore.
+linux_php_extension_packages() {
+    local base="php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath php-zts-pdo php-zts-redis"
+    case "$PKG_MANAGER" in
+        apt) echo "$base php-zts-pdo-sqlite php-zts-pdo-mysql php-zts-pdo-pgsql" ;;
+        dnf) echo "$base php-zts-pdo_sqlite php-zts-pdo_mysql php-zts-pdo_pgsql" ;;
+    esac
+}
+
+# Those packages installed: all in one go, or one at a time when that fails,
+# since apt and dnf refuse the whole list over one package a distro lacks
+# (php-zts-redis, say), which would leave out mysqli and WordPress with it.
+# Quiet; names what it couldn't install and returns 1 then.
+linux_install_php_extensions() {
+    local pkgs p missing=""
+    pkgs=$(linux_php_extension_packages)
+    [ -n "$pkgs" ] || return 0
+    # shellcheck disable=SC2086
+    $SUDO_CMD "$PKG_MANAGER" install -y $pkgs >/dev/null 2>&1 && return 0
+    for p in $pkgs; do
+        $SUDO_CMD "$PKG_MANAGER" install -y "$p" >/dev/null 2>&1 || missing="$missing $p"
+    done
+    [ -z "$missing" ] && return 0
+    gum style --foreground yellow "⚠️  These PHP extension packages couldn't be installed:$missing" \
+        "   Try: sudo $PKG_MANAGER install$missing   (then: cove enable)"
+    return 1
+}
+
+# --- PostgreSQL ------------------------------------------------------------
+# For Laravel sites that ask for it, so not part of `cove install`: the
+# first site on it (--database=pgsql) or `cove postgres install` sets it up.
+# On macOS that is Homebrew's postgresql@17, unless a PostgreSQL already
+# answers on 127.0.0.1:5432 and lets this account in (Homebrew's and
+# Postgres.app's trust the account that started them), which is used as it
+# is. On Linux it is the distribution's. Cove signs in as its own role,
+# cove_user, with a password kept in ~/Cove/config (PGSQL_*), as MariaDB's.
+COVE_PG_FORMULA="postgresql@17"
+
+# Folders that may hold PostgreSQL's client tools: PATH's, Homebrew's
+# versioned formulas (not linked into PATH), the distributions', and
+# Postgres.app's.
+cove_pg_client_dirs() {
+    local d
+    d=$(command -v psql 2>/dev/null) && dirname "$d"
+    for d in /opt/homebrew/opt/postgresql@*/bin /usr/local/opt/postgresql@*/bin /usr/lib/postgresql/*/bin /usr/pgsql-*/bin \
+        /Applications/Postgres.app/Contents/Versions/*/bin "$HOME/Applications/Postgres.app/Contents/Versions"/*/bin; do
+        [ -x "$d/psql" ] && echo "$d"
+    done
+}
+
+# The newest of those (by its pg_dump's version), as "<major> <folder>".
+cove_pg_newest_client() {
+    local d v
+    cove_pg_client_dirs | while IFS= read -r d; do
+        v=$("$d/pg_dump" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -n 1)
+        [ -n "$v" ] && echo "$v $d"
+    done | sort -V | tail -n 1
+}
+
+# A PostgreSQL client tool ($1: psql, pg_dump, pg_isready): from the folder
+# chosen at setup (the server's own formula, or for a server Cove found
+# running, the newest client there is: pg_dump refuses a newer server),
+# else the newest found.
+cove_pg_tool() {
+    local tool="$1" formula d
+    formula=$(config_get PGSQL_FORMULA)
+    if [ -n "$formula" ]; then
+        for d in "/opt/homebrew/opt/$formula/bin" "/usr/local/opt/$formula/bin"; do
+            if [ -x "$d/$tool" ]; then echo "$d/$tool"; return 0; fi
+        done
+    fi
+    d=$(config_get PGSQL_BIN)
+    if [ -n "$d" ] && [ -x "$d/$tool" ]; then echo "$d/$tool"; return 0; fi
+    d=$(cove_pg_newest_client | cut -d' ' -f2-)
+    if [ -n "$d" ] && [ -x "$d/$tool" ]; then echo "$d/$tool"; return 0; fi
+    command -v "$tool" 2>/dev/null
+}
+
+cove_pg_port() {
+    local port
+    port=$(config_get PGSQL_PORT)
+    echo "${port:-5432}"
+}
+
+cove_pg_configured() {
+    [ -n "$(config_get PGSQL_USER)" ]
+}
+
+# Does PostgreSQL answer on 127.0.0.1 ($1 the port, Cove's by default)?
+cove_pg_ready() {
+    local tool
+    tool=$(cove_pg_tool pg_isready) || return 1
+    "$tool" -q -h 127.0.0.1 -p "${1:-$(cove_pg_port)}" -t 3
+}
+
+# psql as Cove's role: $1 the database, the rest psql's own arguments.
+# Quiet, unaligned rows, and stopping at the first error.
+cove_pg_psql() {
+    local db="$1" psql
+    shift
+    psql=$(cove_pg_tool psql) || { echo "❌ Error: psql isn't installed." >&2; return 1; }
+    PGPASSWORD="$(config_get PGSQL_PASSWORD)" PGCONNECT_TIMEOUT=5 "$psql" -X -q -tA -v ON_ERROR_STOP=1 \
+        -h 127.0.0.1 -p "$(cove_pg_port)" -U "$(config_get PGSQL_USER)" -d "$db" "$@"
+}
+
+# A database on Cove's PostgreSQL? Cove's database names are [a-z0-9_].
+cove_pg_db_exists() {
+    [ "$(cove_pg_psql postgres -c "SELECT 1 FROM pg_database WHERE datname = '$1'" 2>/dev/null)" = "1" ]
+}
+
+# psql as the server's superuser, for setting Cove's role up: on Linux the
+# postgres account; on macOS this one, which the server trusts.
+cove_pg_admin_psql() {
+    local psql
+    psql=$(cove_pg_tool psql) || return 1
+    if [ "$OS" = "macos" ]; then
+        PGCONNECT_TIMEOUT=5 "$psql" -X -q -tA -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -d postgres "$@"
+    elif [ "$(id -u)" = "0" ]; then
+        (cd /tmp && runuser -u postgres -- "$psql" -X -q -tA -v ON_ERROR_STOP=1 -d postgres "$@")
+    else
+        (cd /tmp && sudo -u postgres "$psql" -X -q -tA -v ON_ERROR_STOP=1 -d postgres "$@")
+    fi
+}
+
+cove_pg_start() {
+    if [ "$OS" = "macos" ]; then
+        local formula
+        formula=$(config_get PGSQL_FORMULA)
+        [ -n "$formula" ] && pkg_service start "$formula" >/dev/null 2>&1
+    else
+        $SUDO_CMD systemctl start postgresql >/dev/null 2>&1
+    fi
+}
+
+cove_pg_stop() {
+    if [ "$OS" = "macos" ]; then
+        local formula
+        formula=$(config_get PGSQL_FORMULA)
+        [ -n "$formula" ] && pkg_service stop "$formula" >/dev/null 2>&1
+    else
+        $SUDO_CMD systemctl stop postgresql >/dev/null 2>&1
+    fi
+}
+
+cove_pg_wait_ready() {
+    local i
+    for i in $(seq 1 "${2:-30}"); do
+        cove_pg_ready "$1" && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# PostgreSQL ready for Cove: set up the first time, started when it has
+# stopped. Progress on stdout, errors on stderr.
+ensure_postgres() {
+    if cove_pg_configured; then
+        cove_pg_ready && return 0
+        echo "🐘 Starting PostgreSQL…"
+        cove_pg_start
+        cove_pg_wait_ready "" 20 && return 0
+        echo "❌ Error: PostgreSQL isn't answering on 127.0.0.1:$(cove_pg_port). See: cove postgres" >&2
+        return 1
+    fi
+    cove_pg_setup
+}
+
+cove_pg_setup() {
+    local formula="" pass hba
+    echo "🐘 Setting up PostgreSQL for Cove (the first time takes a minute or two)…"
+    if [ "$OS" = "macos" ]; then
+        if cove_pg_ready 5432; then
+            if ! cove_pg_admin_psql -c 'SELECT 1' >/dev/null 2>&1; then
+                echo "❌ Error: A PostgreSQL already answers on 127.0.0.1:5432 (Postgres.app, DBngin, Herd?) and won't let Cove in." >&2
+                echo "   Stop it, or give this account a superuser role in it, then try again." >&2
+                return 1
+            fi
+            echo "   - Using the PostgreSQL already running on 127.0.0.1:5432."
+            # Its clients: the newest there are, as pg_dump can't be older
+            # than the server.
+            local newest
+            newest=$(cove_pg_newest_client | cut -d' ' -f2-)
+            [ -n "$newest" ] && config_set PGSQL_BIN "$newest"
+        else
+            if ! cove_pg_tool pg_ctl >/dev/null 2>&1 || ! "$MAC_BREW" list "$COVE_PG_FORMULA" >/dev/null 2>&1; then
+                echo "   - Installing $COVE_PG_FORMULA (a few minutes the first time)…"
+                if ! "$MAC_BREW" install "$COVE_PG_FORMULA" >&2; then
+                    echo "❌ Error: Could not install $COVE_PG_FORMULA." >&2
+                    return 1
+                fi
+            fi
+            formula="$COVE_PG_FORMULA"
+            config_set PGSQL_FORMULA "$formula"
+            pkg_service start "$formula" >/dev/null 2>&1
+            # nanobrew skips the formula's post-install step, which is what
+            # makes Homebrew's data folder: made here when it's missing.
+            if [ "$MAC_BREW" = "nb" ] && ! cove_pg_wait_ready 5432 8; then
+                local initdb datadir
+                initdb=$(cove_pg_tool initdb)
+                datadir="$("$MAC_BREW" --prefix 2>/dev/null)/var/$formula"
+                if [ -n "$initdb" ] && [ "$datadir" != "/var/$formula" ] && [ ! -f "$datadir/PG_VERSION" ]; then
+                    "$initdb" --locale=en_US.UTF-8 -E UTF-8 "$datadir" >/dev/null 2>&1
+                    pkg_service restart "$formula" >/dev/null 2>&1
+                fi
+            fi
+            if ! cove_pg_wait_ready 5432 30; then
+                echo "❌ Error: $formula did not start. Try: $MAC_BREW services restart $formula" >&2
+                return 1
+            fi
+        fi
+    else
+        if ! cove_pg_tool pg_isready >/dev/null 2>&1 || ! systemctl list-unit-files postgresql.service >/dev/null 2>&1; then
+            echo "   - Installing PostgreSQL via ${PKG_MANAGER}…"
+            if [ "$PKG_MANAGER" = "apt" ]; then
+                $SUDO_CMD apt-get update -qq >/dev/null 2>&1
+                $SUDO_CMD env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql >/dev/null 2>&1
+            else
+                $SUDO_CMD dnf install -y -q postgresql-server postgresql >/dev/null 2>&1
+            fi || { echo "❌ Error: Could not install PostgreSQL." >&2; return 1; }
+        fi
+        # Fedora and RHEL leave the cluster to be made, and let connections
+        # from 127.0.0.1 in only as the matching system account (ident):
+        # Cove's role signs in with its password instead.
+        if [ "$PKG_MANAGER" = "dnf" ]; then
+            hba=/var/lib/pgsql/data/pg_hba.conf
+            $SUDO_CMD test -f /var/lib/pgsql/data/PG_VERSION || $SUDO_CMD postgresql-setup --initdb >/dev/null 2>&1
+            $SUDO_CMD sed -i -E 's/^(host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1\/32|::1\/128)[[:space:]]+)ident/\1md5/' "$hba"
+        fi
+        $SUDO_CMD systemctl enable postgresql >/dev/null 2>&1
+        $SUDO_CMD systemctl restart postgresql >/dev/null 2>&1
+        if ! cove_pg_wait_ready 5432 30; then
+            echo "❌ Error: PostgreSQL did not start. See: systemctl status postgresql" >&2
+            return 1
+        fi
+    fi
+    # Letters and digits only: the password goes into SQL and .env files.
+    pass=$(cove_random_password 24 | tr -dc 'A-Za-z0-9' | cut -c1-24)
+    # Over stdin, not -c: a command line shows in ps, and sudo logs it.
+    if ! printf '%s\n' "DO \$\$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'cove_user') THEN ALTER ROLE cove_user LOGIN SUPERUSER PASSWORD '$pass'; ELSE CREATE ROLE cove_user LOGIN SUPERUSER PASSWORD '$pass'; END IF; END \$\$;" | cove_pg_admin_psql >/dev/null; then
+        echo "❌ Error: Could not create Cove's role in PostgreSQL." >&2
+        return 1
+    fi
+    config_set PGSQL_USER cove_user
+    config_set PGSQL_PASSWORD "$pass"
+    config_set PGSQL_PORT 5432
+    if ! cove_pg_psql postgres -c 'SELECT 1' >/dev/null; then
+        echo "❌ Error: Cove's role can't sign in to PostgreSQL (check pg_hba.conf for 127.0.0.1)." >&2
+        return 1
+    fi
+    echo "   - ✅ PostgreSQL $(cove_pg_psql postgres -c 'SHOW server_version' | cut -d' ' -f1) is ready on 127.0.0.1:5432."
+}
+
+# --- Redis -----------------------------------------------------------------
+# For Laravel sites whose cache, sessions or queue live in it, so, like
+# PostgreSQL, set up the first time one needs it (cove add --from on such an
+# app, or `cove redis install`): Homebrew's redis on macOS, the
+# distribution's on Linux (Valkey, Redis's open fork, where that is what a
+# distribution ships as redis). A server already answering on
+# 127.0.0.1:6379 is used as it is. No password: it listens on loopback only.
+# Each site keeps its own keys apart with REDIS_PREFIX (cove_redis_site_env).
+cove_redis_configured() {
+    [ -n "$(config_get REDIS_PORT)" ]
+}
+
+cove_redis_port() {
+    local port
+    port=$(config_get REDIS_PORT)
+    echo "${port:-6379}"
+}
+
+# Does something answer PING on 127.0.0.1 ($1 the port)? Without
+# redis-cli, a bare RESP PING over bash's /dev/tcp.
+cove_redis_ready() {
+    local port="${1:-$(cove_redis_port)}" cli reply
+    cli=$(command -v redis-cli || command -v valkey-cli)
+    if [ -n "$cli" ]; then
+        [ "$("$cli" -h 127.0.0.1 -p "$port" ping 2>/dev/null)" = "PONG" ]
+        return
+    fi
+    reply=$( (exec 3<>"/dev/tcp/127.0.0.1/$port" && printf 'PING\r\n' >&3 && head -c 7 <&3) 2>/dev/null)
+    [[ "$reply" == "+PONG"* ]]
+}
+
+cove_redis_service() {
+    local s
+    for s in redis-server redis valkey; do
+        if systemctl list-unit-files "$s.service" 2>/dev/null | grep -q "^$s.service"; then echo "$s"; return 0; fi
+    done
+    echo redis
+}
+
+cove_redis_start() {
+    if [ "$OS" = "macos" ]; then
+        [ -n "$(config_get REDIS_FORMULA)" ] && pkg_service start "$(config_get REDIS_FORMULA)" >/dev/null 2>&1
+    else
+        $SUDO_CMD systemctl start "$(cove_redis_service)" >/dev/null 2>&1
+    fi
+}
+
+cove_redis_stop() {
+    if [ "$OS" = "macos" ]; then
+        [ -n "$(config_get REDIS_FORMULA)" ] && pkg_service stop "$(config_get REDIS_FORMULA)" >/dev/null 2>&1
+    else
+        $SUDO_CMD systemctl stop "$(cove_redis_service)" >/dev/null 2>&1
+    fi
+}
+
+cove_redis_wait_ready() {
+    local i
+    for i in $(seq 1 "${2:-20}"); do
+        cove_redis_ready "$1" && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Redis ready for Cove: set up the first time, started when it has stopped.
+# Progress on stdout, errors on stderr.
+ensure_redis() {
+    if cove_redis_configured; then
+        cove_redis_ready && return 0
+        echo "🧰 Starting Redis…"
+        cove_redis_start
+        cove_redis_wait_ready "" 20 && return 0
+        echo "❌ Error: Redis isn't answering on 127.0.0.1:$(cove_redis_port). See: cove redis" >&2
+        return 1
+    fi
+    echo "🧰 Setting up Redis for Cove (the first time takes a minute)…"
+    if cove_redis_ready 6379; then
+        echo "   - Using the Redis already running on 127.0.0.1:6379."
+    elif [ "$OS" = "macos" ]; then
+        if ! "$MAC_BREW" list redis >/dev/null 2>&1; then
+            echo "   - Installing redis…"
+            "$MAC_BREW" install redis >&2 || { echo "❌ Error: Could not install redis." >&2; return 1; }
+        fi
+        config_set REDIS_FORMULA redis
+        pkg_service start redis >/dev/null 2>&1
+    else
+        echo "   - Installing Redis via ${PKG_MANAGER}…"
+        if [ "$PKG_MANAGER" = "apt" ]; then
+            $SUDO_CMD apt-get update -qq >/dev/null 2>&1
+            $SUDO_CMD env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq redis-server >/dev/null 2>&1
+        else
+            $SUDO_CMD dnf install -y -q redis >/dev/null 2>&1 || $SUDO_CMD dnf install -y -q valkey >/dev/null 2>&1
+        fi || { echo "❌ Error: Could not install Redis." >&2; return 1; }
+        $SUDO_CMD systemctl enable --now "$(cove_redis_service)" >/dev/null 2>&1
+    fi
+    if ! cove_redis_wait_ready 6379 20; then
+        echo "❌ Error: Redis did not start on 127.0.0.1:6379." >&2
+        return 1
+    fi
+    config_set REDIS_PORT 6379
+    echo "   - ✅ Redis is ready on 127.0.0.1:6379."
+}
+
+# The key prefix Cove gives a site's Redis keys: cove:<site>:, a shape no
+# Laravel default has (theirs end in _database_ or _cache_) and no other
+# site's can share, as a site name has no colon.
+cove_redis_prefix() {
+    echo "cove:$1:"
+}
+
+# Redis's numbered databases that hold keys (Laravel keeps its cache in 1
+# and the rest in 0), when Redis is set up and answering.
+cove_redis_dbs() {
+    local cli
+    cove_redis_configured && cove_redis_ready || return 1
+    cli=$(command -v redis-cli || command -v valkey-cli) || return 1
+    "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" info keyspace 2>/dev/null | tr -d '\r' | sed -n 's/^db\([0-9]*\):.*/\1/p'
+}
+
+# Removes the keys a site kept in Cove's Redis ($1 its prefix); a delete
+# calls it. Key names go NUL-separated, so one with a space or a quote is
+# still one key.
+cove_redis_forget() {
+    local cli prefix="$1" n
+    [ -n "$prefix" ] || return 0
+    cli=$(command -v redis-cli || command -v valkey-cli) || return 0
+    for n in $(cove_redis_dbs); do
+        "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" --scan --pattern "${prefix}*" 2>/dev/null \
+            | tr '\n' '\0' | xargs -0 -n 500 "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" unlink >/dev/null 2>&1
+    done
+    return 0
+}
+
+# Moves a site's keys to its new prefix ($1 old, $2 new) when it is renamed,
+# so queued jobs, sessions and the cache come along. Run while its workers
+# are held.
+cove_redis_move() {
+    local cli old="$1" new="$2" n
+    cli=$(command -v redis-cli || command -v valkey-cli) || return 0
+    for n in $(cove_redis_dbs); do
+        "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" --scan --pattern "${old}*" 2>/dev/null \
+            | awk -v old="$old" -v new="$new" '{ k = $0; n = new substr(k, length(old) + 1); gsub(/\\/, "\\\\", k); gsub(/"/, "\\\"", k); gsub(/\\/, "\\\\", n); gsub(/"/, "\\\"", n); print "RENAME \"" k "\" \"" n "\"" }' \
+            | "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" -n "$n" >/dev/null 2>&1
+    done
+    return 0
+}
+
+# A Laravel site's Redis settings for Cove's server, as JSON members for
+# laravel_env_set: loopback, no password, and a prefix of the site's own so
+# two apps (both named Laravel, say) never read each other's cache, sessions
+# or queue.
+cove_redis_site_env() {
+    printf '"REDIS_URL":null,"REDIS_HOST":"127.0.0.1","REDIS_PORT":"%s","REDIS_PASSWORD":null,"REDIS_PREFIX":%s' "$(cove_redis_port)" "$(cove_json_str "$(cove_redis_prefix "$1")")"
+}
+
+# --- Laravel ---------------------------------------------------------------
+# A Laravel site's folder is the project root, so Laravel's public/ is the
+# webroot Cove serves anyway. Cove's own files share that folder: these are
+# listed in the app's .gitignore, never copied by clone or snapshot, and
+# never replaced by a restore.
+COVE_SITE_OWN="logs private history php_version mappings multisite twin tailscale_port lan_config laravel_workers reverb_port"
+
+site_is_laravel() {
+    [ -f "$1/artisan" ] && [ -f "$1/bootstrap/app.php" ] && [ -f "$1/public/index.php" ]
+}
+
+# A site whose folder is a whole project rather than just public/: a Laravel
+# app, or any app `cove add --from` brought in (it leaves cove-from, where it
+# came from). Clone and snapshot copy all of such a folder.
+site_is_project() {
+    site_is_laravel "$1" || [ -f "$1/cove-from" ]
+}
+
+# The Laravel version a site runs, read from the framework's own constant
+# rather than by booting the app. Nothing when vendor/ isn't installed.
+laravel_version() {
+    sed -n "s/.*const VERSION = '\([^']*\)'.*/\1/p" "$1/vendor/laravel/framework/src/Illuminate/Foundation/Application.php" 2>/dev/null | head -n 1
+}
+
+# A value from a Laravel site's .env ($1 the site folder, $2 the key), with
+# its quotes removed. Enough for the values Cove itself writes there.
+laravel_env_get() {
+    local v
+    v=$(sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1/.env" 2>/dev/null | tail -n 1)
+    v="${v%$'\r'}"
+    case "$v" in
+        \"*\") v="${v#\"}"; v="${v%\"}" ;;
+        \'*\') v="${v#\'}"; v="${v%\'}" ;;
+        *) v="${v%% #*}" ;;
+    esac
+    printf '%s' "$v"
+}
+
+# Sets keys in a Laravel site's .env. $1 is the file; COVE_ENV_SET in the
+# environment is a JSON object of key → value, where null comments the key
+# out. phpdotenv takes the last uncommented line for a key, so that is the
+# one set, and any earlier uncommented ones are commented out (null comments
+# out every one: a DATABASE_URL left live further down would point the app,
+# and its migrations, somewhere else). With no live line, a commented one is
+# uncommented, and a new key goes after the last line of its group (MAIL_…
+# after MAIL_…). Values travel by environment, never on a command line,
+# because one of them is the database password.
+laravel_env_set() {
+    write_php_tools || return 1
+    COVE_ENV_FILE="$1" "$COVE_TOOLS_DIR/php" -r '
+        $f = getenv("COVE_ENV_FILE");
+        $set = json_decode((string) getenv("COVE_ENV_SET"), true);
+        if (!is_array($set) || !is_file($f)) exit(1);
+        $lines = explode("\n", file_get_contents($f));
+        $quote = function ($v) {
+            if ($v === "" || preg_match("~^[A-Za-z0-9_./:@+=,-]+$~", $v)) return $v;
+            if (strpos($v, chr(39)) === false) return chr(39) . $v . chr(39);
+            return "\"" . str_replace(["\\", "\"", "\$"], ["\\\\", "\\\"", "\\\$"], $v) . "\"";
+        };
+        foreach ($set as $key => $value) {
+            $pattern = "~^\\s*(#\\s*)?" . preg_quote($key, "~") . "\\s*=~";
+            $live = []; $commented = null;
+            foreach ($lines as $i => $line) {
+                if (!preg_match($pattern, $line, $m)) continue;
+                if (empty($m[1])) $live[] = $i;
+                elseif ($commented === null) $commented = $i;
+            }
+            $last = $value === null ? null : array_pop($live);
+            foreach ($live as $i) $lines[$i] = "# " . ltrim($lines[$i]);
+            if ($value === null) continue;
+            $at = $last ?? $commented;
+            if ($at !== null) {
+                $lines[$at] = $key . "=" . $quote((string) $value);
+                continue;
+            }
+            $group = preg_quote(strstr($key, "_", true) . "_", "~");
+            $at = count($lines);
+            foreach ($lines as $i => $line) {
+                if (preg_match("~^\\s*#?\\s*" . $group . "~", $line)) $at = $i + 1;
+            }
+            if ($at === count($lines) && end($lines) === "") $at--;
+            array_splice($lines, $at, 0, [$key . "=" . $quote((string) $value)]);
+        }
+        exit(file_put_contents($f, implode("\n", $lines)) === false ? 1 : 0);
+    '
+}
+
+# A JSON string for laravel_env_set (Cove's names, paths and passwords hold
+# no control characters).
+cove_json_str() {
+    local v="${1//\\/\\\\}"
+    printf '"%s"' "${v//\"/\\\"}"
+}
+
+# The database Cove creates for a new site, WordPress or Laravel (MariaDB or
+# PostgreSQL): cove_ and the name, hyphens as underscores, as the Laravel
+# installer does. A WordPress site added before 2.5 has one more underscore
+# on the end, and keeps it (see cove_db_is_sites).
+cove_db_name() {
+    local n="cove_$1"
+    echo "${n//-/_}"
+}
+
+# The database a WordPress site's wp-config.php names ($1 the site folder);
+# nothing when it can't be read.
+wp_site_db() {
+    (cd "$1/public" && $(get_wp_cmd "$1") config get DB_NAME --skip-plugins --skip-themes 2>/dev/null </dev/null)
+}
+
+# Is $1 the database Cove made for WordPress site $2? cove_<name>, or
+# cove_<name>_ from before 2.5, when `echo … | tr` turned echo's newline into
+# a last underscore. One wp-config.php was pointed at by hand isn't.
+cove_db_is_sites() {
+    [ -n "$1" ] && { [ "$1" = "$(cove_db_name "$2")" ] || [ "$1" = "$(cove_db_name "$2")_" ]; }
+}
+
+# The database a WordPress site ($1 its folder, $2 its name) uses when it is
+# the one Cove made for it (see cove_db_is_sites); nothing and status 1 if not.
+wp_cove_db() {
+    local db
+    db=$(wp_site_db "$1")
+    cove_db_is_sites "$db" "$2" || return 1
+    echo "$db"
+}
+
+# Is there a MariaDB database by this name? Needs source_config. Cove's
+# database names are [a-z0-9_], so the name is safe inside the quotes.
+cove_db_exists() {
+    [ -n "$(MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -N -e "SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '$1'" 2>/dev/null)" ]
+}
+
+# The database a Laravel site uses, on MariaDB or PostgreSQL, when it is the
+# one Cove made for it; nothing (and status 1) for SQLite or any other
+# database, which clone, rename and delete then leave alone.
+laravel_cove_db() {
+    local site_dir="$1" site_name="$2" db
+    laravel_db_server "$site_dir" >/dev/null || return 1
+    db=$(laravel_env_get "$site_dir" DB_DATABASE)
+    [ -n "$db" ] && [ "$db" = "$(cove_db_name "$site_name")" ] || return 1
+    echo "$db"
+}
+
+# Which of Cove's servers a Laravel site's database is on, from .env:
+# mariadb (DB_CONNECTION mysql or mariadb) or pgsql; status 1 for SQLite or
+# anything else.
+laravel_db_server() {
+    case "$(laravel_env_get "$1" DB_CONNECTION)" in
+        mysql|mariadb) echo mariadb ;;
+        pgsql) echo pgsql ;;
+        *) return 1 ;;
+    esac
+}
+
+# A Laravel database on either server ($1 mariadb or pgsql, $2 the name,
+# [a-z0-9_] as Cove makes them). MariaDB's need source_config.
+cove_server_db_exists() {
+    if [ "$1" = "pgsql" ]; then cove_pg_db_exists "$2"; else cove_db_exists "$2"; fi
+}
+
+cove_server_db_create() {
+    if [ "$1" = "pgsql" ]; then
+        cove_pg_psql postgres -c "CREATE DATABASE \"$2\" ENCODING 'UTF8' TEMPLATE template0" >/dev/null
+    else
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$2\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    fi
+}
+
+# Dropped even with a queue worker still connected: its session is ended
+# first (DROP … WITH (FORCE) would, but only from PostgreSQL 13). Two -c,
+# as DROP DATABASE can't run inside the transaction one would share.
+cove_server_db_drop() {
+    if [ "$1" = "pgsql" ]; then
+        cove_pg_psql postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$2' AND pid <> pg_backend_pid()" \
+            -c "DROP DATABASE IF EXISTS \"$2\"" >/dev/null
+    else
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$2\`;"
+    fi
+}
+
+# A PostgreSQL database as plain SQL on stdout, without owners or grants so
+# it loads under any role.
+cove_pg_dump() {
+    local pg_dump
+    pg_dump=$(cove_pg_tool pg_dump) || { echo "❌ Error: pg_dump isn't installed." >&2; return 1; }
+    PGPASSWORD="$(config_get PGSQL_PASSWORD)" "$pg_dump" -h 127.0.0.1 -p "$(cove_pg_port)" -U "$(config_get PGSQL_USER)" --no-owner --no-acl "$1"
+}
+
+# A plain-SQL dump on stdin into a PostgreSQL database ($1). Two lines a
+# newer pg_dump writes that an older server or psql (another machine's)
+# refuses go: 17.6's \restrict wrapping, and 17's SET transaction_timeout
+# (a setting 16 and older don't have, and a no-op for a load anyway).
+cove_pg_load() {
+    sed -E -e '/^\\(un)?restrict [A-Za-z0-9]+$/d' -e '/^SET transaction_timeout = 0;$/d' | cove_pg_psql "$1" >/dev/null
+}
+
+# .env's database settings for Cove's server ($1) and database ($2), as JSON
+# members for laravel_env_set. MariaDB's need source_config.
+cove_laravel_db_env() {
+    local port="3306" user="$DB_USER" pass="$DB_PASSWORD"
+    if [ "$1" = "pgsql" ]; then
+        port=$(cove_pg_port)
+        user=$(config_get PGSQL_USER)
+        pass=$(config_get PGSQL_PASSWORD)
+    fi
+    printf '"DB_HOST":"127.0.0.1","DB_PORT":"%s","DB_DATABASE":%s,"DB_USERNAME":%s,"DB_PASSWORD":%s' "$port" "$(cove_json_str "$2")" "$(cove_json_str "$user")" "$(cove_json_str "$pass")"
+}
+
+# Points a Laravel site's own settings at a new name after a clone, rename,
+# import or restore: APP_URL and the sender address Cove set, when they still
+# name the old site, and given the old folder ($4), absolute paths into it.
+# A cached config holds the old folder's paths, so it is cleared.
+laravel_retarget() {
+    local site_dir="$1" old_name="$2" new_name="$3" old_dir="${4:-}" pairs=() path link target
+    if [ "$(laravel_env_get "$site_dir" APP_URL)" = "$(url_for "$old_name.localhost")" ]; then
+        pairs+=("\"APP_URL\":\"$(url_for "$new_name.localhost")\"")
+    fi
+    if [ "$(laravel_env_get "$site_dir" MAIL_FROM_ADDRESS)" = "hello@$old_name.localhost" ]; then
+        pairs+=("\"MAIL_FROM_ADDRESS\":\"hello@$new_name.localhost\"")
+    fi
+    # The browser's way to its Reverb, under its own name.
+    if [ "$(laravel_env_get "$site_dir" VITE_REVERB_HOST)" = "$old_name.localhost" ]; then
+        pairs+=("\"VITE_REVERB_HOST\":\"$new_name.localhost\"")
+    fi
+    # Its own keys in Redis, under its own name.
+    if [ -n "$old_name" ] && [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "$(cove_redis_prefix "$old_name")" ]; then
+        pairs+=("\"REDIS_PREFIX\":\"$(cove_redis_prefix "$new_name")\"")
+    fi
+    # Absolute paths into the old folder: an SQLite file written out in
+    # full, and the links in public/ (storage:link makes public/storage an
+    # absolute one), which would otherwise serve the old site's files.
+    if [ -n "$old_dir" ] && [ "$old_dir" != "$site_dir" ]; then
+        path=$(laravel_env_get "$site_dir" DB_DATABASE)
+        case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
+            sqlite|"") [[ "$path" == "$old_dir/"* ]] && pairs+=("\"DB_DATABASE\":$(cove_json_str "$site_dir/${path#"$old_dir"/}")") ;;
+        esac
+        for link in "$site_dir"/public/* "$site_dir"/public/.[!.]*; do
+            [ -L "$link" ] || continue
+            target=$(readlink "$link")
+            [[ "$target" == "$old_dir/"* ]] && ln -sfn "$site_dir/${target#"$old_dir"/}" "$link"
+        done
+    fi
+    if [ "${#pairs[@]}" -gt 0 ]; then
+        COVE_ENV_SET="{$(IFS=,; echo "${pairs[*]}")}" laravel_env_set "$site_dir/.env" || return 1
+    fi
+    if [ -f "$site_dir/bootstrap/cache/config.php" ]; then
+        laravel_artisan "$site_dir" config:clear >/dev/null 2>&1 || true
+    fi
+}
+
+# Why an artisan or Composer step failed, from its log ($1; $2 the line its
+# output starts after): the message under the last exception's name
+# (artisan prints the class, then the message), or the last line that says
+# anything. ANSI colours go.
+laravel_log_why() {
+    awk -v from="${2:-0}" 'NR <= from { next }
+         { gsub(/\033\[[0-9;]*m/, ""); line[NR] = $0 }
+         /^[[:space:]]+[A-Za-z\\]*(Exception|Error)[[:space:]]*$/ { n = NR }
+         $0 !~ /^[[:space:]]*$/ && $0 !~ /^(PHP )?Deprecated:/ { last = $0 }
+         END {
+             if (n) for (i = n + 1; i <= NR; i++) if (line[i] !~ /^[[:space:]]*$/) { last = line[i]; break }
+             sub(/^[[:space:]]+/, "", last); print substr(last, 1, 300)
+         }' "$1"
+}
+
+# Runs artisan in a site ($1 the site folder) on the PHP the site serves with.
+laravel_artisan() {
+    local site_dir="$1"
+    shift
+    write_php_tools || return 1
+    (cd "$site_dir" && PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" "$COVE_TOOLS_DIR/php" artisan "$@")
 }
 
 # Read a site's WordPress version straight out of wp-includes/version.php.
@@ -1497,8 +2364,13 @@ update_etc_hosts() {
 # checked again first: it is spliced into a sudo sed expression, and GNU
 # sed's `e` command runs a shell.
 prune_etc_hosts() {
-    local required host stale=() sed_args=()
-    required=$(cove_required_hosts 2>/dev/null)
+    local required="" host stale=() sed_args=()
+    # --all: every name given goes, needed or not (cove uninstall).
+    if [ "${1:-}" = "--all" ]; then
+        shift
+    else
+        required=$(cove_required_hosts 2>/dev/null)
+    fi
     for host in "$@"; do
         [ -n "$host" ] && [[ "$host" != \*.* ]] && validate_hostname "$host" || continue
         printf '%s\n' "$required" | grep -qxF "$host" && continue
@@ -1755,6 +2627,14 @@ if [ -n "\$rot_mb" ] && [ "\$rot_mb" -gt 0 ]; then
             "$watchdog_cove" log rotate --apply >/dev/null 2>&1
         fi
     fi
+fi
+# Laravel sites' workers (cove laravel <site> queue|schedule on): once a
+# minute, any that should run and doesn't is started again, so they come
+# back after a crash or a reboot.
+lv_stamp="$COVE_DIR/.laravel-workers.stamp"
+if [ \$((now_s - \$(cat "\$lv_stamp" 2>/dev/null || echo 0))) -ge 60 ] && ls "$SITES_DIR"/*.localhost/laravel_workers >/dev/null 2>&1; then
+    echo "\$now_s" > "\$lv_stamp"
+    "$watchdog_cove" laravel --ensure >/dev/null 2>&1
 fi
 last_s=\$(cat "\$sweep_stamp" 2>/dev/null || echo 0)
 if [ \$((now_s - last_s)) -ge 300 ]; then
@@ -2155,8 +3035,9 @@ EOM
 # WP-CLI, Minn's CLI and anything built on Symfony Console read their own
 # path as the command: every `cove add` and `cove wp` failed. ~/Cove/php.ini
 # (PHPRC, the only way to set ini values under php-cli) prepends a file that
-# puts the script back at $argv[0] when that is what happened, and does
-# nothing otherwise. The web server and php-fpm pools set their own
+# puts the script back at $argv[0] when that is what happened (the binary
+# there is frankenphp, or the php wrapper write_php_tools names it as), and
+# does nothing otherwise. The web server and php-fpm pools set their own
 # auto_prepend_file (the Whoops bootstrap), which overrides this one.
 ensure_cli_argv_fix() {
     local fix="$APP_DIR/cli-argv-fix.php"
@@ -2165,7 +3046,8 @@ ensure_cli_argv_fix() {
 <?php
 // Generated by Cove (ensure_cli_argv_fix in main). See php/frankenphp#2690.
 if ( PHP_SAPI === 'cli' && isset( $argv[1], $_SERVER['SCRIPT_FILENAME'] )
-    && strpos( basename( (string) $argv[0] ), 'frankenphp' ) === 0
+    && ( strpos( basename( (string) $argv[0] ), 'frankenphp' ) === 0
+        || ( PHP_BINARY !== '' && @realpath( (string) $argv[0] ) === realpath( PHP_BINARY ) ) )
     && ( $argv[1] === $_SERVER['SCRIPT_FILENAME'] || realpath( $argv[1] ) === realpath( $_SERVER['SCRIPT_FILENAME'] ) ) ) {
     array_shift( $argv );
     $argc            = count( $argv );
@@ -2551,6 +3433,125 @@ validate_site_name() {
     return 0
 }
 
+# A site's kind as people call it: Laravel, Minn, WordPress or plain.
+site_kind_label() {
+    local dir="$SITES_DIR/$1.localhost"
+    if site_is_laravel "$dir"; then echo "Laravel"
+    elif site_is_minn "$dir/public"; then echo "Minn"
+    elif [ -f "$dir/public/wp-config.php" ]; then echo "WordPress"
+    else echo "plain"
+    fi
+}
+
+# The error for a site a command can't use, then exit 1: there's none by
+# that name (and here's how to see what there is), or it's of another kind
+# than the command works on ($2, e.g. "WordPress"; empty for any site).
+# On stderr, so `cd "$(cove path typo)"` and a --format=json reader never
+# take it for the answer.
+site_not_found() {
+    local name="${1%.localhost}" want="${2:-}" close d
+    if [ -n "$want" ] && validate_site_name "$name" && [ -d "$SITES_DIR/$name.localhost" ]; then
+        gum style --foreground red "❌ Error: '$name.localhost' is a $(site_kind_label "$name") site; this works on $want sites." >&2
+    else
+        # While `cove demo` limits what Cove shows (~/Cove/demo, a site a
+        # line), only those sites are offered.
+        local names=() demo=""
+        [ -f "$COVE_DIR/demo" ] && demo=$'\n'"$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/\.localhost$//' "$COVE_DIR/demo")"$'\n'
+        for d in "$SITES_DIR"/*.localhost; do
+            [ -d "$d" ] || continue
+            d="${d##*/}"; d="${d%.localhost}"
+            if [ -n "$demo" ]; then case "$demo" in *$'\n'"$d"$'\n'*) ;; *) continue ;; esac; fi
+            names+=("$d")
+        done
+        close=$(cove_closest "$name" ${names[@]+"${names[@]}"} | sed 's/$/.localhost/' | paste -sd, - | sed 's/,/, /g')
+        if [ -n "$close" ]; then
+            gum style --foreground red "❌ Error: There's no site named '$name.localhost'." "Did you mean: $close" >&2
+        else
+            gum style --foreground red "❌ Error: There's no site named '$name.localhost'." "See your sites with: cove list" >&2
+        fi
+    fi
+    exit 1
+}
+
+# Every command `cove` takes, for suggesting one when a name is mistyped.
+COVE_COMMANDS="add artisan backup clone composer core db delete demo directive disable enable health help history import install lan laravel list log login mappings mcp memory menubar network opcache path php ports postgres proxy pull push redis reload rename screenshot share signals snapshot status tailscale transfer trust twin uninstall upgrade url version wp wsl-hosts"
+
+# The words among $2… nearest to $1 as a slip of the keyboard would make
+# them: up to three, nearest first, one per line. Near is one edit for a word
+# of up to four letters and two for a longer one (a swapped pair of letters
+# counts as one), or a word that starts with it (three letters or more).
+cove_closest() {
+    local want="$1"
+    shift
+    [ -n "$want" ] && [ $# -gt 0 ] || return 0
+    printf '%s\n' "$@" | awk -v w="$want" '
+        function dist(a, b,    la, lb, i, j, c, t, d) {
+            la = length(a); lb = length(b)
+            for (i = 0; i <= la; i++) d[i, 0] = i
+            for (j = 0; j <= lb; j++) d[0, j] = j
+            for (i = 1; i <= la; i++) {
+                for (j = 1; j <= lb; j++) {
+                    c = (substr(a, i, 1) != substr(b, j, 1))
+                    t = d[i - 1, j] + 1
+                    if (d[i, j - 1] + 1 < t) t = d[i, j - 1] + 1
+                    if (d[i - 1, j - 1] + c < t) t = d[i - 1, j - 1] + c
+                    if (i > 1 && j > 1 && substr(a, i, 1) == substr(b, j - 1, 1) && substr(a, i - 1, 1) == substr(b, j, 1) && d[i - 2, j - 2] + 1 < t) t = d[i - 2, j - 2] + 1
+                    d[i, j] = t
+                }
+            }
+            return d[la, lb]
+        }
+        $0 != "" && $0 != w {
+            max = length(w) <= 4 ? 1 : 2
+            n = dist(w, $0)
+            if (n <= max) print n "\t" $0
+            else if (length(w) >= 3 && index($0, w) == 1) print (max + 1) "\t" $0
+        }' | sort -n -k1,1 | head -n 3 | cut -f2
+}
+
+# An error on stderr that needs no gum, for paths that run before Cove's
+# tools are known to be there.
+cove_err() {
+    if command -v gum >/dev/null 2>&1; then
+        gum style --foreground red "$1" >&2
+    else
+        echo "$1" >&2
+    fi
+    [ $# -gt 1 ] && printf '%s\n' "${@:2}" >&2
+    return 0
+}
+
+# A command `cove` doesn't have ($1): the nearest one when it's a slip, and
+# where the list is. Exits 1.
+cove_unknown_command() {
+    local close
+    close=$(cove_closest "$1" $COVE_COMMANDS | head -n 1)
+    if [ -n "$close" ]; then
+        cove_err "❌ Error: Unknown command '$1'." "Did you mean: cove $close" "See every command with: cove help"
+    else
+        cove_err "❌ Error: Unknown command '$1'." "See every command with: cove help"
+    fi
+    exit 1
+}
+
+# A subcommand of $1 that it doesn't have ($2), from the ones it does ($3, a
+# space-separated list): the nearest when it's a slip, then exit 1. None at
+# all shows the command's help instead.
+cove_unknown_subcommand() {
+    local cmd="$1" sub="$2" subs="$3" close
+    if [ -z "$sub" ]; then
+        display_command_help "$cmd"
+        exit 0
+    fi
+    close=$(cove_closest "$sub" $subs | head -n 1)
+    if [ -n "$close" ]; then
+        cove_err "❌ Error: Unknown subcommand '$sub' for cove $cmd." "Did you mean: cove $cmd $close" "See them all with: cove help $cmd"
+    else
+        cove_err "❌ Error: Unknown subcommand '$sub' for cove $cmd." "See them all with: cove help $cmd"
+    fi
+    exit 1
+}
+
 # Validate a hostname/domain label before it is written into the Caddyfile and
 # /etc/hosts (site mappings, proxy domains, the Tailscale hostname). Accepts a
 # bare hostname or IP — underscores included (dev hostnames, _domainkey-style
@@ -2883,6 +3884,24 @@ emit_site_php_handler() {
     fi
 }
 
+# A Laravel site's Reverb (cove laravel <site> reverb on), when it is on:
+# its websocket path, /app/<key> exactly, goes to the port it listens on,
+# ahead of PHP, so the browser reaches it at wss://<site>.localhost. Any
+# other /app/… path stays the app's.
+emit_site_reverb_route() {
+    local site_path="$1" key port
+    [ -f "$site_path/artisan" ] && grep -qx reverb "$site_path/laravel_workers" 2>/dev/null || return 0
+    port=$(cat "$site_path/reverb_port" 2>/dev/null)
+    key=$(laravel_env_get "$site_path" REVERB_APP_KEY)
+    [[ "$port" =~ ^[0-9]+$ ]] && [[ "$key" =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+    {
+        echo "    @cove_reverb path /app/$key"
+        echo "    handle @cove_reverb {"
+        echo "        reverse_proxy 127.0.0.1:$port"
+        echo "    }"
+    } >> "$CADDYFILE_PATH"
+}
+
 # Files no site should hand to a browser: WordPress's debug.log (WP_DEBUG_LOG
 # writes it inside the web root) and other logs (cPanel's error_log), database
 # dumps and backup-plugin archives, editor leftovers (wp-config.php.bak,
@@ -3151,6 +4170,13 @@ regenerate_caddyfile() {
         *) disabled_fns="${disabled_fns:+$disabled_fns,}opcache_reset" ;;
     esac
 
+    # Paths OPcache never caches (cove opcache exclude), only while the list
+    # has something in it.
+    local opcache_exclude_directive=""
+    if [ -f "$OPCACHE_EXCLUDE_FILE" ] && grep -q -v -E '^[[:space:]]*(;|$)' "$OPCACHE_EXCLUDE_FILE"; then
+        opcache_exclude_directive="        php_ini opcache.blacklist_filename \"$OPCACHE_EXCLUDE_FILE\""$'\n'
+    fi
+
     # Write the static header of the Caddyfile
     # Who may reach the dashboard, Adminer, and Mailpit: this machine. Under
     # WSL2's default NAT networking the Windows browser arrives from the
@@ -3213,7 +4239,12 @@ ${port_directives}    frankenphp {
         php_ini opcache.interned_strings_buffer $(cove_ini_get opcache.interned_strings_buffer 64)
         php_ini opcache.max_accelerated_files $(cove_ini_get opcache.max_accelerated_files 100000)
         php_ini opcache.optimization_level $(cove_ini_get opcache.optimization_level 0)
-        # See the disabled_fns note above: opcache_reset under ZTS aborts
+        # opcache.max_wasted_percentage is no help under ZTS: request threads
+        # see memory_consumption as 0, so a full arena with any dead weight
+        # restarts, and that restart aborts the process (php/php-src#22281).
+        # What is left is room and less churn: cove opcache sites --watch
+        # shows which site recompiles, cove opcache exclude keeps it out.
+${opcache_exclude_directive}        # See the disabled_fns note above: opcache_reset under ZTS aborts
         # the process. disable_functions leaves opcache_get_status intact
         # so the health command can still read the arena.
         php_ini disable_functions $disabled_fns
@@ -3364,6 +4395,7 @@ EOM
                     emit_multisite_subdir_rewrites
                 fi
 
+                emit_site_reverb_route "$site_path"
                 emit_site_php_handler "$site_path"
 
                 if [ ! -f "$site_path/public/wp-config.php" ]; then
@@ -3791,6 +4823,655 @@ function cove_minn_version($public) {
     return ($head !== false && preg_match("/MINN_ENGINE_VERSION', '([^']+)'/", $head, $m)) ? $m[1] : null;
 }
 
+// A Laravel application with its project root at the site folder, as the
+// CLI's site_is_laravel has it.
+function cove_site_is_laravel($site_path) {
+    return is_file($site_path . '/artisan') && is_file($site_path . '/bootstrap/app.php') && is_file($site_path . '/public/index.php');
+}
+
+// A Laravel .env as key => value, quotes removed and nothing expanded:
+// enough for the keys the dashboard reads.
+function cove_laravel_env($site_path) {
+    $out = [];
+    foreach (@file($site_path . '/.env', FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+        if (!preg_match('/^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$/', $line, $m)) continue;
+        $v = trim($m[2]);
+        if (strlen($v) >= 2 && ($v[0] === '"' || $v[0] === "'") && substr($v, -1) === $v[0]) $v = substr($v, 1, -1);
+        elseif (($p = strpos($v, ' #')) !== false) $v = rtrim(substr($v, 0, $p));
+        $out[$m[1]] = $v;
+    }
+    return $out;
+}
+
+// The SQLite file a Laravel site uses: DB_DATABASE, or Laravel's own
+// default, database/database.sqlite.
+function cove_laravel_sqlite_path($site_path, $env = null) {
+    $env = $env ?? cove_laravel_env($site_path);
+    $db = $env['DB_DATABASE'] ?? '';
+    if ($db === '') return $site_path . '/database/database.sqlite';
+    // A relative path is the project's, as Laravel resolves it (base_path).
+    return $db[0] === '/' ? $db : $site_path . '/' . $db;
+}
+
+// What the sites list says about a Laravel site: the framework's version
+// (its own constant, no boot) and the database .env names. An SQLite
+// database goes by "sqlite:<site>" in the database view.
+function cove_laravel_facts($site_path, $site_name) {
+    $head = @file_get_contents($site_path . '/vendor/laravel/framework/src/Illuminate/Foundation/Application.php', false, null, 0, 16384);
+    $env = cove_laravel_env($site_path);
+    $conn = $env['DB_CONNECTION'] ?? 'sqlite';
+    $db_name = null;
+    if ($conn === 'mysql' || $conn === 'mariadb') $db_name = $env['DB_DATABASE'] ?? null;
+    elseif ($conn === 'pgsql' && ($env['DB_DATABASE'] ?? '') !== '') $db_name = 'pgsql:' . $env['DB_DATABASE'];
+    elseif ($conn === 'sqlite' && is_file(cove_laravel_sqlite_path($site_path, $env))) $db_name = 'sqlite:' . $site_name;
+    return [
+        'version' => ($head !== false && preg_match("/const VERSION = '([^']+)'/", $head, $m)) ? $m[1] : null,
+        'db' => $conn,
+        'db_name' => $db_name,
+    ];
+}
+
+// A Laravel site's log: the newest file in storage/logs (laravel.log, or
+// today's file when the app logs daily).
+function cove_laravel_log($site_path) {
+    $log = $site_path . '/storage/logs/laravel.log'; $mt = 0;
+    foreach (glob($site_path . '/storage/logs/*.log') ?: [] as $f) {
+        $t = (int) @filemtime($f);
+        if ($t > $mt) { $mt = $t; $log = $f; }
+    }
+    return $log;
+}
+
+// When a Laravel site last changed: its own folders and settings, since
+// public/ keeps the dates Composer's package gave it.
+function cove_laravel_mtime($site_path) {
+    $t = 0;
+    foreach (['', '/app', '/routes', '/resources', '/config', '/database', '/.env', '/composer.lock'] as $p) $t = max($t, (int) @filemtime($site_path . $p));
+    return $t ?: null;
+}
+
+// `cove artisan` or `cove wp` for the dashboard, with no shell in between:
+// the output (stderr with stdout), the exit code, and why it was stopped
+// ('time' or 'size', else false). With $limit (seconds) it is stopped when
+// that runs out, since a command that waits on a terminal or runs until
+// stopped (a custom one, or one the consoles' lists miss) would otherwise
+// hold a PHP worker for good. macOS has no `timeout`, so the deadline is
+// kept here, and the whole tree is stopped: cove hands off to php, which
+// may start children of its own.
+function cove_run_limited(array $argv, array $env, $limit = 0) {
+    $proc = proc_open($argv, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes, null, $env);
+    if (!is_resource($proc)) return ['Could not run cove.', 127, false];
+    stream_set_blocking($pipes[1], false);
+    $out = '';
+    $stopped = false;
+    $deadline = $limit > 0 ? microtime(true) + $limit : null;
+    while (!feof($pipes[1])) {
+        $left = $deadline === null ? 60 : $deadline - microtime(true);
+        if ($left <= 0) { $stopped = 'time'; break; }
+        $r = [$pipes[1]]; $w = null; $x = null;
+        if (@stream_select($r, $w, $x, (int) $left, (int) (fmod($left, 1) * 1e6)) === false) break;
+        $chunk = fread($pipes[1], 65536);
+        if ($chunk !== false) $out .= $chunk;
+        // Output past 8 MB is a runaway loop, not something to read.
+        if (strlen($out) > 8 * 1024 * 1024) { $stopped = 'size'; break; }
+    }
+    if ($stopped) {
+        // The tree first (pgrep -P, child by child), then TERM to all of it,
+        // and KILL to whatever is still there two seconds on.
+        $tree = [];
+        $walk = function ($pid) use (&$walk, &$tree) {
+            $tree[] = $pid;
+            exec('pgrep -P ' . (int) $pid . ' 2>/dev/null', $kids);
+            foreach ($kids as $k) if ((int) $k > 0) $walk((int) $k);
+        };
+        $walk((int) proc_get_status($proc)['pid']);
+        exec('kill -TERM ' . implode(' ', $tree) . ' 2>/dev/null');
+        for ($i = 0; $i < 20 && proc_get_status($proc)['running']; $i++) usleep(100000);
+        exec('kill -KILL ' . implode(' ', $tree) . ' 2>/dev/null');
+    }
+    fclose($pipes[1]);
+    // proc_close's code is lost once proc_get_status has seen the exit, so
+    // the code comes from there.
+    do { $st = proc_get_status($proc); if ($st['running']) usleep(20000); } while ($st['running']);
+    proc_close($proc);
+    return [$out, $stopped ? 124 : (int) $st['exitcode'], $stopped];
+}
+
+// A cell for the database view: strings and NULL pass through; anything
+// that is not UTF-8 is shown as a hex prefix, and long text is cut so a 2 MB
+// serialized option doesn't ride along with every page.
+function cove_db_cell($v) {
+    if ($v === null) return null;
+    $v = (string) $v;
+    if (!mb_check_encoding($v, 'UTF-8')) return ['t' => 'bin', 'hex' => bin2hex(substr($v, 0, 48)), 'len' => strlen($v)];
+    if (strlen($v) > 2000) return ['t' => 'long', 'text' => mb_substr($v, 0, 2000), 'len' => strlen($v)];
+    return $v;
+}
+
+// The database view's actions for one SQLite file (a Laravel site's), over
+// PDO, answering in the same shape as the MariaDB side: tables, structure,
+// rows with search and sort, a cell, an edit, a delete, and the console.
+// Rows are addressed by the primary key, else the first unique index whose
+// columns are all NOT NULL; with neither, the grid is read-only.
+function cove_db_sqlite($action, $input, $file) {
+    $cap = 500;
+    try {
+        if (!class_exists('PDO') || !in_array('sqlite', PDO::getAvailableDrivers(), true)) throw new RuntimeException('This PHP has no pdo_sqlite.');
+        // Pdo\Sqlite (PHP 8.4+) is the class with setAuthorizer; new PDO()
+        // returns the generic one even for an sqlite: DSN.
+        $opts = [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5];
+        $pdo = class_exists('Pdo\Sqlite') ? new Pdo\Sqlite('sqlite:' . $file, null, null, $opts) : new PDO('sqlite:' . $file, null, null, $opts);
+        // No ATTACH: the console works on the site's own file, and an
+        // attached one could be another site's (past a demo's limits) or a
+        // new file anywhere. SQLite's action code for it is 24.
+        if (method_exists($pdo, 'setAuthorizer')) $pdo->setAuthorizer(fn($action) => $action === 24 ? Pdo\Sqlite::DENY : Pdo\Sqlite::OK);
+        $q = fn($id) => '"' . str_replace('"', '""', (string) $id) . '"';
+        $names = $pdo->query("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name")->fetchAll(PDO::FETCH_COLUMN);
+        $table = (string) ($input['table'] ?? '');
+        if (in_array($action, ['db_rows', 'db_cell', 'db_update', 'db_delete_row', 'db_structure'], true) && !in_array($table, $names, true)) throw new RuntimeException('No such table.');
+
+        $describe = function () use ($pdo, $q, $table) {
+            $cols = []; $pkpos = [];
+            foreach ($pdo->query('PRAGMA table_xinfo(' . $q($table) . ')')->fetchAll(PDO::FETCH_ASSOC) as $c) {
+                if ((int) $c['hidden'] === 1) continue;
+                $cols[] = ['name' => $c['name'], 'type' => $c['type'], 'null' => !(int) $c['notnull'], 'key' => (int) $c['pk'] > 0 ? 'PRI' : '', 'default' => $c['dflt_value'], 'extra' => (int) $c['hidden'] > 1 ? 'generated' : '', 'collation' => null, 'comment' => ''];
+                if ((int) $c['pk'] > 0) $pkpos[(int) $c['pk']] = $c['name'];
+            }
+            ksort($pkpos);
+            $pk = array_values($pkpos);
+            $indexes = [];
+            $keys = [];
+            foreach ($pdo->query('PRAGMA index_list(' . $q($table) . ')')->fetchAll(PDO::FETCH_ASSOC) as $ix) {
+                $icols = array_map(fn($r) => $r['name'], $pdo->query('PRAGMA index_info(' . $q($ix['name']) . ')')->fetchAll(PDO::FETCH_ASSOC));
+                $indexes[] = ['name' => $ix['name'], 'unique' => (int) $ix['unique'] === 1, 'type' => $ix['origin'] === 'pk' ? 'PRIMARY' : 'BTREE', 'columns' => $icols];
+                // A row key needs an index unique across the whole table, on
+                // plain columns: not a partial one (WHERE …), which is unique
+                // only among the rows it covers, nor one on an expression
+                // (its part has no column name).
+                if ((int) $ix['unique'] === 1 && empty($ix['partial']) && $icols && !in_array(null, $icols, true)) $keys[] = $icols;
+            }
+            if (!$pk) {
+                $notnull = array_map(fn($c) => $c['name'], array_filter($cols, fn($c) => !$c['null']));
+                foreach ($keys as $k) {
+                    if (!array_diff($k, $notnull)) { $pk = $k; break; }
+                }
+            }
+            return [$cols, $pk, $indexes];
+        };
+        $row_where = function ($pk, $key) use ($q) {
+            if (!$pk) throw new RuntimeException('This table has no primary key, so rows cannot be addressed.');
+            if (!is_array($key)) throw new RuntimeException('Missing row key.');
+            $parts = []; $params = [];
+            foreach ($pk as $c) {
+                if (!array_key_exists($c, $key)) throw new RuntimeException('Missing row key.');
+                if ($key[$c] === null) { $parts[] = $q($c) . ' IS NULL'; }
+                else { $parts[] = $q($c) . ' = ?'; $params[] = (string) $key[$c]; }
+            }
+            return [implode(' AND ', $parts), $params];
+        };
+
+        if ($action === 'db_tables') {
+            $types = $pdo->query("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')")->fetchAll(PDO::FETCH_KEY_PAIR);
+            $tables = [];
+            foreach ($names as $n) {
+                $rows = null;
+                try { $rows = (int) $pdo->query('SELECT COUNT(*) FROM ' . $q($n))->fetchColumn(); } catch (Throwable $e) {}
+                $tables[] = ['name' => $n, 'view' => ($types[$n] ?? '') === 'view', 'engine' => 'sqlite', 'rows' => $rows, 'bytes' => null, 'collation' => null];
+            }
+            return ['success' => true, 'tables' => $tables, 'wp' => null];
+        }
+        if ($action === 'db_structure') {
+            [$cols, $pk, $indexes] = $describe();
+            $st = $pdo->prepare('SELECT sql FROM sqlite_master WHERE name = ?');
+            $st->execute([$table]);
+            return ['success' => true, 'columns' => $cols, 'pk' => $pk, 'indexes' => $indexes, 'create' => (string) $st->fetchColumn()];
+        }
+        if ($action === 'db_rows') {
+            [$cols, $pk] = $describe();
+            $cnames = array_map(fn($c) => $c['name'], $cols);
+            $limit = max(10, min(500, (int) ($input['limit'] ?? 100)));
+            $start = max(0, (int) ($input['start'] ?? 0));
+            $where = ''; $params = [];
+            $needle = (string) ($input['q'] ?? '');
+            $col = (string) ($input['col'] ?? '');
+            if ($needle !== '') {
+                $like = '%' . $needle . '%';
+                if ($col !== '' && in_array($col, $cnames, true)) { $where = ' WHERE ' . $q($col) . ' LIKE ?'; $params[] = $like; }
+                else {
+                    $parts = [];
+                    foreach (array_slice($cnames, 0, 60) as $n) { $parts[] = 'CAST(' . $q($n) . ' AS TEXT) LIKE ?'; $params[] = $like; }
+                    $where = ' WHERE ' . implode(' OR ', $parts);
+                }
+            }
+            $order = '';
+            $sort = (string) ($input['sort'] ?? '');
+            $dir = ($input['dir'] ?? 'asc') === 'desc' ? 'DESC' : 'ASC';
+            if ($sort !== '' && in_array($sort, $cnames, true)) $order = ' ORDER BY ' . $q($sort) . ' ' . $dir;
+            elseif ($pk) $order = ' ORDER BY ' . implode(', ', array_map($q, $pk));
+            $from = ' FROM ' . $q($table);
+            $st = $pdo->prepare('SELECT COUNT(*)' . $from . $where);
+            $st->execute($params);
+            $total = (int) $st->fetchColumn();
+            $st = $pdo->prepare('SELECT ' . ($cnames ? implode(', ', array_map($q, $cnames)) : '*') . $from . $where . $order . ' LIMIT ' . $limit . ' OFFSET ' . $start);
+            $st->execute($params);
+            $rows = array_map(fn($r) => array_map('cove_db_cell', $r), $st->fetchAll(PDO::FETCH_NUM));
+            return ['success' => true, 'columns' => $cols, 'pk' => $pk, 'rows' => $rows, 'total' => $total, 'start' => $start, 'limit' => $limit];
+        }
+        if ($action === 'db_cell' || $action === 'db_update' || $action === 'db_delete_row') {
+            [$cols, $pk] = $describe();
+            [$w, $params] = $row_where($pk, $input['pk'] ?? null);
+            $from = ' FROM ' . $q($table) . ' WHERE ' . $w;
+            if ($action === 'db_delete_row') {
+                $st = $pdo->prepare('DELETE' . $from);
+                $st->execute($params);
+                return ['success' => true, 'affected' => $st->rowCount()];
+            }
+            $col = (string) ($input['col'] ?? '');
+            if (!in_array($col, array_map(fn($c) => $c['name'], $cols), true)) throw new RuntimeException('Unknown column.');
+            if ($action === 'db_cell') {
+                $st = $pdo->prepare('SELECT ' . $q($col) . $from . ' LIMIT 1');
+                $st->execute($params);
+                $r = $st->fetch(PDO::FETCH_NUM);
+                if (!$r) throw new RuntimeException('Row not found.');
+                if ($r[0] !== null && !mb_check_encoding((string) $r[0], 'UTF-8')) throw new RuntimeException('Binary values cannot be edited here.');
+                return ['success' => true, 'value' => $r[0] === null ? null : (string) $r[0]];
+            }
+            $isNull = !empty($input['null']);
+            $value = $isNull ? null : (string) ($input['value'] ?? '');
+            $st = $pdo->prepare('UPDATE ' . $q($table) . ' SET ' . $q($col) . ' = ' . ($isNull ? 'NULL' : '?') . ' WHERE ' . $w);
+            $st->execute($isNull ? $params : array_merge([$value], $params));
+            $affected = $st->rowCount();
+            // The row as it now is, keyed the way the grid keys it.
+            $key = $input['pk'];
+            if (!$isNull && in_array($col, $pk, true)) $key[$col] = $value;
+            [$w2, $p2] = $row_where($pk, $key);
+            $st = $pdo->prepare('SELECT ' . implode(', ', array_map(fn($c) => $q($c['name']), $cols)) . ' FROM ' . $q($table) . ' WHERE ' . $w2 . ' LIMIT 1');
+            $st->execute($p2);
+            $row = $st->fetch(PDO::FETCH_NUM);
+            return ['success' => true, 'affected' => $affected, 'row' => $row ? array_map('cove_db_cell', $row) : null];
+        }
+        if ($action === 'db_query') {
+            $sql = (string) ($input['sql'] ?? '');
+            if (trim($sql) === '') throw new RuntimeException('Nothing to run.');
+            $results = [];
+            $t0 = microtime(true);
+            foreach (cove_sqlite_statements($sql) as $stmt) {
+                try {
+                    if (!method_exists($pdo, 'setAuthorizer') && preg_match('/\bATTACH\b/i', preg_replace("~'[^']*'|\"[^\"]*\"~", '', $stmt))) throw new RuntimeException('ATTACH is not allowed here.');
+                    $st = $pdo->prepare($stmt);
+                    $st->execute();
+                    if ($st->columnCount() > 0) {
+                        $cols = [];
+                        for ($k = 0; $k < $st->columnCount(); $k++) { $m = $st->getColumnMeta($k); $cols[] = $m['name'] ?? ('column ' . ($k + 1)); }
+                        $rows = []; $n = 0;
+                        while ($n < 100000 && ($r = $st->fetch(PDO::FETCH_NUM)) !== false) { if ($n++ < $cap) $rows[] = array_map('cove_db_cell', $r); }
+                        $results[] = ['type' => 'rows', 'columns' => $cols, 'rows' => $rows, 'total' => $n, 'truncated' => $n > $cap];
+                    } else {
+                        $results[] = ['type' => 'ok', 'affected' => $st->rowCount(), 'insert_id' => (int) $pdo->lastInsertId(), 'info' => ''];
+                    }
+                } catch (Throwable $e) {
+                    $results[] = ['type' => 'error', 'message' => $e->getMessage()];
+                    break;
+                }
+            }
+            return ['success' => true, 'results' => $results, 'ms' => round((microtime(true) - $t0) * 1000, 1)];
+        }
+        throw new RuntimeException('Unknown database action.');
+    } catch (Throwable $e) {
+        return ['success' => false, 'message' => $e->getMessage()];
+    }
+}
+
+// The database view for a Laravel site's PostgreSQL database ("pgsql:<name>"
+// in the list), over PDO as Cove's role, in the schema the app uses
+// (public, unless its search_path says otherwise). The same actions as
+// MariaDB's and SQLite's above; PostgreSQL has no SHOW CREATE TABLE, so the
+// structure tab's statement is put together from the catalog.
+function cove_pgsql_pdo($cfg, $db) {
+    if (!class_exists('PDO') || !in_array('pgsql', PDO::getAvailableDrivers(), true)) throw new RuntimeException('This PHP has no pdo_pgsql.');
+    if (empty($cfg['PGSQL_USER'])) throw new RuntimeException('PostgreSQL isn\'t set up for Cove.');
+    $dsn = 'pgsql:host=127.0.0.1;port=' . (int) ($cfg['PGSQL_PORT'] ?? 5432) . ';dbname=' . $db . ';connect_timeout=5';
+    return new PDO($dsn, $cfg['PGSQL_USER'], $cfg['PGSQL_PASSWORD'] ?? '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+}
+
+// The statements in a console entry, split at the semicolons between them:
+// not inside quotes ('…', E'…' with its backslash escapes, "…",
+// $tag$…$tag$) or comments (-- and /* */, which nest in PostgreSQL). With
+// $pdo_escape, a ? outside them becomes ?? so PDO doesn't take it for a
+// placeholder (jsonb's ?, ?| and ?&).
+function cove_pg_statements($sql, $pdo_escape = false) {
+    $out = []; $cur = ''; $n = strlen($sql); $i = 0;
+    while ($i < $n) {
+        $c = $sql[$i];
+        if ($c === "'" || $c === '"') {
+            $esc = $c === "'" && $i > 0 && ($sql[$i - 1] === 'E' || $sql[$i - 1] === 'e') && ($i < 2 || !preg_match('/[A-Za-z0-9_]/', $sql[$i - 2]));
+            $j = $i + 1;
+            while ($j < $n) {
+                if ($esc && $sql[$j] === '\\') { $j += 2; continue; }
+                if ($sql[$j] === $c) { if ($j + 1 < $n && $sql[$j + 1] === $c) { $j += 2; continue; } break; }
+                $j++;
+            }
+            $cur .= substr($sql, $i, $j - $i + 1); $i = $j + 1; continue;
+        }
+        if ($c === '$' && preg_match('/\G\$([A-Za-z_][A-Za-z0-9_]*)?\$/', $sql, $m, 0, $i)) {
+            $end = strpos($sql, $m[0], $i + strlen($m[0]));
+            $j = $end === false ? $n : $end + strlen($m[0]);
+            $cur .= substr($sql, $i, $j - $i); $i = $j; continue;
+        }
+        if ($c === '-' && substr($sql, $i, 2) === '--') { $j = strpos($sql, "\n", $i); $j = $j === false ? $n : $j; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
+        if ($c === '/' && substr($sql, $i, 2) === '/*') {
+            $depth = 1; $j = $i + 2;
+            while ($j < $n && $depth > 0) {
+                if (substr($sql, $j, 2) === '/*') { $depth++; $j += 2; }
+                elseif (substr($sql, $j, 2) === '*/') { $depth--; $j += 2; }
+                else $j++;
+            }
+            $cur .= substr($sql, $i, $j - $i); $i = $j; continue;
+        }
+        if ($c === ';') { if (trim($cur) !== '') $out[] = trim($cur); $cur = ''; $i++; continue; }
+        $cur .= ($pdo_escape && $c === '?') ? '??' : $c; $i++;
+    }
+    if (trim($cur) !== '' && trim(preg_replace('~--[^\n]*|/\*.*?\*/~s', '', $cur)) !== '') $out[] = trim($cur);
+    return $out;
+}
+
+// A PostgreSQL value as the grid shows it: booleans as true/false, bytea
+// (a stream from PDO) as its bytes.
+function cove_pg_cell($v) {
+    if (is_bool($v)) return $v ? 'true' : 'false';
+    if (is_resource($v)) $v = stream_get_contents($v);
+    return cove_db_cell($v);
+}
+
+function cove_db_pgsql($action, $input, $db, $cfg) {
+    $cap = 500;
+    try {
+        $pdo = cove_pgsql_pdo($cfg, $db);
+        $q = fn($id) => '"' . str_replace('"', '""', (string) $id) . '"';
+        $tables = $pdo->query("SELECT c.relname, c.relkind, c.reltuples::bigint, pg_total_relation_size(c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'v', 'm', 'p') ORDER BY c.relname")->fetchAll(PDO::FETCH_NUM);
+        $names = array_column($tables, 0);
+        $table = (string) ($input['table'] ?? '');
+        if (in_array($action, ['db_rows', 'db_cell', 'db_update', 'db_delete_row', 'db_structure'], true) && !in_array($table, $names, true)) throw new RuntimeException('No such table.');
+        $rel = $q($table);
+
+        $describe = function () use ($pdo, $table) {
+            $st = $pdo->prepare("SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, pg_get_expr(d.adbin, d.adrelid), a.attidentity, a.attgenerated, col_description(a.attrelid, a.attnum), co.collname
+                FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum LEFT JOIN pg_collation co ON co.oid = a.attcollation AND a.attcollation <> 0
+                WHERE a.attrelid = to_regclass(format('%I.%I', current_schema(), ?::text)) AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum");
+            $st->execute([$table]);
+            $rows = $st->fetchAll(PDO::FETCH_NUM);
+            $st = $pdo->prepare("SELECT ic.relname, i.indisunique, i.indisprimary, am.amname, json_agg(a.attname ORDER BY array_position(i.indkey::int2[], a.attnum)), pg_get_indexdef(i.indexrelid), i.indpred IS NULL AND i.indexprs IS NULL
+                FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid JOIN pg_am am ON am.oid = ic.relam JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                WHERE i.indrelid = to_regclass(format('%I.%I', current_schema(), ?::text)) GROUP BY ic.relname, i.indisunique, i.indisprimary, am.amname, i.indexrelid, i.indpred IS NULL AND i.indexprs IS NULL ORDER BY i.indisprimary DESC, ic.relname");
+            $st->execute([$table]);
+            $indexes = []; $pk = []; $defs = []; $keys = [];
+            foreach ($st->fetchAll(PDO::FETCH_NUM) as $ix) {
+                $cols = json_decode((string) $ix[4], true) ?: [];
+                $indexes[] = ['name' => $ix[0], 'unique' => (bool) $ix[1], 'type' => $ix[2] ? 'PRIMARY' : strtoupper($ix[3]), 'columns' => $cols];
+                if ($ix[2]) $pk = $cols; else $defs[] = $ix[5];
+                // A row key needs an index unique across the whole table, on
+                // plain columns: not a partial one (WHERE …), unique only
+                // among the rows it covers, nor one with an expression, whose
+                // part the column list above leaves out.
+                if (!$ix[2] && $ix[1] && $ix[6] && $cols) $keys[] = $cols;
+            }
+            $cols = [];
+            foreach ($rows as $c) {
+                $extra = $c[4] !== '' && $c[4] !== null ? 'identity' : ($c[5] !== '' && $c[5] !== null ? 'generated' : (preg_match('/^nextval\(/', (string) $c[3]) ? 'serial' : ''));
+                $cols[] = ['name' => $c[0], 'type' => $c[1], 'null' => (bool) $c[2], 'key' => in_array($c[0], $pk, true) ? 'PRI' : '', 'default' => $c[3], 'extra' => $extra, 'collation' => $c[7], 'comment' => (string) $c[6]];
+            }
+            if (!$pk) {
+                $notnull = array_map(fn($c) => $c['name'], array_filter($cols, fn($c) => !$c['null']));
+                foreach ($keys as $k) {
+                    if (!array_diff($k, $notnull)) { $pk = $k; break; }
+                }
+            }
+            return [$cols, $pk, $indexes, $defs];
+        };
+        $row_where = function ($pk, $key) use ($q) {
+            if (!$pk) throw new RuntimeException('This table has no primary key, so rows cannot be addressed.');
+            if (!is_array($key)) throw new RuntimeException('Missing row key.');
+            $parts = []; $params = [];
+            foreach ($pk as $c) {
+                if (!array_key_exists($c, $key)) throw new RuntimeException('Missing row key.');
+                if ($key[$c] === null) { $parts[] = $q($c) . ' IS NULL'; }
+                else { $parts[] = $q($c) . '::text = ?'; $params[] = (string) $key[$c]; }
+            }
+            return [implode(' AND ', $parts), $params];
+        };
+
+        if ($action === 'db_tables') {
+            $out = [];
+            foreach ($tables as [$n, $kind, $est, $bytes]) {
+                $rows = (int) $est >= 0 ? (int) $est : null;
+                // Never analysed (a new table): counted, when small enough.
+                if ($rows === null && (int) $bytes < 50 * 1024 * 1024) {
+                    try { $rows = (int) $pdo->query('SELECT COUNT(*) FROM ' . $q($n))->fetchColumn(); } catch (Throwable $e) {}
+                }
+                $out[] = ['name' => $n, 'view' => $kind === 'v' || $kind === 'm', 'engine' => 'postgres', 'rows' => $rows, 'bytes' => (int) $bytes, 'collation' => null];
+            }
+            return ['success' => true, 'tables' => $out, 'wp' => null];
+        }
+        if ($action === 'db_structure') {
+            [$cols, $pk, $indexes, $defs] = $describe();
+            $lines = array_map(fn($c) => '  ' . $q($c['name']) . ' ' . $c['type'] . ($c['null'] ? '' : ' NOT NULL') . ($c['default'] !== null ? ' DEFAULT ' . $c['default'] : ''), $cols);
+            if ($pk) $lines[] = '  PRIMARY KEY (' . implode(', ', array_map($q, $pk)) . ')';
+            $create = 'CREATE TABLE ' . $rel . " (\n" . implode(",\n", $lines) . "\n);" . ($defs ? "\n" . implode(";\n", $defs) . ';' : '');
+            return ['success' => true, 'columns' => $cols, 'pk' => $pk, 'indexes' => $indexes, 'create' => $create];
+        }
+        if ($action === 'db_rows') {
+            [$cols, $pk] = $describe();
+            $cnames = array_map(fn($c) => $c['name'], $cols);
+            $limit = max(10, min(500, (int) ($input['limit'] ?? 100)));
+            $start = max(0, (int) ($input['start'] ?? 0));
+            $where = ''; $params = [];
+            $needle = (string) ($input['q'] ?? '');
+            $col = (string) ($input['col'] ?? '');
+            if ($needle !== '') {
+                $like = '%' . $needle . '%';
+                if ($col !== '' && in_array($col, $cnames, true)) { $where = ' WHERE ' . $q($col) . '::text ILIKE ?'; $params[] = $like; }
+                else {
+                    $parts = [];
+                    foreach (array_slice($cnames, 0, 60) as $n) { $parts[] = $q($n) . '::text ILIKE ?'; $params[] = $like; }
+                    $where = ' WHERE ' . implode(' OR ', $parts);
+                }
+            }
+            $order = '';
+            $sort = (string) ($input['sort'] ?? '');
+            $dir = ($input['dir'] ?? 'asc') === 'desc' ? 'DESC' : 'ASC';
+            if ($sort !== '' && in_array($sort, $cnames, true)) $order = ' ORDER BY ' . $q($sort) . ' ' . $dir;
+            elseif ($pk) $order = ' ORDER BY ' . implode(', ', array_map($q, $pk));
+            $st = $pdo->prepare('SELECT COUNT(*) FROM ' . $rel . $where);
+            $st->execute($params);
+            $total = (int) $st->fetchColumn();
+            $st = $pdo->prepare('SELECT ' . ($cnames ? implode(', ', array_map($q, $cnames)) : '*') . ' FROM ' . $rel . $where . $order . ' LIMIT ' . $limit . ' OFFSET ' . $start);
+            $st->execute($params);
+            $rows = array_map(fn($r) => array_map('cove_pg_cell', $r), $st->fetchAll(PDO::FETCH_NUM));
+            return ['success' => true, 'columns' => $cols, 'pk' => $pk, 'rows' => $rows, 'total' => $total, 'start' => $start, 'limit' => $limit];
+        }
+        if ($action === 'db_cell' || $action === 'db_update' || $action === 'db_delete_row') {
+            [$cols, $pk] = $describe();
+            [$w, $params] = $row_where($pk, $input['pk'] ?? null);
+            if ($action === 'db_delete_row') {
+                $st = $pdo->prepare('DELETE FROM ' . $rel . ' WHERE ' . $w);
+                $st->execute($params);
+                return ['success' => true, 'affected' => $st->rowCount()];
+            }
+            $col = (string) ($input['col'] ?? '');
+            if (!in_array($col, array_map(fn($c) => $c['name'], $cols), true)) throw new RuntimeException('Unknown column.');
+            if ($action === 'db_cell') {
+                $st = $pdo->prepare('SELECT ' . $q($col) . ' FROM ' . $rel . ' WHERE ' . $w . ' LIMIT 1');
+                $st->execute($params);
+                $r = $st->fetch(PDO::FETCH_NUM);
+                if (!$r) throw new RuntimeException('Row not found.');
+                $v = is_bool($r[0]) ? ($r[0] ? 'true' : 'false') : (is_resource($r[0]) ? stream_get_contents($r[0]) : $r[0]);
+                if ($v !== null && !mb_check_encoding((string) $v, 'UTF-8')) throw new RuntimeException('Binary values cannot be edited here.');
+                return ['success' => true, 'value' => $v === null ? null : (string) $v];
+            }
+            $isNull = !empty($input['null']);
+            $value = $isNull ? null : (string) ($input['value'] ?? '');
+            $st = $pdo->prepare('UPDATE ' . $rel . ' SET ' . $q($col) . ' = ' . ($isNull ? 'NULL' : '?') . ' WHERE ' . $w);
+            $st->execute($isNull ? $params : array_merge([$value], $params));
+            $affected = $st->rowCount();
+            $key = $input['pk'];
+            if (!$isNull && in_array($col, $pk, true)) $key[$col] = $value;
+            [$w2, $p2] = $row_where($pk, $key);
+            $st = $pdo->prepare('SELECT ' . implode(', ', array_map(fn($c) => $q($c['name']), $cols)) . ' FROM ' . $rel . ' WHERE ' . $w2 . ' LIMIT 1');
+            $st->execute($p2);
+            $row = $st->fetch(PDO::FETCH_NUM);
+            return ['success' => true, 'affected' => $affected, 'row' => $row ? array_map('cove_pg_cell', $row) : null];
+        }
+        if ($action === 'db_query') {
+            $sql = (string) ($input['sql'] ?? '');
+            if (trim($sql) === '') throw new RuntimeException('Nothing to run.');
+            $results = [];
+            $t0 = microtime(true);
+            // The pgsql extension, where there is one, runs SQL as written;
+            // PDO reads ? and :name as placeholders (an array slice [1:2]
+            // too), so through it a ? is escaped.
+            if (function_exists('pg_connect')) {
+                $conn = @pg_connect('host=127.0.0.1 port=' . (int) ($cfg['PGSQL_PORT'] ?? 5432) . ' dbname=' . $db . ' user=' . $cfg['PGSQL_USER'] . " password='" . str_replace(["\\", "'"], ["\\\\", "\\'"], (string) ($cfg['PGSQL_PASSWORD'] ?? '')) . "' connect_timeout=5", PGSQL_CONNECT_FORCE_NEW);
+                if (!$conn) throw new RuntimeException('PostgreSQL is not answering.');
+                foreach (cove_pg_statements($sql) as $stmt) {
+                    $res = @pg_query($conn, $stmt);
+                    if ($res === false) { $results[] = ['type' => 'error', 'message' => trim((string) pg_last_error($conn))]; break; }
+                    if (pg_num_fields($res) > 0) {
+                        $cols = [];
+                        for ($k = 0; $k < pg_num_fields($res); $k++) $cols[] = pg_field_name($res, $k);
+                        $rows = []; $n = 0; $types = [];
+                        for ($k = 0; $k < pg_num_fields($res); $k++) $types[$k] = pg_field_type($res, $k);
+                        while ($n < 100000 && ($r = pg_fetch_row($res)) !== false) {
+                            if ($n++ >= $cap) continue;
+                            foreach ($r as $k => $v) {
+                                if ($v !== null && $types[$k] === 'bool') $r[$k] = $v === 't' ? 'true' : 'false';
+                                elseif ($v !== null && $types[$k] === 'bytea') $r[$k] = pg_unescape_bytea($v);
+                            }
+                            $rows[] = array_map('cove_db_cell', $r);
+                        }
+                        $results[] = ['type' => 'rows', 'columns' => $cols, 'rows' => $rows, 'total' => $n, 'truncated' => $n > $cap];
+                    } else {
+                        $results[] = ['type' => 'ok', 'affected' => pg_affected_rows($res), 'insert_id' => 0, 'info' => ''];
+                    }
+                }
+                pg_close($conn);
+                return ['success' => true, 'results' => $results, 'ms' => round((microtime(true) - $t0) * 1000, 1)];
+            }
+            foreach (cove_pg_statements($sql, true) as $stmt) {
+                try {
+                    $st = $pdo->query($stmt);
+                    if ($st->columnCount() > 0) {
+                        $cols = [];
+                        for ($k = 0; $k < $st->columnCount(); $k++) { $m = $st->getColumnMeta($k); $cols[] = $m['name'] ?? ('column ' . ($k + 1)); }
+                        $rows = []; $n = 0;
+                        while ($n < 100000 && ($r = $st->fetch(PDO::FETCH_NUM)) !== false) { if ($n++ < $cap) $rows[] = array_map('cove_pg_cell', $r); }
+                        $results[] = ['type' => 'rows', 'columns' => $cols, 'rows' => $rows, 'total' => $n, 'truncated' => $n > $cap];
+                    } else {
+                        $results[] = ['type' => 'ok', 'affected' => $st->rowCount(), 'insert_id' => 0, 'info' => ''];
+                    }
+                } catch (Throwable $e) {
+                    $results[] = ['type' => 'error', 'message' => $e->getMessage()];
+                    break;
+                }
+            }
+            return ['success' => true, 'results' => $results, 'ms' => round((microtime(true) - $t0) * 1000, 1)];
+        }
+        throw new RuntimeException('Unknown database action.');
+    } catch (Throwable $e) {
+        return ['success' => false, 'message' => $e->getMessage()];
+    }
+}
+
+// The console's SQL split into statements for SQLite, which runs one at a
+// time: semicolons inside quotes, identifiers and comments don't count. In a
+// CREATE TRIGGER they count only once its BEGIN … END closes, with CASE …
+// END inside nesting. A column may be called end (SET end = …, new.end): in
+// the body, the END that closes BEGIN comes before a ; or the end of the
+// input, and an END beside a dot is a name. Comment-only pieces go.
+function cove_sqlite_statements($sql) {
+    $out = []; $cur = ''; $n = strlen($sql); $i = 0;
+    $words = []; $stack = [];
+    // The next character that isn't space or part of a comment.
+    $peek = function ($at) use ($sql, $n) {
+        while ($at < $n) {
+            if (ctype_space($sql[$at])) { $at++; continue; }
+            if (substr($sql, $at, 2) === '--') { $e = strpos($sql, "\n", $at); $at = $e === false ? $n : $e; continue; }
+            if (substr($sql, $at, 2) === '/*') { $e = strpos($sql, '*/', $at + 2); $at = $e === false ? $n : $e + 2; continue; }
+            return $sql[$at];
+        }
+        return '';
+    };
+    while ($i < $n) {
+        $c = $sql[$i];
+        if ($c === "'" || $c === '"' || $c === '`' || $c === '[') {
+            $close = $c === '[' ? ']' : $c;
+            $j = $i + 1;
+            while ($j < $n) {
+                if ($sql[$j] === $close) {
+                    if ($close !== ']' && $j + 1 < $n && $sql[$j + 1] === $close) { $j += 2; continue; }
+                    break;
+                }
+                $j++;
+            }
+            $cur .= substr($sql, $i, $j - $i + 1);
+            $i = $j + 1;
+            continue;
+        }
+        if ($c === '-' && substr($sql, $i, 2) === '--') { $j = strpos($sql, "\n", $i); $j = $j === false ? $n : $j; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
+        if ($c === '/' && substr($sql, $i, 2) === '/*') { $j = strpos($sql, '*/', $i + 2); $j = $j === false ? $n : $j + 2; $cur .= substr($sql, $i, $j - $i); $i = $j; continue; }
+        if (ctype_alpha($c) || $c === '_') {
+            $j = $i;
+            while ($j < $n && (ctype_alnum($sql[$j]) || $sql[$j] === '_' || $sql[$j] === '$')) $j++;
+            $w = strtoupper(substr($sql, $i, $j - $i));
+            if (count($words) < 3) $words[] = $w;
+            $trigger = $words && $words[0] === 'CREATE' && (($words[1] ?? '') === 'TRIGGER' || (in_array($words[1] ?? '', ['TEMP', 'TEMPORARY'], true) && ($words[2] ?? '') === 'TRIGGER'));
+            if ($trigger && ($w === 'BEGIN' || $w === 'CASE')) {
+                $stack[] = $w;
+            } elseif ($trigger && $w === 'END' && $stack) {
+                $before = substr(rtrim($cur), -1);
+                $next = $peek($j);
+                $name = $before === '.' || $next === '.' || (end($stack) === 'BEGIN' && $next !== ';' && $next !== '');
+                if (!$name) array_pop($stack);
+            }
+            $cur .= substr($sql, $i, $j - $i);
+            $i = $j;
+            continue;
+        }
+        if ($c === ';' && !$stack) {
+            $out[] = $cur; $cur = ''; $words = []; $i++;
+            continue;
+        }
+        $cur .= $c; $i++;
+    }
+    $out[] = $cur;
+    return array_values(array_filter($out, fn($s) => trim(preg_replace('~--[^\n]*|/\*.*?\*/~s', '', $s)) !== ''));
+}
+
+// Errors Laravel logged in the last day, in its newest storage/logs file.
+// Its stamps are in the app's timezone, which is UTC unless changed.
+function cove_recent_laravel_errors($site_path) {
+    return cove_laravel_error_count(cove_laravel_log($site_path), time() - 86400);
+}
+
+// Errors (ERROR and worse) in a Laravel log since a time, read from its
+// last $tail bytes.
+function cove_laravel_error_count($log, $since, $tail = 2097152) {
+    $mt = (int) @filemtime($log);
+    if (!$mt || $mt < $since) return 0;
+    $size = (int) @filesize($log);
+    $fh = @fopen($log, 'rb');
+    if (!$fh) return 0;
+    fseek($fh, max(0, $size - $tail));
+    $text = (string) fread($fh, $tail);
+    fclose($fh);
+    if (!preg_match_all('/^\[(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})[^\]]*\] [\w-]+\.(?:ERROR|CRITICAL|ALERT|EMERGENCY):/m', $text, $m)) return 0;
+    $n = 0;
+    foreach ($m[1] as $when) {
+        $t = strtotime(str_replace('T', ' ', $when) . ' UTC');
+        if ($t && $t >= $since) $n++;
+    }
+    return $n;
+}
+
 // --- What the sites list says about each site ---------------------------
 // Beyond the name: what runs it and the last plugin or theme change (from
 // the nightly history save), when someone last opened it in a browser, and
@@ -3818,6 +5499,14 @@ function cove_demo_databases($user_home, $sitedir) {
     foreach (cove_demo_sites($user_home) ?? [] as $site) {
         $cfg = @file_get_contents($sitedir . '/' . $site . '.localhost/public/wp-config.php', false, null, 0, 16384);
         if ($cfg !== false && preg_match('/define\s*\(\s*[\'"]DB_NAME[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $cfg, $m)) $out[] = $m[1];
+        // A Laravel site's: the MariaDB database its .env names.
+        $sp = $sitedir . '/' . $site . '.localhost';
+        if ($cfg === false && cove_site_is_laravel($sp)) {
+            $env = cove_laravel_env($sp);
+            if (in_array($env['DB_CONNECTION'] ?? '', ['mysql', 'mariadb'], true) && ($env['DB_DATABASE'] ?? '') !== '') $out[] = $env['DB_DATABASE'];
+            // Its PostgreSQL one, as the database view names it.
+            if (($env['DB_CONNECTION'] ?? '') === 'pgsql' && ($env['DB_DATABASE'] ?? '') !== '') $out[] = 'pgsql:' . $env['DB_DATABASE'];
+        }
     }
     return $out;
 }
@@ -4116,10 +5805,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                     }
 
                     // The database name as WordPress actually uses it — read
-                    // from wp-config.php rather than recomputed, because
-                    // cove_add's `echo … | tr -c` folds echo's newline into a
-                    // trailing underscore (cove_mysite_), which a mimic would
-                    // have to reproduce forever.
+                    // from wp-config.php rather than recomputed, because a
+                    // site added before 2.5 has a trailing underscore
+                    // (cove_mysite_) that newer ones don't.
                     $db_name = preg_replace('/[^a-zA-Z0-9_]/', '_', 'cove_' . str_replace('.localhost', '', $item));
                     $cfg_file = $site_path . '/public/wp-config.php';
                     if (is_file($cfg_file)) {
@@ -4140,11 +5828,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                     $multisite_mode = is_file($site_path . '/multisite') ? trim((string) @file_get_contents($site_path . '/multisite')) : '';
                     $is_minn = cove_site_is_minn($site_path . '/public');
                     $is_wp = $is_minn || file_exists($site_path . '/public/wp-config.php');
+                    $laravel = !$is_wp && cove_site_is_laravel($site_path) ? cove_laravel_facts($site_path, str_replace('.localhost', '', $item)) : null;
 
                     $__f = $__facts[$item] ?? [];
                     $__f['visit'] = cove_last_visit($site_path . '/logs/caddy.log', $__f['visit'] ?? null);
                     $static_facts = null;
-                    if (!$is_wp) {
+                    if (!$is_wp && !$laravel) {
                         $pm = @filemtime($site_path . '/public') ?: 0;
                         if (($__f['static']['mtime'] ?? -1) !== $pm) $__f['static'] = cove_static_facts($site_path . '/public') + ['mtime' => $pm];
                         $static_facts = ['title' => $__f['static']['title'], 'files' => $__f['static']['files']];
@@ -4158,7 +5847,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'mappings' => $mappings_list,
                         'multisite' => $multisite_mode !== '' ? $multisite_mode : null,
                         'domain' => 'https://' . $item . $__cove_port_suffix,
-                        'type' => $is_minn ? 'Minn' : (file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain'),
+                        'type' => $is_minn ? 'Minn' : ($laravel ? 'Laravel' : (file_exists($site_path . "/public/wp-config.php") ? 'WordPress' : 'Plain')),
+                        // Laravel: {version, db (the connection), db_name}.
+                        'laravel' => $laravel,
                         // On a Minn site, the WordPress release the engine speaks.
                         'wp_version' => $wp_version,
                         'minn_version' => $is_minn ? cove_minn_version($site_path . '/public') : null,
@@ -4169,8 +5860,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'display_path' => '~/Cove/Sites/' . $item,
                         'full_path' => $site_path,
                         'size_bytes' => isset($size_cache[$item]) ? (int) $size_cache[$item] : null,
-                        'modified_at' => $mtime ?: null,
-                        'db_name' => $db_name,
+                        'modified_at' => ($laravel ? cove_laravel_mtime($site_path) : $mtime) ?: null,
+                        'db_name' => $laravel ? $laravel['db_name'] : $db_name,
                         // Per-site PHP pin (`cove php`); null = Cove's default PHP.
                         'php_version' => is_file($site_path . '/php_version') ? trim((string) @file_get_contents($site_path . '/php_version')) : null,
                         // When the dashboard's preview of the front page was captured.
@@ -4181,7 +5872,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'static' => $static_facts,
                         // Unix time of the last visit from a browser, or null.
                         'seen_at' => $__f['visit']['ts'],
-                        'php_errors' => $is_wp ? cove_recent_php_errors($site_path . '/public/wp-content/debug.log') : 0,
+                        'php_errors' => $is_wp ? cove_recent_php_errors($site_path . '/public/wp-content/debug.log') : ($laravel ? cove_recent_laravel_errors($site_path) : 0),
                         'twin' => $twin_domain,
                     ];
                 }
@@ -4391,11 +6082,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $flavor = 'plain';
                 } elseif (!empty($input['wp_version']) && $input['wp_version'] !== 'latest') {
                     $v = $input['wp_version'];
-                    if ($v === 'nightly' || $v === 'minn' || preg_match('/^\d+(\.\d+){1,2}(-[A-Za-z0-9.]+)?$/', $v)) {
+                    if ($v === 'nightly' || $v === 'minn' || $v === 'laravel' || preg_match('/^\d+(\.\d+){1,2}(-[A-Za-z0-9.]+)?$/', $v)) {
                         $flavor = $v;
                     }
                 }
-                $command = sprintf('HOME=%s %s add %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $flavor !== '' ? escapeshellarg($flavor) : '');
+                // A Laravel site's database: sqlite (the default) or mysql; with
+                // an existing project, nothing means the one it names.
+                $database = $flavor === 'laravel' && in_array($input['database'] ?? '', ['sqlite', 'mysql', 'mariadb', 'pgsql'], true) ? '--database=' . $input['database'] : '';
+                // An existing project to set up: a git URL, a folder or an
+                // archive (a Laravel app, or any app as a plain site), which
+                // the CLI checks; here only that it is one line of text.
+                $from = ($flavor === 'laravel' || $flavor === 'plain') ? trim((string) ($input['from'] ?? '')) : '';
+                if ($from !== '' && (strlen($from) > 500 || $from[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $from))) {
+                    $response['message'] = "That isn't a git URL, a folder or an archive.";
+                    break;
+                }
+                $command = sprintf('HOME=%s %s add %s %s %s %s --no-reload 2>&1', escapeshellarg($user_home), escapeshellarg($cove_path), escapeshellarg($site_name), $flavor !== '' ? escapeshellarg($flavor) : '', $database !== '' ? escapeshellarg($database) : '', $from !== '' ? escapeshellarg('--from=' . $from) : '');
                 // Remember we're adding so the post-exec block below can
                 // measure the new site's size and fold it into the cache.
                 $add_site_target = $site_name;
@@ -4492,9 +6194,224 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             fclose($fh);
             echo json_encode(['success' => true, 'log' => $log, 'truncated' => $size > $max]);
             exit;
+        case 'site_routes':
+        case 'site_migrations':
+        case 'site_schedule':
+        case 'site_artisan':
+        case 'site_laravel_op':
+        case 'site_laravel_workers':
+        case 'site_laravel_users':
+            // --- Site page: a Laravel site's routes, migrations, schedule
+            // and artisan console, all through `cove artisan` so the site's
+            // pinned PHP is honoured. As with WP-CLI above, every argument is
+            // one escapeshellarg and nothing the browser sends meets a shell.
+            if (empty($site_name) || !preg_match('/^[a-zA-Z0-9-]+$/', $site_name)) {
+                echo json_encode(['success' => false, 'message' => 'Invalid site name.']);
+                exit;
+            }
+            if (!cove_site_is_laravel($sitedir . '/' . $site_name . '.localhost')) {
+                echo json_encode(['success' => false, 'message' => 'Not a Laravel site.']);
+                exit;
+            }
+            // A wide terminal: without one artisan lays its tables out for 80
+            // columns, and migrate:status drops the dot leader on a long
+            // migration name. $limit as cove_run_limited's.
+            $__artisan = function (array $args, $limit = 0) use ($user_home, $cove_path, $site_name) {
+                $env = getenv();
+                $env['HOME'] = $user_home;
+                $env['COLUMNS'] = '250';
+                $t0 = microtime(true);
+                [$out, $code, $stopped] = cove_run_limited(array_merge([$cove_path, 'artisan', $site_name], array_map('strval', $args), ['--no-ansi', '--no-interaction']), $env, $limit);
+                return [trim(preg_replace('/\x1b\[[0-9;]*m/', '', $out)), (int) $code, round((microtime(true) - $t0) * 1000), $stopped];
+            };
+            // A --json listing; a deprecation notice from the app may come
+            // first, so the last line that parses wins.
+            $__artisan_json = function (array $args) use ($__artisan) {
+                [$out, $code, $ms] = $__artisan($args);
+                $data = json_decode($out, true);
+                if (!is_array($data)) {
+                    foreach (array_reverse(explode("\n", $out)) as $line) { $data = json_decode($line, true); if (is_array($data)) break; }
+                }
+                if (!is_array($data)) {
+                    echo json_encode(['success' => false, 'message' => $out !== '' ? $out : 'artisan failed (' . $code . ').']);
+                    exit;
+                }
+                return [$data, $ms];
+            };
+
+            if ($action === 'site_routes') {
+                [$data, $ms] = $__artisan_json(['route:list', '--json']);
+                $items = array_map(fn($r) => ['method' => $r['method'] ?? '', 'uri' => $r['uri'] ?? '', 'name' => $r['name'] ?? null, 'action' => $r['action'] ?? '', 'middleware' => array_values((array) ($r['middleware'] ?? [])), 'domain' => $r['domain'] ?? null, 'path' => $r['path'] ?? null], $data);
+                echo json_encode(['success' => true, 'items' => $items, 'ms' => $ms]);
+                exit;
+            }
+            if ($action === 'site_schedule') {
+                [$data, $ms] = $__artisan_json(['schedule:list', '--json']);
+                $items = array_map(fn($t) => ['command' => $t['command'] ?? '', 'description' => $t['description'] ?? null, 'expression' => $t['expression'] ?? '', 'next' => $t['next_due_date'] ?? null, 'next_human' => $t['next_due_date_human'] ?? null, 'timezone' => $t['timezone'] ?? null], $data);
+                echo json_encode(['success' => true, 'items' => $items, 'ms' => $ms]);
+                exit;
+            }
+            if ($action === 'site_migrations') {
+                // migrate:status has no --json: its rows are "name .. [batch] Ran"
+                // or "name .. Pending", the dots left out when the name fills
+                // the line.
+                [$out, $code, $ms] = $__artisan(['migrate:status']);
+                $items = [];
+                foreach (explode("\n", $out) as $line) {
+                    if (preg_match('/^\s*(\S+)\s+(?:\.+\s+)?(?:\[(\d+)\]\s+)?(Ran|Pending)\s*$/', $line, $m)) $items[] = ['name' => $m[1], 'batch' => $m[2] !== '' ? (int) $m[2] : null, 'ran' => $m[3] === 'Ran'];
+                }
+                if (!$items && $code !== 0) { echo json_encode(['success' => false, 'message' => $out !== '' ? $out : 'artisan failed (' . $code . ').']); exit; }
+                echo json_encode(['success' => true, 'items' => $items, 'ms' => $ms, 'note' => $items ? null : $out]);
+                exit;
+            }
+            if ($action === 'site_laravel_workers') {
+                // The queue worker and scheduler (`cove laravel`): their
+                // state, or one turned on or off first.
+                $args = ['laravel', $site_name];
+                $kind = (string) ($input['kind'] ?? '');
+                if ($kind !== '') {
+                    $state = (string) ($input['state'] ?? '');
+                    if (!in_array($kind, ['queue', 'schedule', 'reverb'], true) || !in_array($state, ['on', 'off'], true)) { echo json_encode(['success' => false, 'message' => 'Unknown worker.']); exit; }
+                    array_push($args, $kind, $state);
+                    // Reverb's Caddy route needs a reload, which the dashboard
+                    // asks for itself afterwards (this request is served by it).
+                    if ($kind === 'reverb') $args[] = '--no-reload';
+                }
+                $cmd = 'HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path);
+                foreach ($args as $a) $cmd .= ' ' . escapeshellarg($a);
+                exec($cmd . ' --format=json 2>&1 </dev/null', $lines, $code);
+                $data = json_decode((string) end($lines), true);
+                if (!is_array($data)) { echo json_encode(['success' => false, 'message' => trim(implode("\n", $lines)) ?: 'cove laravel failed.']); exit; }
+                echo json_encode(['success' => $code === 0, 'workers' => $data]);
+                exit;
+            }
+            if ($action === 'site_laravel_users') {
+                // The app's users through its auth model (`cove laravel <site>
+                // users`), shaped like WordPress's so one users tab serves
+                // both; or one added. A password typed in reaches the command
+                // through its environment, never a command line.
+                $op = (string) ($input['op'] ?? 'list');
+                $args = ['laravel', $site_name];
+                $env = getenv();
+                $env['HOME'] = $user_home;
+                if ($op === 'add') {
+                    $email = trim((string) ($input['email'] ?? ''));
+                    $name = trim((string) ($input['name'] ?? ''));
+                    $password = (string) ($input['password'] ?? '');
+                    if ($email === '' || strlen($email) > 191 || $email[0] === '-' || !filter_var($email, FILTER_VALIDATE_EMAIL)) { echo json_encode(['success' => false, 'message' => 'Enter an email address.']); exit; }
+                    if (strlen($name) > 191 || preg_match('/[\x00-\x1f\x7f]/', $name)) { echo json_encode(['success' => false, 'message' => 'That name is too long.']); exit; }
+                    if (strlen($password) > 200 || strpos($password, "\0") !== false) { echo json_encode(['success' => false, 'message' => 'That password is too long.']); exit; }
+                    array_push($args, 'user', 'add', $email);
+                    if ($name !== '') $args[] = '--name=' . $name;
+                    $env['COVE_USER_PASSWORD'] = $password;
+                } elseif ($op === 'list') {
+                    $args[] = 'users';
+                } else {
+                    echo json_encode(['success' => false, 'message' => 'Unknown operation.']);
+                    exit;
+                }
+                $args[] = '--format=json';
+                $cmd = escapeshellarg($cove_path);
+                foreach ($args as $a) $cmd .= ' ' . escapeshellarg($a);
+                $t0 = microtime(true);
+                $proc = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes, null, $env);
+                if (!is_resource($proc)) { echo json_encode(['success' => false, 'message' => 'Could not run cove.']); exit; }
+                $out = trim(preg_replace('/\x1b\[[0-9;]*m/', '', (string) stream_get_contents($pipes[1])));
+                fclose($pipes[1]);
+                proc_close($proc);
+                $ms = round((microtime(true) - $t0) * 1000);
+                $lines = explode("\n", $out);
+                $data = json_decode((string) end($lines), true);
+                if (!is_array($data)) { echo json_encode(['success' => false, 'message' => $out !== '' ? $out : 'cove laravel failed.']); exit; }
+                if (isset($data['error'])) { echo json_encode(['success' => false, 'message' => $data['error']]); exit; }
+                // What a log in names: the email, or the id when the email
+                // has characters `cove login` won't take.
+                $login = fn($u) => preg_match('/^[A-Za-z0-9._@+-]{1,60}$/', (string) ($u['email'] ?? '')) ? $u['email'] : (string) $u['id'];
+                if ($op === 'add') {
+                    echo json_encode(['success' => true, 'user' => ['id' => $data['id'], 'email' => $data['email'], 'name' => $data['name'], 'login' => $login($data), 'password' => $data['password']], 'ms' => $ms]);
+                    exit;
+                }
+                $items = array_map(fn($u) => ['ID' => $u['id'], 'user_login' => $login($u), 'display_name' => (string) ($u['name'] ?? ''), 'user_email' => (string) ($u['email'] ?? ''), 'roles' => '', 'verified' => $u['verified'] ?? null, 'registered' => (string) ($u['created'] ?? '')], $data['users'] ?? []);
+                echo json_encode(['success' => true, 'items' => $items, 'ms' => $ms, 'total' => $data['total'] ?? count($items), 'model' => $data['model'] ?? null]);
+                exit;
+            }
+            if ($action === 'site_laravel_op') {
+                // Clearing caches is the four file caches one by one, not
+                // optimize:clear: that also runs cache:clear, which for an app
+                // caching in Redis flushes the database every Cove Laravel
+                // site shares (they keep apart by prefix, not by database).
+                $ops = ['migrate' => [['migrate', '--force']], 'schedule_run' => [['schedule:run']], 'optimize_clear' => [['config:clear'], ['route:clear'], ['view:clear'], ['event:clear']]];
+                $op = (string) ($input['op'] ?? '');
+                if (!isset($ops[$op])) { echo json_encode(['success' => false, 'message' => 'Unknown operation.']); exit; }
+                $outs = []; $code = 0; $ms = 0;
+                foreach ($ops[$op] as $args) {
+                    [$out, $code, $took] = $__artisan($args);
+                    $ms += $took;
+                    if ($out !== '') $outs[] = $out;
+                    if ($code !== 0) { $outs[] = 'artisan ' . $args[0] . ' failed (' . $code . ').'; break; }
+                }
+                // The dashboard shows the last line, which for the four
+                // would name only the event cache.
+                if ($code === 0 && $op === 'optimize_clear') $outs[] = 'Cleared the config, route, view and event caches.';
+                echo json_encode(['success' => $code === 0, 'message' => $outs ? implode("\n", $outs) : 'Done.', 'ms' => $ms]);
+                exit;
+            }
+            if ($action === 'site_artisan') {
+                // An artisan line from the console, split like the WP-CLI one.
+                $line = trim((string) ($input['args'] ?? ''));
+                $line = preg_replace('/^(php\s+)?artisan\s+/', '', $line);
+                if ($line === '' || strlen($line) > 4000) { echo json_encode(['success' => false, 'message' => 'Nothing to run.']); exit; }
+                $tokens = []; $cur = ''; $q = null; $has = false;
+                for ($i = 0, $n = strlen($line); $i < $n; $i++) {
+                    $ch = $line[$i];
+                    if ($q !== null) {
+                        if ($ch === $q) { $q = null; continue; }
+                        if ($ch === '\\' && $q === '"' && $i + 1 < $n) { $cur .= $line[++$i]; continue; }
+                        $cur .= $ch; continue;
+                    }
+                    if ($ch === '"' || $ch === "'") { $q = $ch; $has = true; continue; }
+                    if ($ch === '\\' && $i + 1 < $n) { $cur .= $line[++$i]; $has = true; continue; }
+                    if ($ch === ' ' || $ch === "\t" || $ch === "\n") { if ($cur !== '' || $has) { $tokens[] = $cur; $cur = ''; $has = false; } continue; }
+                    $cur .= $ch; $has = true;
+                }
+                if ($q !== null) { echo json_encode(['success' => false, 'message' => 'Unbalanced quote.']); exit; }
+                if ($cur !== '' || $has) $tokens[] = $cur;
+                if (!$tokens) { echo json_encode(['success' => false, 'message' => 'Nothing to run.']); exit; }
+                // Commands that wait on a terminal, or run until stopped.
+                // Artisan takes any unambiguous abbreviation (serv, q:w) and
+                // ignores case, so a name matches when each of its :-parts
+                // begins its counterpart's. The command is the first word
+                // that isn't an option, since artisan takes its own (-v,
+                // --no-ansi, -q) ahead of it, or --env's value.
+                $long = ['tinker', 'db', 'serve', 'dev', 'pail', 'queue:work', 'queue:listen', 'schedule:work', 'horizon', 'reverb:start', 'octane:start', 'octane:frankenphp', 'pulse:check', 'pulse:work', 'inertia:start-ssr', 'nightwatch:agent'];
+                $command = '';
+                for ($i = 0, $n = count($tokens); $i < $n; $i++) {
+                    if ($tokens[$i] === '--env') { $i++; continue; }
+                    if ($tokens[$i] !== '' && $tokens[$i][0] !== '-') { $command = $tokens[$i]; break; }
+                }
+                $g = explode(':', strtolower($command));
+                foreach ($long as $name) {
+                    $p = explode(':', $name);
+                    if (count($p) !== count($g)) continue;
+                    $all = true;
+                    foreach ($g as $i => $part) { if ($part === '' || strpos($p[$i], $part) !== 0) { $all = false; break; } }
+                    if ($all) {
+                        echo json_encode(['success' => false, 'message' => 'artisan ' . $name . ' waits on a terminal or runs until stopped, so it can\'t run here. Use a terminal: cove artisan ' . $site_name . ' ' . $name]);
+                        exit;
+                    }
+                }
+                // Stopped after four minutes, before the dashboard's own five
+                // run out, so whatever it printed still comes back.
+                [$out, $code, $ms, $stopped] = $__artisan($tokens, 240);
+                if ($stopped) $out .= ($out !== '' ? "\n\n" : '') . ($stopped === 'time' ? 'Stopped after 4 minutes.' : 'Stopped: it printed more than 8 MB.') . ' Run it in a terminal instead: cove artisan ' . $site_name . ' …';
+                echo json_encode(['success' => true, 'output' => $out, 'code' => $code, 'ms' => $ms]);
+                exit;
+            }
+            exit;
         case 'site_plugins':
         case 'site_themes':
         case 'site_users':
+        case 'site_user_add':
         case 'site_cron':
         case 'site_plugin_op':
         case 'site_theme_op':
@@ -4513,14 +6430,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['success' => false, 'message' => 'Not a WordPress site.']);
                 exit;
             }
-            $__wp = function (array $args) use ($user_home, $cove_path, $site_name) {
-                $cmd = 'HOME=' . escapeshellarg($user_home) . ' ' . escapeshellarg($cove_path) . ' wp ' . escapeshellarg($site_name);
-                foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string) $a);
+            // $limit as cove_run_limited's.
+            $__wp = function (array $args, $limit = 0) use ($user_home, $cove_path, $site_name) {
+                $env = getenv();
+                $env['HOME'] = $user_home;
                 $t0 = microtime(true);
-                exec($cmd . ' 2>&1', $lines, $code);
+                [$out, $code, $stopped] = cove_run_limited(array_merge([$cove_path, 'wp', $site_name], array_map('strval', $args)), $env, $limit);
                 // WP-CLI colours its errors even without a TTY in some builds.
-                $out = preg_replace('/\x1b\[[0-9;]*m/', '', implode("\n", $lines));
-                return [$out, (int) $code, round((microtime(true) - $t0) * 1000)];
+                $out = rtrim(preg_replace('/\x1b\[[0-9;]*m/', '', $out));
+                return [$out, (int) $code, round((microtime(true) - $t0) * 1000), $stopped];
             };
             // PHP's own notices (a plugin, or wp-cli itself on a new PHP)
             // arrive on the same stream; they would bury every listing and
@@ -4605,7 +6523,67 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 $supers = [];
                 if ($__multisite) { [$so] = $__wp(['super-admin', 'list', '--skip-plugins', '--skip-themes']); [$so] = $__wp_clean($so); $supers = array_values(array_filter(array_map('trim', explode("\n", $so)))); }
-                echo json_encode(['success' => true, 'items' => array_values($items), 'ms' => $ms, 'multisite' => $__multisite, 'super_admins' => $supers]);
+                // The roles the add form offers (a plugin's own, such as
+                // shop_manager, are stored with the rest). Without them the
+                // list still shows.
+                [$ro, , $ms3] = $__wp(['role', 'list', '--fields=role,name', '--format=json', '--skip-plugins', '--skip-themes']);
+                $roles = null;
+                foreach (array_reverse(explode("\n", trim($ro))) as $line) { $roles = json_decode(trim($line), true); if (is_array($roles)) break; }
+                $roles = is_array($roles) ? array_values(array_filter($roles, fn($r) => is_array($r) && isset($r['role']))) : [];
+                $ms += $ms3;
+                echo json_encode(['success' => true, 'items' => array_values($items), 'ms' => $ms, 'multisite' => $__multisite, 'super_admins' => $supers, 'roles_available' => $roles]);
+                exit;
+            }
+
+            if ($action === 'site_user_add') {
+                // A new user from the users tab: `wp user create`, with the
+                // plugins loaded as they would be in the admin. The password,
+                // typed in or made up here, goes over stdin (--prompt), not on
+                // a command line; WP-CLI echoes the command it built, password
+                // and all, so nothing it prints is passed on but its error,
+                // with the password masked.
+                $email = trim((string) ($input['email'] ?? ''));
+                $login = trim((string) ($input['login'] ?? ''));
+                $role = (string) ($input['role'] ?? '');
+                $password = (string) ($input['password'] ?? '');
+                if ($email === '' || strlen($email) > 100 || $email[0] === '-' || !filter_var($email, FILTER_VALIDATE_EMAIL)) { echo json_encode(['success' => false, 'message' => 'Enter an email address.']); exit; }
+                // Left blank, the username is the email's local part, kept to
+                // the characters WordPress allows in one.
+                if ($login === '') $login = strtolower(preg_replace('/[^A-Za-z0-9_.@-]/', '', strstr($email, '@', true)));
+                if (!preg_match('/^[A-Za-z0-9_.@][A-Za-z0-9 _.@-]{0,59}$/', $login) || substr($login, -1) === ' ') { echo json_encode(['success' => false, 'message' => 'A username is letters, numbers, spaces and _ . - @, up to 60 of them.']); exit; }
+                if (!preg_match('/^[A-Za-z0-9_-]{1,64}$/', $role)) { echo json_encode(['success' => false, 'message' => 'Pick a role.']); exit; }
+                $generated = $password === '';
+                if ($generated) {
+                    $abc = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+                    for ($i = 0; $i < 20; $i++) $password .= $abc[random_int(0, strlen($abc) - 1)];
+                }
+                // WP-CLI reads it as a line and trims it.
+                if (strlen($password) > 200 || preg_match('/[\r\n\0]/', $password) || trim($password) !== $password) { echo json_encode(['success' => false, 'message' => "A password can't be over 200 characters, span lines, or start or end with a space."]); exit; }
+                $cmd = escapeshellarg($cove_path) . ' wp ' . escapeshellarg($site_name);
+                foreach (['user', 'create', $login, $email, '--role=' . $role, '--prompt=user_pass', '--porcelain'] as $a) $cmd .= ' ' . escapeshellarg($a);
+                $env = getenv();
+                $env['HOME'] = $user_home;
+                $t0 = microtime(true);
+                $proc = proc_open($cmd, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes, null, $env);
+                if (!is_resource($proc)) { echo json_encode(['success' => false, 'message' => 'Could not run cove.']); exit; }
+                fwrite($pipes[0], $password . "\n");
+                fclose($pipes[0]);
+                $out = (string) stream_get_contents($pipes[1]);
+                fclose($pipes[1]);
+                $code = proc_close($proc);
+                $ms = round((microtime(true) - $t0) * 1000);
+                [$out] = $__wp_clean(preg_replace('/\x1b\[[0-9;]*m/', '', $out));
+                $id = 0;
+                foreach (array_reverse(explode("\n", $out)) as $line) { if (preg_match('/^\s*(\d+)\s*$/', $line, $m)) { $id = (int) $m[1]; break; } }
+                if ($code !== 0 || !$id) {
+                    $why = 'WP-CLI could not create the user.';
+                    foreach (explode("\n", $out) as $line) {
+                        if (preg_match('/^Error:\s*(.+)$/', trim($line), $m)) { $why = trim(html_entity_decode(strip_tags(preg_replace('/^(<strong>)?Error(<\/strong>)?:\s*/i', '', $m[1])))); break; }
+                    }
+                    echo json_encode(['success' => false, 'message' => str_replace($password, '••••', $why)]);
+                    exit;
+                }
+                echo json_encode(['success' => true, 'user' => ['id' => $id, 'email' => $email, 'login' => $login, 'role' => $role, 'password' => $generated ? $password : null], 'ms' => $ms]);
                 exit;
             }
 
@@ -4674,14 +6652,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($q !== null) { echo json_encode(['success' => false, 'message' => 'Unbalanced quote.']); exit; }
                 if ($cur !== '' || $has) $tokens[] = $cur;
                 if (!$tokens) { echo json_encode(['success' => false, 'message' => 'Nothing to run.']); exit; }
-                $first = $tokens[0];
-                if (in_array($first, ['shell', 'db', 'server'], true) && ($first !== 'db' || in_array($tokens[1] ?? '', ['cli', 'shell'], true) || count($tokens) === 1)) {
+                // The command is the first two words that aren't options,
+                // since WP-CLI takes its own (--quiet, --url=…) ahead of it.
+                $words = array_values(array_filter($tokens, fn($t) => $t === '' || $t[0] !== '-'));
+                $first = $words[0] ?? '';
+                if (in_array($first, ['shell', 'db', 'server'], true) && ($first !== 'db' || in_array($words[1] ?? '', ['cli', 'shell'], true) || count($words) === 1)) {
                     echo json_encode(['success' => false, 'message' => 'Interactive commands (wp shell, wp db cli, wp server) have no terminal here.']);
                     exit;
                 }
                 $tokens[] = '--no-color';
-                [$out, $code, $ms] = $__wp($tokens);
+                // Stopped after four minutes, as artisan's console is.
+                [$out, $code, $ms, $stopped] = $__wp($tokens, 240);
                 [$out, $dropped] = $__wp_clean($out);
+                if ($stopped) $out .= ($out !== '' ? "\n\n" : '') . ($stopped === 'time' ? 'Stopped after 4 minutes.' : 'Stopped: it printed more than 8 MB.') . ' Run it in a terminal instead: cove wp ' . $site_name . ' …';
                 echo json_encode(['success' => true, 'output' => $out, 'code' => $code, 'ms' => $ms, 'notices' => $dropped]);
                 exit;
             }
@@ -4864,7 +6847,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $size = 0;
             exec('du -sk ' . escapeshellarg($sitedir . '/' . $site_name . '.localhost') . ' 2>/dev/null', $du);
             if ($du && preg_match('/^(\d+)/', $du[0], $mm)) $size = (int) $mm[1] * 1024;
-            echo json_encode(['success' => true, 'size_bytes' => $size, 'output' => $out]);
+            echo json_encode(['success' => true, 'size_bytes' => $size, 'output' => $out, 'type' => cove_site_is_laravel($sitedir . '/' . $site_name . '.localhost') ? 'Laravel' : 'WordPress']);
             exit;
         case 'site_backup':
             // One zip of the site's files and database, via `cove backup`,
@@ -5018,6 +7001,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             };
             $count_php($user_home . '/Cove/Logs/errors.log', '/Sites/' . $site_name . '.localhost/');
             $count_php($site_dir . '/public/wp-content/debug.log', null);
+            // A Laravel site keeps its errors in its own log.
+            if (cove_site_is_laravel($site_dir)) $php_errors += cove_laravel_error_count(cove_laravel_log($site_dir), (int) $cutoff, 12 * 1048576);
 
             $out = ['success' => true, 'range' => $range, 'requests' => $agg['requests'], 'bytes' => $agg['bytes'], 'status' => $agg['status'], 'kinds' => $agg['kinds'], 'php_errors' => $php_errors, 'first' => $agg['first'], 'last' => $agg['last'], 'last_cron' => $agg['last_cron'], 'log_size' => $size, 'scanned' => $scanned, 'complete' => $stopped || $scanned >= $size, 'has_log' => is_file($log)];
             if (!$light) {
@@ -5116,7 +7101,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Parse the command's output to find the URL.
                 foreach ($output_lines as $line) {
-                    if (strpos($line, 'https://') !== false && strpos($line, '/wp-login.php') !== false) {
+                    if (strpos($line, 'https://') !== false && (strpos($line, '/wp-login.php') !== false || strpos($line, '/__cove/login/') !== false)) {
                         // Clean the line from any "gum" box characters.
                         $login_url = trim(preg_replace('/[│└┌]/u', '', $line));
                         break;
@@ -5135,6 +7120,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if ($note) $response['note'] = implode(' ', $note);
                 } else {
                     $response = ['success' => false, 'message' => 'Failed to generate login link.', 'output' => $full_output];
+                    // The command's own reason, when it gave one.
+                    foreach ($output_lines as $line) {
+                        $line = trim(preg_replace('/\x1b\[[0-9;]*m/', '', $line));
+                        if (strpos($line, '❌') === 0) { $response['message'] = preg_replace('/^❌\s*(Error:\s*)?/u', '', $line); break; }
+                    }
+                    // A Laravel app no one has registered with yet: the
+                    // dashboard offers its users tab.
+                    if (strpos($full_output, 'has no users yet') !== false) {
+                        $response['code'] = 'no_users';
+                        $response['message'] = 'This app has no users yet. Add one, then log in as them.';
+                    }
                 }
 
             } else {
@@ -5170,12 +7166,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $mapping_verb = $action === 'add_mapping' ? 'add' : 'remove';
             // Either direction regenerates the Caddyfile and reloads the Caddy
             // serving this dashboard, so the response can be dropped and the
-            // UI retries. The CLI is idempotent on both sides ("already
-            // mapped" and "not found" both exit 0), which makes that safe.
+            // UI retries. An add the first try made exits 0 ("already
+            // mapped"), but a remove it made exits 1 ("not found", or "no
+            // mappings" for the last one), so here that counts as done: the
+            // domain is gone either way.
             exec(sprintf('HOME=%s %s mappings %s %s %s 2>&1',
                 escapeshellarg($user_home), escapeshellarg($cove_path),
                 escapeshellarg($site_name), $mapping_verb, escapeshellarg($domain)), $map_out, $map_rc);
             $map_text = implode("\n", $map_out);
+            if ($map_rc !== 0 && $mapping_verb === 'remove' && preg_match('/Mapping \'.*\' not found|No mappings exist/', $map_text)) $map_rc = 0;
             if ($map_rc !== 0) {
                 $msg = $mapping_verb === 'add' ? 'Could not add domain.' : 'Could not remove domain.';
                 if (stripos($map_text, 'Invalid domain') !== false) $msg = 'Invalid domain.';
@@ -5300,7 +7299,62 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'note' => 'WordPress on every Cove site is pointed at the SMTP port above.',
                     'actions' => [['kind' => 'mail', 'label' => 'open inbox'], ['kind' => 'open', 'label' => 'mailpit ↗', 'href' => $mailui]],
                 ],
-            ]]);
+            ] + (empty($__svc_cfg['PGSQL_USER']) ? [] : ['postgres' => (function () use ($__svc_cfg, $__svc_port_open, $user_home, $sitedir) {
+                // For Laravel sites on --database=pgsql (`cove postgres`).
+                $port = (int) ($__svc_cfg['PGSQL_PORT'] ?? 5432);
+                $up = $__svc_port_open($port); $version = '—'; $count = '—';
+                if ($up) {
+                    try {
+                        $pg = cove_pgsql_pdo($__svc_cfg, 'postgres');
+                        $version = explode(' ', (string) $pg->query('SHOW server_version')->fetchColumn())[0];
+                        // During a demo, only how many are its own.
+                        $count = cove_demo_sites($user_home) === null
+                            ? (string) $pg->query("SELECT COUNT(*) FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'")->fetchColumn()
+                            : (string) count(preg_grep('/^pgsql:/', cove_demo_databases($user_home, $sitedir)));
+                    } catch (Throwable $e) {}
+                }
+                return [
+                    'label' => 'PostgreSQL', 'running' => $up,
+                    'status' => $up ? 'Running on 127.0.0.1:' . $port . '.' : 'Not answering on 127.0.0.1:' . $port . ' — start it with: cove postgres start',
+                    'rows' => [
+                        ['version', $version],
+                        ['host', '127.0.0.1:' . $port],
+                        ['user', $__svc_cfg['PGSQL_USER']],
+                        ['password', $__svc_cfg['PGSQL_PASSWORD'] ?? '—'],
+                        ['databases', $count],
+                    ],
+                    'note' => 'For Laravel sites on --database=pgsql. Credentials stored in ~/Cove/config; cove postgres psql opens a shell.',
+                    'actions' => [['kind' => 'db', 'label' => 'open databases']],
+                ];
+            })()]) + (empty($__svc_cfg['REDIS_PORT']) ? [] : ['redis' => (function () use ($__svc_cfg) {
+                // For Laravel sites' cache, sessions and queues (`cove redis`),
+                // asked over its own protocol, so no PHP extension is needed.
+                $port = (int) $__svc_cfg['REDIS_PORT'];
+                $info = '';
+                $sock = @fsockopen('127.0.0.1', $port, $e, $es, 0.5);
+                if ($sock) {
+                    stream_set_timeout($sock, 1);
+                    fwrite($sock, "INFO\r\n");
+                    $len = (int) substr((string) fgets($sock), 1);
+                    while ($len > 0 && strlen($info) < $len && !feof($sock)) $info .= (string) fread($sock, $len - strlen($info));
+                    fclose($sock);
+                }
+                $up = $info !== '';
+                $version = preg_match('/^(?:redis|valkey)_version:(\S+)/m', $info, $m) ? $m[1] : '—';
+                $keys = preg_match_all('/^db\d+:keys=(\d+)/m', $info, $mm) ? (string) array_sum($mm[1]) : '0';
+                return [
+                    'label' => 'Redis', 'running' => $up,
+                    'status' => $up ? 'Running on 127.0.0.1:' . $port . '.' : 'Not answering on 127.0.0.1:' . $port . ' — start it with: cove redis start',
+                    'rows' => [
+                        ['version', $version],
+                        ['host', '127.0.0.1:' . $port],
+                        ['password', 'none (loopback only)'],
+                        ['keys', $up ? $keys : '—'],
+                    ],
+                    'note' => 'For Laravel sites\' cache, sessions and queues. Each site\'s keys carry its own prefix (REDIS_PREFIX); cove redis cli opens a shell.',
+                    'actions' => [],
+                ];
+            })()])]);
             exit;
         case 'db_list':
         case 'db_tables':
@@ -5319,6 +7373,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // rather than allow-listed so any schema a site created works.
             // During `cove demo` it signs in as the demo's own account, which
             // can open only the demo sites' databases (see demo_db_sync).
+            // A Laravel site on SQLite goes by "sqlite:<site>" (cove_db_sqlite).
+            if (strncmp((string) ($input['db'] ?? ''), 'sqlite:', 7) === 0) {
+                $__site = substr((string) $input['db'], 7);
+                $__sp = $sitedir . '/' . $__site . '.localhost';
+                if (!preg_match('/^[a-z0-9-]+$/', $__site) || cove_demo_hides($user_home, $__site) || !cove_site_is_laravel($__sp) || !is_file(cove_laravel_sqlite_path($__sp))) {
+                    echo json_encode(['success' => false, 'message' => 'No such database.']);
+                    exit;
+                }
+                echo json_encode(cove_db_sqlite($action, $input, cove_laravel_sqlite_path($__sp)));
+                exit;
+            }
+            // A database on Cove's PostgreSQL goes by "pgsql:<name>".
+            if (strncmp((string) ($input['db'] ?? ''), 'pgsql:', 6) === 0) {
+                $__pg = substr((string) $input['db'], 6);
+                $__pg_demo = cove_demo_sites($user_home) === null ? null : cove_demo_databases($user_home, $sitedir);
+                if (!preg_match('/^[A-Za-z0-9_][A-Za-z0-9_-]{0,62}$/', $__pg) || $__pg === 'postgres' || ($__pg_demo !== null && !in_array('pgsql:' . $__pg, $__pg_demo, true))) {
+                    echo json_encode(['success' => false, 'message' => 'No such database.']);
+                    exit;
+                }
+                // Cove's PostgreSQL role is a superuser: during a demo the
+                // console, which could look past the demo's databases (the
+                // catalog, other databases' files), is off.
+                if ($__pg_demo !== null && $action === 'db_query') {
+                    echo json_encode(['success' => false, 'message' => 'The SQL console is off for PostgreSQL databases during a demo.']);
+                    exit;
+                }
+                echo json_encode(cove_db_pgsql($action, $input, $__pg, isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : []));
+                exit;
+            }
             $__db_cfg = isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : [];
             if (cove_demo_sites($user_home) !== null) {
                 $__db_cfg = @parse_ini_file($user_home . '/Cove/demo-db') ?: [];
@@ -5341,13 +7424,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // JSON-safe cell values: strings and NULL pass through; anything
             // that is not UTF-8 is shown as a hex prefix, and long text is cut
             // so a 2 MB serialized option doesn't ride along with every page.
-            $__cell = function ($v) {
-                if ($v === null) return null;
-                $v = (string) $v;
-                if (!mb_check_encoding($v, 'UTF-8')) return ['t' => 'bin', 'hex' => bin2hex(substr($v, 0, 48)), 'len' => strlen($v)];
-                if (strlen($v) > 2000) return ['t' => 'long', 'text' => mb_substr($v, 0, 2000), 'len' => strlen($v)];
-                return $v;
-            };
+            $__cell = 'cove_db_cell';
             $__rows_of = function ($res) use ($__cell) {
                 $out = [];
                 while ($r = $res->fetch_row()) $out[] = array_map($__cell, $r);
@@ -5425,7 +7502,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if ($__demo_dbs !== null && !in_array($r['name'], $__demo_dbs, true)) continue;
                     $out[] = ['name' => $r['name'], 'tables' => $light ? null : (int) $r['tables_count'], 'bytes' => $light ? null : (int) $r['bytes']];
                 }
-                echo json_encode(['success' => true, 'databases' => $out, 'server' => $__db->server_info]);
+                // Laravel sites on SQLite, as "sqlite:<site>".
+                foreach (is_dir($sitedir) ? scandir($sitedir) : [] as $item) {
+                    if (substr($item, -10) !== '.localhost' || cove_demo_hides($user_home, $item)) continue;
+                    $sp = $sitedir . '/' . $item;
+                    if (!cove_site_is_laravel($sp)) continue;
+                    $env = cove_laravel_env($sp);
+                    if (($env['DB_CONNECTION'] ?? 'sqlite') !== 'sqlite') continue;
+                    $f = cove_laravel_sqlite_path($sp, $env);
+                    if (!is_file($f)) continue;
+                    $n = null;
+                    if (!$light) {
+                        try { $n = (int) (new PDO('sqlite:' . $f))->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")->fetchColumn(); } catch (Throwable $e) {}
+                    }
+                    $out[] = ['name' => 'sqlite:' . substr($item, 0, -10), 'tables' => $n, 'bytes' => $light ? null : filesize($f)];
+                }
+                // Databases on Cove's PostgreSQL, when it is set up and running,
+                // as "pgsql:<name>".
+                $__pg_version = null;
+                if (!empty($__cove_cfg['PGSQL_USER']) && $__demo_dbs === null || ($__demo_dbs !== null && preg_grep('/^pgsql:/', $__demo_dbs))) {
+                    try {
+                        $pg = cove_pgsql_pdo($__cove_cfg, 'postgres');
+                        $__pg_version = (string) $pg->query('SHOW server_version')->fetchColumn();
+                        foreach ($pg->query("SELECT datname, pg_database_size(datname) FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY datname")->fetchAll(PDO::FETCH_NUM) as [$pgname, $pgbytes]) {
+                            if ($__demo_dbs !== null && !in_array('pgsql:' . $pgname, $__demo_dbs, true)) continue;
+                            $n = null;
+                            if (!$light) {
+                                try { $n = (int) cove_pgsql_pdo($__cove_cfg, $pgname)->query("SELECT COUNT(*) FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace WHERE ns.nspname = current_schema() AND c.relkind IN ('r', 'p')")->fetchColumn(); } catch (Throwable $e) {}
+                            }
+                            $out[] = ['name' => 'pgsql:' . $pgname, 'tables' => $n, 'bytes' => $light ? null : (int) $pgbytes];
+                        }
+                    } catch (Throwable $e) {}
+                }
+                echo json_encode(['success' => true, 'databases' => $out, 'server' => $__db->server_info, 'pg_server' => $__pg_version]);
                 exit;
             }
 
@@ -5611,7 +7720,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     case 'reload':   return [$__logs_dir . '/caddy-reload.log', 'caddy', null];
                     case 'watchdog': return [$__logs_dir . '/watchdog.log', 'plain', null];
                     case 'mailpit':  return [$__logs_dir . '/mailpit.log', 'plain', null];
-                    case 'debug':    return $site_dir ? [$site_dir . '/public/wp-content/debug.log', 'php', null] : null;
+                    case 'debug':
+                        if (!$site_dir) return null;
+                        // A Laravel site's own log takes the WordPress debug.log's place.
+                        if (cove_site_is_laravel($site_dir)) return [cove_laravel_log($site_dir), 'laravel', null];
+                        return [$site_dir . '/public/wp-content/debug.log', 'php', null];
                     case 'access':   return $site_dir ? [$site_dir . '/logs/caddy.log', 'caddy', null] : null;
                 }
                 if (preg_match('/^fpm-(\d+\.\d+)$/', $source, $m)) return [$__logs_dir . '/php-fpm-' . $m[1] . '.log', 'plain', null];
@@ -5633,10 +7746,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         if ($item === '.' || $item === '..' || substr($item, -10) !== '.localhost' || !is_dir($sitedir . '/' . $item)) continue;
                         if (cove_demo_hides($user_home, $item)) continue;
                         $name = substr($item, 0, -10);
-                        $dbg = $sitedir . '/' . $item . '/public/wp-content/debug.log';
+                        $is_laravel = cove_site_is_laravel($sitedir . '/' . $item);
+                        $dbg = $is_laravel ? cove_laravel_log($sitedir . '/' . $item) : $sitedir . '/' . $item . '/public/wp-content/debug.log';
                         $acc = $sitedir . '/' . $item . '/logs/caddy.log';
                         $d = is_file($dbg) ? filesize($dbg) : null; $a = is_file($acc) ? filesize($acc) : null;
-                        $sites[] = ['name' => $name, 'debug' => $d, 'access' => $a, 'mtime' => max($d ? filemtime($dbg) : 0, $a ? filemtime($acc) : 0) ?: null];
+                        $sites[] = ['name' => $name, 'debug' => $d, 'access' => $a, 'laravel' => $is_laravel, 'mtime' => max($d ? filemtime($dbg) : 0, $a ? filemtime($acc) : 0) ?: null];
                     }
                 }
                 echo json_encode(['success' => true, 'system' => $system, 'sites' => $sites, 'dir' => $__logs_dir]);
@@ -5665,6 +7779,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 foreach (explode("\n", $text) as $line) {
                     if ($line === '' || $line === "\r") continue;
                     if ($__log_kind === 'php' && $out && $line[0] !== '[') { $out[count($out) - 1] .= "\n" . $line; continue; }
+                    // Laravel's entries open with a dated stamp; its "[stacktrace]"
+                    // and "[previous exception]" lines belong to the entry above.
+                    if ($__log_kind === 'laravel' && $out && !preg_match('/^\[\d{4}-\d{2}-\d{2}[ T]\d/', $line)) { $out[count($out) - 1] .= "\n" . $line; continue; }
                     $out[] = $line;
                 }
                 return $out;
@@ -5715,7 +7832,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($start > 0) {
                     // Drop the partial entry at the top of the chunk; the next
                     // (older) chunk will contain it whole.
-                    $pos = $__log_kind === 'php' ? strpos($text, "\n[") : strpos($text, "\n");
+                    if ($__log_kind === 'laravel') $pos = preg_match('/\n\[\d{4}-\d{2}-\d{2}[ T]\d/', $text, $__lm, PREG_OFFSET_CAPTURE) ? $__lm[0][1] : false;
+                    else $pos = $__log_kind === 'php' ? strpos($text, "\n[") : strpos($text, "\n");
                     if ($pos === false) { $scanned += $end - $start; $end = $start; continue; }
                     $text = substr($text, $pos + 1);
                     $start += $pos + 1;
@@ -6036,6 +8154,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
                 }
+                // What setting up an existing project couldn't finish (the
+                // migrations, the front end): the summary's ⚠️ and ℹ️ lines.
+                $notes = [];
+                foreach ($output as $line) {
+                    $line = trim(preg_replace('/^\s*│|│\s*$/u', '', preg_replace('/\x1b\[[0-9;]*m/', '', $line)));
+                    if (preg_match('/^(⚠️|ℹ️)\s*(.+)$/u', $line, $m)) $notes[] = $m[2];
+                    elseif ($notes && preg_match('/^Fix it, then: (.+)$/', $line, $m)) $notes[count($notes) - 1] .= ' Then: ' . $m[1];
+                }
+                if ($notes) $response['notes'] = $notes;
             }
         } else {
             // Translate known failure signatures into user-friendly messages.
@@ -6068,6 +8195,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $msg = 'Invalid site name.';
                 } elseif (stripos($err_text, 'WordPress installation failed') !== false) {
                     $msg = 'WordPress installation failed — check the logs.';
+                } else {
+                    // Otherwise the command's own reason, and what it suggests
+                    // (setting up an existing project fails in many ways).
+                    $lines = array_values(array_filter(array_map(fn($l) => trim(preg_replace('/\x1b\[[0-9;]*m/', '', $l)), $output), 'strlen'));
+                    foreach ($lines as $i => $l) {
+                        if (strpos($l, '❌') !== 0) continue;
+                        $msg = preg_replace('/^❌\s*(Error:\s*)?/u', '', $l);
+                        foreach (array_slice($lines, $i + 1) as $next) {
+                            if (preg_match('/^(The locked packages|A package needs|If it\'s there|Try --database|Expected |Copy a site with)/', $next)) $msg .= ' ' . $next;
+                        }
+                        break;
+                    }
                 }
             }
             $response = ['success' => false, 'message' => $msg, 'output' => $err_text];
@@ -6172,6 +8311,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             --pill-minn-bg: color-mix(in oklch, oklch(74% 0.15 45) 18%, transparent);
             --pill-minn-fg: #f2a582;
             --pill-minn-fg: oklch(82% 0.11 45);
+            /* Laravel: a violet, clear of both the teal and Minn's coral. */
+            --pill-laravel-bg: rgba(160, 138, 230, 0.18);
+            --pill-laravel-bg: color-mix(in oklch, oklch(70% 0.13 295) 18%, transparent);
+            --pill-laravel-fg: #c3b2f2;
+            --pill-laravel-fg: oklch(82% 0.08 295);
             --pill-static-bg: #1e2320;
             --pill-static-fg: #9a9d94;
             --input-bg: #0b0e0c;
@@ -6182,6 +8326,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             --ok: #2bb98a;
             --warn: #e3a94f;
             --minn: #e5845c;
+            --laravel: #a08ae6;
             --mark: rgba(77, 176, 194, 0.24);
             --scrim: rgba(15, 18, 16, 0.86);
             --shadow-pop: 0 1px 2px rgba(0, 0, 0, 0.4), 0 14px 40px rgba(0, 0, 0, 0.45);
@@ -6215,6 +8360,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             --pill-minn-bg: color-mix(in oklch, oklch(66% 0.15 45) 14%, transparent);
             --pill-minn-fg: #8a3d1e;
             --pill-minn-fg: oklch(44% 0.11 45);
+            --pill-laravel-bg: rgba(120, 92, 204, 0.13);
+            --pill-laravel-bg: color-mix(in oklch, oklch(55% 0.15 295) 14%, transparent);
+            --pill-laravel-fg: #4b3690;
+            --pill-laravel-fg: oklch(42% 0.13 295);
             --pill-static-bg: #f1ede5;
             --pill-static-fg: #8a8781;
             --input-bg: #fbfaf7;
@@ -6223,6 +8372,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             --ok: #089772;
             --warn: #a8650f;
             --minn: #d3704a;
+            --laravel: #7d63c9;
             --mark: rgba(58, 151, 169, 0.22);
             --scrim: rgba(251, 250, 247, 0.86);
             --shadow-pop: 0 1px 2px rgba(26, 28, 27, 0.06), 0 10px 30px rgba(26, 28, 27, 0.1);
@@ -6329,7 +8479,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .add-drop-text u { text-decoration-color: var(--text-faint); }
         .add-drop-file { display: inline-flex; align-items: center; gap: 0.2rem; padding: 0.15rem 0.25rem 0.15rem 0.6rem; border-radius: var(--radius-pill); background: var(--pill-wp-bg); color: var(--pill-wp-fg); font-size: 0.72rem; white-space: nowrap; }
         .add-progress { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); padding: 0 0 0.6rem; }
-        .add-row.is-importing .plain-toggle, .add-row.is-importing .wp-version, .add-row.has-import .plain-toggle, .add-row.has-import .wp-version { display: none; }
+        .add-row.is-importing .add-type, .add-row.has-import .add-type { display: none; }
         /* Indeterminate progress stripe across the top while cove add is
            running — site creation takes 5-10s so we need a clear "working"
            cue beyond just the button text swap. Solid accent block slides
@@ -6356,10 +8506,22 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .add-row form { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
         .add-row input[type="text"] { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.9rem; padding: 0.5rem 0.8rem; border-radius: var(--radius-md); min-width: 200px; flex: 1; }
         .add-row input[type="text"]:focus { outline: 0; border-color: var(--accent); }
-        .add-row .plain-toggle { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--text-dim); font-size: 0.85rem; cursor: pointer; }
-        .add-row .plain-toggle input { accent-color: var(--accent); }
-        .add-row select.wp-version { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.85rem; padding: 0.5rem 0.7rem; border-radius: var(--radius-md); flex: none; cursor: pointer; }
-        .add-row select.wp-version:focus { outline: 0; border-color: var(--accent); }
+        /* The site type: a field that completes from the kinds cove add
+           makes, with its list (the sort menu's look) underneath. */
+        .add-type { position: relative; flex: none; }
+        .add-row .add-type input[type="text"] { flex: none; min-width: 0; width: 11rem; padding-right: 2rem; cursor: pointer; }
+        .add-row .add-type input[type="text"]:focus { cursor: text; }
+        .add-type-chev { position: absolute; right: 0.7rem; top: 50%; width: 12px; height: 12px; margin-top: -6px; color: var(--text-faint); pointer-events: none; transition: transform 140ms; }
+        .add-type.is-open .add-type-chev { transform: rotate(180deg); }
+        .add-type .sl-menu { left: 0; right: auto; min-width: 18rem; }
+        .add-type .sl-menu button.is-active { background: var(--panel-hover); }
+        .add-type .sl-menu button:disabled { cursor: default; opacity: 0.5; }
+        .add-type-empty { padding: 0.45rem 0.65rem; font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-faint); }
+        .add-row #wpVersion input[type="text"] { width: 8rem; }
+        .add-row #laravelDb input[type="text"] { width: 9.5rem; }
+        .add-row #wpVersion .sl-menu, .add-row #laravelDb .sl-menu { min-width: 15rem; }
+        /* A long list (WordPress versions, a table's columns) scrolls. */
+        .add-type .sl-menu.is-long { max-height: 20rem; overflow-y: auto; }
 
         /* ---- Sites view ------------------------------------------------
            A harbour band (the summary, over a contour chart), a sticky
@@ -6475,6 +8637,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .sl-type:hover { filter: brightness(1.12); }
         .sl-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
         .sl-type.minn { background: var(--pill-minn-bg); color: var(--pill-minn-fg); }
+        .sl-type.laravel { background: var(--pill-laravel-bg); color: var(--pill-laravel-fg); }
         .sl-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); box-shadow: inset 0 0 0 1px var(--hairline); }
         .sl-ver { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); white-space: nowrap; }
         .sl-php { font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-faint); border: 1px solid var(--hairline); border-radius: 999px; padding: 0 0.4rem; white-space: nowrap; }
@@ -6484,6 +8647,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .site-type:hover { filter: brightness(1.15); }
         .site-type.wp { background: var(--pill-wp-bg); color: var(--pill-wp-fg); }
         .site-type.minn { background: var(--pill-minn-bg); color: var(--pill-minn-fg); }
+        .site-type.laravel { background: var(--pill-laravel-bg); color: var(--pill-laravel-fg); }
         .site-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); }
         @keyframes php-pulse { 50% { opacity: 0.45; } }
         .sl-php.applying { border-color: var(--accent); color: var(--text-dim); animation: php-pulse 1.2s ease-in-out infinite; }
@@ -6570,9 +8734,39 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .sl-tdot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
         .sl-tdot.wp { background: var(--accent); }
         .sl-tdot.minn { background: var(--minn); }
+        .sl-tdot.laravel { background: var(--laravel); }
         .sl-tdot.static { background: var(--panel-border-strong); }
 
         .sl-state { margin-top: 1.6rem; padding: 3rem 1.5rem; text-align: center; color: var(--text-dim); border: 1px dashed var(--panel-border); border-radius: 12px; }
+        /* Waiting on list_sites. With a saved listing on screen, one quiet
+           line under the summary; with nothing saved yet, the page's own
+           shapes shimmer until the list lands. */
+        .sl-sync { display: flex; width: fit-content; align-items: center; gap: 0.45rem; margin: 0.6rem 0 0; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-faint); animation: cove-fade 200ms 600ms both; }
+        .sl-sync i { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--accent); animation: dot-pulse 1.4s ease-in-out infinite; }
+        .sl-sync.is-failed { animation: none; }
+        .sl-sync.is-failed i { background: var(--warn); animation: none; }
+        .sl-sync .sl-link, .sl-loading-note .sl-link { font-family: var(--font-mono); font-size: inherit; padding: 0; }
+        @keyframes sl-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+        .sl-bone, .sl-harbor.is-loading .sl-stack, .sl-loading .sl-thumb, .sl-loading .sl-shot { background: linear-gradient(90deg, var(--hairline) 30%, color-mix(in srgb, var(--hairline) 45%, var(--panel-border)) 50%, var(--hairline) 70%); background-size: 200% 100%; animation: sl-shimmer 1.5s ease-in-out infinite; }
+        .sl-bone { display: inline-block; max-width: 100%; height: 0.75rem; border-radius: 4px; vertical-align: middle; }
+        .sl-bone.is-small { height: 0.6rem; }
+        .sl-bone.is-bar { height: 4px; border-radius: 999px; }
+        .sl-tags .sl-bone, .sl-chips .sl-bone { height: 1.45rem; border-radius: 999px; }
+        .sl-bone.is-pill { height: 1.1rem; border-radius: 999px; }
+        .sl-sub .sl-bone { height: 0.95rem; }
+        .sl-legend .sl-bone { height: 0.65rem; }
+        .sites-view.is-stalled :is(.sl-bone, .sl-stack, .sl-thumb, .sl-shot) { animation: none; }
+        .sl-loading { margin-top: 1.6rem; }
+        .sl-loading .sl-group { margin-top: 0; }
+        .sl-loading-rows { pointer-events: none; -webkit-mask-image: linear-gradient(#000 30%, transparent); mask-image: linear-gradient(#000 30%, transparent); }
+        .sl-row.is-skel { cursor: default; }
+        .sl-row.is-skel:hover { background: none; }
+        .sl-card.is-skel { cursor: default; }
+        .sl-loading-note { margin: 0.4rem 0 0; text-align: center; font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); }
+        .sl-loading-note small { display: block; margin-top: 0.3rem; font-family: var(--font-sans); font-size: 0.78rem; color: var(--text-faint); }
+        @media (prefers-reduced-motion: reduce) {
+            .sl-bone, .sl-harbor.is-loading .sl-stack, .sl-loading .sl-thumb, .sl-loading .sl-shot, .sl-sync i { animation: none; }
+        }
         .sl-foot { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; margin-top: 1.75rem; padding-top: 1rem; border-top: 1px solid var(--hairline); font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-faint); }
         .sl-foot .totals { display: inline-flex; align-items: center; gap: 0.45rem; }
         .sl-keys { display: flex; gap: 0.35rem 0.85rem; flex-wrap: wrap; align-items: center; }
@@ -6862,8 +9056,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .db-main > div { min-height: 0; }
         #dbTable, #dbSql { flex: 1; display: flex; flex-direction: column; min-height: 0; }
         .db-bar { flex: none; }
-        .db-rows-search { display: flex; align-items: center; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--input-bg); overflow: hidden; }
-        .db-rows-search select { background: transparent; border: 0; border-right: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.28rem 0.4rem; max-width: 150px; cursor: pointer; }
+        .db-rows-search { display: flex; align-items: center; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--input-bg); }
+        .db-rows-search .add-type { align-self: stretch; display: flex; border-right: 1px solid var(--panel-border); }
+        .db-rows-search .add-type input { background: transparent; border: 0; color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.28rem 1.5rem 0.28rem 0.5rem; width: 128px; outline: 0; cursor: pointer; }
+        .db-rows-search .add-type input:focus { color: var(--text); cursor: text; }
+        .db-rows-search .add-type-chev, .db-sql-actions .add-type-chev { right: 0.45rem; width: 10px; height: 10px; margin-top: -5px; }
+        .db-rows-search .add-type .sl-menu { left: -1px; right: auto; min-width: 16rem; }
         .db-rows-search input { background: transparent; border: 0; color: var(--text); font-family: var(--font-mono); font-size: 0.76rem; padding: 0.28rem 0.55rem; width: 180px; outline: 0; }
         .db-rows-search:focus-within { border-color: var(--accent); }
         /* Grid: the wrap scrolls both ways, the header sticks, and every
@@ -6921,7 +9119,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .db-sql-editor textarea::placeholder { color: var(--text-faint); }
         .db-sql-actions { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 1.5rem 0.7rem; }
         .db-sql-actions .mail-bar-note { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .db-sql-actions select { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.3rem 0.5rem; border-radius: var(--radius-md); max-width: 220px; cursor: pointer; }
+        .db-sql-actions .add-type input { background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text-dim); font-family: var(--font-mono); font-size: 0.72rem; padding: 0.3rem 1.5rem 0.3rem 0.5rem; border-radius: var(--radius-md); width: 9rem; outline: 0; cursor: pointer; }
+        .db-sql-actions .add-type input:focus { border-color: var(--accent); color: var(--text); cursor: text; }
+        .db-sql-actions .add-type input:disabled { cursor: default; opacity: 0.5; }
+        .db-sql-actions .add-type .sl-menu { left: auto; right: 0; max-width: min(36rem, 80vw); max-height: 20rem; overflow-y: auto; }
         .db-kbd { opacity: 0.7; font-size: 0.7em; margin-left: 0.2rem; }
         .db-sql-results { flex: 1; overflow: auto; min-height: 0; }
         .db-sql-result { border-bottom: 1px solid var(--panel-border); }
@@ -6998,6 +9199,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .site-facts .fact-ver.insecure::after { content: "●"; margin-left: 0.25rem; color: var(--pill-warn-fg, #d08c30); font-size: 0.6em; vertical-align: middle; }
         .site-facts .fact-path { cursor: copy; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
         .site-facts .fact-path:hover { color: var(--text); }
+        .site-facts .fact-db { cursor: pointer; }
+        .site-facts .fact-db:hover { color: var(--accent); }
         .site-body { padding: 1.25rem 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 1.25rem; }
         .site-top { display: grid; grid-template-columns: minmax(260px, 400px) minmax(0, 1fr); gap: 1rem; align-items: start; }
         .site-shot { position: relative; display: block; aspect-ratio: 16 / 10; border: 1px solid var(--panel-border); border-radius: var(--radius-md); background: var(--bg-sunk); overflow: hidden; text-decoration: none; color: var(--text-faint); }
@@ -7064,7 +9267,28 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .st-row:hover { background: var(--panel-hover); }
         .st-plugins, .st-themes { grid-template-columns: minmax(0, 1fr) auto auto auto minmax(9rem, auto); }
         .st-users { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+        .st-useradd input { flex: 1 1 10rem; min-width: 0; background: var(--input-bg); border: 1px solid var(--panel-border); color: var(--text); font-family: var(--font-mono); font-size: 0.82rem; padding: 0.35rem 0.6rem; border-radius: var(--radius-md); }
+        .st-useradd input:focus { outline: 0; border-color: var(--accent); }
+        .st-useradd .st-role { flex: 0 1 12rem; min-width: 9rem; }
+        .st-useradd .st-role input { width: 100%; padding-right: 2rem; cursor: pointer; }
+        .st-useradd .st-role input:focus { cursor: text; }
+        .st-role .sl-menu { max-height: 13.5rem; overflow-y: auto; }
+        .st-useradd #userAddEmail { flex-basis: 14rem; }
+        .st-useradd-done { display: flex; align-items: center; flex-wrap: wrap; gap: 0.6rem; padding: 0.5rem 1.5rem; border-bottom: 1px solid var(--panel-border); font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-dim); }
+        .st-useradd-done:empty { display: none; }
+        .st-useradd-done code { color: var(--text); background: var(--panel-hover); padding: 0.1rem 0.4rem; border-radius: var(--radius-sm); user-select: all; }
         .st-cron { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+        .st-routes { grid-template-columns: 7rem minmax(0, 1.3fr) minmax(0, 1fr); }
+        .st-migrations, .st-schedule { grid-template-columns: minmax(0, 1fr) auto auto; }
+        .st-routes .st-chip { justify-self: start; }
+        .st-routes .st-sub.st-act { text-align: right; }
+        .st-title a { color: inherit; text-decoration: none; }
+        .st-title a:hover { color: var(--accent); text-decoration: underline; }
+        .st-chip.st-pending { color: var(--warn); border-color: var(--warn); }
+        .pill .wk-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 0.35rem; background: var(--panel-border-strong); vertical-align: 1px; }
+        .pill .wk-dot.is-running { background: var(--accent); }
+        .pill .wk-dot.is-starting { background: var(--warn); }
+        #schedFoot .sl-link { font-family: var(--font-mono); font-size: inherit; padding: 0; }
         .st-main { min-width: 0; display: flex; flex-direction: column; gap: 0.1rem; }
         .st-title { font-size: 0.88rem; color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .st-title.st-mono { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 400; }
@@ -7314,6 +9538,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 <button type="button" class="dot link" data-service="caddy" title="Caddy status">caddy</button>
                 <button type="button" class="dot link" data-service="mariadb" title="MariaDB status and credentials">mariadb</button>
                 <button type="button" class="dot link" data-service="mailpit" title="Mailpit status">mailpit</button>
+<?php if (!empty($config_data['PGSQL_USER'])): ?>
+                <button type="button" class="dot link" data-service="postgres" title="PostgreSQL status and credentials">postgres</button>
+<?php endif; ?>
+<?php if (!empty($config_data['REDIS_PORT'])): ?>
+                <button type="button" class="dot link" data-service="redis" title="Redis status">redis</button>
+<?php endif; ?>
                 <button type="button" class="dot link is-busy sweep-dot" id="navSweep" data-service="history" title="The nightly history sweep is running — click for the site it is on" style="display: none;">6/80</button>
             </div>
             <button class="theme-btn" id="btnTheme" title="Theme" aria-label="Theme" aria-haspopup="menu">
@@ -7335,6 +9565,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <p class="sl-eyebrow">~/Cove/Sites</p>
                     <h1 class="sl-title" id="slTitle">Sites</h1>
                     <p class="sl-sub" id="slSub"></p>
+                    <p class="sl-sync" id="slSync" style="display: none;"></p>
                     <div class="sl-insight" id="slInsight">
                         <div class="sl-insight-row"><h2>plugins</h2><div class="sl-tags" id="slTopPlugins"></div></div>
                         <div class="sl-insight-row"><h2>themes</h2><div class="sl-tags" id="slTopThemes"></div></div>
@@ -7421,7 +9652,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             </template>
 
             <div class="add-row" id="addRow" style="display: none;">
-                <div class="add-drop" id="addDrop" title="Import a backup: a zip or tar.gz holding a WordPress tree and a .sql dump — a Cove snapshot export, a Local export, a host backup">
+                <div class="add-drop" id="addDrop" title="Import a backup: a zip or tar.gz holding a WordPress tree and a .sql dump — a Cove snapshot export, a Local export, a host backup — or a Cove backup of a Laravel site">
                     <span class="add-drop-art" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11M7 9l5-5 5 5"/><path d="M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></svg></span>
                     <span class="add-drop-text" id="addDropText">drop a backup zip here to import a site, or <u>choose one</u> — otherwise create a fresh site below</span>
                     <span class="add-drop-file" id="addDropFile" style="display: none;"><span id="addDropName"></span><button type="button" class="filter-chip-x" id="addDropClear" aria-label="Remove the archive" title="Remove">×</button></span>
@@ -7430,14 +9661,22 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 <div class="add-progress" id="addProgress" style="display: none;"><span id="addProgressText"></span></div>
                 <form id="addForm">
                     <input type="text" id="newSiteName" placeholder="site-name" required>
-                    <label class="plain-toggle">
-                        <input type="checkbox" id="newSitePlain">
-                        plain (no WordPress)
-                    </label>
-                    <select class="wp-version" id="wpVersionSelect" title="What to install: a WordPress version, or Minn Engine once it has a release" aria-label="What to install">
-                        <option value="latest">latest</option>
-                        <option value="nightly">nightly</option>
-                    </select>
+                    <div class="add-type" id="addType">
+                        <input type="text" role="combobox" aria-label="Site type" aria-autocomplete="list" aria-expanded="false" aria-controls="addTypeList" autocomplete="off" spellcheck="false" value="WordPress" title="What the site is: type a few letters, ↑↓ to choose, ↵ to pick">
+                        <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                        <div class="sl-menu" id="addTypeList" role="listbox" aria-label="Site types" style="display: none;"></div>
+                    </div>
+                    <div class="add-type" id="wpVersion">
+                        <input type="text" role="combobox" aria-label="WordPress version" aria-autocomplete="list" aria-expanded="false" aria-controls="wpVersionList" autocomplete="off" spellcheck="false" title="Which WordPress: latest, nightly, or a version. Type a few digits, ↑↓ to choose, ↵ to pick">
+                        <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                        <div class="sl-menu is-long" id="wpVersionList" role="listbox" aria-label="WordPress versions" style="display: none;"></div>
+                    </div>
+                    <input type="text" id="laravelFrom" placeholder="new app, or a git URL, folder or archive to set up" spellcheck="false" autocomplete="off" aria-label="An existing Laravel project: a git URL, a folder or an archive" title="Empty for a new app. A git URL is cloned and a folder copied, then its packages installed, its database made and migrated, and its front end built" style="display: none;">
+                    <div class="add-type" id="laravelDb" style="display: none;">
+                        <input type="text" role="combobox" aria-label="Laravel's database" aria-autocomplete="list" aria-expanded="false" aria-controls="laravelDbList" autocomplete="off" spellcheck="false" title="Laravel's database: SQLite, Laravel's own default; MySQL on Cove's MariaDB; or PostgreSQL, set up the first time a site asks for it">
+                        <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                        <div class="sl-menu" id="laravelDbList" role="listbox" aria-label="Databases" style="display: none;"></div>
+                    </div>
                     <button class="pill primary" type="submit" id="btnCreate" disabled>
                         <span class="btn-spinner" id="createSpinner" aria-hidden="true" style="display: none;"></span>
                         <span id="createLabel">create</span>
@@ -7452,7 +9691,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             </section>
 
             <div id="siteGroups"></div>
-            <div class="sl-state" id="siteLoading">Loading sites…</div>
+            <div class="sl-loading" id="siteLoading">
+                <div class="sl-loading-rows" id="siteSkeleton" aria-hidden="true"></div>
+                <p class="sl-loading-note" id="siteLoadingNote" role="status">Reading ~/Cove/Sites…</p>
+            </div>
             <div class="sl-state empty" id="emptyNone" style="display: none;">
                         <svg class="empty-art" viewBox="0 0 104 68" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path class="art-fill" d="M52 12 L68 38 H52 Z"/>
@@ -7724,7 +9966,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                                 <button type="button" class="mail-part" role="tab" data-part="structure">structure</button>
                             </div>
                             <div class="db-rows-search" id="dbRowsSearch">
-                                <select id="dbRowsCol" title="Column to search" aria-label="Column to search"><option value="">any column</option></select>
+                                <div class="add-type" id="dbRowsCol">
+                                    <input type="text" role="combobox" aria-label="Column to search" aria-autocomplete="list" aria-expanded="false" aria-controls="dbRowsColList" autocomplete="off" spellcheck="false" title="Column to search: type a few letters, ↑↓ to choose, ↵ to pick">
+                                    <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                                    <div class="sl-menu is-long" id="dbRowsColList" role="listbox" aria-label="Columns" style="display: none;"></div>
+                                </div>
                                 <input type="text" id="dbRowsFilter" placeholder="contains…" spellcheck="false" autocomplete="off" aria-label="Filter rows">
                             </div>
                             <span class="mail-bar-note" id="dbRowsNote"></span>
@@ -7741,7 +9987,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             <textarea id="dbSqlText" spellcheck="false" autocapitalize="off" autocorrect="off" rows="6" placeholder="SELECT option_name, LENGTH(option_value) AS bytes FROM wp_options WHERE autoload = 'yes' ORDER BY bytes DESC LIMIT 20"></textarea>
                             <div class="db-sql-actions">
                                 <span class="mail-bar-note" id="dbSqlNote"></span>
-                                <select id="dbSqlHistory" title="Previous queries" aria-label="Previous queries"><option value="">history</option></select>
+                                <div class="add-type" id="dbSqlHistory">
+                                    <input type="text" role="combobox" aria-label="Previous queries" aria-autocomplete="list" aria-expanded="false" aria-controls="dbSqlHistoryList" autocomplete="off" spellcheck="false" title="Previous queries: type a few letters to find one, ↵ to load it">
+                                    <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                                    <div class="sl-menu" id="dbSqlHistoryList" role="listbox" aria-label="Previous queries" style="display: none;"></div>
+                                </div>
                                 <button type="button" class="pill primary" id="btnDbRun">run <span class="db-kbd">⌘↵</span></button>
                             </div>
                         </div>
@@ -7900,6 +10150,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <button type="button" class="mail-part" role="tab" data-tab="themes">themes</button>
                     <button type="button" class="mail-part" role="tab" data-tab="users">users</button>
                     <button type="button" class="mail-part" role="tab" data-tab="cron">cron</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="routes">routes</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="migrations">migrations</button>
+                    <button type="button" class="mail-part" role="tab" data-tab="schedule">schedule</button>
                     <button type="button" class="mail-part" role="tab" data-tab="traffic">traffic</button>
                     <button type="button" class="mail-part" role="tab" data-tab="history">history</button>
                     <button type="button" class="mail-part" role="tab" data-tab="snapshots">snapshots</button>
@@ -7920,7 +10173,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <button type="button" class="site-tile" data-go="files"><span class="site-tile-text"><span class="site-tile-name">files</span><span class="site-tile-desc">Browse and edit the site's directory, upload, tidy up.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M8 10 h16 l5 5 h27 v22 H8 Z"/><path class="art-line" d="M8 10 h16 l5 5 h27 v22 H8 Z"/><path class="art-line" d="M8 20 h48"/><path class="art-line" d="M20 28 h18 M20 33 h12"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
                     <button type="button" class="site-tile" data-go="db" id="tileDb"><span class="site-tile-text"><span class="site-tile-name">database</span><span class="site-tile-desc">Tables, rows in place, a SQL console.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M16 9 a16 5 0 0 1 32 0 v22 a16 5 0 0 1 -32 0 Z"/><ellipse class="art-line" cx="32" cy="9" rx="16" ry="5"/><path class="art-line" d="M16 9 v22 a16 5 0 0 0 32 0 V9"/><path class="art-line" d="M16 20 a16 5 0 0 0 32 0"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
                     <button type="button" class="site-tile" data-go="mail"><span class="site-tile-text"><span class="site-tile-name">mail</span><span class="site-tile-desc">Everything this site has sent, links lifted out.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M9 12 h46 v24 H9 Z"/><path class="art-line" d="M9 12 h46 v24 H9 Z"/><path class="art-line" d="M9 13 l23 15 l23 -15"/><path class="art-line" d="M9 36 l17 -13 M55 36 l-17 -13"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
-                    <button type="button" class="site-tile" data-go="logs"><span class="site-tile-text"><span class="site-tile-name">logs</span><span class="site-tile-desc">PHP errors, debug.log, and the access log, live.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M14 6 h36 v30 H14 Z"/><path class="art-line" d="M14 6 h36 v30 H14 Z"/><path class="art-line" d="M21 14 h22 M21 20 h14 M21 26 h18"/><circle class="art-dot" cx="45" cy="26" r="2.2"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
+                    <button type="button" class="site-tile" data-go="logs"><span class="site-tile-text"><span class="site-tile-name">logs</span><span class="site-tile-desc" id="siteLogsDesc">PHP errors, debug.log, and the access log, live.</span></span><svg class="tile-art" viewBox="0 0 64 44" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="art-fill" d="M14 6 h36 v30 H14 Z"/><path class="art-line" d="M14 6 h36 v30 H14 Z"/><path class="art-line" d="M21 14 h22 M21 20 h14 M21 26 h18"/><circle class="art-dot" cx="45" cy="26" r="2.2"/><path class="art-wave" d="M4 41 q5 -3 10 0 t10 0 t10 0 t10 0 t10 0"/></svg></button>
                 </div>
                 </div>
                 <div class="site-health" id="siteHealth"></div>
@@ -7946,6 +10199,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         <li class="loading" id="siteNetLoading">Reading the network…</li>
                         <li class="empty" id="siteNetError" style="display: none;"><div id="siteNetErrorText"></div></li>
                     </ul>
+                </section>
+
+                <section class="site-section" id="siteWorkers" style="display: none;">
+                    <div class="site-section-head"><span>workers</span><span class="sec-meta">kept running by the watchdog · output in logs/laravel-*.log</span></div>
+                    <div class="site-manage" id="siteWorkersRow"></div>
                 </section>
 
                 <section class="site-section" id="siteManage">
@@ -7999,6 +10257,19 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <span class="mail-bar-note st-count"></span>
                     <button type="button" class="pill st-refresh" title="Re-read the list">refresh</button>
                 </div>
+                <form class="st-toolbar st-useradd" id="userAdd" style="display: none;" autocomplete="off" novalidate>
+                    <input id="userAddEmail" type="text" inputmode="email" placeholder="email" maxlength="191" spellcheck="false" autocomplete="off" aria-label="The new user's email">
+                    <input id="userAddLogin" type="text" placeholder="username (optional)" title="Left blank, the part of the email before the @" maxlength="60" spellcheck="false" autocomplete="off" aria-label="The new user's username">
+                    <input id="userAddName" type="text" placeholder="name (optional)" maxlength="191" spellcheck="false" autocomplete="off" aria-label="The new user's name">
+                    <div class="add-type st-role" id="userRole">
+                        <input type="text" role="combobox" aria-label="The new user's role" aria-autocomplete="list" aria-expanded="false" aria-controls="userRoleList" autocomplete="off" spellcheck="false" title="The new user's role: type a few letters, ↑↓ to choose, ↵ to pick">
+                        <svg class="add-type-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                        <div class="sl-menu" id="userRoleList" role="listbox" aria-label="Roles" style="display: none;"></div>
+                    </div>
+                    <input id="userAddPassword" type="text" placeholder="password (optional)" title="Left blank, one is made up and shown once" maxlength="200" spellcheck="false" autocomplete="off" aria-label="The new user's password">
+                    <button type="submit" class="pill primary" id="btnUserAdd">add user</button>
+                </form>
+                <div class="st-useradd-done" id="userAddDone"></div>
                 <ul class="st-list"><li class="loading st-loading">Reading users…</li><li class="empty st-error" style="display: none;"></li></ul>
             </div>
             <div class="site-panel" id="sitePanel-cron" style="display: none;">
@@ -8009,6 +10280,34 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     <button type="button" class="pill st-refresh" title="Re-read the schedule">refresh</button>
                 </div>
                 <ul class="st-list"><li class="loading st-loading">Reading the schedule…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel" id="sitePanel-routes" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter by address, name, action or middleware…" spellcheck="false" autocomplete="off" aria-label="Filter routes">
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill st-optimize" title="artisan config:clear, route:clear, view:clear and event:clear. Not cache:clear, which on Redis empties the cache database every Cove Laravel site shares">clear caches</button>
+                    <button type="button" class="pill st-refresh" title="Read the routes again">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading routes…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel" id="sitePanel-migrations" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter migrations…" spellcheck="false" autocomplete="off" aria-label="Filter migrations">
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill primary st-migrate" title="artisan migrate">run pending</button>
+                    <button type="button" class="pill st-refresh" title="Read the status again">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading migrations…</li><li class="empty st-error" style="display: none;"></li></ul>
+            </div>
+            <div class="site-panel" id="sitePanel-schedule" style="display: none;">
+                <div class="st-toolbar">
+                    <input class="filter-input st-filter" type="text" placeholder="filter tasks…" spellcheck="false" autocomplete="off" aria-label="Filter scheduled tasks">
+                    <span class="mail-bar-note st-count"></span>
+                    <button type="button" class="pill st-sched-run" title="artisan schedule:run — every task that is due now">run due now</button>
+                    <button type="button" class="pill st-refresh" title="Read the schedule again">refresh</button>
+                </div>
+                <ul class="st-list"><li class="loading st-loading">Reading the schedule…</li><li class="empty st-error" style="display: none;"></li></ul>
+                <div class="st-foot" id="schedFoot"></div>
             </div>
             <div class="site-panel" id="sitePanel-traffic" style="display: none;">
                 <div class="st-toolbar">
@@ -8414,6 +10713,130 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         const $id = (id) => document.getElementById(id);
         const show = (el, on) => { if (el) el.style.display = on ? '' : 'none'; };
 
+        // A field that completes from a list: the dashboard's own <select>.
+        // A few letters narrow it (a word of the name first, then anywhere),
+        // ↑↓ move, ↵ or Tab pick, Esc puts the field back. The markup is a
+        // .add-type holding an input[role=combobox], the chevron and an
+        // .sl-menu[role=listbox]. opts:
+        //   items()      [{id, label, hint?, dot?, words?, disabled?}]
+        //   value()      the id the closed field shows (null for an action list)
+        //   pick(id)     called with the id chosen
+        //   free(q)      an item for typed text the list doesn't hold, or null
+        //   empty(q)     the line shown when nothing matches
+        //   placeholder  what an empty closed field says
+        //   action       picking runs something, so leaving the field never picks
+        const combo = (rootId, opts) => {
+            const root = $id(rootId), input = root.querySelector('input'), list = root.querySelector('.sl-menu');
+            const st = { open: false, q: '', index: 0 };
+            const esc = (v) => String(v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+            const words = (x) => (x.words || []).concat(x.label.toLowerCase().split(/\s+/), String(x.id).toLowerCase().split(/[\s_-]+/));
+            const matches = () => {
+                const all = opts.items(), q = st.q.trim().toLowerCase();
+                if (!q) return all;
+                const starts = all.filter(x => words(x).some(w => w.startsWith(q)));
+                // A name that starts with it first: "sub" is Subscriber, then EDD Subscriber.
+                starts.sort((a, b) => b.label.toLowerCase().startsWith(q) - a.label.toLowerCase().startsWith(q));
+                const found = starts.concat(all.filter(x => !starts.includes(x) && (x.label.toLowerCase().includes(q) || String(x.id).toLowerCase().includes(q))));
+                const extra = opts.free && !all.some(x => x.label.toLowerCase() === q) ? opts.free(st.q.trim()) : null;
+                return extra ? [extra].concat(found) : found;
+            };
+            // Moves the highlight by d (0: onto the first that can be picked).
+            const step = (d) => {
+                const m = matches();
+                if (!m.length) return;
+                let i = d ? st.index : -1, tries = m.length;
+                do { i = (i + (d || 1) + m.length) % m.length; } while (m[i].disabled && --tries > 0);
+                st.index = i;
+            };
+            const render = () => {
+                const all = opts.items(), v = opts.value();
+                const current = all.find(x => x.id === v);
+                const shown = current ? current.label : (v == null ? '' : String(v));
+                show(list, st.open);
+                root.classList.toggle('is-open', st.open);
+                input.setAttribute('aria-expanded', st.open ? 'true' : 'false');
+                input.placeholder = (st.open && shown) || opts.placeholder || '';
+                if (!st.open) {
+                    input.value = shown;
+                    input.removeAttribute('aria-activedescendant');
+                    return;
+                }
+                const m = matches();
+                st.index = Math.max(0, Math.min(st.index, m.length - 1));
+                list.innerHTML = m.length
+                    ? m.map((x, i) => '<button type="button" role="option" tabindex="-1" id="' + rootId + '-opt-' + i + '" data-i="' + i + '"' + (i === st.index ? ' class="is-active"' : '') + ' aria-selected="' + (x.id === v) + '"' + (x.disabled ? ' disabled' : '') + '><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg>' + (x.dot ? '<i class="sl-tdot ' + x.dot + '" aria-hidden="true"></i>' : '') + esc(x.label) + (x.hint ? '<small>' + esc(x.hint) + '</small>' : '') + '</button>').join('')
+                    : '<div class="add-type-empty">' + esc(opts.empty ? opts.empty(st.q.trim()) : 'nothing matches') + '</div>';
+                const active = list.querySelector('.is-active');
+                if (!active) { input.removeAttribute('aria-activedescendant'); return; }
+                input.setAttribute('aria-activedescendant', active.id);
+                // Keep the highlight in view as ↑↓ move it through a long list.
+                if (active.offsetTop < list.scrollTop) list.scrollTop = active.offsetTop - 4;
+                else if (active.offsetTop + active.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = active.offsetTop + active.offsetHeight - list.clientHeight + 4;
+            };
+            // Opening empties the field, with the current choice as its
+            // placeholder, so the first letter typed starts the search.
+            const open = () => {
+                const all = opts.items();
+                Object.assign(st, { open: true, q: '', index: Math.max(0, all.findIndex(x => x.id === opts.value())) });
+                if (all[st.index] && all[st.index].disabled) step(0);
+                input.value = '';
+                list.scrollTop = 0;
+                render();
+            };
+            const close = () => { st.open = false; st.q = ''; render(); };
+            const choose = (x) => {
+                if (!x || x.disabled) return false;
+                st.open = false;
+                st.q = '';
+                opts.pick(x.id);
+                render();
+                return true;
+            };
+            input.addEventListener('focus', open);
+            input.addEventListener('click', () => { if (!st.open) open(); });
+            input.addEventListener('input', () => {
+                Object.assign(st, { open: true, q: input.value });
+                step(0);
+                render();
+            });
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    if (!st.open) { open(); return; }
+                    step(e.key === 'ArrowDown' ? 1 : -1);
+                    render();
+                } else if (e.key === 'Enter' || e.key === 'Tab') {
+                    // A closed field lets Enter submit the form as usual.
+                    if (!st.open) return;
+                    if (e.key === 'Enter') e.preventDefault();
+                    // Tabbing past an action list (query history) runs nothing.
+                    else if (opts.action) { close(); return; }
+                    if (!choose(matches()[st.index])) close();
+                } else if (e.key === 'Escape' && st.open) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    close();
+                }
+            });
+            // Leaving the field with something typed picks what it highlights
+            // (a whole name first), as ↵ would, so a click on the form's
+            // button mid-search uses the choice on screen. An action list
+            // only closes.
+            input.addEventListener('blur', () => {
+                if (!st.open) return;
+                const q = st.q.trim().toLowerCase(), m = matches();
+                const x = q && !opts.action && (m.find(y => y.label.toLowerCase() === q || String(y.id).toLowerCase() === q) || m[st.index]);
+                if (!choose(x)) close();
+            });
+            // Keep the field focused while an option is clicked.
+            list.addEventListener('mousedown', (e) => e.preventDefault());
+            list.addEventListener('click', (e) => {
+                const b = e.target.closest('[data-i]');
+                if (b && !b.disabled) choose(matches()[Number(b.dataset.i)]);
+            });
+            return { render, input, get isOpen() { return st.open; } };
+        };
+
         const app = {
             // Respect the OS theme preference on first visit, dark otherwise.
             // themePref is what the user chose ('light' | 'dark' | 'system');
@@ -8422,6 +10845,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             theme: (['light', 'dark'].includes(localStorage.getItem('theme')) ? localStorage.getItem('theme') : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')),
             sites: [],
             isLoading: true,
+            // When the sites on screen are this browser's saved listing
+            // (restoreSites) rather than the server's answer: its time, else 0.
+            sitesSavedAt: 0,
+            sitesFailed: false,
+            loadStarted: 0,
             adding: false,
             showDbModal: false,
             isRefreshingSizes: false,
@@ -8455,7 +10883,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             selectedName: null,
             ctxMenu: { open: false, site: null, x: 0, y: 0, openedAt: 0 },
             fileCtx: { open: false, target: null, x: 0, y: 0, openedAt: 0 },
-            sitePage: { name: null, tab: 'overview', tabs: {}, shot: { busy: null, asked: {}, unsupported: false }, net: { items: [], loading: false, error: null, loadedFor: null }, busy: null, cli: { cmd: '', output: '', code: 0, ms: 0, ran: null, running: false, history: [], histIdx: -1 } },
+            sitePage: { name: null, tab: 'overview', tabs: {}, workers: { for: null, data: null, busy: null }, shot: { busy: null, asked: {}, unsupported: false }, net: { items: [], loading: false, error: null, loadedFor: null }, busy: null, cli: { cmd: '', output: '', code: 0, ms: 0, ran: null, running: false, history: [], histIdx: -1 } },
             siteDeleteConfirm: null,
             tabCtx: { open: false, x: 0, y: 0, openedAt: 0, items: [], title: '' },
             palette: { open: false, query: '', index: 0 },
@@ -8471,7 +10899,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // from the site objects because getSites() rebuilds those from the
             // server and would drop a flag stored on them mid-install.
             phpApplying: {},
-            newSite: { name: '', isPlain: false, wpVersion: 'latest', isLoading: false },
+            // kind: wordpress | plain | minn | laravel (the add form's type field).
+            newSite: { name: '', kind: 'wordpress', wpVersion: 'latest', database: 'sqlite', from: '', isLoading: false },
+            userRole: { value: 'administrator' },
+            minnRelease: null,
             // Populated lazily the first time the add row opens — no reason
             // to hit wp.org on a page load that never creates a site. Stays
             // empty when offline, leaving 'latest' and 'nightly' available.
@@ -8539,7 +10970,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             get totalBytes() { return this.sites.reduce((t, s) => t + (s.size_bytes || 0), 0); },
             // Every site the quick filter and the filter box let through, in
             // the chosen order. The box takes words (part of the address, or
-            // the type) and tokens: type:wp|minn|static, is:pinned|idle|
+            // the type) and tokens: type:wp|minn|laravel|static, is:pinned|idle|
             // outdated|insecure|multisite, has:mail|errors|preview|twin,
             // plugin:<slug>, theme:<name>, php:<version>.
             get filteredSites() {
@@ -8599,7 +11030,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
             sortSites(list) {
                 // Version segments compare numerically so 6.10 outranks 6.9.
-                const ver = s => (s.type === 'Minn' ? s.minn_version : s.wp_version) || '';
+                const ver = s => (s.type === 'Minn' ? s.minn_version : s.type === 'Laravel' ? (s.laravel || {}).version : s.wp_version) || '';
                 const vcmp = (a, b) => {
                     const pa = ver(a).split('.'), pb = ver(b).split('.');
                     for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
@@ -8608,7 +11039,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     }
                     return 0;
                 };
-                const rank = { WordPress: 0, Minn: 1, Plain: 2 };
+                const rank = { WordPress: 0, Minn: 1, Laravel: 2, Plain: 3 };
                 const by = {
                     name: (a, b) => a.name.localeCompare(b.name),
                     size: (a, b) => (b.size_bytes || 0) - (a.size_bytes || 0) || a.name.localeCompare(b.name),
@@ -8623,6 +11054,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     { id: 'all', label: 'all', test: () => true },
                     { id: 'wp', label: 'wordpress', test: s => s.type === 'WordPress' },
                     { id: 'minn', label: 'minn', test: s => s.type === 'Minn' },
+                    { id: 'laravel', label: 'laravel', test: s => s.type === 'Laravel' },
                     { id: 'static', label: 'static', test: s => s.type === 'Plain' },
                     { id: 'pinned', label: 'pinned', test: s => this.isPinned(s.name) },
                     { id: 'attention', label: 'php errors', dot: 'danger', test: s => !!this.siteAttention(s) },
@@ -8656,9 +11088,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             siteTypeInfo(type) {
                 if (type === 'WordPress') return { cls: 'wp', pill: 'WP', name: 'WordPress', short: 'wp' };
                 if (type === 'Minn') return { cls: 'minn', pill: 'MINN', name: 'Minn Engine', short: 'minn' };
+                if (type === 'Laravel') return { cls: 'laravel', pill: 'LARAVEL', name: 'Laravel', short: 'laravel' };
                 return { cls: 'static', pill: 'STATIC', name: 'static', short: 'static' };
             },
             isWpLike(site) { return !!site && (site.type === 'WordPress' || site.type === 'Minn'); },
+            // A one-time login: WordPress's admin, or a Laravel app's own users.
+            canLogIn(site) { return this.isWpLike(site) || (!!site && site.type === 'Laravel'); },
 
             // The quick filter. A type pill on a row lands here with the
             // site's type; choosing the active chip again goes back to all.
@@ -8695,6 +11130,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.bindSiteEvents();
                 this.bindSiteTabEvents();
                 this.bindTips();
+                this.restoreSites();
                 this.render();
                 this.sweepPoll();
 
@@ -8737,6 +11173,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         return;
                     }
 
+                    // The shared right-click menu, open over any view.
+                    if (e.key === 'Escape' && this.tabCtx.open) { this.closeTabCtx(); return; }
+
                     if (this.view === 'files') {
                         this.filesKeydown(e, typing);
                         return;
@@ -8744,7 +11183,6 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
                     if (this.view === 'site') {
                         if (e.key === 'Escape') {
-                            if (this.tabCtx.open) { this.closeTabCtx(); return; }
                             if (this.siteDeleteConfirm) { this.closeSiteDeleteConfirm(); return; }
                             if (this.bulkConfirm) { this.closeBulkConfirm(); return; }
                         if (this.phpModal.open) { this.closePhpModal(); return; }
@@ -8758,7 +11196,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         }
                         if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !typing) {
                             const s = this.pageSite;
-                            if (this.isWpLike(s)) { e.preventDefault(); this.getLoginLink(s.name); }
+                            if (this.canLogIn(s)) { e.preventDefault(); this.getLoginLink(s.name); }
                         }
                         return;
                     }
@@ -8835,7 +11273,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         const site = this.selectedSite();
                         if (!site) return;
                         e.preventDefault();
-                        if ((e.metaKey || e.ctrlKey) && this.isWpLike(site)) {
+                        if ((e.metaKey || e.ctrlKey) && this.canLogIn(site)) {
                             this.getLoginLink(site.name);
                         } else {
                             this.openSitePage(site.name);
@@ -9047,11 +11485,16 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.newSite.name = clean;
                     this.render();
                 });
-                $id('newSitePlain').addEventListener('change', (e) => {
-                    this.newSite.isPlain = e.target.checked;
-                    this.render();
+                this.bindAddType();
+                // An existing project brings its own database unless one is
+                // picked; a new app starts on SQLite.
+                $id('laravelFrom').addEventListener('input', (e) => {
+                    const had = !!this.newSite.from;
+                    this.newSite.from = e.target.value.trim();
+                    if (!had && this.newSite.from && this.newSite.database === 'sqlite') this.newSite.database = '';
+                    if (had && !this.newSite.from && this.newSite.database === '') this.newSite.database = 'sqlite';
+                    this.renderChrome();
                 });
-                $id('wpVersionSelect').addEventListener('change', (e) => { this.newSite.wpVersion = e.target.value; });
                 $id('addForm').addEventListener('submit', (e) => { e.preventDefault(); this.addSite(); });
                 const drop = $id('addDrop');
                 const dropInput = $id('addDropInput');
@@ -9244,6 +11687,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
                 // Snackbar action (undo etc.)
                 $id('snackAction').addEventListener('click', () => { if (this.snackbar.action) this.snackbar.action(); });
+
+                // "try again" when a listing never came back.
+                ['slSync', 'siteLoadingNote'].forEach(id => $id(id).addEventListener('click', (e) => { if (e.target.closest('[data-retry-sites]')) this.getSites(); }));
             },
 
             // --- Rendering -------------------------------------------------
@@ -9278,7 +11724,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // match something, or is the one in use.
                 show($id('filterKbd'), !this.filter);
                 show($id('btnFilterClear'), !!this.filter || this.chip !== 'all');
-                $id('slChips').innerHTML = this.chips.map(c => {
+                if (!this.sites.length && (this.isLoading || this.sitesFailed)) $id('slChips').innerHTML = ['3rem', '4.2rem', '4.6rem', '3.8rem'].map(w => '<span class="sl-bone" style="width:' + w + '"></span>').join('');
+                else $id('slChips').innerHTML = this.chips.map(c => {
                     const n = this.sites.filter(c.test).length;
                     if (!n && c.id !== this.chip && c.id !== 'all') return '';
                     return '<button type="button" class="sl-chip" data-chip="' + c.id + '" aria-pressed="' + (this.chip === c.id) + '">'
@@ -9290,17 +11737,33 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 show(addRow, this.adding);
                 addRow.classList.toggle('is-creating', this.newSite.isLoading);
                 $id('newSiteName').disabled = this.newSite.isLoading;
-                $id('newSitePlain').disabled = this.newSite.isLoading;
-                const sel = $id('wpVersionSelect');
-                show(sel, !this.newSite.isPlain);
-                sel.disabled = this.newSite.isLoading || this.newSite.isPlain;
+                // WordPress asks which version; Laravel, which database.
+                const kind = this.newSite.kind;
+                const isLaravel = kind === 'laravel';
+                show($id('wpVersion'), kind === 'wordpress');
+                show($id('laravelDb'), isLaravel);
+                for (const c of [this.addTypeCombo, this.wpVersionCombo, this.laravelDbCombo]) if (c) c.input.disabled = this.newSite.isLoading;
+                this.renderAddFields();
+                // Laravel or plain can start from an existing app.
+                const fromInput = $id('laravelFrom');
+                show(fromInput, isLaravel || kind === 'plain');
+                fromInput.disabled = this.newSite.isLoading;
+                fromInput.placeholder = isLaravel ? 'new app, or a git URL, folder or archive to set up' : 'empty, or an app: git URL, folder or archive';
+                fromInput.title = isLaravel
+                    ? 'Empty for a new app. A git URL is cloned, a folder copied or an archive unpacked, then its packages installed, its database made and migrated, and its front end built'
+                    : 'Empty for a static site. A git URL is cloned, a folder copied, a .zip, .tar.gz, .tgz or .tar (a file or an https:// link) unpacked, and its public/ served. Nothing in it is run';
+                fromInput.setAttribute('aria-label', isLaravel ? 'An existing Laravel project: a git URL, a folder or an archive' : 'An existing app: a git URL, a folder or an archive');
                 $id('btnCreate').disabled = !this.newSite.name || this.newSite.isLoading;
                 show($id('createSpinner'), this.newSite.isLoading);
                 $id('createLabel').textContent = this.newSite.isLoading ? 'creating…' : (this.importFile ? 'create & import' : 'create');
                 this.renderImportProgress();
                 // The same, from a terminal.
                 const nm = this.newSite.name || 'mysite';
-                const fl = this.newSite.isPlain ? ' plain' : (this.newSite.wpVersion && this.newSite.wpVersion !== 'latest' ? ' ' + this.newSite.wpVersion : '');
+                const from = (isLaravel || kind === 'plain') ? this.newSite.from : '';
+                const db = isLaravel ? this.newSite.database : '';
+                const fl = kind === 'wordpress' ? (this.newSite.wpVersion && this.newSite.wpVersion !== 'latest' ? ' ' + this.newSite.wpVersion : '') : ' ' + kind
+                    + (from ? ' --from=' + (/^[A-Za-z0-9@:\/._~+-]+$/.test(from) ? from : "'" + from.replace(/'/g, "'\\''") + "'") : '')
+                    + (db && (from || db !== 'sqlite') ? ' --database=' + db : '');
                 $id('addEcho').textContent = this.importFile ? 'cove import ' + nm + ' ' + this.importFile.name : 'cove add ' + nm + fl;
 
                 // Theme button tooltip tracks the mode it would switch to.
@@ -9367,7 +11830,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // while filtering, where the results should be all there is.
                 const byName = (names) => names.map(n => this.sites.find(s => s.name === n)).filter(Boolean);
                 let shelf = null;
-                if (!filtering && !this.isLoading) {
+                if (!filtering) {
                     const pinned = byName(this.pinned);
                     if (pinned.length) shelf = { label: 'pinned', sites: pinned.slice(0, 8), hint: 'right-click any site to pin it' };
                     else if (this.sites.length > 8) { const opened = byName(this.recent).slice(0, 4); if (opened.length) shelf = { label: 'recently opened', sites: opened, hint: 'pin a site to keep it here' }; }
@@ -9403,9 +11866,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 box.classList.toggle('has-checked', this.checked.size > 0);
 
                 const visible = order.length;
-                show($id('siteLoading'), this.isLoading && !this.sites.length);
-                show($id('emptyNone'), !this.isLoading && this.sites.length === 0);
-                const emptyFilter = !this.isLoading && this.sites.length > 0 && visible === 0;
+                const waiting = !this.sites.length && (this.isLoading || this.sitesFailed);
+                show($id('siteLoading'), waiting);
+                if (waiting) this.renderSkeleton();
+                this.renderLoadState();
+                show($id('emptyNone'), !waiting && this.sites.length === 0);
+                const emptyFilter = this.sites.length > 0 && visible === 0;
                 show($id('emptyFilter'), emptyFilter);
                 if (emptyFilter) $id('emptyFilterQuery').textContent = this.filter || this.chipLabel;
 
@@ -9428,6 +11894,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
             siteVerHtml(site) {
                 const esc = (v) => this.escapeHtml(v == null ? '' : String(v));
+                if (site.type === 'Laravel') {
+                    const v = (site.laravel || {}).version;
+                    return v ? '<span class="sl-ver" title="Laravel ' + esc(v) + '">' + esc(v) + '</span>' : '';
+                }
                 if (site.type === 'Minn') {
                     if (!site.minn_version) return '';
                     return '<span class="sl-ver" title="Minn Engine ' + esc(site.minn_version) + (site.wp_version ? ', speaking WordPress ' + esc(site.wp_version) : '') + '">' + esc(site.minn_version) + '</span>';
@@ -9450,7 +11920,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const mail = this.siteMail[site.name] || 0;
                 const n = (v) => v >= 1000 ? (v / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : String(v);
                 return (mail ? '<span class="sl-sig mail" title="' + mail + ' unread message' + (mail === 1 ? '' : 's') + ' to @' + this.escapeHtml(site.name) + '.localhost"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="m2.5 4.5 5.5 4 5.5-4"/></svg>' + n(mail) + '</span>' : '')
-                    + (site.php_errors ? '<span class="sl-sig err" title="' + site.php_errors + ' PHP error' + (site.php_errors === 1 ? '' : 's') + ' in debug.log in the last 24 hours"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5 14 13H2Z"/><path d="M8 6.5v3M8 11.2v.1"/></svg>' + site.php_errors + '</span>' : '');
+                    + (site.php_errors ? '<span class="sl-sig err" title="' + site.php_errors + ' PHP error' + (site.php_errors === 1 ? '' : 's') + ' in ' + (site.type === 'Laravel' ? 'laravel.log' : 'debug.log') + ' in the last 24 hours"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5 14 13H2Z"/><path d="M8 6.5v3M8 11.2v.1"/></svg>' + site.php_errors + '</span>' : '');
             },
 
             siteFactsHtml(site) {
@@ -9472,6 +11942,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     const st = site.static || {};
                     const files = st.files ? '<span class="n">' + (st.files >= 5000 ? '5000+' : st.files) + ' file' + (st.files === 1 ? '' : 's') + '</span>' : '';
                     top = st.title ? '“' + esc(st.title) + '”' + (files ? ' <span class="n">·</span> ' + files : '') : (files || '<span class="n">static files</span>');
+                } else if (site.type === 'Laravel') {
+                    // The database .env names; the kind column has the version.
+                    const l = site.laravel || {};
+                    const names = { sqlite: 'SQLite', mysql: 'MySQL', mariadb: 'MariaDB', pgsql: 'PostgreSQL' };
+                    top = esc(names[l.db] || l.db || 'no database') + (l.db !== 'sqlite' && l.db_name ? ' <span class="n">· ' + esc(String(l.db_name).replace(/^pgsql:/, '')) + '</span>' : ' <span class="n">database</span>');
                 } else {
                     const c = site.card;
                     if (!c) top = '<span class="n">no history saves yet</span>';
@@ -9496,7 +11971,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             },
 
             siteButtonsHtml(site, more) {
-                const main = this.isWpLike(site)
+                const main = this.canLogIn(site)
                     ? '<button type="button" class="sl-btn primary" data-act="login"' + (site.isLoggingIn ? ' disabled' : '') + ' title="One-time admin login for ' + this.escapeHtml(site.name) + '">' + (site.isLoggingIn ? 'opening…' : 'log in') + '</button>'
                     : '<button type="button" class="sl-btn" data-act="open">open</button>';
                 return main + (more || '') + '<button type="button" class="sl-btn icon" data-act="menu" aria-label="More for ' + this.escapeHtml(site.name) + '" title="More (or right-click)"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/></svg></button>';
@@ -9544,7 +12019,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
             siteIdxHtml(site, q) {
                 const t = this.siteTypeInfo(site.type);
-                const v = site.type === 'Minn' ? site.minn_version : site.wp_version;
+                const v = site.type === 'Minn' ? site.minn_version : site.type === 'Laravel' ? (site.laravel || {}).version : site.wp_version;
                 return '<div class="' + this.siteStateClasses(site, 'sl-idx', true) + '" data-name="' + this.escapeHtml(site.name) + '" title="' + this.escapeHtml(t.name + (v ? ' ' + v : '') + ' · changed ' + this.formatRelative(site.modified_at) + ' ago' + (site.size_bytes ? ' · ' + this.formatSize(site.size_bytes) : '')) + '">'
                     + '<i class="sl-tdot ' + t.cls + '" aria-hidden="true"></i>' + this.siteHostHtml(site, q) + this.sitePinHtml(site) + this.siteSignalsHtml(site) + '<span class="sl-age">' + this.formatRelative(site.modified_at) + '</span></div>';
             },
@@ -9605,8 +12080,31 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this._maxBytes = Math.max(1, ...sites.map(s => s.size_bytes || 0));
                 const words = ['No', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
                 const title = $id('slTitle');
-                if (this.isLoading && !sites.length) title.textContent = 'Sites';
-                else if (!sites.length) title.innerHTML = 'An empty <em>cove</em>.';
+
+                // Nothing to count yet: placeholders where the numbers go,
+                // rather than zeros that read as an empty cove.
+                const waiting = !sites.length && (this.isLoading || this.sitesFailed);
+                $id('slHarbor').classList.toggle('is-loading', waiting);
+                if (waiting) {
+                    const bone = (w) => '<span class="sl-bone" style="width:' + w + '"></span>';
+                    const bones = (ws) => ws.map(bone).join('');
+                    title.textContent = 'Sites';
+                    $id('slSub').innerHTML = bone('min(19rem, 100%)');
+                    show($id('slInsight'), true);
+                    $id('slTopPlugins').innerHTML = bones(['6.5rem', '8rem', '5rem', '7rem', '5.5rem', '6rem']);
+                    $id('slTopThemes').innerHTML = bones(['8.5rem', '6rem', '7rem']);
+                    $id('slTypeStack').innerHTML = '';
+                    $id('slTypeLegend').innerHTML = ['5.5rem', '3.5rem', '4.5rem'].map(w => '<li>' + bone(w) + '</li>').join('');
+                    show($id('slTypeExtra'), false);
+                    $id('slWpVersions').innerHTML = bones(['4.5rem', '4.5rem', '4rem']);
+                    $id('slPhpLine').innerHTML = bone('9rem');
+                    $id('slDiskStack').innerHTML = '';
+                    $id('slDiskLegend').innerHTML = ['4rem', '6rem', '5rem'].map(w => '<li>' + bone(w) + '</li>').join('');
+                    show($id('slTidyText'), false);
+                    this.drawHarbor();
+                    return;
+                }
+                if (!sites.length) title.innerHTML = 'An empty <em>cove</em>.';
                 else title.innerHTML = (sites.length <= 10 ? words[sites.length] : sites.length) + ' site' + (sites.length === 1 ? '' : 's') + ' in the <em>cove</em>.';
 
                 const now = Date.now() / 1000;
@@ -9633,6 +12131,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const types = [
                     { type: 'WordPress', color: 'var(--accent)', chip: 'wp' },
                     { type: 'Minn', color: 'var(--minn)', chip: 'minn' },
+                    { type: 'Laravel', color: 'var(--laravel)', chip: 'laravel' },
                     { type: 'Plain', color: 'var(--panel-border-strong)', chip: 'static' },
                 ].map(t => ({ ...t, n: sites.filter(s => s.type === t.type).length, b: sites.filter(s => s.type === t.type).reduce((x, s) => x + (s.size_bytes || 0), 0) })).filter(t => t.n);
                 const typeName = (t) => esc(this.siteTypeInfo(t.type).name.toLowerCase());
@@ -9865,7 +12364,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             },
 
             renderFooter() {
-                $id('siteCount').textContent = this.siteCountLabel;
+                $id('siteCount').textContent = this.sites.length || !(this.isLoading || this.sitesFailed) ? this.siteCountLabel : this.isLoading ? 'reading sites…' : 'no listing';
                 const totalEl = $id('totalSize');
                 show(totalEl, this.totalBytes > 0);
                 totalEl.textContent = '· ' + this.formatSize(this.totalBytes);
@@ -9885,8 +12384,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('ctxTitle').innerHTML = '<span class="sl-host">' + this.highlightedDomain(site.domain.replace(/:\d+$/, ''), '') + '</span><span class="sl-type ' + ti.cls + '">' + ti.pill + '</span>';
                 this.setCtxEcho('ctxManage');
                 const isWp = this.isWpLike(site);
-                show($id('ctxLogin'), isWp);
-                show($id('ctxDb'), isWp);
+                show($id('ctxLogin'), this.canLogIn(site));
+                show($id('ctxDb'), isWp || (site.type === 'Laravel' && !!site.db_name));
                 $id('ctxReveal').querySelector('span').textContent = this.revealLabel;
                 $id('ctxPin').querySelector('span').textContent = this.isPinned(site.name) ? 'Unpin from top' : 'Pin to top';
                 // Effective PHP as the item's meta; hide the item entirely on
@@ -10113,16 +12612,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     const res = await fetch('/api.php?action=wp_versions');
                     const data = await res.json();
                     if (Array.isArray(data)) {
+                        // 'latest' and 'nightly' come first; real versions after.
                         this.wpVersions = data;
-                        // 'latest' and 'nightly' are hard-coded first options;
-                        // real versions append after them.
-                        const sel = $id('wpVersionSelect');
-                        for (const v of data) {
-                            const opt = document.createElement('option');
-                            opt.value = v.version;
-                            opt.textContent = v.version + (v.status === 'insecure' ? ' — insecure' : '');
-                            sel.appendChild(opt);
-                        }
+                        if (this.wpVersionCombo && this.wpVersionCombo.isOpen) this.wpVersionCombo.render();
                     }
                 } catch (e) { /* offline — 'latest' still works */ }
             },
@@ -10136,14 +12628,101 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 try {
                     const res = await fetch('/api.php?action=minn_release');
                     const data = await res.json();
-                    if (!data || !data.available) return;
-                    const sel = $id('wpVersionSelect');
-                    if (sel.querySelector('option[value="minn"]')) return;
-                    const opt = document.createElement('option');
-                    opt.value = 'minn';
-                    opt.textContent = 'minn engine' + (data.version ? ' ' + data.version : '');
-                    sel.querySelector('option[value="nightly"]').after(opt);
-                } catch (e) { /* offline — WordPress still works */ }
+                    this.minnRelease = { available: !!(data && data.available), version: (data && data.version) || null };
+                } catch (e) { this.minnRelease = { available: false, version: null }; /* offline — WordPress still works */ }
+                if (this.addTypeCombo && this.addTypeCombo.isOpen) this.addTypeCombo.render();
+            },
+
+            // --- The add form's fields -------------------------------------
+            // The site type completes from the kinds `cove add` makes,
+            // WordPress by default (wp or static find theirs too). Minn can be
+            // picked once it has a release, as `cove add --minn` needs one.
+            get siteKinds() {
+                const m = this.minnRelease;
+                return [
+                    { id: 'wordpress', label: 'WordPress', hint: 'latest, nightly, or a version', dot: 'wp', words: ['wordpress', 'wp'] },
+                    { id: 'plain', label: 'Plain', hint: 'static files, no database', dot: 'static', words: ['plain', 'static', 'html'] },
+                    { id: 'minn', label: 'Minn', hint: !m ? 'checking for a release…' : m.available ? (m.version ? 'release ' + m.version : 'the latest release') : 'no release yet', dot: 'minn', words: ['minn', 'engine'], disabled: !(m && m.available) },
+                    { id: 'laravel', label: 'Laravel', hint: 'on SQLite, MySQL or PostgreSQL', dot: 'laravel', words: ['laravel'] },
+                ];
+            },
+
+            // WordPress: latest, nightly, the versions wordpress.org lists,
+            // or any other typed in (`cove add` takes x.y, x.y.z or x.y-RC1).
+            get wpVersionChoices() {
+                const latest = this.wpVersions.find(v => v.status === 'latest');
+                return [
+                    { id: 'latest', label: 'latest', hint: latest ? latest.version : 'the newest release' },
+                    { id: 'nightly', label: 'nightly', hint: 'development build' },
+                ].concat(this.wpVersions.map(v => ({ id: v.version, label: v.version, hint: v.status === 'insecure' ? 'insecure' : '' })));
+            },
+
+            // Laravel: an existing project may keep the database it names.
+            get laravelDbChoices() {
+                return (this.newSite.from ? [{ id: '', label: 'its own db', hint: 'whatever its .env names' }] : []).concat([
+                    { id: 'sqlite', label: 'sqlite', hint: "Laravel's default" },
+                    { id: 'mysql', label: 'mysql', hint: "on Cove's MariaDB" },
+                    { id: 'pgsql', label: 'pgsql', hint: 'PostgreSQL, set up on first use' },
+                ]);
+            },
+
+            bindAddType() {
+                this.addTypeCombo = combo('addType', {
+                    items: () => this.siteKinds,
+                    value: () => this.newSite.kind,
+                    pick: (id) => { this.newSite.kind = id; this.render(); },
+                    empty: () => 'no such type: wordpress, plain, minn or laravel',
+                });
+                this.wpVersionCombo = combo('wpVersion', {
+                    items: () => this.wpVersionChoices,
+                    value: () => this.newSite.wpVersion,
+                    pick: (id) => { this.newSite.wpVersion = id; this.renderChrome(); },
+                    free: (q) => /^\d+(\.\d+){1,2}(-[A-Za-z0-9.]+)?$/.test(q) ? { id: q, label: q, hint: 'not in the list' } : null,
+                    empty: (q) => 'no version “' + q + '”',
+                });
+                this.laravelDbCombo = combo('laravelDb', {
+                    items: () => this.laravelDbChoices,
+                    value: () => this.newSite.database,
+                    pick: (id) => { this.newSite.database = id; this.renderChrome(); },
+                    empty: () => 'sqlite, mysql or pgsql',
+                });
+            },
+
+            renderAddFields() {
+                if (!this.addTypeCombo) return;
+                this.addTypeCombo.render();
+                this.wpVersionCombo.render();
+                this.laravelDbCombo.render();
+            },
+
+            // --- The add-user form's role (WordPress) -----------------------
+            // The same kind of field as the site type: the site's roles, a
+            // few letters narrowing them (a word of the name or the slug, so
+            // "sub" finds Subscriber and EDD Subscriber), ↑↓ to move, ↵ or
+            // Tab to pick, Esc to put the field back.
+            get userRoles() {
+                const t = this.sitePage.tabs.users;
+                const have = t && t.loadedFor === this.sitePage.name && t.extra && Array.isArray(t.extra.roles_available) && t.extra.roles_available.length ? t.extra.roles_available : null;
+                // Until the site's list lands, WordPress's own.
+                return (have || ['administrator', 'editor', 'author', 'contributor', 'subscriber'].map(r => ({ role: r, name: r[0].toUpperCase() + r.slice(1) })))
+                    .map(r => ({ id: String(r.role), label: String(r.name || r.role) }));
+            },
+
+            bindUserRole() {
+                this.userRoleCombo = combo('userRole', {
+                    items: () => this.userRoles.map(x => ({ ...x, hint: x.id !== x.label.toLowerCase() ? x.id : '' })),
+                    value: () => this.userRole.value,
+                    pick: (id) => { this.userRole.value = id; },
+                    empty: (q) => 'no role matches “' + q + '”',
+                    placeholder: 'role',
+                });
+            },
+
+            renderUserRole() {
+                const r = this.userRole, roles = this.userRoles;
+                // A role picked on another site that this one doesn't have.
+                if (!roles.some(x => x.id === r.value)) r.value = roles.some(x => x.id === 'administrator') ? 'administrator' : (roles[0] ? roles[0].id : '');
+                if (this.userRoleCombo) this.userRoleCombo.render();
             },
 
             formatSize(bytes) {
@@ -10365,7 +12944,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     else if (m[2]) { this.logs.site = m[2].toLowerCase(); this.logs.tab = m[3] ? m[3].toLowerCase() : null; }
                     else { this.logs.site = null; this.logs.source = 'errors'; }
                     this.setView('logs', { force: true });
-                } else if ((m = /^\/site\/([a-z0-9-]+)(?:\/(plugins|themes|users|cron|traffic|history|snapshots|cli))?$/i.exec(p))) {
+                } else if ((m = /^\/site\/([a-z0-9-]+)(?:\/(plugins|themes|users|cron|routes|migrations|schedule|traffic|history|snapshots|cli))?$/i.exec(p))) {
                     this.sitePage.name = m[1].toLowerCase();
                     this.sitePage.tab = m[2] ? m[2].toLowerCase() : 'overview';
                     this.setView('site', { force: true });
@@ -10580,9 +13159,16 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (e.metaKey || e.ctrlKey || e.altKey) return false;
                 const isDown = e.key === 'ArrowDown' || (!typing && e.key === 'j');
                 const isUp   = e.key === 'ArrowUp'   || (!typing && e.key === 'k');
-                if (isDown || isUp) { e.preventDefault(); this.mailMove(isDown ? 1 : -1); return true; }
+                if (isDown || isUp) {
+                    // A right-click menu names the message it was opened on,
+                    // which the arrows move away from: close it.
+                    e.preventDefault();
+                    this.closeTabCtx();
+                    this.mailMove(isDown ? 1 : -1);
+                    return true;
+                }
                 if (typing) return false; // the search box handles its own Esc
-                if (this.showDbModal || this.ctxMenu.open) return false;
+                if (this.showDbModal || this.ctxMenu.open || this.tabCtx.open) return false;
                 if ((e.key === 'Backspace' || e.key === 'Delete') && m.selectedId) {
                     e.preventDefault();
                     this.mailDelete([m.selectedId]);
@@ -10699,6 +13285,40 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 m.selectedId = null; m.msg = null; m.renderedId = null; m.items = [];
                 this.showSnack(q ? 'Matching mail deleted.' : 'Inbox emptied.');
                 this.loadMail();
+            },
+
+            // The right-click menu for one message in the list. No key hints:
+            // u and ⌫ act on the selected message, not the right-clicked one,
+            // and are ignored while the menu is open.
+            mailCtxItems(it) {
+                const site = this.mailSiteOf(it), from = it.From && it.From.Address;
+                const items = [
+                    { label: 'Open', run: () => this.openMail(it.ID) },
+                    { label: it.Read ? 'Mark as unread' : 'Mark as read', run: () => this.mailSetRead([it.ID], !it.Read) },
+                    { sep: true },
+                ];
+                if (site && this.mail.site !== site) items.push({ label: 'Only mail for ' + site, run: () => this.setMailSite(site) });
+                if (from) items.push({ label: 'Mail from this sender', run: () => {
+                    this.mail.query = 'from:' + from;
+                    $id('mailSearch').value = this.mail.query;
+                    this.mail.start = 0;
+                    this.loadMail();
+                } });
+                if (site && this.sites.some(x => x.name === site)) items.push({ label: 'Go to ' + site, run: () => this.openSitePage(site) });
+                if (items[items.length - 1].sep !== true) items.push({ sep: true });
+                if (from) items.push({ label: 'Copy sender', run: () => this.copyText(from, 'Sender copied') });
+                items.push({ label: 'Copy subject', run: () => this.copyText(it.Subject || '', 'Subject copied') });
+                items.push({ label: 'Download .eml', run: () => {
+                    const a = document.createElement('a');
+                    a.href = '/mail-api/v1/message/' + encodeURIComponent(it.ID) + '/raw';
+                    a.download = ((it.Subject || '').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || it.ID) + '.eml';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                } });
+                items.push({ sep: true });
+                items.push({ label: 'Delete', danger: true, run: () => this.mailDelete([it.ID]) });
+                return items;
             },
 
             mailAddrLabel(a) {
@@ -11031,6 +13651,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     if (chip) { this.setMailSite(chip.textContent); return; }
                     this.openMail(row.dataset.id);
                 });
+                $id('mailList').addEventListener('contextmenu', (e) => {
+                    const row = e.target.closest('.mail-row');
+                    const it = row && this.mail.items.find(x => x.ID === row.dataset.id);
+                    if (it) this.openTabCtx(e, it.Subject || '(no subject)', this.mailCtxItems(it));
+                });
                 $id('mailParts').addEventListener('click', (e) => {
                     const b = e.target.closest('.mail-part');
                     if (b) this.setMailPart(b.dataset.part);
@@ -11092,7 +13717,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // and sizes, which can take seconds on a box with thousands
                 // of tables.
                 const res = await this.apiPost('db_list', { light: true }, { quiet: true, timeoutMs: 15000 });
-                if (res.success) { d.list = res.databases || []; d.server = res.server || ''; d.error = null; }
+                if (res.success) { d.list = res.databases || []; d.server = res.server || ''; d.pgServer = res.pg_server || ''; d.error = null; }
                 else d.error = res.message || 'MariaDB is not answering.';
                 d.loaded = true;
                 d.loading = false;
@@ -11400,6 +14025,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.renderViewBack('dbBack', site);
                 const adminer = this.adminerUrl + '/?username=' + encodeURIComponent(DB_USER) + (d.name ? '&db=' + encodeURIComponent(d.name) + (d.table ? '&select=' + encodeURIComponent(d.table) : '') : '');
                 $id('dbAdminerLink').href = adminer;
+                // Cove's Adminer signs in to MariaDB; SQLite and PostgreSQL stay here.
+                show($id('dbAdminerLink'), !/^(sqlite|pgsql):/.test(String(d.name || '')));
                 $id('dbAdminerLink').title = 'Open ' + (d.table ? d.table + ' in Adminer' : d.name ? d.name + ' in Adminer' : 'Adminer') + (site ? ' (' + site + '.localhost)' : '') + ' — exports, imports, schema changes, users';
             },
 
@@ -11460,7 +14087,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const sub = [];
                 if (site) sub.push('<a href="https://' + esc(site) + '.localhost' + PORT_SUFFIX + '" target="_blank" rel="noopener" style="color: var(--accent); text-decoration: none;">' + esc(site) + '.localhost</a>');
                 if (meta && meta.tables !== null) sub.push(meta.tables + ' table' + (meta.tables === 1 ? '' : 's') + ' · ' + this.formatSize(meta.bytes));
-                if (d.server) sub.push('MariaDB ' + esc(d.server.replace(/-MariaDB.*$/, '')));
+                if (String(d.name).startsWith('sqlite:')) sub.push('SQLite, the site\'s database file');
+                else if (String(d.name).startsWith('pgsql:')) sub.push('PostgreSQL' + (d.pgServer ? ' ' + esc(String(d.pgServer).split(' ')[0]) : ''));
+                else if (d.server) sub.push('MariaDB ' + esc(d.server.replace(/-MariaDB.*$/, '')));
                 html += '<p class="db-ov-sub">' + sub.join(' · ') + '</p>';
                 if (d.tablesFor !== d.name) { html += '<div class="loading">Loading…</div>'; box.innerHTML = html; return; }
                 if (d.error) { html += '<div class="mail-msg-error">' + esc(d.error) + '</div>'; box.innerHTML = html; return; }
@@ -11481,7 +14110,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             + '</ul>';
                     }
                 } else if (d.tables.length) {
-                    html += '<p class="db-ov-sub">Not a WordPress database — pick a table on the left, or open the SQL console.</p>';
+                    const owner = site ? this.sites.find(x => x.name === site) : null;
+                    html += '<p class="db-ov-sub">' + (owner && owner.type === 'Laravel' ? 'The Laravel app\'s database' : 'Not a WordPress database') + ' — pick a table on the left, or open the SQL console.</p>';
                 } else {
                     html += '<p class="db-ov-sub">Empty database. The SQL console is the place to start.</p>';
                 }
@@ -11500,9 +14130,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 show($id('dbGridWrap'), d.part === 'rows');
                 show($id('dbStructure'), d.part === 'structure');
                 // Column picker for the filter
-                const sel = $id('dbRowsCol');
-                const want = ['<option value="">any column</option>'].concat(r.columns.map(c => '<option value="' + this.escapeHtml(c.name) + '"' + (r.col === c.name ? ' selected' : '') + '>' + this.escapeHtml(c.name) + '</option>')).join('');
-                if (sel.innerHTML !== want) sel.innerHTML = want;
+                this.dbColCombo.render();
                 const note = $id('dbRowsNote');
                 if (d.part === 'rows') {
                     note.textContent = r.error ? r.error : (!r.pk.length && r.columns.length ? 'read-only — no primary key' : (r.columns.length ? 'double-click a cell to edit' : ''));
@@ -11576,9 +14204,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (this.view !== 'db' || !d.sql) return;
                 $id('dbSqlNote').textContent = d.name ? 'runs against ' + d.name : 'no database selected — qualify tables as database.table';
                 const hist = this.dbHistory;
-                const sel = $id('dbSqlHistory');
-                sel.innerHTML = '<option value="">history</option>' + hist.map((h, i) => '<option value="' + i + '">' + esc(h.replace(/\s+/g, ' ').slice(0, 60)) + '</option>').join('');
-                sel.disabled = hist.length === 0;
+                this.dbHistoryCombo.input.disabled = hist.length === 0;
+                this.dbHistoryCombo.render();
                 const run = $id('btnDbRun');
                 run.disabled = c.running;
                 run.innerHTML = c.running ? 'running…' : 'run <span class="db-kbd">⌘↵</span>';
@@ -11670,7 +14297,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     if (e.key === 'Enter') { e.preventDefault(); clearTimeout(this.db.rows.timer); this.loadDbRows(); }
                     if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); this.db.rows.q = ''; rowsFilter.value = ''; rowsFilter.blur(); this.db.rows.start = 0; this.loadDbRows(); }
                 });
-                $id('dbRowsCol').addEventListener('change', (e) => { this.db.rows.col = e.target.value; if (this.db.rows.q) { this.db.rows.start = 0; this.loadDbRows(); } });
+                this.dbColCombo = combo('dbRowsCol', {
+                    items: () => [{ id: '', label: 'any column' }].concat(this.db.rows.columns.map(c => ({ id: c.name, label: c.name, hint: c.type }))),
+                    value: () => this.db.rows.col,
+                    pick: (id) => { this.db.rows.col = id; if (this.db.rows.q) { this.db.rows.start = 0; this.loadDbRows(); } },
+                    empty: (q) => 'no column “' + q + '”',
+                });
                 $id('btnDbRowsRefresh').addEventListener('click', () => { this.db.structure = null; this.loadDbRows(); });
                 $id('btnDbNewer').addEventListener('click', () => this.dbPage(-1));
                 $id('btnDbOlder').addEventListener('click', () => this.dbPage(1));
@@ -11712,11 +14344,18 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
 
                 $id('btnDbRun').addEventListener('click', () => this.runDbSql());
                 $id('dbSqlText').addEventListener('input', (e) => { this.db.console.text = e.target.value; });
-                $id('dbSqlHistory').addEventListener('change', (e) => {
-                    const h = this.dbHistory[Number(e.target.value)];
-                    if (h !== undefined) { $id('dbSqlText').value = h; this.db.console.text = h; }
-                    e.target.value = '';
-                    $id('dbSqlText').focus();
+                // Searches every word of the queries, not just what fits on a line.
+                this.dbHistoryCombo = combo('dbSqlHistory', {
+                    items: () => this.dbHistory.map((h, i) => ({ id: String(i), label: h.replace(/\s+/g, ' ').slice(0, 60), words: h.toLowerCase().split(/[\s,()=.`'"]+/) })),
+                    value: () => null,
+                    pick: (id) => {
+                        const h = this.dbHistory[Number(id)];
+                        if (h !== undefined) { $id('dbSqlText').value = h; this.db.console.text = h; }
+                        $id('dbSqlText').focus();
+                    },
+                    empty: (q) => 'no query has “' + q + '”',
+                    placeholder: 'history',
+                    action: true,
                 });
             },
 
@@ -11742,6 +14381,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     l.dir = res.dir || '';
                     l.sourcesLoaded = true;
                     this.renderLogsSide();
+                    // The debug.log tab is called laravel.log on a Laravel site.
+                    this.renderLogsBar();
                 });
                 return l.sourcesPromise;
             },
@@ -11892,6 +14533,22 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         }
                         e.detail = JSON.stringify(j, null, 2);
                     } catch (err) { e.msg = head; e.detail = rest; }
+                } else if (kind === 'laravel') {
+                    // [2026-10-17 06:04:48] local.ERROR: message {"exception":"[object]
+                    // (RuntimeException(code: 0): message at /path/file.php:22)
+                    // [stacktrace] … Stamps are the app's timezone, UTC by default.
+                    const m = /^\[(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})[^\]]*\]\s+[\w-]+\.([A-Z]+):\s?(.*)$/s.exec(head);
+                    if (m) {
+                        const t = Date.parse(m[1] + 'T' + m[2] + 'Z');
+                        e.ts = isNaN(t) ? null : t / 1000;
+                        e.level = /^(EMERGENCY|ALERT|CRITICAL|ERROR)$/.test(m[3]) ? 'error' : m[3] === 'WARNING' ? 'warning' : m[3] === 'NOTICE' ? 'notice' : m[3] === 'DEBUG' ? 'log' : 'info';
+                        e.msg = m[4].replace(/\s+[\[{]".*$/s, '');
+                        const at = / at (\/\S+?):(\d+)\)/.exec(raw);
+                        if (at) { e.file = at[1]; e.line = at[2]; }
+                    }
+                    e.detail = rest || (m && m[4] !== e.msg ? m[4] : '');
+                    const sm = /\/Sites\/([a-z0-9-]+)\.localhost\//i.exec(raw);
+                    if (sm) e.site = sm[1].toLowerCase();
                 } else {
                     const m = /^\[([^\]]+)\]\s?(.*)$/s.exec(head);
                     let body = head;
@@ -12025,6 +14682,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         b.classList.toggle('is-active', l.tab === t);
                         b.setAttribute('aria-selected', l.tab === t ? 'true' : 'false');
                         if (meta && t === 'debug') b.style.opacity = meta.debug ? '' : '0.5';
+                        if (t === 'debug') { b.textContent = meta && meta.laravel ? 'laravel.log' : 'debug.log'; b.title = meta && meta.laravel ? 'storage/logs, the newest file' : 'wp-content/debug.log'; }
                         if (meta && t === 'access') b.style.opacity = meta.access ? '' : '0.5';
                     });
                 }
@@ -12048,9 +14706,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     $id('logsEmptyText').textContent = l.missing ? 'No log file yet.' : filtered ? 'Nothing matches.' : (l.site && l.tab === 'errors' ? 'No PHP errors mention this site.' : 'Nothing logged.');
                     const meta = l.site ? l.sites.find(x => x.name === l.site) : null;
                     $id('logsEmptyHint').textContent = l.missing
-                        ? (l.tab === 'debug' ? 'Set WP_DEBUG and WP_DEBUG_LOG in wp-config.php and WordPress will write one.' : '')
+                        ? (l.tab === 'debug' ? (meta && meta.laravel ? 'Laravel writes storage/logs/laravel.log the first time something is logged.' : 'Set WP_DEBUG and WP_DEBUG_LOG in wp-config.php and WordPress will write one.') : '')
                         : filtered ? 'Press Esc to clear the filters.'
-                        : (l.site && l.tab === 'errors' && meta && meta.debug) ? 'This site keeps its PHP errors in its own debug.log — see the debug.log tab.'
+                        : (l.site && l.tab === 'errors' && meta && meta.debug) ? (meta.laravel ? 'Laravel keeps this site\'s errors in its own log — see the laravel.log tab.' : 'This site keeps its PHP errors in its own debug.log — see the debug.log tab.')
                         : (l.scanned ? 'Looked through the last ' + this.formatSize(l.scanned) + '.' : '');
                 }
                 const tpl = $id('tpl-log-row');
@@ -12196,6 +14854,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 }
                 const isWp = this.isWpLike(site);
                 const isMinn = site.type === 'Minn';
+                $id('siteLogsDesc').textContent = 'PHP errors, ' + (site.type === 'Laravel' ? 'laravel.log' : 'debug.log') + ', and the access log, live.';
+                this.renderSiteWorkers();
                 const facts = $id('siteFacts');
                 facts.innerHTML = '';
                 const fact = (text, cls, title) => { const s = document.createElement('span'); s.className = 'fact' + (cls ? ' ' + cls : ''); s.textContent = text; if (title) s.title = title; facts.appendChild(s); return s; };
@@ -12205,9 +14865,19 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (isMinn && site.minn_version) fact(site.minn_version, 'fact-ver', 'Minn Engine ' + site.minn_version);
                 if (isMinn && site.wp_version) fact('speaks wp ' + site.wp_version, '', 'The WordPress release whose contracts the engine speaks; none of its code runs here');
                 if (!isMinn && isWp && site.wp_version) fact(site.wp_version, 'fact-ver' + (site.wp_status === 'insecure' ? ' insecure' : ''), site.wp_status === 'insecure' ? 'wp.org marks this version insecure' : (site.wp_status === 'outdated' ? 'A newer WordPress is available' : ''));
+                // A Laravel site: its framework version and the database .env
+                // names, which opens in the database view.
+                const lv = site.type === 'Laravel' ? (site.laravel || {}) : null;
+                if (lv && lv.version) fact(lv.version, 'fact-ver', 'Laravel ' + lv.version);
+                if (lv && lv.db) {
+                    const label = { sqlite: 'sqlite', mysql: 'mysql', mariadb: 'mariadb', pgsql: 'postgres' }[lv.db] || lv.db;
+                    const dbn = String(lv.db_name || '').replace(/^(pgsql|sqlite):/, '');
+                    const f = fact(lv.db === 'sqlite' || !dbn ? label : label + ' · ' + dbn, lv.db_name ? 'fact-db' : '', lv.db_name ? 'Open the database' : 'Database: ' + label);
+                    if (lv.db_name) f.setAttribute('role', 'button');
+                }
                 if (site.multisite) fact('multisite · ' + site.multisite, 'fact-ms');
                 const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
-                if (isWp && effPhp) fact('php ' + effPhp, '', site.php_version ? 'Pinned with cove php' : 'Cove\'s default PHP');
+                if ((isWp || lv) && effPhp) fact('php ' + effPhp, '', site.php_version ? 'Pinned with cove php' : 'Cove\'s default PHP');
                 if (site.size_bytes) fact(this.formatSize(site.size_bytes), '', 'On disk');
                 if (site.modified_at) { const rel = this.formatRelative(site.modified_at); fact(rel === 'now' ? 'modified just now' : 'modified ' + rel + ' ago', '', new Date(site.modified_at * 1000).toLocaleString()); }
                 const path = fact(site.display_path, 'fact-path', 'Click to copy the path');
@@ -12215,10 +14885,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('siteOpenLink').href = site.domain;
                 this.renderSiteShot(site);
                 const login = $id('btnSiteLogin');
-                show(login, isWp);
+                show(login, this.canLogIn(site));
                 login.disabled = !!site.isLoggingIn;
-                login.querySelector('.btn-label').textContent = site.isLoggingIn ? 'opening…' : (isMinn ? 'log in to Minn Admin' : 'log in to admin');
-                show($id('tileDb'), isWp);
+                login.querySelector('.btn-label').textContent = site.isLoggingIn ? 'opening…' : (isMinn ? 'log in to Minn Admin' : site.type === 'Laravel' ? 'log in' : 'log in to admin');
+                // A Laravel site's database: its SQLite file, or one on MariaDB or PostgreSQL.
+                show($id('tileDb'), isWp || (site.type === 'Laravel' && !!site.db_name));
                 show($id('siteNetwork'), !!site.multisite);
                 if (site.multisite) {
                     // A deep link renders before the sites list lands; fetch
@@ -12235,9 +14906,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('spReveal').querySelector('.pill-label').textContent = this.revealLabel.toLowerCase();
                 $id('spPin').querySelector('.pill-label').textContent = this.isPinned(site.name) ? 'unpin' : 'pin to top';
                 // Tabs: WordPress only; a static site has just the overview.
-                if (!isWp && p.tab !== 'overview' && p.tab !== 'snapshots' && p.tab !== 'traffic' && p.tab !== 'history') { p.tab = 'overview'; this.syncUrl({ replace: true }); }
+                if (!this.siteTabsFor(site).includes(p.tab)) { p.tab = 'overview'; this.syncUrl({ replace: true }); }
                 show($id('siteTabs'), true);
-                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); show(b, isWp || ['overview', 'snapshots', 'traffic', 'history'].includes(b.dataset.tab)); });
+                document.querySelectorAll('#siteTabs .mail-part').forEach(b => { const on = b.dataset.tab === p.tab; b.classList.toggle('is-active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); show(b, this.siteTabsFor(site).includes(b.dataset.tab)); if (b.dataset.tab === 'cli') b.textContent = site.type === 'Laravel' ? 'artisan' : 'wp-cli'; });
                 for (const tb of this.siteTabs) show($id('sitePanel-' + tb), p.tab === tb);
                 this.renderSiteTab();
             },
@@ -12339,7 +15010,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     tile('requests', fmtN(d.requests), fmtN(k.page || 0) + ' pages · ' + fmtN(k.asset || 0) + ' assets'),
                     tile('page views', fmtN(k.page || 0), fmtN(k.admin || 0) + ' admin · ' + fmtN(k.rest || 0) + ' rest · ' + fmtN(k.ajax || 0) + ' ajax'),
                     tile('server errors', fmtN(errors), fmtN(d.status['4xx'] || 0) + ' × 4xx · ' + fmtN(d.status['3xx'] || 0) + ' × 3xx', errors ? 'is-bad' : ''),
-                    tile('php errors', fmtN(d.php_errors), 'error log + debug.log', d.php_errors ? 'is-warn' : ''),
+                    tile('php errors', fmtN(d.php_errors), 'error log + ' + (site && site.type === 'Laravel' ? 'laravel.log' : 'debug.log'), d.php_errors ? 'is-warn' : ''),
                     tile('response time', d.avg_ms != null ? esc(d.avg_ms) + ' ms' : '—', d.p95_ms != null ? 'p95 ' + esc(d.p95_ms) + ' ms · max ' + esc(d.max_ms) + ' ms' : ''),
                     tile('served', this.formatSize(d.bytes), (d.last_cron ? 'cron ran ' + (this.formatRelative(d.last_cron) === 'now' ? 'just now' : this.formatRelative(d.last_cron) + ' ago') : 'cron not seen')),
                     tile('mail sent', d.mail == null ? '—' : fmtN(d.mail), d.mail == null ? 'Mailpit did not answer' : 'by whole days'),
@@ -12544,7 +15215,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     + bit('5xx', d.status['5xx'], d.status['5xx'] ? 'is-bad' : '')
                     + bit('php errors', d.php_errors, d.php_errors ? 'is-warn' : '')
                     + (h.mail == null ? '' : bit('mail', h.mail))
-                    + (d.last_cron ? '<span class="fact" title="' + new Date(d.last_cron * 1000).toLocaleString() + '">cron ' + (this.formatRelative(d.last_cron) === 'now' ? 'just now' : this.formatRelative(d.last_cron) + ' ago') + '</span>' : '<span class="fact">cron not seen</span>');
+                    // WordPress's cron rides on page loads; Laravel's scheduler doesn't.
+                    + (site && site.type === 'Laravel' ? '' : d.last_cron ? '<span class="fact" title="' + new Date(d.last_cron * 1000).toLocaleString() + '">cron ' + (this.formatRelative(d.last_cron) === 'now' ? 'just now' : this.formatRelative(d.last_cron) + ' ago') + '</span>' : '<span class="fact">cron not seen</span>');
             },
 
             // --- Previews in the background ---------------------------------
@@ -12809,6 +15481,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('siteFacts').addEventListener('click', (e) => {
                     const path = e.target.closest('.fact-path');
                     if (path) { this.copyPath(path.dataset.path); return; }
+                    if (e.target.closest('.fact-db')) { const s = this.pageSite; if (s) this.openDbForSite(s); return; }
                     const type = e.target.closest('.fact-type');
                     if (type) { this.setTypeFilter(type.dataset.type); this.setView('sites'); }
                 });
@@ -12822,6 +15495,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     if (t.dataset.go === 'logs') this.openLogsForSite(s.name);
                 });
                 $id('btnSiteNetworkRefresh').addEventListener('click', () => this.loadSiteNetwork(true));
+                for (const id of ['siteWorkersRow', 'schedFoot']) $id(id).addEventListener('click', (e) => { const b = e.target.closest('[data-worker]'); if (b) this.toggleSiteWorker(b.dataset.worker); });
                 $id('siteNetList').addEventListener('click', (e) => {
                     const row = e.target.closest('.net-row');
                     if (!row || !row.dataset.url) return;
@@ -12845,13 +15519,22 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // --- Site page tabs: plugins, themes, users, cron, wp-cli --------
             // Each tab is a WP-CLI listing fetched when first shown and kept
             // per site; row actions run one command and refetch.
-            get siteTabs() { return ['overview', 'plugins', 'themes', 'users', 'cron', 'traffic', 'history', 'snapshots', 'cli']; },
+            get siteTabs() { return ['overview', 'plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule', 'traffic', 'history', 'snapshots', 'cli']; },
+
+            // The tabs a site's page offers: WordPress's listings, Laravel's
+            // routes, migrations, schedule and artisan, or just the basics.
+            siteTabsFor(site) {
+                if (!site) return ['overview'];
+                if (site.type === 'Laravel') return ['overview', 'users', 'routes', 'migrations', 'schedule', 'traffic', 'snapshots', 'cli'];
+                if (this.isWpLike(site)) return ['overview', 'plugins', 'themes', 'users', 'cron', 'traffic', 'history', 'snapshots', 'cli'];
+                return ['overview', 'snapshots', 'traffic', 'history'];
+            },
 
             setSiteTab(tab) {
                 const p = this.sitePage;
                 tab = this.siteTabs.includes(tab) ? tab : 'overview';
                 const site = this.pageSite;
-                if (site && !this.isWpLike(site) && tab !== 'snapshots' && tab !== 'traffic' && tab !== 'history') tab = 'overview';
+                if (site && !this.siteTabsFor(site).includes(tab)) tab = 'overview';
                 p.tab = tab;
                 this.syncUrl();
                 this.renderSitePage();
@@ -12870,19 +15553,24 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const tab = p.tab;
                 const site = this.pageSite;
                 if (tab === 'traffic') { this.loadTraffic(opts); return; }
-                if (tab === 'overview') { this.loadSiteHealth(); return; }
-                if (!site || !['plugins', 'themes', 'users', 'cron', 'snapshots', 'history'].includes(tab)) return;
-                if (!this.isWpLike(site) && tab !== 'snapshots' && tab !== 'history') return;
+                if (tab === 'overview') { this.loadSiteHealth(); this.loadSiteWorkers(); return; }
+                if (tab === 'schedule') this.loadSiteWorkers();
+                if (!site || !['plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule', 'snapshots', 'history'].includes(tab)) return;
+                if (!this.siteTabsFor(site).includes(tab)) return;
                 const t = this.siteTabState(tab);
                 if (t.loadedFor === site.name && !opts.force) return;
-                if (t.loadedFor !== site.name) { t.items = []; t.loadedFor = null; t.filter = t.filterFor === site.name ? t.filter : ''; t.status = 'all'; t.arm = null; t.open = null; t.diff = null; }
+                if (t.loadedFor !== site.name) {
+                    t.items = []; t.loadedFor = null; t.filter = t.filterFor === site.name ? t.filter : ''; t.status = 'all'; t.arm = null; t.open = null; t.diff = null; t.added = null;
+                    // Another site's add-user form starts empty, password included.
+                    if (tab === 'users') for (const id of ['userAddEmail', 'userAddLogin', 'userAddName', 'userAddPassword']) $id(id).value = '';
+                }
                 t.loading = true; t.error = null;
                 this.renderSiteTab();
-                const action = { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron', snapshots: 'site_snapshots', history: 'site_history' }[tab];
+                const action = tab === 'users' && site.type === 'Laravel' ? 'site_laravel_users' : { plugins: 'site_plugins', themes: 'site_themes', users: 'site_users', cron: 'site_cron', routes: 'site_routes', migrations: 'site_migrations', schedule: 'site_schedule', snapshots: 'site_snapshots', history: 'site_history' }[tab];
                 const res = await this.apiPost(action, { site_name: site.name, check: !!opts.check }, { quiet: true, timeoutMs: opts.check ? 180000 : 90000 });
                 if (this.sitePage.name !== site.name) return;
                 t.loading = false;
-                if (!res.success) t.error = res.message || 'wp-cli failed.';
+                if (!res.success) t.error = res.message || (site.type === 'Laravel' ? 'artisan failed.' : 'wp-cli failed.');
                 else { t.items = res.items || []; t.loadedFor = site.name; t.ms = res.ms || 0; t.extra = res; if (opts.check) t.checked = true; }
                 if (tab === 'history') {
                     const sv = res.saving;
@@ -12912,6 +15600,69 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (this.sitePage.name !== site.name) return;
                 const last = (res.message || '').split('\n').filter(Boolean).pop() || '';
                 this.showSnack(last.replace(/^(Success|Error|Warning): /, '') || (res.success ? 'Done.' : 'Failed.'), !res.success);
+                this.loadSiteTab({ force: true });
+            },
+
+            // --- A Laravel site's workers (cove laravel) ----------------------
+            async loadSiteWorkers(kind, state) {
+                const site = this.pageSite;
+                const w = this.sitePage.workers;
+                if (!site || site.type !== 'Laravel') return;
+                if (kind) w.busy = kind;
+                this.renderSiteWorkers();
+                const res = await this.apiPost('site_laravel_workers', kind ? { site_name: site.name, kind, state } : { site_name: site.name }, { quiet: true, timeoutMs: 60000 });
+                w.busy = null;
+                // Reverb's websocket route is Caddy's: reloaded in the
+                // background, and owed even if another page is showing by now.
+                if (kind === 'reverb' && res.success) this.apiPost('reload_server', {}, { quiet: true });
+                if (this.sitePage.name !== site.name) return;
+                if (res.workers) { w.for = site.name; w.data = res.workers; }
+                if (!res.success) this.showSnack(res.message || 'Could not change the worker.', true);
+                else if (kind === 'reverb' && state === 'on') this.showSnack('Reverb is on at wss://' + site.name + '.localhost. Build the front end again (npm run build), or run npm run dev, so Echo uses it.', false, { duration: 12000 });
+                this.renderSiteWorkers();
+            },
+
+            renderSiteWorkers() {
+                const site = this.pageSite;
+                const w = this.sitePage.workers;
+                const on = site && site.type === 'Laravel';
+                show($id('siteWorkers'), on);
+                const foot = $id('schedFoot');
+                if (!on) { foot.textContent = ''; return; }
+                const data = w.for === site.name ? w.data : null;
+                const names = { queue: ['queue worker', 'artisan queue:listen: runs queued jobs, reloading the code for each'], schedule: ['scheduler', 'artisan schedule:work: runs the scheduled tasks every minute'], reverb: ['reverb', 'artisan reverb:start: the app\'s websockets, at wss://' + site.name + '.localhost'] };
+                // Reverb's only for an app that has it.
+                $id('siteWorkersRow').innerHTML = ['queue', 'schedule'].concat(data && data.reverb ? ['reverb'] : []).map(k => {
+                    const st = data ? data[k] : null;
+                    const busy = w.busy === k;
+                    const state = !st ? '…' : busy ? (st.on ? 'stopping…' : 'starting…') : st.running ? 'running' : st.on ? 'starting' : 'off';
+                    const dot = st && st.running ? 'is-running' : st && st.on ? 'is-starting' : '';
+                    return '<button type="button" class="pill" data-worker="' + k + '"' + (busy || !st ? ' disabled' : '') + ' title="' + this.escapeHtml(names[k][1] + (st ? (st.on ? ' · click to turn off' : ' · click to turn on') : '')) + '"><span class="pill-label"><i class="wk-dot ' + dot + '"></i>' + names[k][0] + '</span><span class="pill-meta">' + state + (st && st.pid ? ' · pid ' + st.pid : '') + '</span></button>';
+                }).join('');
+                const sch = data ? data.schedule : null;
+                foot.innerHTML = !sch ? '' : sch.running ? 'The scheduler is running these every minute. <button type="button" class="sl-link" data-worker="schedule">turn it off</button>'
+                    : 'The scheduler is off, so these run only when you press run due now. <button type="button" class="sl-link" data-worker="schedule">turn it on</button>';
+            },
+
+            toggleSiteWorker(kind) {
+                const w = this.sitePage.workers;
+                const st = w.data && w.data[kind];
+                if (!st || w.busy) return;
+                this.loadSiteWorkers(kind, st.on ? 'off' : 'on');
+            },
+
+            // One of Laravel's one-click artisan commands, then a refetch.
+            async laravelOp(tab, op) {
+                const site = this.pageSite;
+                const t = this.siteTabState(tab);
+                if (!site || t.busy[op]) return;
+                t.busy[op] = true;
+                this.renderSiteTab();
+                const res = await this.apiPost('site_laravel_op', { site_name: site.name, op }, { quiet: true, timeoutMs: 300000 });
+                delete t.busy[op];
+                if (this.sitePage.name !== site.name) return;
+                const lines = (res.message || '').split('\n').map(l => l.trim()).filter(Boolean);
+                this.showSnack((lines.filter(l => !/^[.\s]*$/.test(l)).pop() || (res.success ? 'Done.' : 'Failed.')).replace(/^(INFO|ERROR|WARN)\s+/, ''), !res.success);
                 this.loadSiteTab({ force: true });
             },
 
@@ -13376,25 +16127,51 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (this.sitePage.name === site.name) this.renderSiteTab();
             },
 
+            // A new user from the users tab's form: `wp user create` on a
+            // WordPress site, the app's own user model on a Laravel one. A
+            // password left blank is made up, and shown here once.
+            async siteUserAdd() {
+                const site = this.pageSite;
+                const t = this.siteTabState('users');
+                const lv = !!site && site.type === 'Laravel';
+                if (!site || !(lv || this.isWpLike(site)) || t.busy['+']) return;
+                const email = $id('userAddEmail').value.trim();
+                if (!email) { $id('userAddEmail').focus(); return; }
+                t.busy['+'] = 'add'; t.added = null;
+                this.renderSiteTab();
+                const password = $id('userAddPassword').value;
+                const res = lv
+                    ? await this.apiPost('site_laravel_users', { site_name: site.name, op: 'add', email, name: $id('userAddName').value.trim(), password }, { quiet: true, timeoutMs: 90000 })
+                    : await this.apiPost('site_user_add', { site_name: site.name, email, login: $id('userAddLogin').value.trim(), role: this.userRole.value, password }, { quiet: true, timeoutMs: 120000 });
+                delete t.busy['+'];
+                if (this.sitePage.name !== site.name) return;
+                if (!res.success || !res.user) { this.showSnack(res.message || 'Could not add the user.', true); this.renderSiteTab(); return; }
+                t.added = res.user;
+                for (const id of ['userAddEmail', 'userAddLogin', 'userAddName', 'userAddPassword']) $id(id).value = '';
+                this.showSnack('Added ' + (lv ? res.user.email : res.user.login) + '.');
+                this.loadSiteTab({ force: true });
+            },
+
             async runSiteCli() {
                 const site = this.pageSite;
                 const c = this.sitePage.cli;
                 const input = $id('siteCliInput');
                 const line = input.value.trim();
                 if (!site || !line || c.running) return;
+                const kind = this.cliKind(site);
                 c.running = true; c.cmd = line;
                 c.history = [line].concat(c.history.filter(h => h !== line)).slice(0, 50);
                 c.histIdx = -1;
-                try { localStorage.setItem(this.historyKey('cove.cli.history'), JSON.stringify(c.history)); } catch (e) {}
+                try { localStorage.setItem(this.cliHistoryKey(kind), JSON.stringify(c.history)); } catch (e) {}
                 this.renderSiteCli();
-                const res = await this.apiPost('site_wp', { site_name: site.name, args: line }, { quiet: true, timeoutMs: 300000 });
+                const res = await this.apiPost(kind === 'artisan' ? 'site_artisan' : 'site_wp', { site_name: site.name, args: line }, { quiet: true, timeoutMs: 300000 });
                 c.running = false;
                 if (!res.success) { c.output = res.message || 'Failed.'; c.code = 1; c.ms = 0; }
                 else { c.output = res.output; c.code = res.code; c.ms = res.ms; c.notices = res.notices || 0; }
                 c.ran = line;
                 this.renderSiteCli();
                 // Listings the command may have changed are refetched next visit.
-                for (const tab of ['plugins', 'themes', 'users', 'cron']) { const t = this.sitePage.tabs[tab]; if (t) t.loadedFor = null; }
+                for (const tab of ['plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule']) { const t = this.sitePage.tabs[tab]; if (t) t.loadedFor = null; }
             },
 
             siteTabVisible(tab) {
@@ -13412,6 +16189,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     if (q) rows = rows.filter(u => (u.user_login + ' ' + u.display_name + ' ' + u.user_email + ' ' + u.roles).toLowerCase().includes(q));
                 } else if (tab === 'cron') {
                     if (q) rows = rows.filter(e => (e.hook + ' ' + e.recurrence).toLowerCase().includes(q));
+                } else if (tab === 'routes') {
+                    if (q) rows = rows.filter(r => (r.method + ' /' + r.uri + ' ' + (r.name || '') + ' ' + r.action + ' ' + (r.middleware || []).join(' ')).toLowerCase().includes(q));
+                } else if (tab === 'migrations') {
+                    if (q) rows = rows.filter(m => (m.name + (m.ran ? ' ran' : ' pending')).toLowerCase().includes(q));
+                } else if (tab === 'schedule') {
+                    if (q) rows = rows.filter(x => (x.command + ' ' + (x.description || '') + ' ' + x.expression).toLowerCase().includes(q));
                 } else if (tab === 'history') {
                     if (q) rows = rows.filter(s => { const sum = s.summary || {}; const comps = Array.isArray(sum.components) ? sum.components : []; return (s.id + ' ' + (s.note || '') + ' ' + (sum.summary || '') + ' ' + comps.map(c => c.slug + ' ' + (c.title || '')).join(' ')).toLowerCase().includes(q); });
                 }
@@ -13425,7 +16208,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (tab === 'cli') { this.renderSiteCli(); return; }
                 if (tab === 'traffic') { this.renderTraffic(); return; }
                 if (tab === 'overview') { this.renderSiteHealth(); return; }
-                if (!['plugins', 'themes', 'users', 'cron', 'snapshots', 'history'].includes(tab)) return;
+                if (!['plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule', 'snapshots', 'history'].includes(tab)) return;
                 const site = this.pageSite;
                 const t = this.siteTabState(tab);
                 const panel = $id('sitePanel-' + tab);
@@ -13456,10 +16239,36 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (check) { check.disabled = t.loading; check.textContent = t.loading && t.checking ? 'checking…' : 'check for updates'; }
                 const due = panel.querySelector('.st-due');
                 if (due) { due.disabled = !!t.busy['*']; due.textContent = t.busy['*'] ? 'running…' : 'run all due'; }
+                // Laravel's one-click artisan commands, busy while they run.
+                for (const [sel, op, idle, running] of [['.st-migrate', 'migrate', 'run pending', 'migrating…'], ['.st-sched-run', 'schedule_run', 'run due now', 'running…'], ['.st-optimize', 'optimize_clear', 'clear caches', 'clearing…']]) {
+                    const b = panel.querySelector(sel);
+                    if (b) { b.disabled = !!t.busy[op]; b.textContent = t.busy[op] ? running : idle; }
+                }
+                if (tab === 'migrations') { const b = panel.querySelector('.st-migrate'); if (b && !t.busy.migrate) b.disabled = !t.items.some(m => !m.ran); }
+                if (tab === 'users') {
+                    // The add-user form, and the user it just added. WordPress
+                    // asks for a username and a role; Laravel for a name.
+                    const lv = !!site && site.type === 'Laravel';
+                    const wp = !!site && !lv && this.isWpLike(site);
+                    show($id('userAdd'), lv || wp);
+                    show($id('userAddLogin'), wp);
+                    show($id('userRole'), wp);
+                    show($id('userAddName'), lv);
+                    const add = $id('btnUserAdd');
+                    add.disabled = !!t.busy['+']; add.textContent = t.busy['+'] ? 'adding…' : 'add user';
+                    add.title = lv ? "A verified user in the app's users table, through its own user model" : (site && site.multisite ? 'wp user create, on the main site of the network' : 'wp user create');
+                    const e = (s) => this.escapeHtml(s == null ? '' : String(s));
+                    if (wp) this.renderUserRole();
+                    const a = (lv || wp) && t.added;
+                    const who = a ? (lv ? a.email : a.login) : '';
+                    $id('userAddDone').innerHTML = a ? '<span>Added <strong>' + e(who) + '</strong>' + (a.role ? ' (' + e(a.role) + ')' : '') + (a.password ? ', password <code>' + e(a.password) + '</code>' : '') + '</span>'
+                        + (a.password ? '<button type="button" class="pill ua-copy">copy password</button>' : '')
+                        + '<button type="button" class="pill primary ua-login">log in as ' + e(who) + '</button>' : '';
+                }
                 const count = panel.querySelector('.st-count');
                 if (!loaded) { count.textContent = savingText; return; }
                 const rows = this.siteTabVisible(tab);
-                const label = { plugins: 'plugin', themes: 'theme', users: 'user', cron: 'event', snapshots: 'snapshot', history: 'save' }[tab];
+                const label = { plugins: 'plugin', themes: 'theme', users: 'user', cron: 'event', routes: 'route', migrations: 'migration', schedule: 'task', snapshots: 'snapshot', history: 'save' }[tab];
                 const updates = (tab === 'plugins' || tab === 'themes') ? t.items.filter(i => i.update === 'available').length : 0;
                 count.textContent = (rows.length === t.items.length ? t.items.length : rows.length + ' of ' + t.items.length) + ' ' + label + (t.items.length === 1 ? '' : 's')
                     + (updates ? ' · ' + updates + ' update' + (updates === 1 ? '' : 's') : '')
@@ -13469,7 +16278,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const frag = document.createDocumentFragment();
                 const esc = (s) => this.escapeHtml(s == null ? '' : String(s));
                 const ms = site && site.multisite;
-                if (!rows.length) { const li = document.createElement('li'); li.className = 'st-empty'; li.textContent = t.items.length ? 'Nothing matches.' : (tab === 'history' ? 'No saves yet — press save now, or wait for tonight.' : 'Nothing here.'); frag.appendChild(li); }
+                const emptyText = { history: 'No saves yet — press save now, or wait for tonight.', schedule: 'Nothing scheduled. Tasks are defined in routes/console.php.', migrations: (t.extra && t.extra.note) || 'No migrations.', users: site && site.type === 'Laravel' ? 'No users yet. Add one above, then log in as them.' : 'No users.' }[tab] || 'Nothing here.';
+                if (!rows.length) { const li = document.createElement('li'); li.className = 'st-empty'; li.textContent = t.items.length ? 'Nothing matches.' : emptyText; frag.appendChild(li); }
                 for (const it of rows) {
                     const li = document.createElement('li');
                     li.className = 'st-row st-' + tab;
@@ -13499,11 +16309,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             + (it.status === 'must-use' ? '<span></span>' : '<button type="button" class="st-auto' + (it.auto_update === 'on' ? ' is-on' : '') + '" data-op="' + (it.auto_update === 'on' ? 'auto-off' : 'auto-on') + '" title="Auto-updates ' + (it.auto_update === 'on' ? 'on — click to turn off' : 'off — click to turn on') + '">auto</button>')
                             + '<span class="st-actions">' + actions + '</span>';
                     } else if (tab === 'users') {
+                        const lv = site && site.type === 'Laravel';
                         const supers = (t.extra && t.extra.super_admins) || [];
                         const roles = String(it.roles || '').split(',').map(r => r.trim()).filter(Boolean);
                         if (supers.includes(it.user_login)) roles.unshift('super admin');
                         const blogs = Array.isArray(it.blogs) ? it.blogs : [];
-                        let chips = roles.map(r => '<span class="st-chip">' + esc(r) + '</span>');
+                        // A Laravel user has no role: whether the email was verified instead.
+                        let chips = lv ? (it.verified === false ? ['<span class="st-chip st-pending" title="email_verified_at is empty, so routes behind the verified middleware turn this user away">unverified</span>'] : it.verified ? ['<span class="st-chip">verified</span>'] : [])
+                            : roles.map(r => '<span class="st-chip">' + esc(r) + '</span>');
                         let loginUrl = '';
                         if (it.network_only && blogs.length) {
                             // Roles on subsites, shown with the site's path.
@@ -13518,8 +16331,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         const busy = t.busy[it.user_login];
                         li.dataset.login = it.user_login;
                         if (loginUrl) li.dataset.loginUrl = loginUrl;
-                        li.innerHTML = '<div class="st-main"><span class="st-title">' + esc(it.display_name || it.user_login) + '</span><span class="st-sub">' + esc(it.user_login) + ' · ' + esc(it.user_email) + '</span></div>'
-                            + '<span class="st-roles">' + (chips.length ? chips.join('') : '<span class="st-chip st-none">no role</span>') + '</span>'
+                        li.innerHTML = '<div class="st-main"><span class="st-title">' + esc(it.display_name || it.user_email || it.user_login) + '</span><span class="st-sub">' + (lv ? '#' + esc(it.ID) : esc(it.user_login)) + ' · ' + esc(it.user_email) + '</span></div>'
+                            + '<span class="st-roles">' + (chips.length ? chips.join('') : lv ? '' : '<span class="st-chip st-none">no role</span>') + '</span>'
                             + '<span class="st-ver" title="' + esc(it.registered || '') + '">' + esc(it.registered ? String(it.registered).slice(0, 10) : '') + '</span>'
                             + '<span class="st-actions"><button type="button" class="pill primary st-login"' + (busy ? ' disabled' : '') + ' title="One-time login as ' + esc(it.user_login) + (loginUrl ? ' on ' + esc(loginUrl) : '') + '">' + (busy ? 'opening…' : 'log in') + '</button></span>';
                     } else if (tab === 'snapshots') {
@@ -13565,6 +16378,25 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             + '<span class="st-ver" title="' + esc(it.next_run_gmt || '') + ' UTC">' + (past ? 'due' : esc(it.next_run_relative || '')) + '</span>'
                             + '<span class="st-chip' + (it.recurrence === 'Non-repeating' ? ' st-none' : '') + '">' + esc(it.recurrence === 'Non-repeating' ? 'once' : it.recurrence) + '</span>'
                             + '<span class="st-actions">' + (busy ? '<span class="st-busy">' + (busy === 'delete' ? 'unscheduling…' : 'running…') + '</span>' : '<button type="button" class="pill st-run">run now</button>' + (armX ? '<button type="button" class="pill st-del armed st-cron-del">sure? unschedule</button>' : '')) + '</span>';
+                    } else if (tab === 'routes') {
+                        // A GET route with no parameters opens in a new tab.
+                        const uri = '/' + String(it.uri || '').replace(/^\//, '');
+                        const open = /GET/.test(it.method) && !/[{]/.test(uri) && !it.domain && site;
+                        const mw = (it.middleware || []).map(m => String(m).split('\\').pop()).join(', ');
+                        li.innerHTML = '<span class="st-chip">' + esc(String(it.method).replace('GET|HEAD', 'GET')) + '</span>'
+                            + '<div class="st-main"><span class="st-title st-mono">' + (open ? '<a href="' + esc(site.domain + (uri === '/' ? '/' : uri)) + '" target="_blank" rel="noopener">' + esc(uri) + '</a>' : esc(uri)) + '</span>'
+                            + '<span class="st-sub">' + esc([it.name, mw].filter(Boolean).join(' · ')) + '</span></div>'
+                            + '<span class="st-sub st-act" title="' + esc((it.action || '') + (it.path ? '\n' + it.path : '')) + '">' + esc(it.action === 'Closure' && it.path ? 'closure · ' + it.path : it.action) + '</span>';
+                    } else if (tab === 'migrations') {
+                        li.classList.toggle('is-off', !it.ran);
+                        li.innerHTML = '<div class="st-main"><span class="st-title st-mono">' + esc(it.name) + '</span></div>'
+                            + '<span class="st-ver">' + (it.batch != null ? 'batch ' + esc(it.batch) : '') + '</span>'
+                            + '<span class="st-chip' + (it.ran ? '' : ' st-pending') + '">' + (it.ran ? 'ran' : 'pending') + '</span>';
+                    } else if (tab === 'schedule') {
+                        li.innerHTML = '<div class="st-main"><span class="st-title st-mono">' + esc(it.command) + '</span>'
+                            + (it.description && it.description !== it.command ? '<span class="st-sub">' + esc(it.description) + '</span>' : '') + '</div>'
+                            + '<span class="st-ver" title="' + esc((it.next || '') + (it.timezone ? ' (' + it.timezone + ')' : '')) + '">' + esc(it.next_human || '') + '</span>'
+                            + '<span class="st-chip st-mono" title="cron expression">' + esc(it.expression) + '</span>';
                     }
                     frag.appendChild(li);
                 }
@@ -13584,10 +16416,32 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 }
             },
 
+            // The console runs WP-CLI, or artisan on a Laravel site; each
+            // keeps a history of its own.
+            cliKind(site) { return site && site.type === 'Laravel' ? 'artisan' : 'wp'; },
+
+            cliHistoryKey(kind) { return this.historyKey(kind === 'artisan' ? 'cove.artisan.history' : 'cove.cli.history'); },
+
             renderSiteCli() {
                 const c = this.sitePage.cli;
                 const site = this.pageSite;
-                $id('siteCliPrompt').textContent = 'cove wp ' + (site ? site.name : '') + ' ';
+                const kind = this.cliKind(site);
+                if (c.kind !== kind) {
+                    // Switching between a WordPress and a Laravel site.
+                    c.kind = kind;
+                    try { c.history = JSON.parse(localStorage.getItem(this.cliHistoryKey(kind)) || '[]'); } catch (e) { c.history = []; }
+                    c.histIdx = -1;
+                    c.ran = null;
+                    // No optimize:clear among them: its cache:clear empties
+                    // the Redis cache every Cove Laravel site shares.
+                    const examples = kind === 'artisan'
+                        ? ['about', 'route:list --except-vendor', 'migrate:status', 'make:model Post -m', 'db:show', 'config:show database', 'config:clear']
+                        : ['core version --extra', 'option get siteurl', 'plugin list --status=active', 'cache flush', 'transient delete --all', ['search-replace https://old.example https://new.example --dry-run', 'search-replace --dry-run'], ['eval \'echo wp_get_environment_type();\'', 'eval …']];
+                    $id('siteCliExamples').innerHTML = '<span>try</span>' + examples.map(x => { const [cmd, label] = Array.isArray(x) ? x : [x, x]; return '<button type="button" data-cmd="' + this.escapeHtml(cmd) + '">' + this.escapeHtml(label) + '</button>'; }).join('');
+                    $id('siteCliInput').placeholder = kind === 'artisan' ? 'route:list' : 'plugin list --status=active';
+                    $id('siteCliInput').setAttribute('aria-label', kind === 'artisan' ? 'artisan command' : 'WP-CLI command');
+                }
+                $id('siteCliPrompt').textContent = 'cove ' + kind + ' ' + (site ? site.name : '') + ' ';
                 $id('btnSiteCliRun').disabled = c.running;
                 $id('btnSiteCliRun').textContent = c.running ? 'running…' : 'run';
                 const out = $id('siteCliOut');
@@ -13596,19 +16450,23 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 show(out, true);
                 out.textContent = c.output === '' ? '(no output)' : c.output;
                 out.classList.toggle('is-error', c.code !== 0);
-                meta.textContent = '$ wp ' + c.ran + '  ·  exit ' + c.code + (c.ms ? ' · ' + (c.ms >= 1000 ? (c.ms / 1000).toFixed(1) + ' s' : c.ms + ' ms') : '') + (c.notices ? ' · ' + c.notices + ' PHP notice line' + (c.notices === 1 ? '' : 's') + ' hidden' : '');
+                meta.textContent = '$ ' + (kind === 'artisan' ? 'artisan ' : 'wp ') + c.ran + '  ·  exit ' + c.code + (c.ms ? ' · ' + (c.ms >= 1000 ? (c.ms / 1000).toFixed(1) + ' s' : c.ms + ' ms') : '') + (c.notices ? ' · ' + c.notices + ' PHP notice line' + (c.notices === 1 ? '' : 's') + ' hidden' : '');
             },
 
             bindSiteTabEvents() {
                 const p = this.sitePage;
-                try { p.cli.history = JSON.parse(localStorage.getItem(this.historyKey('cove.cli.history')) || '[]'); } catch (e) {}
+                try { p.cli.history = JSON.parse(localStorage.getItem(this.historyKey('cove.cli.history')) || '[]'); p.cli.kind = 'wp'; } catch (e) {}
                 $id('siteTabs').addEventListener('click', (e) => {
                     const b = e.target.closest('.mail-part');
                     if (b) this.setSiteTab(b.dataset.tab);
                 });
-                for (const tab of ['plugins', 'themes', 'users', 'cron', 'snapshots', 'history']) {
+                for (const tab of ['plugins', 'themes', 'users', 'cron', 'routes', 'migrations', 'schedule', 'snapshots', 'history']) {
                     const panel = $id('sitePanel-' + tab);
                     const t = () => this.siteTabState(tab);
+                    for (const [sel, op] of [['.st-migrate', 'migrate'], ['.st-sched-run', 'schedule_run'], ['.st-optimize', 'optimize_clear']]) {
+                        const b = panel.querySelector(sel);
+                        if (b) b.addEventListener('click', () => this.laravelOp(tab, op));
+                    }
                     const filter = panel.querySelector('.st-filter');
                     if (filter) {
                         filter.addEventListener('input', () => { t().filter = filter.value; this.renderSiteTab(); });
@@ -13683,6 +16541,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.bindTrafficModalEvents();
                 $id('siteHealth').addEventListener('click', (e) => { if (e.target.closest('.site-health-bit')) this.setSiteTab('traffic'); });
                 $id('btnSnapCreate').addEventListener('click', () => this.snapshotCreate());
+                $id('userAdd').addEventListener('submit', (e) => { e.preventDefault(); this.siteUserAdd(); });
+                this.bindUserRole();
+                $id('userAddDone').addEventListener('click', (e) => {
+                    const a = this.siteTabState('users').added;
+                    if (!a) return;
+                    if (e.target.closest('.ua-copy')) this.copyText(a.password, 'Password copied');
+                    if (e.target.closest('.ua-login')) this.siteUserLogin(a.login, '');
+                });
                 $id('btnHistSave').addEventListener('click', () => this.historySave());
                 $id('histNote').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this.historySave(); } if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.target.blur(); } });
                 $id('snapNote').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this.snapshotCreate(); } if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.target.blur(); } });
@@ -14958,7 +17824,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.showDbModal = true;
                 show($id('dbModal'), true);
                 const svcTitle = $id('svcTitle'), svcStatus = $id('svcStatus'), svcRows = $id('svcRows'), svcNote = $id('svcNote'), svcActions = $id('svcActions');
-                svcTitle.textContent = { caddy: 'Caddy', mariadb: 'MariaDB', mailpit: 'Mailpit' }[name] || name;
+                svcTitle.textContent = { caddy: 'Caddy', mariadb: 'MariaDB', mailpit: 'Mailpit', postgres: 'PostgreSQL', redis: 'Redis' }[name] || name;
                 svcStatus.textContent = 'Checking…'; svcStatus.classList.remove('is-down');
                 svcRows.innerHTML = ''; svcNote.textContent = '';
                 svcActions.innerHTML = '<button class="pill" id="btnDbClose">close</button>';
@@ -15319,7 +18185,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (!item) return;
                 // A site: Enter opens its page, Shift+Enter the site itself in
                 // a new tab, Cmd/Ctrl+Enter a one-time admin login.
-                if (event && (event.metaKey || event.ctrlKey) && this.isWpLike(item.site)) {
+                if (event && (event.metaKey || event.ctrlKey) && this.canLogIn(item.site)) {
                     this.closePalette();
                     this.getLoginLink(item.site.name);
                     return;
@@ -15463,8 +18329,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             },
 
             async getSites(opts = {}) {
-                this.requestShotSweep();
-                if (!opts.quiet) { this.isLoading = true; this.render(); }
+                if (!opts.quiet) {
+                    this.isLoading = true;
+                    this.sitesFailed = false;
+                    this.startLoadClock();
+                    this.render();
+                }
                 try {
                     const r = await fetch('/api.php?action=list_sites');
                     const data = await r.json();
@@ -15477,8 +18347,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.sites = data
                         .map(s => ({ ...s, isLoggingIn: false }))
                         .filter(s => !staged.has(s.name));
+                    this.sitesSavedAt = 0;
+                    this.sitesFailed = false;
+                    this.saveSites(data);
                 } catch (e) {
-                    if (!opts.quiet) this.showSnack('Could not fetch sites.', true);
+                    if (!opts.quiet) {
+                        this.sitesFailed = true;
+                        if (this.sites.length) this.showSnack('Could not refresh sites.', true);
+                    }
                 } finally {
                     this.isLoading = false;
                     this.render();
@@ -15486,11 +18362,96 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.afterSitesLoaded(opts.round || 0);
             },
 
+            // The last listing, kept in this browser so a reload paints at
+            // once while list_sites runs again (seconds on a loaded machine).
+            // Keyed like the console histories: a demo only ever saves and
+            // paints its own sites.
+            restoreSites() {
+                try {
+                    const saved = JSON.parse(localStorage.getItem(this.historyKey('cove.sites')) || 'null');
+                    if (!saved || !Array.isArray(saved.sites) || !saved.sites.length) return;
+                    this.sites = saved.sites.map(s => ({ ...s, isLoggingIn: false }));
+                    this.sitesSavedAt = saved.at || 1;
+                } catch (e) { /* storage blocked or unreadable: wait for the server */ }
+            },
+
+            saveSites(data) {
+                try {
+                    const key = this.historyKey('cove.sites');
+                    for (let i = localStorage.length - 1; i >= 0; i--) {
+                        const k = localStorage.key(i);
+                        if (k && k !== key && k.startsWith('cove.sites.demo-')) localStorage.removeItem(k);
+                    }
+                    localStorage.setItem(key, JSON.stringify({ at: Date.now(), sites: data }));
+                } catch (e) { /* full or blocked: the next load waits, as before */ }
+            },
+
+            // Ticks the waiting line once a second while a listing is out.
+            startLoadClock() {
+                this.loadStarted = Date.now();
+                clearInterval(this._loadClock);
+                this._loadClock = setInterval(() => {
+                    if (!this.isLoading) { clearInterval(this._loadClock); this._loadClock = null; }
+                    this.renderLoadState();
+                }, 1000);
+            },
+
+            renderLoadState() {
+                const secs = this.isLoading && this.loadStarted ? Math.floor((Date.now() - this.loadStarted) / 1000) : 0;
+                const clock = secs >= 3 ? ' · <span aria-hidden="true">' + secs + ' s</span>' : '';
+                const retry = '<button type="button" class="sl-link" data-retry-sites>try again</button>';
+
+                // A listing on screen: say how old it is while a fresh one
+                // is out, or that the fresh one never came.
+                const sync = $id('slSync');
+                const syncing = this.sites.length > 0 && (this.isLoading || this.sitesFailed);
+                show(sync, syncing);
+                if (syncing) {
+                    const ago = this.sitesSavedAt ? this.formatRelative(this.sitesSavedAt / 1000) : '';
+                    const from = ago ? 'showing the list from ' + (ago === 'now' ? 'a moment' : ago) + ' ago' : '';
+                    sync.classList.toggle('is-failed', !this.isLoading);
+                    sync.innerHTML = '<i aria-hidden="true"></i><span>' + (this.isLoading
+                        ? (from ? from + ' · ' : '') + 'refreshing' + clock
+                        : "couldn't refresh" + (from ? ' · ' + from : '') + ' · ' + retry) + '</span>';
+                }
+
+                // Nothing on screen yet: the skeleton's caption.
+                const waiting = !this.sites.length && (this.isLoading || this.sitesFailed);
+                $id('sitesCard').classList.toggle('is-stalled', waiting && !this.isLoading);
+                if (!waiting) return;
+                $id('siteLoadingNote').innerHTML = this.isLoading
+                    ? 'Reading ~/Cove/Sites' + (clock || '…') + (secs >= 8 ? '<small>A busy machine slows the first read. After this one, the last listing shows at once while it refreshes.</small>' : '')
+                    : "Couldn't read ~/Cove/Sites. " + retry;
+            },
+
+            // The page's own shapes, drawn once per layout while the first
+            // listing is out.
+            renderSkeleton() {
+                const box = $id('siteSkeleton');
+                if (box.dataset.layout === this.layout) return;
+                box.dataset.layout = this.layout;
+                const bone = (w, cls) => '<span class="sl-bone' + (cls ? ' ' + cls : '') + '" style="width:' + w + '"></span>';
+                const widths = [58, 44, 66, 50, 62, 40];
+                const body = this.layout === 'grid'
+                    ? '<div class="sl-cards">' + widths.concat(widths.slice(0, 2)).map(w => '<div class="sl-card is-skel"><div class="sl-shot"></div><div class="sl-card-body">' + bone(w + '%') + bone((w + 20) + '%', 'is-small') + '</div></div>').join('') + '</div>'
+                    : '<div class="sl-rows">' + widths.map(w => '<div class="sl-row is-skel"><span class="sl-check"></span><span class="sl-thumb"></span>'
+                        + '<span class="sl-who">' + bone(w + '%') + '</span>'
+                        + '<span class="sl-inside">' + bone((w + 18) + '%') + bone((w - 6) + '%', 'is-small') + '</span>'
+                        + '<span class="sl-kind">' + bone('2.4rem', 'is-pill') + bone('2.4rem') + '</span>'
+                        + '<span class="sl-seen">' + bone('2.2rem') + '</span>'
+                        + '<span class="sl-size">' + bone('100%', 'is-bar') + bone('2.6rem') + '</span>'
+                        + '<span class="sl-acts"></span></div>').join('') + '</div>';
+                box.innerHTML = '<section class="sl-group"><header class="sl-group-head">' + bone('3.6rem', 'is-small') + '<span class="sl-rule"></span></header>' + body + '</section>';
+            },
+
             // Follow-ups to a listing, none of them blocking it: history
             // cards the server had no time for this round, sizes never
             // measured, unread mail per site, and wordpress.org's verdict on
-            // each WordPress version (refetched once it is in).
+            // each WordPress version (refetched once it is in). Preview
+            // captures wait for the listing too, so on a loaded machine
+            // headless Chrome isn't competing with the first paint.
             afterSitesLoaded(round) {
+                this.requestShotSweep();
                 if (round < 6 && this.sites.some(s => s.card && s.card.pending)) {
                     clearTimeout(this._cardTimer);
                     this._cardTimer = setTimeout(() => this.getSites({ quiet: true, round: round + 1 }), 700);
@@ -15528,8 +18489,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (file) {
                     $id('addDropName').textContent = file.name + ' · ' + this.formatSize(file.size);
                     if (!this.newSite.name) { this.newSite.name = this.nameFromArchive(file.name); $id('newSiteName').value = this.newSite.name; }
-                    this.newSite.isPlain = false;
-                    $id('newSitePlain').checked = false;
+                    // An import makes a WordPress site.
+                    this.newSite.kind = 'wordpress';
                 }
                 this.render();
                 $id('newSiteName').focus();
@@ -15565,7 +18526,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.sites.push({
                     name,
                     domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
-                    type: 'WordPress',
+                    type: res.type || 'WordPress',
                     display_path: '~/Cove/Sites/' + name + '.localhost',
                     full_path: SITES_DIR + '/' + name + '.localhost',
                     size_bytes: (typeof res.size_bytes === 'number') ? res.size_bytes : null,
@@ -15578,14 +18539,19 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('newSiteName').value = '';
                 this.adding = false;
                 this.apiPost('reload_server');
-                this.alerts.push({ id: Date.now() + Math.random(), name, isPlain: false, isLoggingIn: false });
+                // A Laravel backup imports as a Laravel site: "open site", no admin login.
+                this.alerts.push({ id: Date.now() + Math.random(), name, isPlain: res.type === 'Laravel', isLoggingIn: false });
                 this.render();
                 this.getSites();
             },
 
             renderImportProgress() {
                 const imp = this.importing;
-                show($id('addProgress'), !!imp);
+                const settingUp = !imp && this.newSite.isLoading && (this.newSite.kind === 'laravel' || this.newSite.kind === 'plain') && !!this.newSite.from;
+                show($id('addProgress'), !!imp || settingUp);
+                if (settingUp) $id('addProgressText').textContent = this.newSite.kind === 'laravel'
+                    ? 'setting up ' + this.newSite.from + ' — cloning or copying it, installing its Composer and npm packages, migrating, building the front end. A big app takes a few minutes.'
+                    : 'setting up ' + this.newSite.from + ' — cloning, copying or downloading it.';
                 $id('addRow').classList.toggle('is-importing', !!imp);
                 if (imp) $id('addProgressText').textContent = imp.phase === 'uploading' ? 'uploading ' + imp.pct + '%…' : 'importing — creating the site, restoring files and database, rewriting URLs. A large archive takes a few minutes.';
                 const label = $id('createLabel');
@@ -15599,13 +18565,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.newSite.isLoading = true;
                 this.render();
                 const name = this.newSite.name;
-                const isPlain = this.newSite.isPlain;
-                // 'latest' is the server's default, so it's sent as nothing
-                // at all — keeps the generated command identical to what a
-                // plain `cove add <name>` produces.
-                const wpVersion = isPlain ? '' : this.newSite.wpVersion;
-
-                const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined });
+                const kind = this.newSite.kind;
+                const isPlain = kind === 'plain', isLaravel = kind === 'laravel';
+                // The flavor cove add takes: a WordPress version, minn or
+                // laravel. 'latest' is the server's default, so it's sent as
+                // nothing at all — keeps the generated command identical to
+                // what a plain `cove add <name>` produces.
+                const wpVersion = kind === 'wordpress' ? this.newSite.wpVersion : isPlain ? '' : kind;
+                const add = await this.apiPost('add_site', { site_name: name, is_plain: isPlain, wp_version: (wpVersion && wpVersion !== 'latest') ? wpVersion : undefined, database: isLaravel ? this.newSite.database : undefined, from: (isLaravel || isPlain) && this.newSite.from ? this.newSite.from : undefined });
                 if (add.success) {
                     // Optimistic insert: we already know every field the row
                     // template uses. No auto-refresh — the Caddy reload that
@@ -15615,7 +18582,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.sites.push({
                         name,
                         domain: 'https://' + name + '.localhost' + PORT_SUFFIX,
-                        type: isPlain ? 'Plain' : (wpVersion === 'minn' ? 'Minn' : 'WordPress'),
+                        type: isPlain ? 'Plain' : kind === 'minn' ? 'Minn' : isLaravel ? 'Laravel' : 'WordPress',
                         display_path: '~/Cove/Sites/' + name + '.localhost',
                         full_path: SITES_DIR + '/' + name + '.localhost',
                         // Server calculates size in add_site and returns it
@@ -15625,11 +18592,15 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         modified_at: Math.floor(Date.now() / 1000),
                         isLoggingIn: false,
                     });
-                    this.showSnack('Site created.');
+                    // Setting up a project can finish with things left to do.
+                    if (Array.isArray(add.notes) && add.notes.length) this.showSnack('Site created. ' + add.notes.join(' '), false, { duration: 20000 });
+                    else this.showSnack('Site created.');
                     this.newSite.name = '';
                     $id('newSiteName').value = '';
                     this.newSite.wpVersion = 'latest';
-                    $id('wpVersionSelect').value = 'latest';
+                    this.newSite.database = 'sqlite';
+                    this.newSite.from = '';
+                    $id('laravelFrom').value = '';
                     this.adding = false;
                     this.apiPost('reload_server'); // fire and forget — Caddy reloads in the background
 
@@ -15640,7 +18611,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     this.alerts.push({
                         id: Date.now() + Math.random(),
                         name,
-                        isPlain,
+                        // A Laravel app has no admin to sign in to: "open site", as for plain.
+                        isPlain: isPlain || isLaravel,
                         isLoggingIn: false,
                     });
                 }
@@ -15817,12 +18789,23 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.touchRecent(name);
                 this.renderList();
                 this.renderSitePage();
-                const res = await this.apiPost('get_login_link', { site_name: name });
+                const res = await this.apiPost('get_login_link', { site_name: name }, { quiet: true });
                 if (res.success && res.url) {
                     this.openUrl(res.url);
                     this.showSnack(res.note || 'Login link opened in a new tab.', false, res.note ? { duration: 12000 } : {});
+                } else if (res.code !== 'no_users') {
+                    this.showSnack(res.message || (res.transport ? 'Network error.' : 'An error occurred.'), true);
                 }
                 site.isLoggingIn = false;
+                if (res.code === 'no_users') {
+                    // A Laravel app no one has registered with: its users tab,
+                    // ready for one, and a note rather than an error.
+                    this.showSnack(res.message);
+                    if (this.view !== 'site' || this.sitePage.name !== name) this.openSitePage(name);
+                    this.setSiteTab('users');
+                    $id('userAddEmail').focus();
+                    return;
+                }
                 this.renderList();
                 this.renderSitePage();
             },
@@ -15904,72 +18887,81 @@ show_general_help() {
     echo ""
     echo "Usage: cove <command> [options]"
     echo ""
-    echo "For help with a specific command, run: cove <command> --help"
+    echo "For help with a command: cove help <command>, or cove <command> --help"
+    echo "A site can be named as shop or shop.localhost."
     echo ""
     help_section "Sites"
-    help_cmd add "Creates a new WordPress, Minn Engine, or plain static site."
-    help_cmd import "Create a new site from a backup archive (zip or tar.gz)."
-    help_cmd clone "Copies an existing site, database and all, under a new name."
-    help_cmd list "Lists all sites currently managed by Cove."
-    help_cmd rename "Renames a site, its directory, and database."
-    help_cmd delete "Deletes a site's directory and associated database."
-    help_cmd path "Outputs the full path to a site's directory."
-    help_cmd url "Prints the HTTPS URL for a given site."
+    help_cmd add "Creates a WordPress, Laravel, Minn Engine or plain site."
+    help_cmd import "Creates a site from a backup archive (zip or tar.gz)."
+    help_cmd clone "Copies a site, database and all, under a new name."
+    help_cmd list "Lists every site Cove manages, with its type."
+    help_cmd rename "Renames a site, its folder and its database."
+    help_cmd delete "Deletes a site's folder and its database."
+    help_cmd login "Prints a one-time login link (WordPress or Laravel)."
+    help_cmd path "Prints the path to a site's public folder."
+    help_cmd url "Prints a site's HTTPS URL."
+    help_cmd php "Pins a site to an older PHP (macOS, with Homebrew)."
     echo ""
     help_section "WordPress"
-    help_cmd login "Generates a one-time login link for a WordPress site."
     help_cmd wp "Runs WP-CLI inside a site from anywhere."
-    help_cmd core "Report or update the WordPress version of your sites."
+    help_cmd core "Reports or updates the WordPress version of your sites."
     help_cmd network "Lists the sites on a multisite network."
-    help_cmd php "Pin a site to an older PHP (native php-fpm behind FrankenPHP)."
+    echo ""
+    help_section "Laravel"
+    help_cmd artisan "Runs a Laravel site's artisan from anywhere."
+    help_cmd composer "Runs Composer in a site on the PHP the site serves with."
+    help_cmd laravel "Laravel users and workers: queue, scheduler, Reverb."
+    help_cmd postgres "Optional PostgreSQL server for Laravel sites."
+    help_cmd redis "Optional Redis for Laravel caches, sessions and queues."
     echo ""
     help_section "Backups & transfer"
-    help_cmd backup "A site's files and database as one zip, in ~/Cove/Backups."
-    help_cmd snapshot "Take, list, restore, or delete snapshots of a site."
-    help_cmd history "Nightly saves of plugins and themes; roll any of them back."
-    help_cmd db "Manage databases (e.g., 'cove db backup')."
+    help_cmd backup "Packs a site's files and database into one zip."
+    help_cmd snapshot "Takes, lists, restores or deletes snapshots of a site."
+    help_cmd history "Nightly saves of plugins and themes, to roll back."
+    help_cmd db "WordPress databases: backup, list, fix-collation."
     help_cmd pull "Pulls a remote WordPress site into Cove via SSH."
-    help_cmd push "Pushes a local Cove site to a remote WordPress site via SSH."
-    help_cmd transfer "Inspect the backup/restore engine used by pull and push."
+    help_cmd push "Pushes a local site to a remote WordPress site via SSH."
+    help_cmd transfer "Inspects the backup/restore engine behind pull and push."
     echo ""
     help_section "Inspect"
-    help_cmd log "View logs for a site or the global error log; 'rotate' sets retention."
-    help_cmd screenshot "Capture any page of a site with a headless browser."
-    help_cmd health "Diagnose crashes, OPcache pressure, and on-disk hygiene."
-    help_cmd status "Check the status of all background services."
+    help_cmd log "Shows a site's logs; 'rotate' sets how long logs are kept."
+    help_cmd screenshot "Captures any page of a site with a headless browser."
+    help_cmd health "Diagnoses crashes, OPcache and hygiene; changes nothing."
+    help_cmd status "Checks the status of Cove's background services."
     echo ""
     help_section "Serving & access"
-    help_cmd share "Create a temporary public tunnel to share a site."
-    help_cmd lan "Enable LAN access to sites for mobile app sync."
-    help_cmd tailscale "Expose all sites to your Tailscale network."
-    help_cmd mappings "Extra domains a site answers on; a '*.' entry covers every subdomain."
-    help_cmd twin "A second domain serving another folder of a site (WordPress beside Minn Engine)."
-    help_cmd directive "Add or remove custom Caddyfile rules for a site."
-    help_cmd proxy "Manage standalone reverse proxy entries."
-    help_cmd ports "Reconfigure HTTP/HTTPS ports + update site URLs."
-    help_cmd trust "Install Cove's local CA into browser + system trust stores."
+    help_cmd share "Shares a site through a temporary public tunnel."
+    help_cmd lan "Opens a site to your local network, for mobile apps."
+    help_cmd tailscale "Exposes every site to your Tailscale network."
+    help_cmd mappings "Extra domains a site answers on ('*.' for subdomains)."
+    help_cmd twin "Serves another folder of a site at a second domain."
+    help_cmd directive "Adds, updates or deletes a site's custom Caddy rules."
+    help_cmd proxy "Manages standalone reverse proxy entries."
+    help_cmd ports "Changes the HTTP/HTTPS ports; site URLs follow."
+    help_cmd trust "Trusts Cove's local CA in the system and browsers."
     if [ "$IS_WSL" = true ]; then
-        help_cmd wsl-hosts "Show Windows hosts file update commands."
+        help_cmd wsl-hosts "Shows how to update the Windows hosts file."
     fi
     echo ""
     help_section "Services & PHP"
-    help_cmd enable "Starts the Caddy, MariaDB, and Mailpit background services."
-    help_cmd disable "Stops all background services managed by Cove."
-    help_cmd reload "Regenerates the Caddyfile and reloads the Caddy server."
-    help_cmd memory "Show or raise PHP memory_limit across Cove + Homebrew PHPs."
-    help_cmd opcache "Show or resize FrankenPHP's shared OPcache (all sites share it)."
-    help_cmd signals "Check or repair FrankenPHP's SIGSEGV handler (parallel extension crash guard)."
+    help_cmd enable "Starts Cove's services: Caddy, MariaDB and Mailpit."
+    help_cmd disable "Stops Cove's background services."
+    help_cmd reload "Regenerates the Caddyfile and reloads Caddy."
+    help_cmd memory "Shows or raises PHP's memory_limit across Cove's PHPs."
+    help_cmd opcache "FrankenPHP's shared OPcache: show, sites, exclude, set."
+    help_cmd signals "Checks or repairs FrankenPHP's SIGSEGV handler."
     echo ""
     help_section "Cove itself"
-    help_cmd install "Installs and configures Homebrew dependencies."
-    help_cmd upgrade "Upgrades Cove to the latest available version."
-    help_cmd version "Displays the current version of Cove."
-    help_cmd demo "Show only a few sites (and a mailbox of their own) for recording a demo."
-    help_cmd mcp "Let an AI agent work with your sites: claude mcp add cove -- cove mcp"
+    help_cmd install "Installs and configures Cove's dependencies."
+    help_cmd uninstall "Removes Cove; keeps your sites unless --purge."
+    help_cmd upgrade "Upgrades Cove, FrankenPHP and Adminer."
+    help_cmd version "Prints the current version of Cove."
+    help_cmd demo "Shows only the sites you name, for recording a demo."
+    help_cmd mcp "MCP server for agents: claude mcp add cove -- cove mcp"
     if [ "$OS" == "macos" ]; then
-        help_cmd menubar "Manage the macOS menu bar companion app."
+        help_cmd menubar "Manages the menu bar companion app."
     elif [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; then
-        help_cmd menubar "Manage the system tray companion app."
+        help_cmd menubar "Manages the system tray companion app."
     fi
 }
 
@@ -15980,8 +18972,11 @@ display_command_help() {
             echo "Usage: cove install [--yes] [--http PORT] [--https PORT]"
             echo "                    [--db-root-user USER] [--db-root-pass PASS]"
             echo ""
-            echo "Installs and configures Homebrew dependencies like Caddy, MariaDB, and Mailpit."
-            echo "It also sets up the required directory structure inside '~/Cove'."
+            echo "Installs and configures what Cove needs: FrankenPHP (Caddy with PHP),"
+            echo "MariaDB, Mailpit, gum and WP-CLI. macOS uses Homebrew (FrankenPHP comes"
+            echo "from its GitHub release, for Apple Silicon and Intel); Linux uses apt or"
+            echo "dnf. It also sets up ~/Cove. PostgreSQL and Redis are optional and set up"
+            echo "when a Laravel site needs them (see cove postgres, cove redis)."
             echo ""
             echo "Options:"
             echo "  --yes, -y, --force   Skip confirmation prompts for scripted installs."
@@ -15996,17 +18991,22 @@ display_command_help() {
         enable)
             echo "Usage: cove enable"
             echo ""
-            echo "Starts the Caddy, MariaDB, and Mailpit background services."
+            echo "Starts Cove's background services: Caddy (FrankenPHP), MariaDB, Mailpit"
+            echo "and the watchdog. PostgreSQL and Redis are optional and left alone; start"
+            echo "them with cove postgres start or cove redis start."
             ;;
         disable)
             echo "Usage: cove disable"
             echo ""
-            echo "Stops all background services managed by Cove."
+            echo "Stops Cove's background services and Laravel sites' workers."
+            echo "PostgreSQL and Redis are optional and left alone; stop them with"
+            echo "cove postgres stop or cove redis stop."
             ;;
         status)
             echo "Usage: cove status [--porcelain]"
             echo ""
-            echo "Checks the status of all background services."
+            echo "Checks the status of Cove's background services. PostgreSQL and Redis"
+            echo "show once a Laravel site has set them up, marked optional."
             echo ""
             echo "Options:"
             echo "  --porcelain    Stable machine-readable output (key=value per line),"
@@ -16018,8 +19018,9 @@ display_command_help() {
             echo "Read-only diagnostic. Reports service liveness, the FrankenPHP"
             echo "process state and last exit code, recent hard segfaults"
             echo "(classified as OPcache vs Imagick vs other), live OPcache"
-            echo "pressure, and on-disk hygiene (zombie site dirs, oversized"
-            echo "logs). Recommends fixes but changes nothing."
+            echo "pressure, on-disk hygiene (zombie site dirs, oversized logs),"
+            echo "and network exposure (what other machines can reach). Recommends"
+            echo "fixes but changes nothing."
             ;;
         transfer)
             echo "Usage: cove transfer probe [site] [--tenant=<id>]"
@@ -16046,37 +19047,63 @@ display_command_help() {
             echo "Run once after install; re-run anytime to refresh."
             ;;
         list)
-            echo "Usage: cove list [--totals]"
+            echo "Usage: cove list [--totals] [--format=json]"
             echo ""
-            echo "Lists all sites currently managed by Cove, showing their domain and type (WordPress/Plain)."
+            echo "Lists every site Cove manages: its domain, type (WordPress, Multisite,"
+            echo "Minn, Laravel or Plain), WordPress version and PHP."
             echo ""
             echo "Flags:"
-            echo "  --totals       Calculates and displays the size of each site's public directory."
+            echo "  --totals         Adds each site's size on disk."
+            echo "  --format=json    Prints the list as JSON, for scripts (--json works too)."
             ;;
         add)
-            echo "Usage: cove add <name> [flavor]"
+            echo "Usage: cove add <name> [type] [flags]"
             echo ""
-            echo "Creates a new local site accessible at 'https://<name>.localhost'."
+            echo "Creates a new local site at https://<name>.localhost."
             echo ""
             echo "Arguments:"
             echo "  <name>         The name for the new site. Becomes the subdomain."
-            echo "  [flavor]       What goes inside the site. Defaults to the latest WordPress."
+            echo "  [type]         What goes inside the site. Defaults to the latest WordPress."
             echo "                   <version>  A WordPress version: 6.4, 6.4.3, or 6.9-RC1."
             echo "                   nightly    WordPress trunk, rebuilt daily."
             echo "                   latest     The newest WordPress release (the default)."
             echo "                   plain      A static HTML site with no database."
             echo "                   minn       WordPress with Minn Engine installed over it"
             echo "                              (WordPress's own files parked in wp-parked/)."
+            echo "                   laravel    A new Laravel application. The site folder is the"
+            echo "                              project; its public/ is the webroot."
             echo ""
-            echo "Flags:"
-            echo "  --plain        Alias for the 'plain' flavor."
-            echo "  --minn         Alias for the 'minn' flavor. --minn=<url or path> installs"
+            echo "Flags (a value flag takes --flag=value or --flag value; an unknown"
+            echo "flag is an error):"
+            echo "  --plain        Same as the 'plain' type."
+            echo "  --minn         Same as the 'minn' type. --minn=<url or path> installs"
             echo "                 that Minn Engine zip instead of the latest release."
-            echo "  --php=<ver>    Pin the site to an older PHP (see 'cove php')."
+            echo "  --wp-version=<ver>  Same as giving a WordPress version as the type."
+            echo "  --php=<ver>    Pin the site to an older PHP (macOS; see 'cove php')."
             echo "  --multisite    Install a WordPress multisite network (subdirectory"
-            echo "                 mode: <name>.localhost/store/). Use --multisite=subdomain"
-            echo "                 for subdomain mode (store.<name>.localhost) — subsites"
+            echo "                 mode: <name>.localhost/store/). --multisite=subdomain"
+            echo "                 (or --multisite subdomain, or --multisite-subdomain)"
+            echo "                 builds a subdomain one (store.<name>.localhost): subsites"
             echo "                 resolve and get HTTPS automatically, no extra setup."
+            echo "  --database=<db>  Laravel only: sqlite (the default, as with 'laravel new'),"
+            echo "                 mysql or mariadb (a database on Cove's MariaDB), or pgsql"
+            echo "                 (on Cove's PostgreSQL, set up the first time; see"
+            echo "                 'cove postgres'). With --from, the one the project names"
+            echo "                 unless given."
+            echo "  --from=<src>   Set up an existing app instead of a new site. A git URL"
+            echo "                 (https://…, git@host:path) is cloned; a folder is copied,"
+            echo "                 the original left as it is; a .zip, .tar.gz, .tgz or .tar"
+            echo "                 (a file, or an https:// link such as a GitHub release"
+            echo "                 asset) is downloaded and unpacked. A Laravel app then gets its"
+            echo "                 Composer and npm packages, a .env for Cove, its database"
+            echo "                 made and migrated, its front end built. Any other app is"
+            echo "                 served from its public/ (or the cove.json 'webroot'); the"
+            echo "                 site folder is the project. Nothing in it is run."
+            echo "                 WordPress from elsewhere comes in with 'cove import'."
+            echo "  --branch=<b>   With a git URL: the branch or tag to check out."
+            echo "  --seed         Laravel: run the database seeders after the migrations."
+            echo "  --no-reload    Don't reload Caddy afterwards (for scripts that add"
+            echo "                 several sites and run 'cove reload' once)."
             echo ""
             echo "Examples:"
             echo "  cove add mysite                        Latest WordPress."
@@ -16086,6 +19113,12 @@ display_command_help() {
             echo "  cove add mysite minn                   Minn Engine, latest release."
             echo "  cove add mysite --multisite            Subdirectory multisite network."
             echo "  cove add mysite --multisite=subdomain  Subdomain multisite network."
+            echo "  cove add myapp laravel                 Laravel on SQLite."
+            echo "  cove add myapp laravel --database=mysql  Laravel on Cove's MariaDB."
+            echo "  cove add myapp laravel --database=pgsql  Laravel on PostgreSQL."
+            echo "  cove add shop --from=git@github.com:acme/shop.git  An existing app, cloned."
+            echo "  cove add shop --from=~/Herd/shop --seed  An existing app, copied, seeded."
+            echo "  cove add tools --from=https://example.com/releases/tools.zip  An app from a release."
             ;;
         clone)
             echo "Usage: cove clone <source> <new-name>"
@@ -16133,46 +19166,53 @@ display_command_help() {
             echo "  cove core update --all --dry-run"
             ;;
         delete)
-            echo "Usage: cove delete <name> [--force]"
+            echo "Usage: cove delete <name> [--yes]"
             echo ""
-            echo "Deletes a site's directory and associated WordPress database."
+            echo "Deletes a site's folder and its database (MariaDB or PostgreSQL), after"
+            echo "asking. Without a terminal to ask on (a script, the dashboard) it deletes"
+            echo "without asking. Its snapshots, custom Caddy rules and a Laravel app's"
+            echo "Redis keys go too; zips in ~/Cove/Backups stay."
             echo ""
             echo "Arguments:"
             echo "  <name>         The name of the site to delete."
             echo ""
             echo "Flags:"
-            echo "  --force        Deletes a site without the interactive confirmation prompt."
+            echo "  --yes, -y      Deletes without asking (--force works too)."
+            echo "  --no-reload    Don't reload Caddy afterwards."
             ;;
         rename)
             echo "Usage: cove rename <old-name> <new-name>"
             echo ""
-            echo "Renames an existing local site."
-            echo "This command will rename the site's directory, update its database name and"
-            echo "contents for WordPress sites, and regenerate the server configuration."
+            echo "Renames a site: its folder, its database, and the address stored in it"
+            echo "(WordPress's URLs, a Laravel app's .env and Redis keys), then regenerates"
+            echo "the server configuration."
             echo ""
             echo "Arguments:"
             echo "  <old-name>     The current name of the site to rename."
             echo "  <new-name>     The new name for the site."
             ;;
         directive)
-            echo "Usage: cove directive <subcommand>"
+            echo "Usage: cove directive add|update <site> [rules | --rules \"…\" | --file <path>]"
+            echo "       cove directive delete <site> [--force]"
+            echo "       cove directive list"
             echo ""
-            echo "Add or remove custom Caddyfile rules for a site."
-            echo "Opens an editor to add/edit rules which are then included in the main Caddyfile."
-            echo
+            echo "Custom Caddy rules for a site, included in its block of the Caddyfile:"
+            echo "a reverse proxy, headers, auth, or anything else Caddy supports."
+            echo "'cove directive <site> add' reads the same as 'cove directive add <site>'."
+            echo ""
             echo "Subcommands:"
-            echo "  add                 Adds a rule to the Caddyfile for the specified site."
-            echo "  update              Updates a rule in the Caddyfile for the specified site."
-            echo "  delete <name>       Deletes custom rules from the Caddyfile for the specified site."
-            echo "  list                Lists all custom directives for all managed sites."
+            echo "  add, update <site>  Sets the site's rules, replacing any it had."
+            echo "  delete <site>       Removes the site's rules."
+            echo "  list                Lists every site's rules."
             echo ""
             echo "Flags:"
-            echo "  --rules \"...\"       Directives as a string, instead of opening the editor."
-            echo "  --file <path>       Read directives from a file instead of the editor."
-            echo "  --force             Skip confirmation prompt (delete only)."
+            echo "  --rules \"…\"         The rules as a string (or give them after the site)."
+            echo "  --file <path>       Read the rules from a file."
+            echo "  --force             Delete without asking (assumed without a terminal)."
             echo ""
-            echo "Without --rules/--file, add/update opens an editor on a TTY and otherwise"
-            echo "reads from stdin, so this also works:"
+            echo "Without rules, --rules or --file, add and update open an editor (on the"
+            echo "current rules) in a terminal, and otherwise read the rules from stdin:"
+            echo "  cove directive add mysite \"header X-Robots-Tag noindex\""
             echo "  cat rules.conf | cove directive add mysite"
             ;;
         proxy)
@@ -16242,33 +19282,58 @@ display_command_help() {
             echo "  cove menubar disable"
             ;;
         db)
-            echo "Usage: cove db <subcommand>"
+            echo "Usage: cove db backup"
+            echo "       cove db list"
+            echo "       cove db fix-collation <site> | --all [--dry-run]"
             echo ""
-            echo "Manage databases."
+            echo "WordPress sites' databases, on Cove's MariaDB. A Laravel site's database"
+            echo "travels with cove backup, cove snapshot and the dashboard's databases view."
             echo ""
             echo "Subcommands:"
-            echo "  backup             Creates a .sql dump for each WP site."
-            echo "  list               Lists database connection details for each WP site."
+            echo "  backup             Dumps each WordPress site's database to a .sql file"
+            echo "                     in the site's private/ folder."
+            echo "  list               Shows each WordPress site's database credentials."
             echo "  fix-collation      Converts tables stamped with MariaDB 11.5+'s uca1400"
             echo "                     collations back to utf8mb4_unicode_ci so dumps import"
             echo "                     on older MariaDB / MySQL hosts."
-            echo ""
-            echo "Usage: cove db fix-collation <site> | --all [--dry-run]"
             ;;
         login)
-            echo "Usage: cove login <site> [<user>] [--url=<subsite-url>]"
+            echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>] [--plain]"
             echo ""
-            echo "Generates a one-time login link for a WordPress site."
-            echo "If no user is specified, it defaults to the first available administrator."
+            echo "Prints a one-time login link for a WordPress or Laravel site."
+            echo "WordPress: if no user is specified, the first available administrator."
+            echo "Laravel: the user is an id or email (default: the app's first user),"
+            echo "signed in through the app's own auth guard. The link works once, within"
+            echo "five minutes, and only from this machine."
             echo ""
             echo "Arguments:"
-            echo "  <site>         The name of the WordPress site."
-            echo "  <user>         (Optional) The user ID, email, or login of the admin to use."
-            echo "  --url=<url>    (Optional) On a multisite network, the subsite to log in to,"
-            echo "                 e.g. --url=https://mysite.localhost/store/ — see 'cove network'."
+            echo "  <site>         The name of the site."
+            echo "  <user>         (Optional) The user ID, email, or login to use."
+            echo "                 --user=<user> works too."
+            echo "  --url=<url>    (Optional, WordPress) On a multisite network, the subsite"
+            echo "                 to log in to, e.g. --url=https://mysite.localhost/store/"
+            echo "                 (see 'cove network')."
+            echo "  --to=<path>    (Optional, Laravel) The page to land on, e.g. --to=/admin."
+            echo "                 Default: the app's dashboard route, or the home page."
+            echo "  --plain        Print only the link, for scripts (--url-only works too)."
             ;;
         wp)
             cove_wp --help
+            ;;
+        artisan)
+            cove_artisan --help
+            ;;
+        laravel)
+            cove_laravel --help
+            ;;
+        postgres|postgresql|pgsql)
+            cove_postgres --help
+            ;;
+        redis|valkey)
+            cove_redis --help
+            ;;
+        composer)
+            cove_composer --help
             ;;
         snapshot)
             cove_snapshot --help
@@ -16296,6 +19361,7 @@ display_command_help() {
             echo ""
             echo "Manage additional domain mappings for a site."
             echo "Mappings allow a single site to be served from multiple domains."
+            echo "A leading '*.' (quoted: '*.mysite.localhost') answers on every subdomain."
             ;;
         demo)
             echo "Usage: cove demo <site> [<site>...] | off | status"
@@ -16318,10 +19384,13 @@ display_command_help() {
             echo "Usage: cove mcp [tools]"
             echo ""
             echo "Runs a Model Context Protocol server on stdin and stdout, so an AI agent can"
-            echo "work with your sites: list and create them, run WP-CLI, get a one-time login"
-            echo "link, read the logs and the mail a site sent, look at a page, and take or"
-            echo "restore a snapshot. Nothing it offers deletes a site or reaches a remote host,"
-            echo "and during 'cove demo' it sees only the demo's sites."
+            echo "work with your sites: list, create and clone them, run WP-CLI or a Laravel"
+            echo "app's artisan, keep a Laravel app's queue, scheduler and Reverb running, list"
+            echo "and add its users, get a one-time login link, read the logs and the mail a"
+            echo "site sent, look at a page, and save, snapshot or roll back before a risky"
+            echo "change. Nothing it offers deletes a site or reaches a remote host, and during"
+            echo "'cove demo' it sees only the demo's sites. The wp and artisan tools run code"
+            echo "in the site you name, so approve them as you would a shell command."
             echo ""
             echo "Add it to your agent:"
             echo "  Claude Code   claude mcp add cove -- cove mcp"
@@ -16368,27 +19437,29 @@ display_command_help() {
             echo ""
             echo "Reconfigure the HTTP/HTTPS ports Cove listens on."
             echo ""
-            echo "By default, asks once to migrate every WordPress site's stored URLs"
+            echo "After asking once, it rewrites every WordPress site's stored URLs"
             echo "(siteurl, home, and serialized content) via 'wp search-replace' so"
-            echo "existing sites keep working on the new port. Handles custom mappings"
-            echo "and skips non-WordPress sites automatically."
+            echo "existing sites keep working on the new port. Handles custom mappings."
+            echo "A Laravel site's APP_URL follows too (and VITE_REVERB_PORT, ready for the"
+            echo "front end's next build), unless APP_URL was set to another address."
             echo ""
             echo "Run with no arguments for an interactive menu, or pass --http / --https"
             echo "for scripted use."
             echo ""
             echo "Options:"
-            echo "  --http PORT     Non-interactive: set HTTP port"
-            echo "  --https PORT    Non-interactive: set HTTPS port"
-            echo "  --skip-urls     Change ports without touching WordPress databases"
+            echo "  --http=PORT     Non-interactive: set HTTP port (--http PORT works too)"
+            echo "  --https=PORT    Non-interactive: set HTTPS port (--https PORT works too)"
+            echo "  --skip-urls     Change ports without touching sites' stored URLs"
             echo "  --dry-run       Preview changes (including replacement counts)"
             echo "                  without committing anything"
+            echo "  --yes, -y       Don't ask before the change (assumed without a terminal)"
             echo ""
             echo "Examples:"
             echo "  cove ports                          Interactive menu"
-            echo "  cove ports --http 8090 --https 8453 Set ports non-interactively"
+            echo "  cove ports --http=8090 --https=8453 Set ports non-interactively"
             echo "  cove ports --dry-run                Preview the effect of a port change"
             echo ""
-            echo "Tip: run 'cove db backup' first if you want a safety net before the DB update."
+            echo "Tip: run 'cove snapshot <site>' first if you want a safety net before the update."
             ;;
         signals)
             echo "Usage: cove signals [status | apply] [--quiet]"
@@ -16404,18 +19475,49 @@ display_command_help() {
             echo "Upstream: krakjoe/parallel#406, php/frankenphp#2650."
             ;;
         opcache)
-            echo "Usage: cove opcache [show | set <mb> [--interned <mb>] [--files <n>] [--no-restart] [--yes]]"
+            echo "Usage: cove opcache [show]"
+            echo "       cove opcache sites [--top=<n>] [--format=json]"
+            echo "       cove opcache sites --watch[=<seconds>] [--top=<n>]"
+            echo "       cove opcache exclude [list]"
+            echo "       cove opcache exclude add|remove <site> [<folder>] [--no-restart] [--yes]"
+            echo "       cove opcache exclude add|remove <path> [--no-restart] [--yes]"
+            echo "       cove opcache exclude apply [--no-restart] [--yes]"
+            echo "       cove opcache set <mb> [--interned <mb>] [--files <n>]"
+            echo "                        [--no-restart] [--yes]"
             echo ""
             echo "Every local site is served by one FrankenPHP, so its OPcache holds"
             echo "every site's PHP at once and fills as the fleet grows. Once it is"
             echo "full, files that are not already cached compile on every request:"
             echo "the plugin-heavy site you are working on crawls while others stay"
             echo "fast. 'show' reports the configured limits and the running server's"
-            echo "live state (full or not, hits and misses). 'set' writes"
-            echo "opcache.memory_consumption (MB) to ~/Cove/php.ini, optionally the"
-            echo "interned-strings buffer and the file cap, regenerates the Caddyfile"
-            echo "and restarts FrankenPHP, which the resize needs (a reload is not"
-            echo "enough). --no-restart writes without restarting; --yes skips the"
+            echo "live state (full or not, hits and misses)."
+            echo ""
+            echo "'sites' splits the cache by site: files, MB, and how much changed"
+            echo "since the server started. A file edited while the server runs is"
+            echo "compiled again and its old copy stays as dead weight until the next"
+            echo "restart. When the cache fills with any dead weight, OPcache empties"
+            echo "it while other threads still use it, which crashes FrankenPHP"
+            echo "(php/php-src#22281), so the sites that keep recompiling matter."
+            echo "--watch compares the cache every <seconds> (default 60) and prints,"
+            echo "per site, what was new and what was compiled again; Ctrl-C prints"
+            echo "the totals. Leave it running into a file during a test run."
+            echo ""
+            echo "'exclude' keeps paths out of the cache (opcache.blacklist_filename,"
+            echo "listed in ~/Cove/opcache-exclude.txt): their files compile on every"
+            echo "request instead of taking room. Name a site and a folder inside its"
+            echo "public/ (or no folder for the whole site), '*' for every site, or an"
+            echo "absolute path; * matches within one folder name, ** across folders."
+            echo "PHP reads the list when it starts, so add, remove and apply restart"
+            echo "FrankenPHP. Sites pinned to an older PHP have their own OPcache."
+            echo "  cove opcache exclude add mysite wp-content/cache"
+            echo "  cove opcache exclude add '*' wp-content/cache"
+            echo ""
+            echo "'set' writes opcache.memory_consumption (MB) to ~/Cove/php.ini,"
+            echo "optionally the interned-strings buffer and the file cap, regenerates"
+            echo "the Caddyfile and restarts FrankenPHP, which the resize needs (a"
+            echo "reload is not enough)."
+            echo ""
+            echo "--no-restart writes without restarting; --yes skips the"
             echo "confirmation. Without a terminal (a script, the dashboard) nothing"
             echo "is restarted unless --yes is given."
             ;;
@@ -16447,31 +19549,35 @@ display_command_help() {
             echo "  cove memory set -1       Unlimited (use sparingly)"
             ;;
         php)
-            echo "Usage: cove php [<site>] [<version>|default]"
+            echo "Usage: cove php [<site>] [<version>|default|unpin]"
             echo ""
-            echo "Per-site PHP version switching. FrankenPHP (bundling the latest PHP)"
-            echo "serves every site by default; pinning a site routes its PHP through a"
-            echo "native Homebrew php-fpm (php@<version>) behind Caddy via php_fastcgi."
-            echo "TLS, logs, mappings, and custom directives are unaffected."
+            echo "Per-site PHP version switching, on macOS with Homebrew only. FrankenPHP"
+            echo "(bundling the latest PHP) serves every site by default; pinning a site"
+            echo "routes its PHP through a native Homebrew php-fpm (php@<version>) behind"
+            echo "Caddy via php_fastcgi. TLS, logs, mappings, and custom directives are"
+            echo "unaffected. On Linux every site runs on FrankenPHP's PHP."
             echo ""
             echo "Commands:"
             echo "  cove php                 Overview: every site's effective PHP + services."
             echo "  cove php <site>          Show the site's effective PHP version."
             echo "  cove php <site> 8.2      Pin the site to PHP 8.2 (installs php@8.2 if needed)."
-            echo "  cove php <site> default  Unpin — back to FrankenPHP's bundled PHP."
+            echo "  cove php <site> default  Unpin — back to FrankenPHP's bundled PHP"
+            echo "                           ('unpin' works too)."
             echo ""
             echo "The pin is stored in the site's 'php_version' file and travels with the"
-            echo "site through clone and rename. wp-cli commands for a pinned site run"
-            echo "under the same native PHP. Requires Homebrew on macOS."
+            echo "site through clone and rename. WP-CLI, artisan and Composer for a pinned"
+            echo "site run under the same native PHP."
             ;;
         log)
-            echo "Usage: cove log [site] [--follow]"
+            echo "Usage: cove log [site] [--app|--access] [--follow]"
             echo "       cove log rotate                     How long each log is kept, and sizes"
             echo "       cove log rotate <MB> | off           Cove's own logs (~/Cove/Logs)"
             echo "       cove log rotate services <MB> | off | default"
             echo "       cove log rotate access <MB> | off | default [--keep=<files>] [--days=<days>]"
             echo ""
-            echo "View logs for a site or the global error log."
+            echo "Shows a site's logs, or with no site the global PHP error log. The app's own"
+            echo "log comes first: a Laravel app's newest storage/logs/*.log, or WordPress's"
+            echo "wp-content/debug.log. Then Caddy's access log for the site."
             echo ""
             echo "Cove keeps every line of its own logs unless asked otherwise: 'cove log rotate 50'"
             echo "moves a log past 50 MB to <name>.log.1, replacing the one before. The services'"
@@ -16484,6 +19590,8 @@ display_command_help() {
             echo "  [site]           The site name (optional). If omitted, shows global error log."
             echo ""
             echo "Options:"
+            echo "  --app            Only the app's own log."
+            echo "  --access         Only the access log."
             echo "  -f, --follow     Continuously follow log output (like tail -f)"
             echo ""
             echo "Examples:"
@@ -16492,10 +19600,12 @@ display_command_help() {
             echo "  cove log beckon -f    Follow beckon site logs in real-time"
             ;;
         share)
-            echo "Usage: cove share [site] [--yes]"
+            echo "Usage: cove share [site] [--yes] [--background] [--format=json]"
+            echo "       cove share <site> stop"
             echo ""
-            echo "Creates a temporary public tunnel to share a local site with anyone on the internet."
-            echo "Powered by Cloudflare Quick Tunnels (cloudflared installed on-demand)."
+            echo "Creates a temporary public tunnel to share a local site with anyone on"
+            echo "the internet. Powered by Cloudflare Quick Tunnels (cloudflared installed"
+            echo "on demand)."
             echo ""
             echo "Arguments:"
             echo "  [site]    The site name (optional). If omitted, prompts for selection."
@@ -16503,17 +19613,22 @@ display_command_help() {
             echo "Flags:"
             echo "  --yes, -y Install cloudflared without asking, if it's missing."
             echo "            Assumed when stdin is not a TTY."
-            echo "  --background, -d"
-            echo "            Start the tunnel, print the URL, and return; it keeps running."
-            echo "            Pair with --format=json for scripts and agents."
+            echo "  --background, --detach, -d"
+            echo "            Start the tunnel, print the URL, and return; it keeps running"
+            echo "            until 'cove share <site> stop'."
+            echo "  --format=json, --json"
+            echo "            Print the result as one line of JSON, for scripts and agents."
             echo "  stop      cove share <site> stop — end a background tunnel."
             echo ""
             echo "Examples:"
-            echo "  cove share           Interactive site selection"
-            echo "  cove share mysite    Share mysite.localhost publicly"
+            echo "  cove share                     Interactive site selection"
+            echo "  cove share mysite              Share mysite.localhost until Ctrl+C"
+            echo "  cove share mysite --background Share it and return to the prompt"
+            echo "  cove share mysite stop         End that background share"
             echo ""
-            echo "You'll receive a random URL like https://random-words.trycloudflare.com"
-            echo "The URL is temporary and stops working when you press Ctrl+C."
+            echo "You'll receive a random URL like https://random-words.trycloudflare.com."
+            echo "It stops working when you press Ctrl+C, or, for a background share,"
+            echo "when you run 'cove share <site> stop'."
             ;;
         wsl-hosts)
             echo "Usage: cove wsl-hosts"
@@ -16529,7 +19644,8 @@ display_command_help() {
         path)
             echo "Usage: cove path <name>"
             echo ""
-            echo "Outputs the full path to the specified site's directory."
+            echo "Outputs the full path to the site's public/ folder, the one it serves."
+            echo "A Laravel app, or one from 'cove add --from', is the folder above it."
             echo ""
             echo "Arguments:"
             echo "  <name>         The name of the site."
@@ -16602,11 +19718,30 @@ display_command_help() {
         upgrade)
             echo "Usage: cove upgrade [--yes]"
             echo ""
-            echo "Checks for the latest version of Cove on GitHub and replaces the current executable if a newer version is available."
-            echo "Also checks FrankenPHP and Adminer and upgrades them if newer versions are published."
+            echo "Checks GitHub for the latest version of Cove and replaces the current"
+            echo "executable if a newer one is available. Also upgrades FrankenPHP and"
+            echo "Adminer when newer versions are published, and refreshes the pieces Cove"
+            echo "manages (Whoops, the login helper, the watchdog)."
             echo ""
             echo "Flags:"
-            echo "  --yes, -y    Skip the prompt shown when the local Adminer version can't be parsed."
+            echo "  --yes, -y    Skip the prompt shown when the local Adminer version"
+            echo "               can't be parsed."
+            ;;
+        uninstall)
+            echo "Usage: cove uninstall [--purge] [--dry-run] [--yes]"
+            echo ""
+            echo "Removes Cove: stops its services and takes them out of launchd or systemd,"
+            echo "ends background shares and LAN advertisements, removes the menu bar app and"
+            echo "Cove's /etc/hosts lines, then the cove command itself. Your sites in ~/Cove"
+            echo "and their databases stay. The packages Cove installed (MariaDB, Mailpit,"
+            echo "FrankenPHP, gum, WP-CLI, PostgreSQL, Redis) stay too; the summary says how to"
+            echo "remove them."
+            echo ""
+            echo "Flags:"
+            echo "  --purge     Also delete every site (files, databases, Redis keys), ~/Cove"
+            echo "              and Cove's local certificate authority. Asks you to type delete."
+            echo "  --dry-run   Show what would happen, and change nothing."
+            echo "  --yes, -y   Don't ask (needed without a terminal)."
             ;;
         version)
             echo "Usage: cove version"
@@ -16614,10 +19749,7 @@ display_command_help() {
             echo "Displays the current version of Cove."
             ;;
         *)
-            echo "Error: Unknown command '$cmd'"
-            echo ""
-            show_general_help
-            exit 1
+            cove_unknown_command "$cmd"
             ;;
     esac
 }
@@ -16652,9 +19784,26 @@ main() {
         COVE_CMD="$0"
     fi
 
-    # Check for a help flag anywhere in the arguments.
+    # `cove help` and `cove help <command>`, as people type them.
+    if [ "${1:-}" = "help" ]; then
+        if [ -n "${2:-}" ]; then display_command_help "$2"; else show_general_help; fi
+        exit 0
+    fi
+
+    # Check for a help flag anywhere in the arguments. For wp, artisan and
+    # composer only one straight after the command is Cove's: a later one
+    # belongs to WP-CLI, Artisan or Composer (cove wp mysite plugin list --help),
+    # as one after `cove redis cli` or `cove postgres psql` does to those.
+    local arg_index=0
     for arg in "$@"; do
+        arg_index=$((arg_index + 1))
         if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+            case "$1" in
+                wp|artisan|composer) [ "$arg_index" -gt 2 ] && break ;;
+                # Past `cli` or `psql`, it's redis-cli's or psql's own.
+                redis|valkey) [ "${2:-}" = cli ] && [ "$arg_index" -gt 2 ] && break ;;
+                postgres|postgresql|pgsql) [ "${2:-}" = psql ] && [ "$arg_index" -gt 2 ] && break ;;
+            esac
             local command_for_help="$1"
             # If the command is empty or a help flag, show general help.
             if [[ -z "$command_for_help" || "$command_for_help" == "--help" || "$command_for_help" == "-h" ]]; then
@@ -16675,6 +19824,20 @@ main() {
     fi
 
     shift # Remove command from argument list
+
+    # A site named as the browser shows it (shop.localhost) means shop. Only
+    # where the site goes, so a .localhost value later in the arguments
+    # (cove wp shop search-replace old.localhost new.localhost) is left be.
+    local site_re='^[a-z0-9-]+\.localhost$'
+    case "$command" in
+        add|artisan|backup|composer|delete|history|import|laravel|log|login|mappings|network|path|php|screenshot|share|snapshot|twin|url|wp)
+            [[ "${1:-}" =~ $site_re ]] && set -- "${1%.localhost}" "${@:2}" ;;
+        clone|rename|directive)
+            [[ "${1:-}" =~ $site_re ]] && set -- "${1%.localhost}" "${@:2}"
+            [[ "${2:-}" =~ $site_re ]] && set -- "$1" "${2%.localhost}" "${@:3}" ;;
+        core|db|lan|transfer)
+            [[ "${2:-}" =~ $site_re ]] && set -- "$1" "${2%.localhost}" "${@:3}" ;;
+    esac
 
     case "$command" in
         add)
@@ -16728,6 +19891,24 @@ main() {
             check_dependencies
             cove_wp "$@"
             ;;
+        laravel)
+            check_dependencies
+            cove_laravel "$@"
+            ;;
+        postgres|postgresql|pgsql)
+            cove_postgres "$@"
+            ;;
+        redis|valkey)
+            cove_redis "$@"
+            ;;
+        artisan)
+            check_dependencies
+            cove_artisan "$@"
+            ;;
+        composer)
+            check_dependencies
+            cove_composer "$@"
+            ;;
         snapshot)
             check_dependencies
             cove_snapshot "$@"
@@ -16771,6 +19952,9 @@ main() {
             deploy_whoops
             create_whoops_bootstrap
             refresh_all_mu_plugins
+            # The php and composer wrappers name FrankenPHP's path; rewrite
+            # them if this install has them.
+            [ -d "$COVE_TOOLS_DIR" ] && write_php_tools
             ensure_cli_sendmail_path
             # The Adminer entry point and theme. The upgrade itself also calls
             # this, but from the old script still in memory, which writes the
@@ -16801,6 +19985,29 @@ main() {
                 echo "   - Restarting FrankenPHP to apply its updated service definition..."
                 start_caddy_service
                 for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
+            fi
+            # Linux installs before Laravel support lack PDO (Laravel's only
+            # way to its database), and those before PostgreSQL and Redis
+            # their drivers: install them, then restart FrankenPHP once so
+            # the web server loads them too. mysqli and PDO's SQLite and
+            # MySQL drivers are tried on every upgrade until they load, but
+            # pdo_pgsql and phpredis only once (PHP_EXTRAS_TRIED): some
+            # distributions don't package them, and retrying the list one
+            # package at a time, with the same warning, on every upgrade
+            # would buy nothing. `cove add` names the package a site needs.
+            if [ "$OS" = "linux" ] && [ -n "$(linux_php_extension_packages)" ]; then
+                local ext_core='extension_loaded("mysqli") && extension_loaded("pdo_sqlite") && extension_loaded("pdo_mysql")'
+                local ext_extra='extension_loaded("pdo_pgsql") && extension_loaded("redis")'
+                if ! frankenphp php-cli -r "exit($ext_core ? 0 : 1);" 2>/dev/null \
+                    || { [ -z "$(config_get PHP_EXTRAS_TRIED)" ] && ! frankenphp php-cli -r "exit($ext_extra ? 0 : 1);" 2>/dev/null; }; then
+                    echo "   - Installing PHP's PDO and Redis extensions (for Laravel sites)..."
+                    linux_install_php_extensions
+                    config_set PHP_EXTRAS_TRIED 1
+                    if frankenphp php-cli -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);' 2>/dev/null && is_caddy_running; then
+                        $SUDO_CMD systemctl restart cove.service
+                        for _ in $(seq 1 50); do is_caddy_running && break; sleep 0.3; done
+                    fi
+                fi
             fi
             if [ "$OS" = "linux" ] && fix_cove_service_home; then
                 echo "   - Restarting FrankenPHP so it sees the right home folder..."
@@ -16848,13 +20055,14 @@ main() {
                     cove_db_fix_collation "$@"
                     ;;
                 *)
-                    display_command_help "db"
-                    exit 0
+                    cove_unknown_subcommand db "$action" "backup list fix-collation"
                     ;;
             esac
             ;;
         directive)
             check_dependencies
+            # The site first (cove directive mysite add) reads the same.
+            case "${2:-}" in add|update|delete) set -- "$2" "$1" "${@:3}" ;; esac
             local action="$1"
             shift # Remove subcommand from argument list
             case "$action" in
@@ -16867,9 +20075,11 @@ main() {
                 list)
                     cove_directive_list "$@"
                     ;;
-                *)
+                "")
                     display_command_help "directive"
-                    exit 0
+                    ;;
+                *)
+                    cove_unknown_subcommand directive "$action" "add update delete list"
                     ;;
             esac
             ;;
@@ -16939,14 +20149,16 @@ main() {
         upgrade)
             cove_upgrade "$@"
             ;;
-        version)
+        uninstall)
+            # Not gated on the dependencies: a Cove that never finished
+            # installing has to come out too.
+            cove_uninstall "$@"
+            ;;
+        version|--version|-v|-V)
             cove_version
             ;;
         *)
-            echo "Error: Unknown command '$command'"
-            echo ""
-            show_general_help
-            exit 1
+            cove_unknown_command "$command"
             ;;
     esac
 }
@@ -16955,6 +20167,8 @@ main() {
 # The following functions are sourced from the 'commands/' directory.
 
 cove_add() {
+    # Where the command was run from, for a relative --from.
+    local caller_dir="$PWD"
     cd ~/
     local site_name="$1"
     local site_type="wordpress"
@@ -16963,7 +20177,8 @@ cove_add() {
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove add <name> [flavor] [--plain] [--minn] [--php=8.2] [--multisite[=subdomain]]"
+        echo "Usage: cove add <name> [type] [--plain] [--minn[=<zip>]] [--wp-version=<ver>] [--php=<ver>] [--multisite[=subdomain]] [--database=sqlite|mysql|mariadb|pgsql] [--from=<folder, git URL or archive>] [--branch=<name>] [--seed] [--no-reload]"
+        echo "See: cove add --help"
         exit 1
     fi
 
@@ -16993,8 +20208,27 @@ cove_add() {
     local minn_zip=""
     local php_pin=""
     local multisite_mode=""
+    local database=""
+    local from="" branch="" seed=false
     shift
-    for arg in "$@"; do
+    # Value flags take --flag=value or --flag value. An unknown flag stops
+    # here: dropped silently, `--from ~/app` (no =) built a blank app.
+    local usage="Usage: cove add <name> [type] [--plain] [--minn[=<zip>]] [--wp-version=<ver>] [--php=<ver>] [--multisite[=subdomain]] [--database=sqlite|mysql|mariadb|pgsql] [--from=<folder, git URL or archive>] [--branch=<name>] [--seed] [--no-reload]   (cove add --help)"
+    local arg val
+    while [ $# -gt 0 ]; do
+        arg="$1"; shift
+        case "$arg" in
+            --wp-version|--php|--database|--from|--branch)
+                if [ $# -eq 0 ] || [[ "$1" == -* ]]; then
+                    gum style --foreground red "❌ Error: $arg needs a value." "$usage"
+                    exit 1
+                fi
+                val="$1"; shift
+                arg="$arg=$val" ;;
+            # --multisite's mode, given apart, only when it's one of the two.
+            --multisite)
+                if [ "${1:-}" = "subdomain" ] || [ "${1:-}" = "subdirectory" ]; then arg="$arg=$1"; shift; fi ;;
+        esac
         case "$arg" in
             --plain)        plain_flag=true ;;
             --minn)         minn=true ;;
@@ -17006,8 +20240,23 @@ cove_add() {
             --multisite)    multisite_mode="subdirectory" ;;
             --multisite=*)  multisite_mode="${arg#*=}" ;;
             --multisite-subdomain) multisite_mode="subdomain" ;;
-            -*)             ;;  # unknown flags ignored, as before
-            *)              [ -z "$flavor" ] && flavor="$arg" ;;
+            --database=*)   database="${arg#*=}" ;;
+            # The shell leaves a ~ after = alone, so expand it here too.
+            --from=*)       from="${arg#*=}"; from="${from/#\~/$HOME}"
+                            # A folder named relative to where cove ran.
+                            if [[ "$from" != /* ]] && [ -e "$caller_dir/$from" ]; then from="$caller_dir/$from"; fi ;;
+            --branch=*)     branch="${arg#*=}" ;;
+            --seed)         seed=true ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'." "$usage"
+                exit 1 ;;
+            *)
+                if [ -z "$flavor" ]; then
+                    flavor="$arg"
+                else
+                    gum style --foreground red "❌ Error: Unexpected '$arg' after '$flavor'." "$usage"
+                    exit 1
+                fi ;;
         esac
     done
 
@@ -17043,6 +20292,15 @@ cove_add() {
         fi
     fi
 
+    # --from brings in an existing project. `laravel --from=` and `plain
+    # --from=` say which kind it is; without a type, Cove looks once it has
+    # the files: a Laravel app is set up as one, any other app is served from
+    # its public/ (see cove_add_app_from).
+    local from_detect=false
+    if [ -n "$from" ] && [ -z "$flavor" ] && [ "$plain_flag" = false ] && [ "$minn" = false ]; then
+        from_detect=true
+    fi
+
     # Resolve the flavor into a site type + an optional pinned version.
     case "$flavor" in
         ""|latest)
@@ -17051,6 +20309,8 @@ cove_add() {
             site_type="plain" ;;
         minn)
             minn=true ;;
+        laravel)
+            site_type="laravel" ;;
         nightly|trunk)
             wp_version="nightly" ;;
         [0-9]*)
@@ -17064,9 +20324,58 @@ cove_add() {
             fi
             wp_version="$flavor" ;;
         *)
-            gum style --foreground red "❌ Error: Unknown option '$flavor'." "Expected a WordPress version (6.4.3), 'nightly', 'latest', 'minn', or 'plain'."
+            gum style --foreground red "❌ Error: Unknown option '$flavor'." "Expected a WordPress version (6.4.3), 'nightly', 'latest', 'minn', 'laravel', or 'plain'."
             exit 1 ;;
     esac
+    # Decided once the project is staged; nothing WordPress happens before.
+    [ "$from_detect" = true ] && site_type="from"
+
+    # A Laravel application is its own kind of site: no WordPress to pin,
+    # network or hand to Minn Engine.
+    if [ "$site_type" == "laravel" ]; then
+        local laravel_conflict=""
+        if [ "$plain_flag" = true ]; then
+            laravel_conflict="A site is either plain or Laravel."
+        elif [ "$minn" = true ]; then
+            laravel_conflict="Minn Engine installs over WordPress, not Laravel."
+        elif [ -n "$multisite_mode" ]; then
+            laravel_conflict="Multisite is a WordPress network."
+        fi
+        if [ -n "$laravel_conflict" ]; then
+            gum style --foreground red "❌ Error: Cannot create a Laravel site with those options." "$laravel_conflict"
+            exit 1
+        fi
+        # Laravel's own default, as `laravel new` has it; an existing project
+        # brings its own unless --database overrides it.
+        [ -n "$database" ] || [ -n "$from" ] || database="sqlite"
+    fi
+    if [ "$site_type" == "laravel" ] || [ "$from_detect" = true ]; then
+        case "$database" in
+            ""|sqlite|mysql|mariadb) ;;
+            # PostgreSQL is set up the first time a site asks for it.
+            pgsql|postgres|postgresql) database="pgsql" ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown database '$database'." "Use --database=sqlite (the default), mysql, mariadb or pgsql."
+                exit 1 ;;
+        esac
+    elif [ -n "$database" ]; then
+        gum style --foreground red "❌ Error: --database is for Laravel sites." "WordPress sites always get a MariaDB database; try 'cove add $site_name laravel --database=$database'."
+        exit 1
+    elif [ "$seed" = true ]; then
+        gum style --foreground red "❌ Error: --seed is for Laravel sites."
+        exit 1
+    elif [ -n "$from" ] && [ "$site_type" != "plain" ] && [ "$plain_flag" = false ]; then
+        gum style --foreground red "❌ Error: --from brings in an app: Laravel, or any app with a public/ folder." "A WordPress site from elsewhere comes in with: cove import $site_name <backup.zip>, or cove pull."
+        exit 1
+    fi
+    if [ "$from_detect" = true ] && [ -n "$multisite_mode" ]; then
+        gum style --foreground red "❌ Error: Cannot combine --multisite with --from." "Multisite is a WordPress network; --from brings in an app."
+        exit 1
+    fi
+    if [ -n "$branch" ] && [ -z "$from" ]; then
+        gum style --foreground red "❌ Error: --branch goes with --from=<git URL>."
+        exit 1
+    fi
 
     if [ "$plain_flag" = true ]; then
         # --plain alongside a version is a contradiction rather than a harmless
@@ -17117,7 +20426,7 @@ cove_add() {
     full_hostname=$(basename "$site_dir")
 
     if [ -d "$site_dir" ]; then
-        echo "⚠️ Site '$full_hostname' already exists."
+        gum style --foreground red "❌ Error: Site '$full_hostname' already exists." "Open it: $(url_for "$full_hostname")" "Or pick another name (cove list shows the ones in use)."
         exit 1
     fi
     local owner
@@ -17126,10 +20435,46 @@ cove_add() {
         exit 1
     fi
 
+    # A WordPress site's database has to be a new one: a failed install
+    # drops it again on the way out.
+    if [ "$site_type" == "wordpress" ]; then
+        source_config
+        if cove_db_exists "$(cove_db_name "$site_name")"; then
+            gum style --foreground red "❌ Error: A database named '$(cove_db_name "$site_name")' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+            exit 1
+        fi
+    fi
+
     # Resolve the PHP pin before creating anything so a failed brew install
     # leaves no half-made site behind.
     if [ -n "$php_pin" ] && ! ensure_php_formula "$php_pin"; then
         exit 1
+    fi
+
+    # Set first, so a Ctrl-C (or a kill, such as the MCP server's time
+    # limit) partway through a long download or Composer install leaves
+    # nothing behind: the work folder in ~/Cove/cache and, until the site is
+    # in place, the database made for it (see cove_new_site_cleanup).
+    COVE_FROM_WORK="" COVE_NEW_WORK="" COVE_NEW_DB=""
+    if [ -n "$from" ] || [ "$site_type" == "laravel" ]; then
+        trap cove_new_site_cleanup EXIT
+    fi
+
+    # A project for --from is staged before anything is created, too: a
+    # failed clone or download, or a bad archive, leaves no site behind.
+    # What is shown of its address has no credentials (cove_from_redact).
+    local from_shown=""
+    if [ -n "$from" ]; then
+        from_shown=$(cove_from_redact "$from")
+        cove_from_stage "$site_name" "$from" "$branch" "$([ "$site_type" = plain ] && echo keep-deps)" || exit 1
+        cove_from_check_names "$COVE_FROM_STAGE" "$from_shown" || exit 1
+        if [ "$from_detect" = true ]; then
+            if site_is_laravel "$COVE_FROM_STAGE"; then site_type="laravel"; else site_type="plain"; fi
+        fi
+        if [ "$site_type" == "plain" ] && { [ -n "$database" ] || [ "$seed" = true ]; }; then
+            gum style --foreground red "❌ Error: --database and --seed are for Laravel apps, and $from_shown isn't one."
+            exit 1
+        fi
     fi
 
     # The engine is fetched and checked before anything is created, so a
@@ -17142,8 +20487,17 @@ cove_add() {
 
     if [ "$minn" = true ]; then
         echo "➕ Creating Minn Engine site: $full_hostname"
+    elif [ "$site_type" == "plain" ] && [ -n "$from" ]; then
+        echo "➕ Creating app site: $full_hostname"
     else
         echo "➕ Creating $site_type site: $full_hostname"
+    fi
+    if [ "$site_type" == "laravel" ] && [ -n "$from" ]; then
+        cove_add_laravel_from "$site_name" "$site_dir" "$from_shown" "$branch" "$database" "$php_pin" "$seed" || exit 1
+    elif [ "$site_type" == "laravel" ]; then
+        cove_add_laravel "$site_name" "$site_dir" "$database" "$php_pin" "$seed" || exit 1
+    elif [ "$site_type" == "plain" ] && [ -n "$from" ]; then
+        cove_add_app_from "$site_name" "$site_dir" "$from_shown" "$branch" "$php_pin" || exit 1
     fi
     mkdir -p "$site_dir/public" "$site_dir/logs"
     if [ -n "$php_pin" ]; then
@@ -17152,7 +20506,7 @@ cove_add() {
         echo "$php_pin" > "$site_dir/php_version"
     fi
 
-    if [ "$site_type" == "plain" ]; then
+    if [ "$site_type" == "plain" ] && [ -z "$from" ]; then
         write_plain_site_landing "$site_dir/public"
     fi
 
@@ -17163,7 +20517,7 @@ cove_add() {
     if [ "$site_type" == "wordpress" ]; then
         source_config
         local db_name
-        db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+        db_name=$(cove_db_name "$site_name")
 
         if [ -n "$wp_version" ]; then
             # Show the pairing rather than just the pinned version. Cove runs a
@@ -17342,7 +20696,980 @@ PHP
         else
             gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ WordPress Installed" "URL: $(url_for "$full_hostname")/wp-admin" "User: $admin_user" "Pass: $admin_pass" "One-time login URL: $one_time_login_url"
         fi
+    elif [ "$site_type" == "laravel" ] && [ -n "$from" ]; then
+        local conn db_line
+        conn=$(laravel_env_get "$site_dir" DB_CONNECTION)
+        db_line="Database: SQLite, $(laravel_env_get "$site_dir" DB_DATABASE)"
+        [ "$db_line" = "Database: SQLite, " ] && db_line="Database: SQLite, database/database.sqlite"
+        [ "$conn" = "sqlite" ] || db_line="Database: $(cove_db_name "$site_name") on Cove's MariaDB ($conn)"
+        [ "$conn" = "pgsql" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's PostgreSQL"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") set up from $from_shown" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "What the tools printed: $site_dir/logs/laravel-setup.log" "${COVE_ADD_NOTES[@]}"
+    elif [ "$site_type" == "plain" ] && [ -n "$from" ]; then
+        local next_line=""
+        [ -n "$COVE_ADD_NEXT" ] && next_line="Next, in the site folder: $COVE_ADD_NEXT"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ App set up from $from_shown" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" ${next_line:+"$next_line"} "${COVE_ADD_NOTES[@]}"
+    elif [ "$site_type" == "laravel" ]; then
+        local db_line="Database: SQLite, database/database.sqlite"
+        [ "$database" != "sqlite" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's MariaDB ($database)"
+        [ "$database" = "pgsql" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's PostgreSQL"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") Installed" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "Queued jobs run once a worker is going: cove laravel $site_name queue on"
     fi
+}
+
+# The EXIT trap while a site is made (cove add, a Laravel import): whatever a
+# Ctrl-C or a kill partway through would leave goes. The work folders under
+# ~/Cove/cache (COVE_FROM_WORK, COVE_NEW_WORK), and the database made for
+# the site (COVE_NEW_DB, "<server> <name>"), which is set only once Cove has
+# created it and emptied again once the site is in place, so a database
+# that was there before, or one a finished site uses, is never dropped.
+cove_new_site_cleanup() {
+    local server name
+    if [ -n "${COVE_NEW_DB:-}" ]; then
+        read -r server name <<< "$COVE_NEW_DB"
+        [ -n "$name" ] && cove_server_db_drop "$server" "$name" >/dev/null 2>&1
+    fi
+    [ -n "${COVE_FROM_WORK:-}" ] && rm -rf "$COVE_FROM_WORK"
+    [ -n "${COVE_NEW_WORK:-}" ] && rm -rf "$COVE_NEW_WORK"
+    return 0
+}
+
+# Creates a Laravel application for `cove add <name> laravel` the way
+# `laravel new` does: the skeleton from Composer without its scripts, .env
+# from .env.example, an app key, the database, then the migrations. Then Cove's
+# own settings go into .env: the https address, mail to Cove's mailbox through
+# the same sendmail wrapper WordPress uses (so `cove demo` holds it too), and
+# MariaDB credentials when asked for. It is built in a folder under
+# ~/Cove/cache and moved into place whole, so the dashboard and a reload never
+# see half an application. Composer's output goes to a log shown on failure.
+cove_add_laravel() {
+    local site_name="$1" site_dir="$2" database="$3" php_pin="$4" seed="$5"
+    local full_hostname="$site_name.localhost"
+    local php="$COVE_TOOLS_DIR/php" native="" prefix db_name="" server="mariadb"
+    [ "$database" = "pgsql" ] && server="pgsql"
+
+    ensure_composer || return 1
+    if [ -n "$php_pin" ]; then
+        prefix=$(php_fpm_prefix_for "$php_pin")
+        [ -n "$prefix" ] && [ -x "$prefix/bin/php" ] && native="$prefix/bin/php"
+    fi
+
+    # Laravel's database layer is PDO, which some FrankenPHP builds lack.
+    cove_laravel_need_pdo "$database" "$native" || return 1
+
+    mkdir -p "$COVE_DIR/cache" || return 1
+    local work
+    work=$(mktemp -d "$COVE_DIR/cache/laravel-new-$site_name.XXXXXX") || return 1
+    COVE_NEW_WORK="$work"
+    local stage="$work/app" log="$work/install.log"
+
+    if [ "$database" != "sqlite" ]; then
+        source_config
+        db_name=$(cove_db_name "$site_name")
+        # Never one that exists already: a failed install drops what it made.
+        if ! cove_laravel_create_db "$db_name" "$server"; then
+            rm -rf "$work"
+            return 1
+        fi
+        # Dropped again by the EXIT trap until the app is in place.
+        COVE_NEW_DB="$server $db_name"
+    fi
+
+    (
+        export COVE_PHP_BIN="$native" PHP_BINARY="$php"
+        echo "Installing Laravel..."
+        if ! "$COVE_TOOLS_DIR/composer" create-project laravel/laravel "$stage" --remove-vcs --prefer-dist --no-scripts --no-interaction --no-progress > "$log" 2>&1; then
+            echo "❌ Error: Composer could not create the application:"
+            tail -n 15 "$log" | sed 's/^/   /'
+            exit 1
+        fi
+        cd "$stage" || exit 1
+        "$COVE_TOOLS_DIR/composer" run-script post-root-package-install --no-interaction >> "$log" 2>&1
+        [ -f .env ] || cp .env.example .env
+        chmod 755 artisan
+
+        local set example
+        set="{\"APP_URL\":$(cove_json_str "$(url_for "$full_hostname")"),\"DB_CONNECTION\":\"$database\""
+        example="{\"DB_CONNECTION\":\"$database\""
+        if [ "$database" = "sqlite" ]; then
+            set="$set,\"DB_HOST\":null,\"DB_PORT\":null,\"DB_DATABASE\":null,\"DB_USERNAME\":null,\"DB_PASSWORD\":null"
+            example="$example,\"DB_HOST\":null,\"DB_PORT\":null,\"DB_DATABASE\":null,\"DB_USERNAME\":null,\"DB_PASSWORD\":null"
+            touch database/database.sqlite
+        else
+            set="$set,$(cove_laravel_db_env "$server" "$db_name")"
+            example="$example,\"DB_HOST\":\"127.0.0.1\",\"DB_PORT\":\"$( [ "$server" = pgsql ] && echo 5432 || echo 3306 )\",\"DB_DATABASE\":$(cove_json_str "${site_name//-/_}"),\"DB_USERNAME\":\"root\",\"DB_PASSWORD\":\"\""
+        fi
+        # A prefix of its own, so its keys stay apart once it uses Redis.
+        set="$set,\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t"),\"MAIL_FROM_ADDRESS\":$(cove_json_str "hello@$full_hostname"),\"REDIS_PREFIX\":$(cove_json_str "$(cove_redis_prefix "$site_name")")}"
+        if ! COVE_ENV_SET="$set" laravel_env_set "$stage/.env" || ! COVE_ENV_SET="$example}" laravel_env_set "$stage/.env.example"; then
+            echo "❌ Error: Could not write the application's .env."
+            exit 1
+        fi
+
+        local mark
+        mark=$(wc -l < "$log" | tr -d ' ')
+        if ! "$php" artisan key:generate --no-interaction >> "$log" 2>&1; then
+            echo "❌ Error: artisan key:generate failed: $(laravel_log_why "$log" "$mark")"
+            exit 1
+        fi
+        echo "   - Running migrations..."
+        mark=$(wc -l < "$log" | tr -d ' ')
+        if ! "$php" artisan migrate --force --no-interaction >> "$log" 2>&1; then
+            echo "❌ Error: The migrations failed: $(laravel_log_why "$log" "$mark")"
+            exit 1
+        fi
+        # The skeleton's seeder makes one user, test@example.com.
+        if [ "$seed" = true ]; then
+            echo "   - Seeding the database..."
+            "$php" artisan db:seed --force --no-interaction >> "$log" 2>&1 || echo "⚠️  The seeders failed; the app is installed. Run them with: cove artisan $site_name db:seed"
+        fi
+
+        # Cove keeps a few files of its own in the site folder, which is
+        # also the project: keep them out of the application's repository.
+        printf '\n# Cove: this site'"'"'s own files (access logs, backups, settings)\n%s\n' "$(printf '/%s\n' $COVE_SITE_OWN)" >> .gitignore
+    ) 2> >(grep -v -E '^(PHP )?Deprecated:' >&2)
+
+    if [ $? -ne 0 ] || [ ! -f "$stage/artisan" ]; then
+        gum style --foreground red "❌ Laravel installation failed. Please review the errors above."
+        echo "   - Cleaning up failed installation..."
+        [ -n "$db_name" ] && cove_server_db_drop "$server" "$db_name"
+        rm -rf "$work"
+        return 1
+    fi
+    # The folder may have appeared during the install: a reload's logs/ for a
+    # site deleted just before takes nothing, anything more is refused rather
+    # than moved into.
+    if [ -d "$site_dir" ] && [ -z "$(ls -A "$site_dir" | grep -vx logs)" ]; then
+        rm -rf "$site_dir"
+    fi
+    if [ -e "$site_dir" ] || ! mv "$stage" "$site_dir"; then
+        gum style --foreground red "❌ Error: Could not move the application into $site_dir."
+        [ -n "$db_name" ] && cove_server_db_drop "$server" "$db_name"
+        rm -rf "$work"
+        return 1
+    fi
+    # In place: the database is the site's now.
+    COVE_NEW_DB=""
+    rm -rf "$work"
+}
+
+# The PDO driver a Laravel database needs, checked on the PHP the site will
+# run ($2, a pinned PHP, or Cove's): some FrankenPHP builds lack them.
+cove_laravel_need_pdo() {
+    local ext="pdo_sqlite" php="$COVE_TOOLS_DIR/php" fix
+    case "$1" in mysql|mariadb) ext="pdo_mysql" ;; pgsql) ext="pdo_pgsql" ;; esac
+    COVE_EXT="$ext" COVE_PHP_BIN="$2" "$php" -r 'exit(extension_loaded(getenv("COVE_EXT")) ? 0 : 1);' 2>/dev/null && return 0
+    fix="Laravel talks to its database through PDO, so it can't run here yet."
+    if [ -n "$(linux_php_extension_packages)" ]; then
+        fix="Install PHP's PDO extensions, then restart Cove's web server:"$'\n'"  sudo $PKG_MANAGER install $(linux_php_extension_packages | tr ' ' '\n' | grep pdo | tr '\n' ' ')"$'\n'"  sudo systemctl restart cove"
+    fi
+    gum style --foreground red "❌ Error: This PHP has no $ext extension." "$fix"
+    return 1
+}
+
+# A new database for a Laravel site ($1) on Cove's MariaDB or PostgreSQL
+# ($2, mariadb by default; PostgreSQL is set up when it isn't yet), never
+# one that exists already. MariaDB needs source_config.
+cove_laravel_create_db() {
+    local name="$1" server="${2:-mariadb}"
+    if [ "$server" = "pgsql" ]; then
+        ensure_postgres || return 1
+    fi
+    if cove_server_db_exists "$server" "$name"; then
+        gum style --foreground red "❌ Error: A database named '$name' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+        return 1
+    fi
+    echo "🗄️ Creating database: $name"
+    if ! cove_server_db_create "$server" "$name"; then
+        gum style --foreground red "❌ Error: Could not create the database '$name'."
+        return 1
+    fi
+}
+
+# Puts a Node.js on PATH for a project's front end: the one already there, or
+# one a version manager installed (Volta, fnm, nvm, Herd's), which a shell
+# would find but Cove, started from the dashboard or launchd, wouldn't.
+# Status 1 when there is none.
+cove_find_node() {
+    command -v node >/dev/null 2>&1 && return 0
+    local d
+    for d in "$HOME/.volta/bin" "$HOME/.local/share/fnm/aliases/default/bin" "$HOME/Library/Application Support/fnm/aliases/default/bin" "$HOME/.fnm/aliases/default/bin"; do
+        if [ -x "$d/node" ]; then PATH="$d:$PATH"; export PATH; return 0; fi
+    done
+    d=$(for d in "$HOME"/.nvm/versions/node/v*/bin "$HOME/Library/Application Support/Herd/config/nvm/versions/node"/v*/bin; do [ -x "$d/node" ] && echo "$d"; done | sort -V | tail -n 1)
+    [ -n "$d" ] || return 1
+    PATH="$d:$PATH"
+    export PATH
+}
+
+# Brings an existing project into ~/Cove/cache for `cove add --from`, before
+# anything is created: a folder is copied, a repository cloned, an archive
+# (.zip, .tar.gz, .tgz or .tar: a file, or an https:// address) downloaded and
+# unpacked. An archive whose entries are all inside one folder (a GitHub
+# release, `git archive --prefix`) loses that folder. Sets COVE_FROM_WORK,
+# COVE_FROM_STAGE (the project), COVE_FROM_KIND (folder|git|archive),
+# COVE_FROM_SRC (a folder's real path) and COVE_FROM_LOG, so it must not run
+# in $(…). Nothing in the project runs here. $4 keep-deps copies a folder's
+# vendor/ and node_modules/ too, for an app that isn't going to be set up as
+# Laravel. A repository's or an archive's links have to stay inside it.
+cove_from_stage() {
+    local site_name="$1" source="$2" branch="$3" keep_deps="$4"
+    local kind="" src="" work stage log archive="" ext="" shown
+    COVE_FROM_WORK="" COVE_FROM_STAGE="" COVE_FROM_KIND="" COVE_FROM_SRC="" COVE_FROM_LOG=""
+    # What is printed of an address: the output can end up with an agent
+    # (Cove's MCP server returns it), so never its credentials.
+    shown=$(cove_from_redact "$source")
+
+    # macOS keeps Documents, Desktop and Downloads from apps it hasn't been
+    # told to trust, Cove's web server among them: started from the
+    # dashboard, a project there can't be read.
+    local private=""
+    case "$source" in "$HOME/Documents"*|"$HOME/Desktop"*|"$HOME/Downloads"*) [ "$OS" = "macos" ] && private=1 ;; esac
+    if [ -n "$private" ] && { [ ! -e "$source" ] || ! ls "$source" >/dev/null 2>&1; }; then
+        gum style --foreground red "❌ Error: Cove can't read $source." "If it's there, macOS is keeping it from Cove: Documents, Desktop and Downloads are private to the apps you allow. Run this in Terminal instead:" "  cove add $site_name --from=$source"
+        return 1
+    fi
+    case "$source" in
+        *.zip|*.ZIP) ext=zip ;;
+        *.tar.gz|*.tgz|*.tar) ext=tar ;;
+    esac
+    if [ -d "$source" ]; then
+        kind=folder
+        src=$(cd "$source" && pwd -P) || return 1
+        if [[ "$src/" == "$(cd "$SITES_DIR" && pwd -P)/"* ]]; then
+            gum style --foreground red "❌ Error: $source is a Cove site already." "Copy a site with: cove clone <site> $site_name"
+            return 1
+        fi
+        # A folder holding ~/Cove (your home, say) would be copied into
+        # itself, through the cache folder the copy goes to.
+        if [[ "$(cd "$COVE_DIR" && pwd -P)/" == "$src/"* ]]; then
+            gum style --foreground red "❌ Error: $source holds Cove's own folder ($COVE_DIR), so it can't be copied in." "Point --from at the project's own folder."
+            return 1
+        fi
+    elif [ -f "$source" ] && [ -n "$ext" ]; then
+        kind=archive
+    elif [[ "$source" =~ ^https?://[^[:space:]?#]+\.(zip|ZIP|tar\.gz|tgz|tar)([?#][^[:space:]]*)?$ ]]; then
+        kind=archive
+        case "${BASH_REMATCH[1]}" in zip|ZIP) ext=zip ;; *) ext=tar ;; esac
+        if [[ "$source" != https://* ]]; then
+            gum style --foreground red "❌ Error: An archive is downloaded over https:// only." "$shown"
+            return 1
+        fi
+    elif [[ "$source" =~ ^(https?|ssh|git|file)://[^[:space:]]+$ ]] || [[ "$source" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^[:space:]]+$ ]]; then
+        kind=git
+        if ! command -v git >/dev/null 2>&1; then
+            gum style --foreground red "❌ Error: git isn't installed, so Cove can't clone $shown."
+            return 1
+        fi
+    else
+        gum style --foreground red "❌ Error: --from is a folder, a git repository's address, or an archive." "There is no folder '$shown', and it isn't an https://, ssh:// or git@host:path address, or a .zip / .tar.gz file or https:// link."
+        return 1
+    fi
+    if [ -n "$branch" ]; then
+        if [ "$kind" != git ]; then
+            gum style --foreground red "❌ Error: --branch is for a repository; a folder or an archive is used as it is."
+            return 1
+        fi
+        if ! [[ "$branch" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]]; then
+            gum style --foreground red "❌ Error: '$branch' isn't a branch or tag name."
+            return 1
+        fi
+    fi
+
+    mkdir -p "$COVE_DIR/cache" || return 1
+    work=$(mktemp -d "$COVE_DIR/cache/from-$site_name.XXXXXX") || return 1
+    COVE_FROM_WORK="$work"
+    stage="$work/app"
+    log="$work/setup.log"
+    : > "$log"
+
+    if [ "$kind" = git ]; then
+        echo "   - Cloning ${shown}…"
+        # Nothing can stop to ask for a password when no one is there to
+        # answer (the dashboard, an agent): git and ssh fail instead.
+        if ! (
+            if [ ! -t 0 ]; then
+                export GIT_TERMINAL_PROMPT=0
+                # Unless the user picks their own (core.sshCommand, say a
+                # key of its own), which this would override.
+                if [ -z "${GIT_SSH_COMMAND:-}" ] && [ -z "$(git config --get core.sshCommand 2>/dev/null)" ]; then
+                    export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
+                fi
+            fi
+            if [ -n "$branch" ]; then
+                git -c protocol.ext.allow=never clone --quiet --branch "$branch" -- "$source" "$stage"
+            else
+                git -c protocol.ext.allow=never clone --quiet -- "$source" "$stage"
+            fi
+        ) >>"$log" 2>&1; then
+            gum style --foreground red "❌ Error: git could not clone $shown:"
+            tail -n 8 "$log" | cove_from_redact_lines | sed 's/^/   /'
+            rm -rf "$work"
+            return 1
+        fi
+        # The clone keeps the address it came from as origin, credentials
+        # and all, in .git/config: kept without them, as cove-from is.
+        if [ "$shown" != "$source" ]; then
+            git -C "$stage" config remote.origin.url "$shown" 2>>"$log"
+        fi
+    elif [ "$kind" = folder ]; then
+        # A Laravel project's vendor/ and node_modules/ are installed again
+        # for this machine, so they stay behind, named one by one: an
+        # --exclude pattern also matches deeper folders on macOS's tar
+        # (resources/views/vendor, public/vendor). Any other project is
+        # copied whole. Both sides' errors count, so an unreadable file
+        # doesn't make a quiet partial copy.
+        local rc_read rc_write skip_deps=false
+        [ "$keep_deps" != keep-deps ] && site_is_laravel "$src" && skip_deps=true
+        if $skip_deps; then
+            echo "   - Copying ${src} (vendor/ and node_modules/ are installed fresh)…"
+        else
+            echo "   - Copying ${src}…"
+        fi
+        mkdir "$stage" || { rm -rf "$work"; return 1; }
+        if $skip_deps; then
+            (cd "$src" && find . -mindepth 1 -maxdepth 1 ! -name vendor ! -name node_modules -print0 | COPYFILE_DISABLE=1 tar --null -cf - -T -) 2>>"$log" \
+                | (cd "$stage" && tar -xpf -) 2>>"$log"
+        else
+            (cd "$src" && COPYFILE_DISABLE=1 tar -cf - .) 2>>"$log" | (cd "$stage" && tar -xpf -) 2>>"$log"
+        fi
+        rc_read=${PIPESTATUS[0]} rc_write=${PIPESTATUS[1]}
+        if [ "$rc_read" -ne 0 ] || [ "$rc_write" -ne 0 ]; then
+            gum style --foreground red "❌ Error: Could not copy $src." "$(tail -n 3 "$log")"
+            rm -rf "$work"
+            return 1
+        fi
+    else
+        archive="$work/download.$ext"
+        if [ -f "$source" ]; then
+            cp "$source" "$archive" || { rm -rf "$work"; return 1; }
+        else
+            echo "   - Downloading ${shown}…"
+            # https all the way, redirects included (GitHub's release links
+            # redirect to its CDN), and nothing past 2 GB.
+            if ! curl -fsSL --proto '=https' --proto-redir '=https' --max-filesize 2147483648 --retry 2 -o "$archive" "$source" 2>>"$log"; then
+                gum style --foreground red "❌ Error: Could not download $shown." "$(tail -n 2 "$log" | cove_from_redact_lines)"
+                rm -rf "$work"
+                return 1
+            fi
+        fi
+        # Every entry has to stay inside the folder it unpacks into: no
+        # absolute paths, no .. anywhere.
+        local names
+        if [ "$ext" = zip ]; then
+            if command -v unzip >/dev/null 2>&1; then
+                names=$(unzip -Z1 "$archive" 2>>"$log")
+            else
+                # Paths by environment, not $argv: FrankenPHP 1.13.0's
+                # php-cli shifts $argv (see ensure_cli_argv_fix).
+                names=$(COVE_ZIP="$archive" $(cove_php_cmd) -r '$z = new ZipArchive(); if ($z->open(getenv("COVE_ZIP")) !== true) exit(1); for ($i = 0; $i < $z->numFiles; $i++) echo $z->getNameIndex($i), "\n";' 2>>"$log")
+            fi
+        else
+            names=$(tar -tf "$archive" 2>>"$log")
+        fi
+        if [ $? -ne 0 ] || [ -z "$names" ]; then
+            gum style --foreground red "❌ Error: $shown isn't an archive Cove can open."
+            rm -rf "$work"
+            return 1
+        fi
+        if printf '%s\n' "$names" | grep -qE '^/|(^|/)\.\.(/|$)|\\'; then
+            gum style --foreground red "❌ Error: $shown has files that would land outside its own folder (an absolute path or ..), so it isn't unpacked."
+            rm -rf "$work"
+            return 1
+        fi
+        # The download stops at 2 GB, but what is inside can be far bigger (a
+        # few MB of zip can hold terabytes of zeros), so what it unpacks to is
+        # held to the same 2 GB: past that, an archive is a mistake or a bomb
+        # rather than a project. Counted by unpacking to a pipe, never to
+        # disk, which stops a byte past the limit; without unzip, from the
+        # sizes the zip declares.
+        local limit=2147483648 size
+        if [ "$ext" = zip ] && ! command -v unzip >/dev/null 2>&1; then
+            size=$(COVE_ZIP="$archive" $(cove_php_cmd) -r '$z = new ZipArchive(); if ($z->open(getenv("COVE_ZIP")) !== true) exit(1); $n = 0; for ($i = 0; $i < $z->numFiles; $i++) { $s = $z->statIndex($i); $n += $s ? $s["size"] : 0; } echo $n;' 2>>"$log")
+        elif [ "$ext" = zip ]; then
+            size=$(unzip -p "$archive" 2>>"$log" </dev/null | head -c $((limit + 1)) | wc -c)
+        else
+            size=$(tar -xOf "$archive" 2>>"$log" | head -c $((limit + 1)) | wc -c)
+        fi
+        size="${size//[[:space:]]/}"
+        if ! [[ "$size" =~ ^[0-9]+$ ]]; then
+            gum style --foreground red "❌ Error: $shown isn't an archive Cove can open."
+            rm -rf "$work"
+            return 1
+        fi
+        if [ "$size" -gt "$limit" ]; then
+            gum style --foreground red "❌ Error: $shown unpacks to more than 2 GB, so it isn't unpacked." "A project that big comes in as a folder or a git repository instead."
+            rm -rf "$work"
+            return 1
+        fi
+        mkdir "$work/x" || { rm -rf "$work"; return 1; }
+        local rc
+        if [ "$ext" = zip ]; then
+            if command -v unzip >/dev/null 2>&1; then
+                # -o: a name twice (or twice but for case, on macOS) would
+                # otherwise stop to ask, with no one there to answer.
+                unzip -o -q "$archive" -d "$work/x" >>"$log" 2>&1 </dev/null
+            else
+                COVE_ZIP="$archive" COVE_DEST="$work/x" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->extractTo(getenv("COVE_DEST")) ? 0 : 1);' >>"$log" 2>&1
+            fi
+        else
+            tar -xf "$archive" -C "$work/x" >>"$log" 2>&1
+        fi
+        rc=$?
+        rm -f "$archive"
+        if [ "$rc" -ne 0 ]; then
+            gum style --foreground red "❌ Error: Could not unpack $shown." "$(tail -n 3 "$log")"
+            rm -rf "$work"
+            return 1
+        fi
+        # One folder holding everything (macOS's __MACOSX and .DS_Store
+        # aside) is the project itself.
+        local entry top="" count=0
+        for entry in "$work/x"/* "$work/x"/.[!.]* "$work/x"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            case "${entry##*/}" in __MACOSX|.DS_Store) rm -rf "$entry"; continue ;; esac
+            count=$((count + 1))
+            top="$entry"
+        done
+        if [ "$count" -eq 1 ] && [ -d "$top" ] && [ ! -L "$top" ]; then
+            mv "$top" "$stage" && rm -rf "$work/x"
+        else
+            mv "$work/x" "$stage"
+        fi || { rm -rf "$work"; return 1; }
+    fi
+
+    # A link out of the project would have Cove serve what it points at
+    # (public -> your home), so a download or a clone has none. A folder of
+    # your own is copied as it is.
+    if [ "$kind" != folder ]; then
+        local outside
+        outside=$(cove_links_outside "$stage" "$SITES_DIR/$site_name.localhost" 2>>"$log")
+        if [ -n "$outside" ]; then
+            gum style --foreground red "❌ Error: $shown has links that point outside the project, so it isn't used:" "$outside"
+            rm -rf "$work"
+            return 1
+        fi
+    fi
+
+    COVE_FROM_WORK="$work" COVE_FROM_STAGE="$stage" COVE_FROM_KIND="$kind" COVE_FROM_SRC="$src" COVE_FROM_LOG="$log"
+}
+
+# The links in a project ($1) that would lead outside it once it is a site,
+# up to three, one per line as "path -> target"; nothing when there are
+# none. A project is checked where it is staged, a folder deeper
+# (~/Cove/cache/from-x.XXXX/app) than its home ($2, ~/Cove/Sites/x.localhost),
+# so a ../../.. that lands nowhere here could land in your home there. Each
+# target is followed from the project's own top instead, the way the system
+# would follow it (through the project's other links, so a .. after a link
+# to a shallower folder climbs from there), and whether or not it exists:
+# any step above the top is outside. An absolute target is inside only when
+# it names the project, where it is or at its home. A project that can't be
+# read through counts as having one, so nothing unchecked gets through.
+cove_links_outside() {
+    local found
+    found=$(COVE_STAGE="$1" COVE_HOME="${2:-}" $(cove_php_cmd) -r '
+        $root = realpath(getenv("COVE_STAGE"));
+        if ($root === false) exit(1);
+        $homes = [$root];
+        $home = rtrim((string) getenv("COVE_HOME"), "/");
+        if ($home !== "") {
+            $homes[] = $home;
+            $up = realpath(dirname($home));
+            if ($up !== false) $homes[] = $up . "/" . basename($home);
+        }
+        // What an absolute target names past the project folder, or null
+        // when it is somewhere else.
+        $within = function ($abs) use ($homes) {
+            foreach ($homes as $h) {
+                if ($abs === $h) return "";
+                if (strpos($abs, $h . "/") === 0) return substr($abs, strlen($h) + 1);
+            }
+            return null;
+        };
+        // Follows a target from a folder ($at, its names below the top);
+        // false as soon as it would leave. A loop of links counts as leaving.
+        $inside = function (array $at, $to) use ($root, $within) {
+            $todo = [];
+            $hops = 0;
+            while ($to !== null) {
+                if ($to !== "" && $to[0] === "/") {
+                    $to = $within($to);
+                    if ($to === null) return false;
+                    $at = [];
+                }
+                $todo = array_merge(explode("/", $to), $todo);
+                $to = null;
+                while ($todo && $to === null) {
+                    $name = array_shift($todo);
+                    if ($name === "" || $name === ".") continue;
+                    if ($name === "..") {
+                        if (!$at) return false;
+                        array_pop($at);
+                        continue;
+                    }
+                    $at[] = $name;
+                    $path = $root . "/" . implode("/", $at);
+                    if (is_link($path)) {
+                        if (++$hops > 40) return false;
+                        $to = (string) readlink($path);
+                        array_pop($at);
+                    }
+                }
+            }
+            return true;
+        };
+        $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
+        foreach ($it as $f) {
+            if (!$f->isLink()) continue;
+            $rel = substr($f->getPathname(), strlen($root) + 1);
+            $link = (string) readlink($f->getPathname());
+            $at = explode("/", $rel);
+            array_pop($at);
+            if (!$inside($at, $link)) echo $rel, " -> ", $link, "\n";
+        }') || found="(its links could not all be checked)"
+    printf '%s' "$found" | head -n 3
+}
+
+# A project's top-level names that Cove keeps for a site's own files
+# (COVE_SITE_OWN). A file by one of them would be read as Cove's settings for
+# the site (lan_config puts it on the network), so the project is refused.
+# Folders named logs, private or history are fine: Cove only adds to them.
+cove_from_check_names() {
+    local stage="$1" source="$2" name
+    for name in $COVE_SITE_OWN; do
+        [ -e "$stage/$name" ] || [ -L "$stage/$name" ] || continue
+        case "$name" in
+            logs|private|history) [ -d "$stage/$name" ] && [ ! -L "$stage/$name" ] && continue ;;
+        esac
+        gum style --foreground red "❌ Error: $source has '$name' at its top, a name Cove keeps for a site's own settings." "Rename it in the project, then add it again."
+        return 1
+    done
+}
+
+# An address for --from as it may be shown or kept: without a URL's
+# user:password@, query string or fragment, any of which can hold a token
+# (https://<token>@github.com/…, a signed download's ?X-Amz-Signature=).
+# An ssh:// address keeps its user name, which is how ssh logs in rather
+# than a secret, but not a password after it. A folder, a file or a
+# git@host:path address is left as it is.
+cove_from_redact() {
+    local url="$1" rest auth user
+    case "$url" in *://*) ;; *) printf '%s' "$url"; return 0 ;; esac
+    url="${url%%[?#]*}"
+    rest="${url#*://}"
+    auth="${rest%%/*}"
+    if [[ "$auth" == *@* ]]; then
+        user=""
+        case "$url" in ssh://*) user="${auth%@*}"; user="${user%%:*}@" ;; esac
+        url="${url%%://*}://$user${auth##*@}${rest#"$auth"}"
+    fi
+    printf '%s' "$url"
+}
+
+# The same for what git or curl printed (stdin to stdout): any URL's
+# credentials and query go, wherever they are in a line.
+cove_from_redact_lines() {
+    sed -E 's|([A-Za-z][A-Za-z0-9+.-]*://)[^/?#[:space:]]*@|\1|g; s|(://[^?#[:space:]]*)[?#][^[:space:]]*|\1|g'
+}
+
+# Where a site came from, kept as <site>/cove-from (and what makes it a
+# project for clone and snapshot). A URL's credentials, query and fragment
+# are left out (cove_from_redact).
+cove_from_record() {
+    local dest="$1" source="$2" kind="$3" branch="$4"
+    [ "$kind" = folder ] && source="$COVE_FROM_SRC"
+    source=$(cove_from_redact "$source")
+    {
+        echo "kind=$kind"
+        echo "source=$source"
+        [ -n "$branch" ] && echo "branch=$branch"
+        echo "added=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$dest/cove-from"
+}
+
+# Lists Cove's own files in a project's .git/info/exclude (this copy's alone,
+# never a .gitignore the project tracks), so they never become changes in it.
+cove_from_git_exclude() {
+    local dir="$1" ignore="$1/.git/info/exclude"
+    [ -d "$dir/.git" ] || return 0
+    mkdir -p "$dir/.git/info"
+    if ! grep -qs '^# Cove: this site' "$ignore"; then
+        printf '\n# Cove: this site'"'"'s own files (access logs, backups, settings)\n%s\n' "$(printf '/%s\n' $COVE_SITE_OWN cove-from)" >> "$ignore"
+    elif ! grep -qx '/cove-from' "$ignore"; then
+        echo '/cove-from' >> "$ignore"
+    fi
+}
+
+# Any app other than Laravel, brought in by `cove add <name> --from=…` (or
+# `plain --from=`): served from its public/, as every Cove site is. A
+# cove.json at the top can say more, and is read, never run:
+#   webroot  the folder to serve when it isn't public/ (public/ becomes a link)
+#   php      the oldest PHP it runs on; a newer Cove PHP is fine
+#   next     one line to show in the summary, e.g. "./myapp setup"
+# A project with no public/ but an index.php or index.html at the top is all
+# webroot, so it moves into public/. Notes go into COVE_ADD_NOTES and the
+# next step into COVE_ADD_NEXT.
+cove_add_app_from() {
+    local site_name="$1" site_dir="$2" source="$3" branch="$4" php_pin="$5"
+    local stage="$COVE_FROM_STAGE" work="$COVE_FROM_WORK" log="$COVE_FROM_LOG"
+    local webroot="public" webroot_given=false min_php="" facts k v entry
+    COVE_ADD_NOTES=() COVE_ADD_NEXT=""
+
+    if [ -f "$stage/cove.json" ]; then
+        if ! facts=$(COVE_JSON="$stage/cove.json" $(cove_php_cmd) -r '
+            $j = json_decode((string) file_get_contents(getenv("COVE_JSON")), true);
+            if (!is_array($j)) exit(1);
+            foreach (["webroot", "php", "next"] as $k) {
+                if (isset($j[$k]) && is_string($j[$k])) echo $k, "\t", str_replace(["\r", "\n", "\t"], " ", $j[$k]), "\n";
+            }' 2>>"$log"); then
+            gum style --foreground red "❌ Error: $source has a cove.json that isn't valid JSON."
+            rm -rf "$work"
+            return 1
+        fi
+        while IFS=$'\t' read -r k v; do
+            case "$k" in
+                webroot) webroot="${v%/}" webroot_given=true ;;
+                php) min_php="$v" ;;
+                next) COVE_ADD_NEXT="${v:0:200}" ;;
+            esac
+        done <<< "$facts"
+        if $webroot_given && { [ -z "$webroot" ] || [[ "$webroot" == /* ]] || [[ "/$webroot/" == *"/../"* ]] || [[ "/$webroot/" == *"/./"* ]] || [ ! -d "$stage/$webroot" ]; }; then
+            gum style --foreground red "❌ Error: cove.json's webroot '$webroot' isn't a folder inside the project."
+            rm -rf "$work"
+            return 1
+        fi
+    fi
+
+    if [ "$webroot" != "public" ]; then
+        if [ -e "$stage/public" ] || [ -L "$stage/public" ]; then
+            gum style --foreground red "❌ Error: cove.json names '$webroot' as the webroot, but the project has a public/ too." "Cove serves a site's public/; remove one of them."
+            rm -rf "$work"
+            return 1
+        fi
+        ln -s "$webroot" "$stage/public" || { rm -rf "$work"; return 1; }
+    elif [ ! -d "$stage/public" ]; then
+        # Everything moves, .git too, so the repository stays whole (Cove
+        # never serves a dotfile). Cove's own files then sit outside it.
+        if [ -f "$stage/index.php" ] || [ -f "$stage/index.html" ]; then
+            mkdir "$stage/.cove-public" || { rm -rf "$work"; return 1; }
+            for entry in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
+                [ -e "$entry" ] || [ -L "$entry" ] || continue
+                case "${entry##*/}" in .cove-public) continue ;; esac
+                mv "$entry" "$stage/.cove-public/" || { rm -rf "$work"; return 1; }
+            done
+            mv "$stage/.cove-public" "$stage/public" || { rm -rf "$work"; return 1; }
+        else
+            gum style --foreground red "❌ Error: $source has no public/ folder for Cove to serve." "Cove serves a site's public/. A project without one needs an index.php or index.html at the top, or a cove.json naming its webroot: {\"webroot\": \"web\"}"
+            rm -rf "$work"
+            return 1
+        fi
+    fi
+
+    # WordPress isn't an app to serve as it is: its wp-config.php names the
+    # database of wherever it came from, which Cove would then treat as this
+    # site's own.
+    if [ -f "$stage/public/wp-config.php" ] || [ -f "$stage/public/wp-settings.php" ]; then
+        gum style --foreground red "❌ Error: $source is WordPress, and --from brings in apps." "A WordPress site from elsewhere comes in with: cove import $site_name <backup.zip>, or cove pull." "A new one: cove add $site_name"
+        rm -rf "$work"
+        return 1
+    fi
+
+    for entry in private history; do
+        [ -d "$stage/$entry" ] && COVE_ADD_NOTES+=("⚠️  Its $entry/ folder is left out of clones and snapshots: Cove keeps its own files under that name.")
+    done
+
+    if [ -n "$min_php" ] && [ -z "$php_pin" ]; then
+        local cur
+        cur=$(normalize_php_version "$(frankenphp_php_version)")
+        min_php=$(normalize_php_version "$min_php")
+        if [ -n "$min_php" ] && [ -n "$cur" ] && [ "$(printf '%s\n' "$min_php" "$cur" | sort -V | head -1)" != "$min_php" ]; then
+            COVE_ADD_NOTES+=("⚠️  It needs PHP $min_php or newer, and Cove runs $cur.")
+        fi
+    fi
+
+    cove_from_git_exclude "$stage"
+    cove_from_record "$stage" "$source" "$COVE_FROM_KIND" "$branch"
+
+    cd ~/ || true
+    if [ -d "$site_dir" ] && [ -z "$(ls -A "$site_dir" | grep -vx logs)" ]; then
+        rm -rf "$site_dir"
+    fi
+    if [ -e "$site_dir" ] || ! mv "$stage" "$site_dir"; then
+        gum style --foreground red "❌ Error: Could not move the app into $site_dir."
+        rm -rf "$work"
+        return 1
+    fi
+    mkdir -p "$site_dir/logs"
+    rm -rf "$work"
+    [ -n "$php_pin" ] && echo "$php_pin" > "$site_dir/php_version"
+    return 0
+}
+
+# An existing Laravel project as a site: `cove add <name> laravel --from=<git
+# URL, folder or archive>`, or plain `--from=` when what it brings is Laravel.
+# cove_from_stage has already put it under ~/Cove/cache (a folder without its
+# vendor/ and node_modules/, installed again for this machine). There
+# Composer installs the packages and .env is set
+# up for Cove: from .env.example when there is none, the https address, mail
+# to Cove's mailbox, and the database the project names (or --database=):
+# SQLite in its file, or a new database on Cove's MariaDB. All of that has to
+# work, or nothing is kept. Then it moves into place, and the rest happens
+# there, where a failure is reported but the site stays for you to fix: an
+# app key if there is none, the migrations (seeders too with --seed), the
+# storage link, and the front end, built with the package manager its lock
+# file names. Notes for the summary go into COVE_ADD_NOTES; everything the
+# tools printed into the site's logs/laravel-setup.log.
+cove_add_laravel_from() {
+    local site_name="$1" site_dir="$2" source="$3" branch="$4" database="$5" php_pin="$6" seed="$7"
+    local full_hostname="$site_name.localhost"
+    local php="$COVE_TOOLS_DIR/php" native="" prefix db_name="" server="mariadb" kind src="" work stage log conn was set mail_from k v
+    COVE_ADD_NOTES=()
+
+    # The project is already staged (cove_from_stage) in COVE_FROM_STAGE.
+    kind="$COVE_FROM_KIND" src="$COVE_FROM_SRC" work="$COVE_FROM_WORK" stage="$COVE_FROM_STAGE" log="$COVE_FROM_LOG"
+    _cove_from_fail() {
+        [ -n "$db_name" ] && cove_server_db_drop "$server" "$db_name"
+        rm -rf "$work"
+        return 1
+    }
+    if ! site_is_laravel "$stage"; then
+        gum style --foreground red "❌ Error: $source isn't a Laravel project." "Expected artisan, bootstrap/app.php and public/index.php at the top. Any other app comes in with: cove add $site_name --from=$source"
+        _cove_from_fail
+        return 1
+    fi
+    # Vite's dev-server marker: copied, it would point every page at a
+    # server that isn't running.
+    [ "$kind" = folder ] && rm -f "$stage/public/hot"
+
+    ensure_composer || { _cove_from_fail; return 1; }
+    if [ -n "$php_pin" ]; then
+        prefix=$(php_fpm_prefix_for "$php_pin")
+        [ -n "$prefix" ] && [ -x "$prefix/bin/php" ] && native="$prefix/bin/php"
+    fi
+    if ! grep -q '"laravel/framework"' "$stage/composer.json" 2>/dev/null; then
+        gum style --foreground red "❌ Error: $source has no laravel/framework in its composer.json."
+        _cove_from_fail
+        return 1
+    fi
+    # Caches made on another machine name its folders: config, routes,
+    # packages and services are all built again.
+    find "$stage/bootstrap/cache" -maxdepth 1 -name '*.php' -delete 2>/dev/null
+    cd "$stage" || { _cove_from_fail; return 1; }
+
+    # The database: what --database says, else what .env (or .env.example,
+    # which becomes .env) says, else the default config/database.php falls
+    # back to (sqlite since Laravel 11, mysql before).
+    if [ ! -f .env ]; then
+        if [ -f .env.example ]; then cp .env.example .env; else : > .env; fi
+    fi
+    was=$(laravel_env_get "$stage" DB_CONNECTION)
+    conn="$database"
+    [ -n "$conn" ] || conn="$was"
+    [ -n "$conn" ] || conn=$(sed -n "s/.*'default' *=> *env('DB_CONNECTION', *'\([a-z]*\)').*/\1/p" config/database.php 2>/dev/null | head -n 1)
+    [ -n "$conn" ] || conn="sqlite"
+    case "$conn" in
+        sqlite|mysql|mariadb|pgsql) ;;
+        *)
+            gum style --foreground red "❌ Error: This app's database is '$conn', which Cove can't provide." "Try --database=sqlite, --database=mysql or --database=pgsql."
+            _cove_from_fail
+            return 1 ;;
+    esac
+    cove_laravel_need_pdo "$conn" "$native" || { _cove_from_fail; return 1; }
+    if [ "$conn" != "sqlite" ]; then
+        source_config
+        [ "$conn" = "pgsql" ] && server="pgsql"
+        db_name=$(cove_db_name "$site_name")
+        cove_laravel_create_db "$db_name" "$server" || { db_name=""; _cove_from_fail; return 1; }
+        # Dropped again by the EXIT trap until the app is in place.
+        COVE_NEW_DB="$server $db_name"
+    fi
+
+    echo "   - Setting up .env for Cove…"
+    # A database URL (DB_URL, or DATABASE_URL before Laravel 11) would win
+    # over every DB_ setting below, and could name the project's real
+    # server: the migrations would run there. It goes.
+    set="{\"DB_URL\":null,\"DATABASE_URL\":null,\"APP_URL\":$(cove_json_str "$(url_for "$full_hostname")"),\"DB_CONNECTION\":\"$conn\",\"MAIL_MAILER\":\"sendmail\",\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t")"
+    mail_from=$(laravel_env_get "$stage" MAIL_FROM_ADDRESS)
+    if [ -z "$mail_from" ] || [ "$mail_from" = "hello@example.com" ]; then
+        set="$set,\"MAIL_FROM_ADDRESS\":$(cove_json_str "hello@$full_hostname")"
+    fi
+    # key:generate fills APP_KEY in, but only where the line is.
+    grep -qE '^[[:space:]]*APP_KEY[[:space:]]*=' .env || set="$set,\"APP_KEY\":\"\""
+    # Redis is always Cove's, with a key prefix of the site's own, written
+    # now, before anything boots the app: the Redis .env names may be the
+    # project's real one, and Laravel clears a Redis cache with FLUSHDB, the
+    # whole database. When the app keeps its cache, sessions or queue there,
+    # Cove's is set up if it isn't yet.
+    local uses="" redis_ok=false
+    for k in CACHE_STORE CACHE_DRIVER SESSION_DRIVER QUEUE_CONNECTION; do
+        [ "$(laravel_env_get "$stage" "$k")" = "redis" ] && uses="$uses $k"
+    done
+    [ -n "$uses" ] && ensure_redis >>"$log" 2>&1 && redis_ok=true
+    set="$set,$(cove_redis_site_env "$site_name")"
+    if [ "$conn" = "sqlite" ]; then
+        # Switched from a server database: its settings would name a file.
+        [ "$was" = "sqlite" ] || set="$set,\"DB_HOST\":null,\"DB_PORT\":null,\"DB_DATABASE\":null,\"DB_USERNAME\":null,\"DB_PASSWORD\":null"
+    else
+        set="$set,$(cove_laravel_db_env "$server" "$db_name")"
+    fi
+    if ! COVE_ENV_SET="$set}" laravel_env_set "$stage/.env"; then
+        gum style --foreground red "❌ Error: Could not write the application's .env."
+        _cove_from_fail
+        return 1
+    fi
+
+    # Without the project's install and update scripts, which can assume
+    # their author's machine (a starter kit's build its front end before
+    # npm has run): package discovery, which Laravel needs, runs after.
+    echo "   - Installing Composer packages…"
+    if ! (export COVE_PHP_BIN="$native" PHP_BINARY="$php"
+          "$COVE_TOOLS_DIR/composer" install --no-scripts --no-interaction --no-progress --prefer-dist \
+            && "$COVE_TOOLS_DIR/composer" run-script post-autoload-dump --no-interaction) >>"$log" 2>&1; then
+        local hint=""
+        if grep -qiE 'requires php|your php version' "$log"; then
+            # The newest PHP below this one that the locked packages accept.
+            local cur want
+            cur=$(frankenphp_php_version | cut -d. -f1,2)
+            want=$(grep -oE 'requires php [^>]*' "$log" | grep -oE '[0-9]+\.[0-9]+' | sort -uV \
+                | awk -v cur="$cur" '{ split($0, a, "."); split(cur, c, "."); if (a[1] + 0 < c[1] + 0 || (a[1] == c[1] && a[2] + 0 < c[2] + 0)) v = $0 } END { print v }')
+            hint="The locked packages need an older PHP than $cur: try --php=${want:-8.4}"
+        elif grep -qiE 'authentication|401|403|auth\.json' "$log"; then
+            hint="A package needs credentials (Nova, Spark, a private repository): add them with composer config --global, then try again."
+        fi
+        gum style --foreground red "❌ Error: Composer could not install the packages:"
+        grep -v -E '^(PHP )?Deprecated:' "$log" | tail -n 12 | sed 's/^/   /'
+        [ -n "$hint" ] && echo "   $hint"
+        _cove_from_fail
+        return 1
+    fi
+    chmod 755 artisan
+
+    # Cove's own files in the folder stay out of the repository: listed in
+    # .git/info/exclude, which is this copy's alone, rather than in a
+    # .gitignore the project tracks.
+    local ignore=".gitignore"
+    if [ -d .git ]; then mkdir -p .git/info; ignore=".git/info/exclude"; fi
+    if ! grep -qs '^# Cove: this site' "$ignore"; then
+        printf '\n# Cove: this site'"'"'s own files (access logs, backups, settings)\n%s\n' "$(printf '/%s\n' $COVE_SITE_OWN cove-from)" >> "$ignore"
+    elif ! grep -qx '/cove-from' "$ignore"; then
+        echo '/cove-from' >> "$ignore"
+    fi
+    cove_from_record "$stage" "$source" "$kind" "$branch"
+
+    cd ~/ || true
+    if [ -d "$site_dir" ] && [ -z "$(ls -A "$site_dir" | grep -vx logs)" ]; then
+        rm -rf "$site_dir"
+    fi
+    if [ -e "$site_dir" ] || ! mv "$stage" "$site_dir"; then
+        gum style --foreground red "❌ Error: Could not move the application into $site_dir."
+        _cove_from_fail
+        return 1
+    fi
+    # In place: the database is the site's now, and stays with it while the
+    # rest is set up (a failure from here on is a note).
+    COVE_NEW_DB=""
+    mkdir -p "$site_dir/logs"
+    mv -f "$log" "$site_dir/logs/laravel-setup.log"
+    log="$site_dir/logs/laravel-setup.log"
+    rm -rf "$work"
+    [ -n "$php_pin" ] && echo "$php_pin" > "$site_dir/php_version"
+    cd "$site_dir" || return 1
+
+    # From here a failure is a note: the site stays, to be fixed.
+    # Each step marks where its output starts in the log.
+    local mark=0
+    _cove_from_mark() { mark=$(wc -l < "$log" | tr -d ' '); }
+    _cove_from_artisan() { _cove_from_mark; (export COVE_PHP_BIN="$native" PHP_BINARY="$php"; "$php" artisan "$@" --no-interaction) >>"$log" 2>&1; }
+    # Why the last step failed: the message under the last exception's name
+    # (artisan prints the class, then the message), or its last line.
+    _cove_from_why() { laravel_log_why "$log" "$mark"; }
+    # A copied folder's absolute paths into the original (an SQLite file
+    # named in full, the public/storage link) point at this copy instead.
+    [ "$kind" = folder ] && laravel_retarget "$site_dir" "" "$site_name" "$src" >/dev/null 2>&1
+    if [ "$conn" = "sqlite" ]; then
+        local file
+        file=$(laravel_env_get "$site_dir" DB_DATABASE)
+        [ -n "$file" ] || file="database/database.sqlite"
+        [ "$file" = ":memory:" ] && file="$site_dir/database/database.sqlite"
+        [[ "$file" == /* ]] || file="$site_dir/$file"
+        # A file outside the project (another folder's, the original's) is
+        # copied in, so the migrations never touch the one it names.
+        if [[ "$file" != "$site_dir/"* ]]; then
+            local own="$site_dir/database/$(basename "$file")"
+            mkdir -p "$site_dir/database"
+            if [ -f "$file" ] && [ ! -e "$own" ]; then
+                cp "$file" "$own" && COVE_ADD_NOTES+=("ℹ️  Its SQLite database, $file, was copied into the site: database/$(basename "$file").")
+            fi
+            COVE_ENV_SET="{\"DB_DATABASE\":$(cove_json_str "$own")}" laravel_env_set "$site_dir/.env"
+            file="$own"
+        fi
+        [ -e "$file" ] || { mkdir -p "$(dirname "$file")" && : > "$file"; }
+    fi
+    if [ -z "$(laravel_env_get "$site_dir" APP_KEY)" ] && ! _cove_from_artisan key:generate; then
+        COVE_ADD_NOTES+=("⚠️  artisan key:generate failed: $(_cove_from_why)")
+    fi
+    # Compiled views from another machine name its folders. Not
+    # optimize:clear, which clears the cache store too: on Redis that is a
+    # FLUSHDB of a database other sites share. The config, route and event
+    # caches went with bootstrap/cache above.
+    _cove_from_artisan view:clear
+    echo "   - Running migrations…"
+    if ! _cove_from_artisan migrate --force; then
+        COVE_ADD_NOTES+=("⚠️  The migrations failed: $(_cove_from_why)" "   Fix it, then: cove artisan $site_name migrate")
+    elif [ "$seed" = true ]; then
+        echo "   - Seeding the database…"
+        _cove_from_artisan db:seed --force || COVE_ADD_NOTES+=("⚠️  The seeders failed: $(_cove_from_why)")
+    fi
+    [ -e public/storage ] || _cove_from_artisan storage:link
+
+    # The front end, with the package manager the lock file belongs to.
+    if [ -f package.json ]; then
+        local pm=npm
+        if [ -f pnpm-lock.yaml ]; then pm=pnpm
+        elif [ -f yarn.lock ]; then pm=yarn
+        elif [ -f bun.lockb ] || [ -f bun.lock ]; then pm=bun
+        fi
+        if ! cove_find_node; then
+            COVE_ADD_NOTES+=("⚠️  The front end isn't built: Node.js isn't installed. Pages that load Vite assets fail until you install Node, then in the site folder: npm install && npm run build")
+        else
+            if ! command -v "$pm" >/dev/null 2>&1; then
+                if [ "$pm" != npm ] && command -v npm >/dev/null 2>&1; then
+                    COVE_ADD_NOTES+=("ℹ️  The lock file is $pm's, which isn't installed, so npm installed the packages.")
+                    pm=npm
+                else
+                    pm=""
+                    COVE_ADD_NOTES+=("⚠️  The front end isn't built: there's no npm. Install Node.js, then: npm install && npm run build")
+                fi
+            fi
+            if [ -n "$pm" ]; then
+                # Vite plugins may run php artisan (Wayfinder does): Cove's.
+                export PATH="$COVE_TOOLS_DIR:$PATH" PHP_BINARY="$php" COVE_PHP_BIN="$native"
+                echo "   - Installing JavaScript packages ($pm)…"
+                local install=("$pm" install)
+                [ "$pm" = npm ] && install+=(--no-audit --no-fund)
+                _cove_from_mark
+                if ! "${install[@]}" >>"$log" 2>&1; then
+                    COVE_ADD_NOTES+=("⚠️  $pm install failed: $(_cove_from_why)")
+                elif grep -qE '"build"[[:space:]]*:' package.json; then
+                    echo "   - Building the front end…"
+                    _cove_from_mark
+                    "$pm" run build >>"$log" 2>&1 || COVE_ADD_NOTES+=("⚠️  $pm run build failed: $(_cove_from_why)")
+                fi
+            fi
+        fi
+    fi
+
+    # Redis, set up for Cove's with the rest of .env above.
+    if [ -n "$uses" ] && [ "$redis_ok" = true ]; then
+        COVE_ADD_NOTES+=("ℹ️  Its${uses} use Redis: Cove's, on 127.0.0.1:$(cove_redis_port), keys prefixed $(cove_redis_prefix "$site_name").")
+        if ! COVE_PHP_BIN="$native" "$php" -r 'exit(extension_loaded("redis") ? 0 : 1);' 2>/dev/null && [ ! -d vendor/predis/predis ] && [ "$(laravel_env_get "$site_dir" REDIS_CLIENT)" != "predis" ]; then
+            COVE_ADD_NOTES+=("⚠️  This PHP has no redis extension: add the predis client (cove composer $site_name require predis/predis) and set REDIS_CLIENT=predis.")
+        fi
+    elif [ -n "$uses" ]; then
+        COVE_ADD_NOTES+=("⚠️  Its${uses} use Redis, which Cove couldn't start (see logs/laravel-setup.log): set them to database or file in .env.")
+    fi
+    [ "$kind" = folder ] && [ "$conn" != "sqlite" ] && COVE_ADD_NOTES+=("ℹ️  The database started empty: the migrations made its tables, and none of the original's rows came along.")
+    cd ~/ || true
+    return 0
 }
 
 # Downloads a Minn Engine release zip (the latest by default, or the URL or
@@ -17399,6 +21726,41 @@ cove_add_minn() {
     return "$rc"
 }
 
+cove_artisan() {
+    local site_name="$1"
+    if [ -z "$site_name" ] || [ "$site_name" == "--help" ] || [ "$site_name" == "-h" ]; then
+        echo "Usage: cove artisan <site> <artisan arguments…>"
+        echo ""
+        echo "Runs a Laravel site's artisan from anywhere, on the PHP the site serves"
+        echo "with. A --help after the site name is artisan's own."
+        echo ""
+        echo "Examples:"
+        echo "  cove artisan myapp migrate"
+        echo "  cove artisan myapp route:list"
+        echo "  cove artisan myapp make:model Post -m"
+        echo "  cove artisan myapp migrate --help"
+        echo ""
+        echo "To keep a queue worker, the scheduler or Reverb running: cove laravel --help"
+        [ -z "$site_name" ] && exit 1
+        return
+    fi
+    shift
+
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if [ ! -d "$site_dir" ] || ! site_is_laravel "$site_dir"; then
+        site_not_found "$site_name" "Laravel"
+    fi
+
+    write_php_tools || exit 1
+    cd "$site_dir" || exit 1
+    PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" exec "$COVE_TOOLS_DIR/php" artisan "$@"
+}
+
 cove_backup() {
     local site_name="" out="" keep=false format="table"
     local arg
@@ -17434,8 +21796,7 @@ cove_backup() {
         exit 1
     fi
     if [ ! -d "$SITES_DIR/$site_name.localhost/public" ]; then
-        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
 
     local backups_dir="$COVE_DIR/Backups"
@@ -17453,7 +21814,7 @@ cove_backup() {
     local tmp="$out.tmp"
     rm -f "$tmp"
     if command -v zip >/dev/null 2>&1; then
-        ( umask 077; cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; [ "$keep" = true ] || rm -rf "$src"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
+        ( umask 077; cd "$src" && zip -qr -X $( [ "$(snapshot_files .)" = project ] && echo -y ) "$tmp" "$(snapshot_files .)" $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; [ "$keep" = true ] || rm -rf "$src"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
     else
         gum style --foreground red "❌ Error: 'zip' is not installed." "Use cove snapshot $site_name export $id for a tar.gz instead."
         [ "$keep" = true ] || rm -rf "$src"
@@ -17494,14 +21855,128 @@ cove_copy_tree() {
     cp -R "$src" "$dst"
 }
 
+# Copies a project site's folder ($1 → $2): the whole project, without
+# Cove's own files (COVE_SITE_OWN) or what a restore left half-done.
+cove_copy_project() {
+    local src="$1" dst="$2" entry name
+    mkdir -p "$dst" || return 1
+    for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name="${entry##*/}"
+        case " $COVE_SITE_OWN .project.restoring .project.replaced " in *" $name "*) continue ;; esac
+        cove_copy_tree "$entry" "$dst/$name" || return 1
+    done
+}
+
+# Copies one database into a new one ($1 → $2) on MariaDB or, with $3
+# pgsql, PostgreSQL. The new one is dropped again if the import fails.
+# MariaDB needs source_config.
+cove_copy_database() {
+    local from="$1" to="$2" server="${3:-mariadb}" dump rc
+    # Never into one that exists: a failure would drop it.
+    if cove_server_db_exists "$server" "$to"; then
+        echo "   ❌ A database named '$to' already exists, perhaps left by an earlier site." >&2
+        return 1
+    fi
+    dump=$(mktemp) || return 1
+    if [ "$server" = "pgsql" ]; then
+        if ! cove_pg_dump "$from" > "$dump" 2>/dev/null; then
+            rm -f "$dump"
+            return 1
+        fi
+        cove_server_db_create pgsql "$to" && cove_pg_load "$to" < "$dump" 2>/dev/null
+        rc=$?
+    else
+        if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$from" > "$dump" 2>/dev/null; then
+            rm -f "$dump"
+            return 1
+        fi
+        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$to\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+            && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" "$to" < "$dump" 2>/dev/null
+        rc=$?
+    fi
+    rm -f "$dump"
+    if [ "$rc" -ne 0 ]; then
+        cove_server_db_drop "$server" "$to"
+        return 1
+    fi
+}
+
+# A Laravel clone or rename's own database ($1 the site folder, $2 and $3
+# the old and new names): a copy of the one Cove made under the old name,
+# with .env pointed at it. An SQLite file moves with the folder (see
+# laravel_retarget for a full path). Prints the new database, if any.
+# Needs source_config.
+laravel_take_database() {
+    local site_dir="$1" old_name="$2" new_name="$3" db new_db server
+    if db=$(laravel_cove_db "$site_dir" "$old_name"); then
+        server=$(laravel_db_server "$site_dir")
+        if [ "$server" = "pgsql" ]; then
+            ensure_postgres >&2 || return 1
+        fi
+        new_db=$(cove_db_name "$new_name")
+        echo "   - Copying database '$db' to '$new_db'..." >&2
+        cove_copy_database "$db" "$new_db" "$server" || return 1
+        if ! COVE_ENV_SET="{\"DB_DATABASE\":$(cove_json_str "$new_db")}" laravel_env_set "$site_dir/.env"; then
+            cove_server_db_drop "$server" "$new_db"
+            return 1
+        fi
+        echo "$new_db"
+        return 0
+    fi
+    case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
+        sqlite|"") ;;
+        *) echo "   ⚠️  .env names the database '$(laravel_env_get "$site_dir" DB_DATABASE)', which Cove didn't make for this site; it is left as it is." >&2 ;;
+    esac
+}
+
+# A Laravel clone's Reverb settings ($1 the clone's folder, $2 its source's,
+# $3 its name). .env came
+# over as it was, so the clone's app would broadcast to the source's Reverb
+# (its REVERB_PORT is the source's reverb_port, a file of Cove's that isn't
+# copied) under the source's app id, key and secret, which reach the
+# source's browsers. The port goes, as on a site that hasn't turned Reverb
+# on (cove laravel <site> reverb on gives the clone one of its own), and
+# the app gets keys of its own, made the way laravel_reverb_install makes
+# them. A front end already built has the old key in it, so it needs
+# building again. A site without Reverb is left as it is.
+cove_clone_reverb() {
+    local new_dir="$1" source_dir="$2" new_name="$3" pairs=() port rand_id keys=false
+    port=$(cat "$source_dir/reverb_port" 2>/dev/null)
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$(laravel_env_get "$new_dir" REVERB_PORT)" = "$port" ]; then
+        pairs+=("\"REVERB_PORT\":null")
+    fi
+    if [ -n "$(laravel_env_get "$new_dir" REVERB_APP_KEY)" ]; then
+        keys=true
+        rand_id=$(( (RANDOM * 32768 + RANDOM) % 900000 + 100000 ))
+        pairs+=("\"REVERB_APP_ID\":\"$rand_id\"" "\"REVERB_APP_KEY\":\"$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 20)\"" "\"REVERB_APP_SECRET\":\"$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 20)\"")
+    fi
+    [ "${#pairs[@]}" -gt 0 ] || return 0
+    if ! COVE_ENV_SET="{$(IFS=,; echo "${pairs[*]}")}" laravel_env_set "$new_dir/.env"; then
+        gum style --foreground yellow "⚠️  Could not give the clone Reverb settings of its own; its .env still names the source's Reverb (REVERB_PORT, REVERB_APP_*)."
+        return 0
+    fi
+    echo "   - Gave the clone Reverb settings of its own (cove laravel $new_name reverb on gives it a port too)."
+    if [ "$keys" = true ] && [ -d "$new_dir/public/build" ]; then
+        gum style --foreground yellow "⚠️  The clone's built front end still has the source's Reverb key: build it again (npm run build in $new_dir)."
+    fi
+}
+
 cove_clone() {
     cd ~/
     local source_name="$1"
     local new_name="$2"
     local no_reload_flag=false
 
-    for arg in "$@"; do
-        [ "$arg" == "--no-reload" ] && no_reload_flag=true
+    local arg
+    for arg in "${@:3}"; do
+        case "$arg" in
+            --no-reload) no_reload_flag=true ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                echo "Usage: cove clone <source> <new-name>"
+                exit 1 ;;
+        esac
     done
 
     # --- Validation ---
@@ -17518,8 +21993,7 @@ cove_clone() {
 
     local source_dir="$SITES_DIR/$source_name.localhost"
     if [ ! -d "$source_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$source_name.localhost' not found."
-        exit 1
+        site_not_found "$source_name"
     fi
 
     # Same name rules as cove_add — a clone must produce a site add could have.
@@ -17549,18 +22023,44 @@ cove_clone() {
         exit 1
     fi
 
-    local is_wordpress=false
+    local is_wordpress=false is_laravel=false
     [ -f "$source_dir/public/wp-config.php" ] && is_wordpress=true
+    site_is_laravel "$source_dir" && is_laravel=true
+
+    # A WordPress source's database is the one its wp-config.php names (a
+    # site added before 2.5 spells it with a trailing underscore). The
+    # copy's must be new: a failed import drops it.
+    local source_db="" new_db=""
+    if [ "$is_wordpress" = true ]; then
+        source_config
+        source_db=$( (cd "$source_dir/public" && $(get_wp_cmd "$source_dir") config get DB_NAME --skip-plugins --skip-themes 2>/dev/null </dev/null) )
+        new_db=$(cove_db_name "$new_name")
+        if [ -z "$source_db" ]; then
+            gum style --foreground red "❌ Error: Could not read DB_NAME from $source_name.localhost's wp-config.php."
+            exit 1
+        fi
+        if cove_db_exists "$new_db"; then
+            gum style --foreground red "❌ Error: A database named '$new_db' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+            exit 1
+        fi
+    fi
 
     echo "🧬 Cloning $source_name.localhost → $new_name.localhost"
 
     # --- Files ---
-    # Only public/ is cloned. logs/ is the source's own request history and
-    # would be actively misleading under a new hostname, so the clone starts
-    # with an empty one.
+    # Only public/ is cloned, or a project site's whole folder (Laravel, or
+    # an app `cove add --from` brought in). logs/ is the
+    # source's own request history and would be actively misleading under a
+    # new hostname, so the clone starts with an empty one.
     mkdir -p "$new_dir"
     echo "   - Copying files..."
-    if ! cove_copy_tree "$source_dir/public" "$new_dir/public"; then
+    local copied=true
+    if site_is_project "$source_dir"; then
+        cove_copy_project "$source_dir" "$new_dir" || copied=false
+    else
+        cove_copy_tree "$source_dir/public" "$new_dir/public" || copied=false
+    fi
+    if [ "$copied" = false ]; then
         gum style --foreground red "❌ Error: Failed to copy site files."
         rm -rf "$new_dir"
         exit 1
@@ -17588,9 +22088,6 @@ cove_clone() {
         local wp_cmd
         wp_cmd=$(get_wp_cmd "$new_dir")
 
-        local source_db new_db
-        source_db=$(echo "cove_$source_name" | tr -c '[:alnum:]_' '_')
-        new_db=$(echo "cove_$new_name" | tr -c '[:alnum:]_' '_')
 
         local temp_sql
         temp_sql=$(mktemp) || {
@@ -17651,6 +22148,24 @@ cove_clone() {
         inject_mu_plugin "$new_dir/public"
     fi
 
+    if [ "$is_laravel" = true ]; then
+        source_config
+        if ! laravel_take_database "$new_dir" "$source_name" "$new_name" >/dev/null; then
+            gum style --foreground red "❌ Error: Failed to copy the Laravel site's database."
+            rm -rf "$new_dir"
+            exit 1
+        fi
+        laravel_retarget "$new_dir" "$source_name" "$new_name" "$source_dir" || \
+            gum style --foreground yellow "⚠️  Could not update APP_URL in the clone's .env."
+        cove_clone_reverb "$new_dir" "$source_dir" "$new_name"
+        # An SQLite file named by a full path outside the folder isn't copied.
+        local sqlite_path
+        sqlite_path=$(laravel_env_get "$new_dir" DB_DATABASE)
+        if [ "$(laravel_env_get "$new_dir" DB_CONNECTION)" = "sqlite" ] && [[ "$sqlite_path" == /* ]] && [[ "$sqlite_path" != "$new_dir/"* ]]; then
+            gum style --foreground yellow "⚠️  Both sites use the SQLite file $sqlite_path, which is outside the site's folder."
+        fi
+    fi
+
     # Made during `cove demo`: it joins the demo, like a site from `cove add`.
     if [ -f "$COVE_DIR/demo" ] && ! grep -qx "$new_name" "$COVE_DIR/demo"; then
         echo "$new_name" >> "$COVE_DIR/demo"
@@ -17701,6 +22216,41 @@ cove_clone() {
             "✅ Cloned '$source_name' → '$new_name'" \
             "URL: $(url_for "$new_name.localhost")"
     fi
+}
+
+cove_composer() {
+    local site_name="$1"
+    if [ -z "$site_name" ] || [ "$site_name" == "--help" ] || [ "$site_name" == "-h" ]; then
+        echo "Usage: cove composer <site> <composer arguments…>"
+        echo ""
+        echo "Runs Composer in a site's folder, on the PHP the site serves with, so its"
+        echo "platform checks and @php scripts see the same PHP as the site."
+        echo "Cove keeps its own composer.phar in ~/Cove/App, fetched on first use."
+        echo "A --help after the site name is Composer's own."
+        echo ""
+        echo "Examples:"
+        echo "  cove composer myapp require laravel/sanctum"
+        echo "  cove composer myapp update"
+        echo "  cove composer myapp self-update"
+        [ -z "$site_name" ] && exit 1
+        return
+    fi
+    shift
+
+    if ! validate_site_name "$site_name"; then
+        gum style --foreground red "❌ Error: Invalid site name '$site_name'."
+        exit 1
+    fi
+
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if [ ! -f "$site_dir/composer.json" ]; then
+        gum style --foreground red "❌ Error: '$site_name.localhost' has no composer.json in its folder."
+        exit 1
+    fi
+
+    ensure_composer || exit 1
+    cd "$site_dir" || exit 1
+    COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" exec "$COVE_TOOLS_DIR/composer" "$@"
 }
 
 # Refresh the wp.org stable-check cache the dashboard also reads. Best-effort:
@@ -17878,11 +22428,17 @@ cove_core() {
                     --all)              all=true ;;
                     --dry-run)          dry_run=true ;;
                     --yes|-y|--force)   assume_yes=true ;;
-                    -*)                 ;;
+                    # A typo stops it: --dryrun going ahead as an update
+                    # is the one mistake this mustn't make.
+                    -*)
+                        gum style --foreground red "❌ Error: Unknown option '$arg'."
+                        echo "Usage: cove core update <site> [version] [--dry-run]"
+                        echo "       cove core update --all [--dry-run] [--yes]"
+                        exit 1 ;;
                     *)
-                        # Same grammar as `cove add`: a bare token that starts
-                        # with a digit is a version, anything else is a site.
-                        if [[ "$arg" == [0-9]* ]]; then target="$arg"; else site="$arg"; fi ;;
+                        # A version has a dot (6.4, 6.9-RC1); site names
+                        # can't, so 3d-shop is a site.
+                        if [[ "$arg" =~ ^[0-9]+\.[0-9] ]]; then target="$arg"; else site="${arg%.localhost}"; fi ;;
                 esac
             done
 
@@ -17902,8 +22458,7 @@ cove_core() {
             if [ "$all" = false ]; then
                 local public_dir="$SITES_DIR/$site.localhost/public"
                 if [ ! -d "$SITES_DIR/$site.localhost" ]; then
-                    gum style --foreground red "❌ Error: Site '$site.localhost' not found."
-                    exit 1
+                    site_not_found "$site"
                 fi
                 if [ ! -f "$public_dir/wp-config.php" ]; then
                     gum style --foreground red "❌ Error: '$site.localhost' is not a WordPress site."
@@ -17912,6 +22467,23 @@ cove_core() {
                 if site_is_minn "$public_dir"; then
                     gum style --foreground red "❌ Error: '$site.localhost' runs Minn Engine, which has no WordPress core to update." "Update the engine with its own tools instead."
                     exit 1
+                fi
+                # --dry-run holds here too: it used to be read only by --all,
+                # so a single site was updated for real.
+                if [ "$dry_run" = true ]; then
+                    local to="$target"
+                    if [ -z "$to" ]; then
+                        cove_wpver_refresh >/dev/null 2>&1
+                        to=$(grep -oE '"version":"[^"]+","status":"latest"' "$COVE_WPVER_CACHE" 2>/dev/null | head -1 | cut -d'"' -f4)
+                    fi
+                    local now
+                    now=$(cove_wp_version "$public_dir" 2>/dev/null)
+                    if [ -n "$to" ] && [ "$now" = "$to" ]; then
+                        echo "🔎 Dry run — $site.localhost is already on WordPress $now, so there's nothing to update. Nothing changed."
+                    else
+                        echo "🔎 Dry run — $site.localhost is on WordPress ${now:-an unknown version} and would move to ${to:-the latest release}. Nothing changed."
+                    fi
+                    return 0
                 fi
                 source_config
                 echo "🔄 Updating WordPress core on $site.localhost..."
@@ -17957,6 +22529,10 @@ cove_core() {
             fi
 
             if [ "$assume_yes" = false ]; then
+                if [ ! -t 0 ]; then
+                    gum style --foreground red "❌ Error: No terminal to confirm on." "Run it again with --yes to update $count site(s) without asking."
+                    return 1
+                fi
                 if ! gum confirm "Update $count site(s)?"; then
                     echo "Aborted."
                     return 1
@@ -17984,16 +22560,7 @@ cove_core() {
             fi
             ;;
         *)
-            echo "Usage: cove core <check|update>"
-            echo ""
-            echo "  cove core check                    Report the WordPress version of every site."
-            echo "  cove core update <site> [version]  Update one site to the latest, or to a version."
-            echo "  cove core update --all             Update every site that is behind."
-            echo ""
-            echo "Flags:"
-            echo "  --all          Apply to every WordPress site."
-            echo "  --dry-run      List what would change without touching anything."
-            echo "  --yes, -y      Skip the confirmation prompt."
+            cove_unknown_subcommand core "$sub" "check update"
             ;;
     esac
 }
@@ -18142,46 +22709,51 @@ cove_db_list() {
             exit(1);
         }
 
+        // The settings straight from wp-config.php, as wp-cli and Cove write
+        // them: define( NAME, value ) with either quote. Only a site that
+        // works them out some other way (getenv, say) costs a wp-cli run;
+        // three per site used to take most of a minute on a big machine.
+        function wpConst(string $cfg, string $name): ?string {
+            $re = "/define\\s*\\(\\s*[\x27\"]" . $name . "[\x27\"]\\s*,\\s*(?:\x27((?:[^\x27\\\\]|\\\\.)*)\x27|\"((?:[^\"\\\\]|\\\\.)*)\")\\s*\\)/";
+            if (!preg_match($re, $cfg, $m)) return null;
+            $v = isset($m[2]) && $m[2] !== "" ? $m[2] : $m[1];
+            return strtr($v, ["\\\x27" => "\x27", "\\\"" => "\"", "\\\\" => "\\"]);
+        }
+        function wpCli(string $public_dir, string $name): ?string {
+            $out = shell_exec("cd " . escapeshellarg($public_dir) . " && " . getenv("WP_INVOKER") . " config get " . $name . " --skip-plugins --skip-themes --quiet 2>/dev/null");
+            return $out === null ? null : trim($out);
+        }
+
+        // The size of every database, in one query.
+        $sizes = [];
+        $res = $mysqli->query("SELECT table_schema, SUM(data_length + index_length) FROM information_schema.TABLES GROUP BY table_schema");
+        foreach ($res->fetch_all() as $row) $sizes[$row[0]] = (int) $row[1];
+
         $sites_info = [];
         foreach (scandir($sites_dir) as $item) {
             $public_dir = $sites_dir . "/" . $item . "/public";
-            if (is_file($public_dir . "/wp-config.php")) {
-                $site_name = str_replace(".localhost", "", $item);
-                $public_dir_esc = escapeshellarg($public_dir);
-                $cmd_suffix = " --skip-plugins --skip-themes --quiet 2>/dev/null";
-                
-                $name_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_NAME" . $cmd_suffix);
-                if (is_null($name_raw)) { continue; }
-                $site_db_name = trim($name_raw);
-                if (empty($site_db_name)) { continue; }
+            if (!is_file($public_dir . "/wp-config.php")) continue;
+            $site_name = str_replace(".localhost", "", $item);
+            $cfg = (string) @file_get_contents($public_dir . "/wp-config.php");
+            $site_db_name = wpConst($cfg, "DB_NAME") ?? wpCli($public_dir, "DB_NAME");
+            if ($site_db_name === null || $site_db_name === "") continue;
 
-                $site_db_user = "N/A";
-                $site_db_pass = "N/A";
-                $size_str = "N/A";
-
-                if (!str_contains(strtolower($site_db_name), "sqlite")) {
-                    $user_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_USER" . $cmd_suffix);
-                    if (!is_null($user_raw)) { $site_db_user = trim($user_raw); }
-
-                    $pass_raw = shell_exec("cd " . $public_dir_esc . " && " . $wp_invoker . " config get DB_PASSWORD" . $cmd_suffix);
-                    if (!is_null($pass_raw)) { $site_db_pass = trim($pass_raw); }
-                    
-                    $stmt = $mysqli->prepare("SELECT SUM(data_length + index_length) as size FROM information_schema.TABLES WHERE table_schema = ?");
-                    $stmt->bind_param("s", $site_db_name);
-                    $stmt->execute();
-                    $size_bytes = $stmt->get_result()->fetch_assoc()["size"] ?? 0;
-                    $stmt->close();
-                    $size_str = formatSize((int)$size_bytes);
-                }
-
-                $sites_info[] = [
-                    "name" => $site_name,
-                    "db_name" => $site_db_name,
-                    "db_user" => $site_db_user,
-                    "db_pass" => $site_db_pass,
-                    "size" => $size_str,
-                ];
+            $site_db_user = "N/A";
+            $site_db_pass = "N/A";
+            $size_str = "N/A";
+            if (!str_contains(strtolower($site_db_name), "sqlite")) {
+                $site_db_user = wpConst($cfg, "DB_USER") ?? wpCli($public_dir, "DB_USER") ?? "N/A";
+                $site_db_pass = wpConst($cfg, "DB_PASSWORD") ?? wpCli($public_dir, "DB_PASSWORD") ?? "N/A";
+                $size_str = formatSize($sizes[$site_db_name] ?? 0);
             }
+
+            $sites_info[] = [
+                "name" => $site_name,
+                "db_name" => $site_db_name,
+                "db_user" => $site_db_user,
+                "db_pass" => $site_db_pass,
+                "size" => $size_str,
+            ];
         }
 
         if (empty($sites_info)) { exit; }
@@ -18268,8 +22840,7 @@ cove_db_fix_collation() {
     else
         local site_dir="$SITES_DIR/$site_name.localhost"
         if [ ! -f "$site_dir/public/wp-config.php" ]; then
-            gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
-            exit 1
+            site_not_found "$site_name" "WordPress"
         fi
         site_dirs=("$site_dir")
     fi
@@ -18377,9 +22948,22 @@ cove_db_fix_collation() {
     fi
 }
 
+if false; then : <<'exit 0'
+#########################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+exit 0
+fi
 cove_delete() {
     source_config
     local site_name="$1"
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: Which site? Usage: cove delete <name> [--yes]" "See your sites with: cove list"
+        exit 1
+    fi
     # Reject traversal / metacharacters before the name reaches rm -rf and
     # DROP DATABASE below — cove delete never validated it, so `../x` escaped
     # the Sites tree (and the sudo -n rm fallback made that worse).
@@ -18396,10 +22980,16 @@ cove_delete() {
 
     local force_delete=false
     local no_reload=false
-    for arg in "$@"; do
+    local arg
+    for arg in "${@:2}"; do
         case "$arg" in
             --force|--yes|-y) force_delete=true ;;
             --no-reload) no_reload=true ;;
+            # Anything else stops it: a delete can't be undone, so a typo
+            # (or a --dry-run it doesn't have) mustn't go ahead as one.
+            *)
+                gum style --foreground red "❌ Error: Unknown option '$arg'." "Usage: cove delete <name> [--yes]" "It asks before deleting anything unless you add --yes."
+                exit 1 ;;
         esac
     done
     # Non-interactive callers (dashboard shell_exec, scripted cleanup) have no
@@ -18408,8 +22998,7 @@ cove_delete() {
 
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir" ]; then
-        echo "⚠️ Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
 
     if ! $force_delete; then
@@ -18434,20 +23023,56 @@ cove_delete() {
     fi
 
     echo "🔥 Deleting site: $site_name.localhost"
+    laravel_workers_hold "$site_name"
+    laravel_workers_stop_site "$site_name"
     if [ -f "$site_dir/public/wp-config.php" ]; then
-        local db_name wp_cmd
-        wp_cmd=$(get_wp_cmd "$site_dir")
-        # Prefer the DB actually named in wp-config.php. Deriving cove_<name>
-        # blindly (as before) would orphan the real database for any site whose
-        # DB_NAME was changed — and could drop an unrelated database that
-        # happened to match the derived name. Fall back to the derived name only
-        # if wp-config can't be read.
-        db_name=$( (cd "$site_dir/public" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        # Only the database Cove made for the site (either spelling, see
+        # cove_db_is_sites): one wp-config.php was pointed at by hand may be
+        # another site's, or one you use elsewhere. When wp-config.php can't
+        # be read, whichever of Cove's two spellings is there.
+        local db_name
+        db_name=$(wp_site_db "$site_dir")
         if [ -z "$db_name" ]; then
-            db_name=$(echo "cove_$site_name" | tr -c '[:alnum:]_' '_')
+            db_name=$(cove_db_name "$site_name")
+            cove_db_exists "$db_name" || db_name="${db_name}_"
+        elif ! cove_db_is_sites "$db_name" "$site_name"; then
+            echo "🗄️ Keeping database '$db_name': wp-config.php names it, and it isn't one Cove made for this site."
+            db_name=""
         fi
-        echo "🗄️ Deleting database: $db_name"
-        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"
+        if [ -n "$db_name" ]; then
+            echo "🗄️ Deleting database: $db_name"
+            # The files stay when it can't be dropped: without them, nothing
+            # would lead back to the database.
+            if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$db_name\`;"; then
+                laravel_workers_release "$site_name"
+                gum style --foreground red "❌ Error: Could not delete the database '$db_name', so the site stays as it is." "Is MariaDB running? See: cove status"
+                exit 1
+            fi
+        fi
+    elif site_is_laravel "$site_dir"; then
+        # Only the database Cove made for the site: one .env was pointed at
+        # by hand may be shared, or someone else's.
+        local db_name server
+        if db_name=$(laravel_cove_db "$site_dir" "$site_name"); then
+            server=$(laravel_db_server "$site_dir")
+            echo "🗄️ Deleting database: $db_name"
+            # A PostgreSQL that won't start is a database that can't be
+            # dropped, as with MariaDB: the site stays, and with it the way
+            # back to the database (uninstall --purge counts on the failure).
+            if [ "$server" = "pgsql" ] && ! ensure_postgres >/dev/null; then
+                laravel_workers_release "$site_name"
+                gum style --foreground red "❌ Error: PostgreSQL isn't running, so the database '$db_name' can't be deleted and the site stays as it is." "Start it (see: cove status), then delete the site again."
+                exit 1
+            fi
+            if ! cove_server_db_drop "$server" "$db_name"; then
+                laravel_workers_release "$site_name"
+                gum style --foreground red "❌ Error: Could not delete the database '$db_name', so the site stays as it is." "Is $([ "$server" = pgsql ] && echo PostgreSQL || echo MariaDB) running? See: cove status"
+                exit 1
+            fi
+        fi
+        # Its keys in Cove's Redis, when the prefix is the one Cove gave it:
+        # only once the database is gone, as a site that stays keeps them.
+        [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "$(cove_redis_prefix "$site_name")" ] && cove_redis_forget "$(cove_redis_prefix "$site_name")"
     fi
 
     # Don't trust the bare rm — a pre-1.10 dashboard-created site would be
@@ -18462,6 +23087,7 @@ cove_delete() {
         fi
     fi
     echo "✅ Directory deleted."
+    laravel_workers_release "$site_name"
 
     # What Cove kept about the site outside its directory: snapshots, the
     # dashboard preview, and any archive an import left behind. Backups in
@@ -18545,6 +23171,12 @@ demo_db_sync() {
     while IFS= read -r site; do
         [[ "$site" =~ ^[a-z0-9-]+$ ]] || continue
         db=$(sed -nE "s/.*define\([[:space:]]*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]+)['\"].*/\1/p" "$SITES_DIR/$site.localhost/public/wp-config.php" 2>/dev/null | head -1)
+        # A Laravel site's MariaDB database is the one its .env names.
+        if [ -z "$db" ] && site_is_laravel "$SITES_DIR/$site.localhost"; then
+            case "$(laravel_env_get "$SITES_DIR/$site.localhost" DB_CONNECTION)" in
+                mysql|mariadb) db=$(laravel_env_get "$SITES_DIR/$site.localhost" DB_DATABASE) ;;
+            esac
+        fi
         # wp-config.php is the site's to write: a name that isn't plain goes.
         [[ "$db" =~ ^[A-Za-z0-9_-]+$ ]] || continue
         # _ is a wildcard in a GRANT's database name.
@@ -18573,6 +23205,15 @@ demo_db_drop() {
     printf '%s\n' "DROP USER IF EXISTS 'cove_demo'@'localhost';" | MYSQL_PWD="$pw" mysql -u "$user" 2>/dev/null
 }
 
+if false; then : <<'exit 0'
+###########################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+exit 0
+fi
 cove_demo() {
     local demo_file="$COVE_DIR/demo"
     case "${1:-}" in
@@ -18673,23 +23314,46 @@ cove_directive_add_or_update() {
     local have_rules=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --rules) arg_rules="$2"; have_rules=true; shift 2 ;;
+            --rules|--file)
+                if [ $# -lt 2 ]; then
+                    gum style --foreground red "❌ Error: $1 needs a value."
+                    echo "Usage: cove directive <add|update> <name> [rules | --rules \"...\" | --file <path>]"
+                    exit 1
+                fi
+                if [ "$1" = "--rules" ]; then arg_rules="$2"; have_rules=true; else arg_file="$2"; fi
+                shift 2 ;;
             --rules=*) arg_rules="${1#*=}"; have_rules=true; shift ;;
-            --file) arg_file="$2"; shift 2 ;;
             --file=*) arg_file="${1#*=}"; shift ;;
             -h|--help) display_command_help directive; exit 0 ;;
+            # Before the name, a dash word is a mistyped option. After it,
+            # it's part of rules typed as words: `header -Server` removes a
+            # header, and has to reach the rules rather than stop the command.
             -*)
+                if [ -n "$site_name" ]; then
+                    if ! $have_rules; then arg_rules="$1"; have_rules=true
+                    else arg_rules="$arg_rules $1"
+                    fi
+                    shift
+                    continue
+                fi
                 gum style --foreground red "❌ Unknown option: $1"
-                echo "Usage: cove directive <add|update> <name> [--rules \"...\" | --file <path>]"
+                echo "Usage: cove directive <add|update> <name> [rules | --rules \"...\" | --file <path>]"
                 exit 1
                 ;;
-            *) [ -z "$site_name" ] && site_name="$1"; shift ;;
+            # The rules may follow the name: cove directive add mysite "…".
+            # Unquoted, they arrive as words, joined back with spaces.
+            *)
+                if [ -z "$site_name" ]; then site_name="$1"
+                elif ! $have_rules; then arg_rules="$1"; have_rules=true
+                else arg_rules="$arg_rules $1"
+                fi
+                shift ;;
         esac
     done
 
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: Please provide a site name."
-        echo "Usage: cove directive <add|update> <name> [--rules \"...\" | --file <path>]"
+        echo "Usage: cove directive <add|update> <name> [rules | --rules \"...\" | --file <path>]"
         exit 1
     fi
 
@@ -18707,8 +23371,7 @@ cove_directive_add_or_update() {
     local custom_conf_file="$CUSTOM_CADDY_DIR/$site_hostname"
 
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$site_hostname' not found."
-        exit 1
+        site_not_found "$site_hostname"
     fi
 
     local existing_rules=""
@@ -18817,12 +23480,14 @@ cove_directive_list() {
 cove_disable() {
     echo "🛑 Disabling Cove services..."
 
+
     echo "   - Stopping Caddy/FrankenPHP..."
 
     # Stop services on MacOS
     if [ "$OS" == "macos" ]; then
         # Unload the watchdog first so it doesn't SIGKILL Caddy mid-shutdown.
         launchctl unload "$COVE_DIR/com.cove.watchdog.plist" &>/dev/null
+        cove_disable_laravel_workers
         launchctl unload "$COVE_DIR/com.cove.caddy.plist" &>/dev/null
         "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
         echo "   - Stopping MariaDB..."
@@ -18852,6 +23517,7 @@ cove_disable() {
         # Stop the watchdog first so it doesn't SIGKILL cove.service as we
         # bring it down.
         $SUDO_CMD systemctl stop cove-watchdog.timer &>/dev/null || true
+        cove_disable_laravel_workers
         # v1.10+: FrankenPHP runs as cove.service under systemd. Try that
         # first; fall back to `frankenphp stop` in case a user skipped
         # cove_enable since the upgrade and still has an ad-hoc instance.
@@ -18884,6 +23550,15 @@ cove_disable() {
     
     echo "✅ Services stopped."
 }
+# Laravel sites' workers (cove laravel), stopped once the watchdog is gone so
+# it can't start them again; their on/off choice is kept for the next enable.
+cove_disable_laravel_workers() {
+    if ls "$RUN_DIR"/laravel/*.pid >/dev/null 2>&1; then
+        echo "   - Stopping Laravel workers..."
+        cove_laravel --stop-all
+    fi
+}
+
 cove_enable() {
     echo "🚀 Enabling Cove services..."
 
@@ -19416,6 +24091,9 @@ cove_health() {
         gum style --foreground green "✅ All healthy."
     fi
     echo ""
+    # Something critical fails the command, so a script can tell; warnings
+    # alone don't.
+    [ "$crit" -eq 0 ]
 }
 
 # History: a git record of a site's plugins, themes and mu-plugins, kept at
@@ -20038,6 +24716,15 @@ history_rollback() {
 
 # Save every site that changed since its last save. Runs from the watchdog
 # nightly (idle-only), or by hand: cove history --sweep.
+if false; then : <<'exit 0'
+################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+exit 0
+fi
 history_sweep() {
     local idle_only="$1" force="$2" max="$3" quiet="$4"
     local lock="$COVE_DIR/.history-sweep.lock"
@@ -20159,8 +24846,11 @@ cove_history() {
                 echo "       cove history <site> save [--note=\"…\"] [--force] [--background]"
                 echo "       cove history <site> status                   is a save running?"
                 echo "       cove history <site> show <id>               what changed in one save"
-                echo "       cove history <site> diff <id> [--plugin=<slug>|--theme=<slug>|--file=<path>] [--stat]"
-                echo "       cove history <site> rollback <id> (--plugin=<slug>|--theme=<slug>|--mu-plugin=<name>|--file=<path>|--all) [--force]"
+                echo "       cove history <site> diff <id> [--plugin=<slug>|--theme=<slug>|--file=<path>]"
+                echo "                                     [--stat]"
+                echo "       cove history <site> rollback <id> --plugin=<slug>|--theme=<slug>|"
+                echo "                                     --mu-plugin=<name>|--file=<path>|--all"
+                echo "                                     [--force]"
                 echo "       cove history --sweep [--idle-only] [--max=N] [--force]"
                 echo "       cove history --status                        the nightly sweep: running, waiting, or done"
                 echo ""
@@ -20250,8 +24940,7 @@ cove_history() {
     fi
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir/public" ]; then
-        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
     local gitdir content
     gitdir=$(history_gitdir "$site_name")
@@ -20429,6 +25118,11 @@ cove_import() {
                 echo "at any depth) and a .sql or .sql.gz dump; Cove snapshot exports, Local"
                 echo "exports, and most host backups qualify. URLs are rewritten to the new"
                 echo "site's address. Multisite archives are not supported yet."
+                echo ""
+                echo "A Cove backup of a Laravel site (cove backup, or a snapshot export)"
+                echo "becomes a Laravel site: its project, its database, and its .env set up"
+                echo "for this machine and the new name. One of any other app (from"
+                echo "cove add --from) or of a plain site comes back as it was."
                 return
                 ;;
             -*)
@@ -20466,6 +25160,18 @@ cove_import() {
     esac
     archive=$(cd "$(dirname "$archive")" && pwd -P)/$(basename "$archive")
 
+    # A Cove backup of a Laravel site: project/ beside db.sql and meta.
+    if archive_has_laravel_project "$archive"; then
+        cove_import_laravel "$site_name" "$archive" "$no_reload" "$php_pin"
+        return
+    fi
+    # One of any other app (cove add --from) or a plain site.
+    local cove_kind
+    if cove_kind=$(archive_cove_site_kind "$archive"); then
+        cove_import_app "$site_name" "$archive" "$cove_kind" "$no_reload" "$php_pin"
+        return
+    fi
+
     echo "📦 Importing $(basename "$archive") into a new site '$site_name.localhost'…"
     echo "   1/2 Creating the site…"
     # A subprocess: cove add exits on its own failures, and this keeps it
@@ -20495,6 +25201,271 @@ cove_import() {
         cove_reload
     fi
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Imported into $site_name.localhost" "$(url_for "$site_name.localhost")" "Log in with: cove login $site_name"
+}
+
+# Does a backup archive hold a Laravel project the way Cove's backups and
+# snapshot exports pack one, project/artisan at the top?
+archive_has_laravel_project() {
+    local archive="$1"
+    case "$archive" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -Z1 "$archive" 2>/dev/null | grep -qx 'project/artisan'
+            else
+                COVE_ZIP="$archive" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->locateName("project/artisan") !== false ? 0 : 1);'
+            fi ;;
+        *) tar -tzf "$archive" 2>/dev/null | grep -qxE '(\./)?project/artisan' ;;
+    esac
+}
+
+# What a Cove backup that is neither WordPress nor Laravel holds: "app" (an
+# app from cove add --from: project/ beside meta) or "plain" (a plain site:
+# public/ beside meta, with no database or WordPress). Status 1 for anything
+# else, which import then reads as WordPress.
+archive_cove_site_kind() {
+    local names
+    case "$1" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                names=$(unzip -Z1 "$1" 2>/dev/null)
+            else
+                names=$(COVE_ZIP="$1" $(cove_php_cmd) -r '$z = new ZipArchive(); if ($z->open(getenv("COVE_ZIP")) !== true) exit(1); for ($i = 0; $i < $z->numFiles; $i++) echo $z->getNameIndex($i), "\n";' 2>/dev/null)
+            fi ;;
+        *) names=$(tar -tzf "$1" 2>/dev/null) ;;
+    esac
+    names=$(printf '%s\n' "$names" | sed 's#^\./##')
+    printf '%s\n' "$names" | grep -qx 'meta' || return 1
+    if printf '%s\n' "$names" | grep -q '^project/'; then
+        echo app
+    elif printf '%s\n' "$names" | grep -q '^public/' && ! printf '%s\n' "$names" | grep -qxE 'db\.sql|public/wp-(config|settings)\.php'; then
+        echo plain
+    else
+        return 1
+    fi
+}
+
+# A site from a Cove backup of an app (its project moves into place whole,
+# as cove add --from would leave it) or of a plain site (its public/). Nothing
+# in it is run, and it is held to --from's rules: no links out of it, none of
+# Cove's own names at its top.
+cove_import_app() {
+    local site_name="$1" archive="$2" kind="$3" no_reload="$4" php_pin="$5"
+    local site_dir="$SITES_DIR/$site_name.localhost" work names rc protected_name owner src from_src
+    for protected_name in $PROTECTED_NAMES; do
+        if [ "$site_name" == "$protected_name" ]; then
+            gum style --foreground red "❌ Error: '$site_name' is a reserved name. Choose another."
+            exit 1
+        fi
+    done
+    if owner=$(cove_domain_owner "$site_name.localhost"); then
+        gum style --foreground red "❌ Error: '$site_name.localhost' already answers as $owner."
+        exit 1
+    fi
+    if [ -n "$php_pin" ]; then
+        php_pin=$(normalize_php_version "$php_pin")
+        if [ -z "$php_pin" ]; then
+            gum style --foreground red "❌ Error: Invalid PHP version." "Use a version like 8.3 or php@8.3."
+            exit 1
+        fi
+        ensure_php_formula "$php_pin" || exit 1
+    fi
+
+    echo "📦 Importing $(basename "$archive"), $([ "$kind" = app ] && echo "an app" || echo "a plain site"), into '$site_name.localhost'…"
+    case "$archive" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then names=$(unzip -Z1 "$archive" 2>/dev/null); else names=""; fi ;;
+        *) names=$(tar -tzf "$archive" 2>/dev/null) ;;
+    esac
+    if printf '%s\n' "$names" | grep -qE '^/|(^|/)\.\.(/|$)|\\'; then
+        gum style --foreground red "❌ Error: The archive has files that would land outside its own folder (an absolute path or ..), so it isn't unpacked."
+        exit 1
+    fi
+    mkdir -p "$COVE_DIR/cache" || exit 1
+    work=$(mktemp -d "$COVE_DIR/cache/import-$site_name.XXXXXX") || exit 1
+    COVE_IMPORT_WORK="$work"
+    trap 'rm -rf "$COVE_IMPORT_WORK"' EXIT
+    echo "   - Unpacking…"
+    case "$archive" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -o -q "$archive" -d "$work" </dev/null
+            else
+                COVE_ZIP="$archive" COVE_DEST="$work" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->extractTo(getenv("COVE_DEST")) ? 0 : 1);'
+            fi ;;
+        *) tar -xzf "$archive" -C "$work" ;;
+    esac
+    rc=$?
+    src="$work/project"
+    [ "$kind" = plain ] && src="$work/public"
+    if [ "$rc" -ne 0 ] || [ ! -d "$src" ] || [ -L "$src" ]; then
+        gum style --foreground red "❌ Error: Could not unpack the archive's $([ "$kind" = app ] && echo project || echo "public/ folder")."
+        exit 1
+    fi
+    local outside
+    outside=$(cove_links_outside "$src" "$([ "$kind" = app ] && echo "$site_dir" || echo "$site_dir/public")")
+    if [ -n "$outside" ]; then
+        gum style --foreground red "❌ Error: The archive has links that point outside the site, so it isn't used:" "$outside"
+        exit 1
+    fi
+    if [ "$kind" = app ]; then
+        cove_from_check_names "$src" "The archive" || exit 1
+        mv "$src" "$site_dir" || { gum style --foreground red "❌ Error: Could not move the app into $site_dir."; exit 1; }
+    else
+        mkdir -p "$site_dir" && mv "$src" "$site_dir/public" || { rm -rf "$site_dir"; gum style --foreground red "❌ Error: Could not move the site into $site_dir."; exit 1; }
+    fi
+    rm -rf "$work"
+    mkdir -p "$site_dir/logs"
+    [ -n "$php_pin" ] && echo "$php_pin" > "$site_dir/php_version"
+
+    if [ "$no_reload" = false ]; then
+        cove_reload
+    fi
+    from_src=$(sed -n 's/^source=//p' "$site_dir/cove-from" 2>/dev/null)
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Imported into $site_name.localhost" "$(url_for "$site_name.localhost")" "Folder: $site_dir" ${from_src:+"First added from: $from_src"}
+}
+
+# A site from a Cove backup of a Laravel site. The project moves into place
+# whole; a MariaDB dump goes into the database Cove makes for the new name;
+# .env is pointed at this machine's Cove (database credentials, the mail
+# wrapper's path) and at the new name, folder and address.
+cove_import_laravel() {
+    local site_name="$1" archive="$2" no_reload="$3" php_pin="$4"
+    local site_dir="$SITES_DIR/$site_name.localhost" work db_name="" from from_dir owner protected_name pairs=() mail_path rc
+    for protected_name in $PROTECTED_NAMES; do
+        if [ "$site_name" == "$protected_name" ]; then
+            gum style --foreground red "❌ Error: '$site_name' is a reserved name. Choose another."
+            exit 1
+        fi
+    done
+    if owner=$(cove_domain_owner "$site_name.localhost"); then
+        gum style --foreground red "❌ Error: '$site_name.localhost' already answers as $owner."
+        exit 1
+    fi
+    if [ -n "$php_pin" ]; then
+        php_pin=$(normalize_php_version "$php_pin")
+        if [ -z "$php_pin" ]; then
+            gum style --foreground red "❌ Error: Invalid PHP version." "Use a version like 8.3 or php@8.3."
+            exit 1
+        fi
+        ensure_php_formula "$php_pin" || exit 1
+    fi
+
+    echo "📦 Importing $(basename "$archive"), a Laravel site, into '$site_name.localhost'…"
+    local names
+    case "$archive" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then names=$(unzip -Z1 "$archive" 2>/dev/null); else names=""; fi ;;
+        *) names=$(tar -tzf "$archive" 2>/dev/null) ;;
+    esac
+    if printf '%s\n' "$names" | grep -qE '^/|(^|/)\.\.(/|$)|\\'; then
+        gum style --foreground red "❌ Error: The archive has files that would land outside its own folder (an absolute path or ..), so it isn't unpacked."
+        exit 1
+    fi
+    mkdir -p "$COVE_DIR/cache" || exit 1
+    work=$(mktemp -d "$COVE_DIR/cache/import-$site_name.XXXXXX") || exit 1
+    # A Ctrl-C or a kill partway through leaves nothing: the work folder,
+    # and the database once it is made, until the site is in place (see
+    # cove_new_site_cleanup).
+    COVE_FROM_WORK="" COVE_NEW_WORK="$work" COVE_NEW_DB=""
+    trap cove_new_site_cleanup EXIT
+    echo "   - Unpacking…"
+    case "$archive" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -o -q "$archive" -d "$work" </dev/null
+            else
+                COVE_ZIP="$archive" COVE_DEST="$work" $(cove_php_cmd) -r '$z = new ZipArchive(); exit($z->open(getenv("COVE_ZIP")) === true && $z->extractTo(getenv("COVE_DEST")) ? 0 : 1);'
+            fi ;;
+        *) tar -xzf "$archive" -C "$work" ;;
+    esac
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ ! -f "$work/project/artisan" ]; then
+        rm -rf "$work"
+        gum style --foreground red "❌ Error: Could not unpack the archive's Laravel project."
+        exit 1
+    fi
+    from=$(sed -n 's/^site=//p' "$work/meta" 2>/dev/null)
+    from_dir=$(sed -n 's/^folder=//p' "$work/meta" 2>/dev/null)
+
+    # Held to --from's rules, as an app's backup is: no links out of it, none
+    # of Cove's own names at its top. storage:link makes public/storage an
+    # absolute link into the old folder (meta's folder=), which
+    # laravel_retarget would point at the new one after the move: done here
+    # instead, for every link into the old folder, so the check sees where
+    # they will lead.
+    local link target old_dir="${from_dir:-$SITES_DIR/$from.localhost}" outside
+    while IFS= read -r -d '' link; do
+        target=$(readlink "$link")
+        [[ "$target" == "$old_dir/"* ]] && ln -sfn "$site_dir/${target#"$old_dir"/}" "$link"
+    done < <(find "$work/project" -type l -print0 2>/dev/null)
+    outside=$(cove_links_outside "$work/project" "$site_dir")
+    if [ -n "$outside" ]; then
+        gum style --foreground red "❌ Error: The archive has links that point outside the site, so it isn't used:" "$outside"
+        exit 1
+    fi
+    cove_from_check_names "$work/project" "The archive" || exit 1
+
+    # The dump's server: PostgreSQL when meta says so, MariaDB otherwise.
+    local server="mariadb"
+    [ "$(sed -n 's/^db_server=//p' "$work/meta" 2>/dev/null)" = "pgsql" ] && server="pgsql"
+    if [ -f "$work/db.sql" ]; then
+        source_config
+        if [ "$server" = "pgsql" ] && ! ensure_postgres; then
+            rm -rf "$work"
+            exit 1
+        fi
+        db_name=$(cove_db_name "$site_name")
+        if cove_server_db_exists "$server" "$db_name"; then
+            rm -rf "$work"
+            gum style --foreground red "❌ Error: A database named '$db_name' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+            exit 1
+        fi
+        echo "   - Restoring its database into '$db_name'…"
+        local loaded=false
+        # The trap drops it from the moment it exists until the site is in place.
+        if [ "$server" = "pgsql" ]; then
+            cove_server_db_create pgsql "$db_name" && COVE_NEW_DB="pgsql $db_name" \
+                && cove_pg_load "$db_name" < "$work/db.sql" && loaded=true
+        else
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" && COVE_NEW_DB="mariadb $db_name" \
+                && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" --max_allowed_packet=512M "$db_name" < "$work/db.sql" && loaded=true
+        fi
+        if [ "$loaded" != true ]; then
+            cove_server_db_drop "$server" "$db_name"
+            rm -rf "$work"
+            gum style --foreground red "❌ Error: The database import failed; nothing was created."
+            exit 1
+        fi
+        pairs+=("$(cove_laravel_db_env "$server" "$db_name")")
+    fi
+
+    if ! mv "$work/project" "$site_dir"; then
+        [ -n "$db_name" ] && cove_server_db_drop "$server" "$db_name"
+        rm -rf "$work"
+        gum style --foreground red "❌ Error: Could not move the project into $site_dir."
+        exit 1
+    fi
+    # In place: the database is the site's now.
+    COVE_NEW_DB=""
+    rm -rf "$work"
+    mkdir -p "$site_dir/logs"
+    [ -n "$php_pin" ] && echo "$php_pin" > "$site_dir/php_version"
+
+    echo "   - Setting up .env for this machine…"
+    mail_path=$(laravel_env_get "$site_dir" MAIL_SENDMAIL_PATH)
+    [[ "$mail_path" == */cove-sendmail.sh\ -t ]] && pairs+=("\"MAIL_SENDMAIL_PATH\":$(cove_json_str "$APP_DIR/cove-sendmail.sh -t")")
+    if [ "${#pairs[@]}" -gt 0 ] && ! COVE_ENV_SET="{$(IFS=,; echo "${pairs[*]}")}" laravel_env_set "$site_dir/.env"; then
+        gum style --foreground yellow "⚠️  Could not update .env; check its database and mail settings."
+    fi
+    if [ -n "$from" ]; then
+        laravel_retarget "$site_dir" "$from" "$site_name" "${from_dir:-$SITES_DIR/$from.localhost}" || \
+            gum style --foreground yellow "⚠️  Could not update APP_URL in .env."
+    fi
+
+    if [ "$no_reload" = false ]; then
+        cove_reload
+    fi
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Imported into $site_name.localhost" "$(url_for "$site_name.localhost")" "Laravel $(laravel_version "$site_dir")$( [ -n "$db_name" ] && echo " on $db_name" )" "Artisan: cove artisan $site_name <command>"
 }
 
 # A robust function to check, validate, and install a given dependency.
@@ -20590,7 +25561,7 @@ install_dependency() {
                     fi
                 fi
                 echo "   - Downloading and extracting tarball..."
-                if curl -sL "$binary_url" | tar -xz -C "$temp_dir"; then
+                if curl -fsSL "$binary_url" | tar -xz -C "$temp_dir"; then
                     # Find the binary in extracted contents
                     local binary_file
                     binary_file=$(find "$temp_dir" -name "$cmd_name" -type f -executable 2>/dev/null | head -1)
@@ -20606,9 +25577,10 @@ install_dependency() {
                     fi
                 fi
             else
-                # Direct binary download
+                # Direct binary download. --fail, or an HTTP error page
+                # would be installed as the command.
                 echo "   - Downloading binary..."
-                if curl -sL "$binary_url" -o "$temp_dir/$cmd_name"; then
+                if curl -fsSL "$binary_url" -o "$temp_dir/$cmd_name"; then
                     chmod +x "$temp_dir/$cmd_name"
                     if $SUDO_CMD mv "$temp_dir/$cmd_name" "$BIN_DIR/$cmd_name"; then
                         installed_successfully=true
@@ -20651,13 +25623,13 @@ cove_install() {
                 auto_yes=true
                 shift
                 ;;
-            --http) explicit_http="$2"; shift 2 ;;
+            --http) [ $# -ge 2 ] || { echo "❌ Error: --http needs a value." >&2; exit 1; }; explicit_http="$2"; shift 2 ;;
             --http=*) explicit_http="${1#*=}"; shift ;;
-            --https) explicit_https="$2"; shift 2 ;;
+            --https) [ $# -ge 2 ] || { echo "❌ Error: --https needs a value." >&2; exit 1; }; explicit_https="$2"; shift 2 ;;
             --https=*) explicit_https="${1#*=}"; shift ;;
-            --db-root-user) db_root_user="$2"; shift 2 ;;
+            --db-root-user) [ $# -ge 2 ] || { echo "❌ Error: --db-root-user needs a value." >&2; exit 1; }; db_root_user="$2"; shift 2 ;;
             --db-root-user=*) db_root_user="${1#*=}"; shift ;;
-            --db-root-pass) db_root_pass="$2"; shift 2 ;;
+            --db-root-pass) [ $# -ge 2 ] || { echo "❌ Error: --db-root-pass needs a value." >&2; exit 1; }; db_root_pass="$2"; shift 2 ;;
             --db-root-pass=*) db_root_pass="${1#*=}"; shift ;;
             -h|--help)
                 display_command_help install
@@ -20699,32 +25671,37 @@ cove_install() {
     echo "🚀 Starting Cove installation..."
 
     # --- WSL/Systemd Check ---
+    # MariaDB and FrankenPHP run as systemd services on Linux, so without
+    # systemd the install fails at its first `systemctl`, after every
+    # package is in. Stop before installing anything instead. No
+    # /run/systemd/system is systemd's own test for "not booted with it":
+    # WSL without systemd turned on, or a container whose init isn't systemd.
     if [ "$OS" == "linux" ]; then
-        if [ "$IS_WSL" = true ]; then
-            echo "🐧 WSL environment detected."
-            # Check if systemd is running
-            if ! pidof systemd >/dev/null 2>&1; then
-                echo ""
-                echo "⚠️  WARNING: systemd is not running in WSL."
-                echo "   Cove requires systemd for service management."
-                echo ""
-                echo "   To enable systemd in WSL2, add to /etc/wsl.conf:"
-                echo "   [boot]"
-                echo "   systemd=true"
-                echo ""
-                echo "   Then restart WSL with: wsl --shutdown"
-                echo ""
-                if $auto_yes; then
-                    echo "   (--yes set — continuing anyway.)"
-                else
-                    read -p "Do you want to continue anyway? (y/N) " -n 1 -r
-                    echo
-                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                        echo "🚫 Installation cancelled."
-                        exit 0
-                    fi
-                fi
+        [ "$IS_WSL" = true ] && echo "🐧 WSL environment detected."
+        if [ ! -d /run/systemd/system ]; then
+            local lines=("❌ Cove needs systemd, and this system isn't running it.")
+            if [ "$IS_WSL" = true ]; then
+                lines+=(
+                    "To turn it on in WSL, add these lines to /etc/wsl.conf:"
+                    "    [boot]"
+                    "    systemd=true"
+                    "Then run 'wsl --shutdown' in PowerShell, open this distro again,"
+                    "and run 'cove install' again."
+                )
+            else
+                lines+=(
+                    "Cove runs MariaDB and FrankenPHP as systemd services. In a container,"
+                    "start it with systemd as its init, or install Cove in a VM instead."
+                )
             fi
+            echo ""
+            # gum isn't installed yet on a first run.
+            if command -v gum >/dev/null 2>&1; then
+                gum style --border normal --border-foreground red --padding "0 1" "${lines[@]}" >&2
+            else
+                printf '%s\n' "${lines[@]}" >&2
+            fi
+            exit 1
         fi
     fi
 
@@ -20786,6 +25763,11 @@ cove_install() {
                 ;;
             "Pick different"*)
                 prompt_custom_ports 8090 8453
+                ;;
+            *)
+                # Esc or Ctrl-C leaves gum choose with no answer.
+                echo "🚫 Installation cancelled."
+                exit 1
                 ;;
         esac
         port_choice_made=true
@@ -20850,7 +25832,7 @@ cove_install() {
                 gum style --foreground yellow \
                     "⚠️  Services may fail to bind on ${HTTP_PORT}/${HTTPS_PORT}."
                 ;;
-            "Cancel installation")
+            "Cancel installation"|*)
                 echo "🚫 Installation cancelled."
                 exit 1
                 ;;
@@ -20876,39 +25858,52 @@ cove_install() {
     # only fires when it's actually meaningful.
     if [ -d "$ADMINER_DIR" ]; then
         if ! $auto_yes && ! gum confirm "⚠️ Cove already appears to be installed at ~/Cove. Proceeding may overwrite some configurations. Continue?"; then
+            # Non-zero, so the installer that ran us doesn't report success.
             echo "🚫 Installation cancelled."
-            exit 0
+            exit 1
         fi
     fi
     
-    # FrankenPHP uses its own universal installer.
-    # The upstream installer tries to write to /usr/local/bin and silently
-    # falls back to CWD when that fails — which happens on a fresh Apple
-    # Silicon Mac (Homebrew lives at /opt/homebrew/bin). To handle both,
-    # we run the installer from a tempdir and, if the binary ends up there
-    # instead of on PATH, move it into $BIN_DIR ourselves.
+    # FrankenPHP. On Linux, its upstream installer, which sets up the apt/dnf
+    # repository and falls back to a static binary saved in the working
+    # directory. On macOS, the release binary straight from GitHub (as
+    # cove_upgrade does): the upstream installer has no Intel Mac build in
+    # its list and exits there, though releases publish frankenphp-mac-x86_64,
+    # and it saves the download without --fail. Either way the binary may
+    # land in a tempdir rather than on PATH, so we move it into $BIN_DIR.
     if ! command -v frankenphp &> /dev/null; then
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Installing Dependency: frankenphp"
-        echo "   - Using the official FrankenPHP installer..."
         local fp_tmpdir
         fp_tmpdir=$(mktemp -d)
-        if run_installer_script https://frankenphp.dev/install.sh "$fp_tmpdir"; then
-            hash -r
-            if ! command -v frankenphp &> /dev/null && [ -x "$fp_tmpdir/frankenphp" ]; then
-                $SUDO_CMD mv "$fp_tmpdir/frankenphp" "$BIN_DIR/frankenphp"
-                $SUDO_CMD chmod +x "$BIN_DIR/frankenphp"
-                hash -r
-            fi
-            rm -rf "$fp_tmpdir"
-            if command -v frankenphp &> /dev/null; then
-                echo "✅ FrankenPHP installed successfully."
-            else
-                gum style --foreground red "❌ FrankenPHP installer ran but the binary is not on PATH."
+        if [ "$OS" = "macos" ]; then
+            local fp_asset="frankenphp-mac-arm64"
+            [ "$(uname -m)" = "x86_64" ] && fp_asset="frankenphp-mac-x86_64"
+            echo "   - Downloading ${fp_asset} from FrankenPHP's latest release..."
+            if ! curl -L --fail --progress-bar "https://github.com/php/frankenphp/releases/latest/download/${fp_asset}" -o "$fp_tmpdir/frankenphp"; then
+                rm -rf "$fp_tmpdir"
+                gum style --foreground red "❌ Failed to download FrankenPHP (${fp_asset})."
                 exit 1
             fi
+            chmod 755 "$fp_tmpdir/frankenphp"
         else
-            rm -rf "$fp_tmpdir"
-            gum style --foreground red "❌ The FrankenPHP download script failed."
+            echo "   - Using the official FrankenPHP installer..."
+            if ! run_installer_script https://frankenphp.dev/install.sh "$fp_tmpdir"; then
+                rm -rf "$fp_tmpdir"
+                gum style --foreground red "❌ The FrankenPHP download script failed."
+                exit 1
+            fi
+        fi
+        hash -r
+        if ! command -v frankenphp &> /dev/null && [ -x "$fp_tmpdir/frankenphp" ]; then
+            $SUDO_CMD mv "$fp_tmpdir/frankenphp" "$BIN_DIR/frankenphp"
+            $SUDO_CMD chmod +x "$BIN_DIR/frankenphp"
+            hash -r
+        fi
+        rm -rf "$fp_tmpdir"
+        if command -v frankenphp &> /dev/null; then
+            echo "✅ FrankenPHP installed successfully."
+        else
+            gum style --foreground red "❌ FrankenPHP was downloaded but isn't on PATH (expected it in $BIN_DIR)."
             exit 1
         fi
     else
@@ -20918,23 +25913,17 @@ cove_install() {
     # On Linux with apt/dnf, FrankenPHP needs additional PHP extensions installed
     # The DEB/RPM packages don't include all extensions by default
     if [ "$OS" = "linux" ]; then
-        echo "📦 Installing FrankenPHP PHP extensions for WordPress..."
-        if [ "$PKG_MANAGER" = "apt" ]; then
-            # Install required PHP extensions for WordPress via apt
-            $SUDO_CMD apt install -y php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath 2>/dev/null || true
-            echo "✅ FrankenPHP PHP extensions installed."
-        elif [ "$PKG_MANAGER" = "dnf" ]; then
-            # Install required PHP extensions for WordPress via dnf
-            $SUDO_CMD dnf install -y php-zts-mysqli php-zts-curl php-zts-gd php-zts-xml php-zts-mbstring php-zts-zip php-zts-intl php-zts-bcmath 2>/dev/null || true
+        echo "📦 Installing FrankenPHP PHP extensions for WordPress and Laravel..."
+        # Names any package it couldn't install, and fails then.
+        if linux_install_php_extensions; then
             echo "✅ FrankenPHP PHP extensions installed."
         fi
-        
+
         # Verify mysqli is available
         if ! frankenphp php-cli -r "echo implode(',', get_loaded_extensions());" 2>/dev/null | grep -qi mysqli; then
-            gum style --foreground yellow "⚠️ Warning: mysqli extension not found in FrankenPHP."
-            gum style --foreground yellow "   WordPress may not work correctly."
-            gum style --foreground yellow "   Try: sudo apt install php-zts-mysqli (for apt)"
-            gum style --foreground yellow "   Or:  sudo dnf install php-zts-mysqli (for dnf)"
+            gum style --foreground yellow "⚠️ Warning: mysqli extension not found in FrankenPHP." \
+                "   WordPress may not work correctly." \
+                "   Try: sudo $PKG_MANAGER install php-zts-mysqli"
         fi
 
         # Let FrankenPHP bind ports 80/443 as the user. Without this cap,
@@ -21021,7 +26010,13 @@ INI
     # WP-CLI under FrankenPHP 1.13.0's php-cli (see ensure_cli_argv_fix).
     ensure_cli_argv_fix
     echo "🗃️ Downloading Adminer 6.0.0..."
-    curl -sL "https://github.com/vrana/adminer/releases/download/v6.0.0/adminer-6.0.0.php" -o "$ADMINER_DIR/adminer-core.php"
+    # Saved beside it and moved into place, so a failed download (--fail
+    # keeps an HTTP error page out) never replaces a working copy.
+    if ! { curl -fsSL "https://github.com/vrana/adminer/releases/download/v6.0.0/adminer-6.0.0.php" -o "$ADMINER_DIR/adminer-core.php.new" \
+        && mv -f "$ADMINER_DIR/adminer-core.php.new" "$ADMINER_DIR/adminer-core.php"; }; then
+        rm -f "$ADMINER_DIR/adminer-core.php.new"
+        gum style --foreground yellow "⚠️ Couldn't download Adminer: the database manager won't open until 'cove install' runs again."
+    fi
     # Entry point + theme assets. Keep in sync with cove_upgrade so upgraders
     # pick up index.php/head() and CSS/JS changes without a full reinstall.
     deploy_adminer_theme
@@ -21137,7 +26132,8 @@ INI
     # and the root cert to exist (Caddy generated it during the initial
     # cove_enable above). Idempotent — users can re-run via `cove trust`.
     echo ""
-    cove_trust
+    local ssl_trusted=false
+    cove_trust && ssl_trusted=true
 
     # If the user changed HTTPS ports during install AND there are pre-existing
     # WordPress sites in $SITES_DIR, migrate their stored URLs to the new port.
@@ -21148,41 +26144,58 @@ INI
             echo "🔄 Updating WordPress site URLs to new HTTPS port..."
             update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT"
         fi
+        # Laravel sites have no wp-config.php, so they're looked for on their
+        # own: an APP_URL left on the old port sends every redirect and asset
+        # URL to a port nothing listens on. It names only the sites it changes.
+        update_laravel_site_urls_for_port_change
     fi
 
-    # Show post-install guidance
-    echo ""
+    # Show post-install guidance: the ports when they aren't the defaults,
+    # and the certificate workarounds only when cove_trust above didn't
+    # succeed. After a successful trust, browsers show no warning to explain.
     if [ "$HTTPS_PORT" != "443" ]; then
+        echo ""
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
             "📋 First-Time Setup Notes" \
             "Cove is running on custom ports: HTTP ${HTTP_PORT} / HTTPS ${HTTPS_PORT}" \
             "Access the dashboard at: $(url_for cove.localhost)"
-    else
+    elif ! $ssl_trusted; then
+        echo ""
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
             "📋 First-Time Setup Notes"
     fi
-    echo ""
-    echo "  Your browser will show a certificate warning when accessing Cove sites."
-    echo "  This is normal for local development with self-signed certificates."
-    echo ""
-    echo "  Options to resolve:"
-    echo "    1. Click 'Advanced' and 'Proceed' to accept the certificate"
-    echo "    2. Or trust Caddy's root CA certificate system-wide (recommended)"
-    echo ""
-    if [ "$OS" == "macos" ]; then
-        echo "  On macOS, Caddy typically auto-trusts its CA. If not, the CA cert is at:"
-        echo "    ~/Library/Application Support/Caddy/pki/authorities/local/root.crt"
-    else
-        echo "  On Linux, the CA certificate is located at:"
-        echo "    ~/.local/share/caddy/pki/authorities/local/root.crt"
+    if ! $ssl_trusted; then
         echo ""
-        echo "  To trust it system-wide (Ubuntu/Debian):"
-        echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"
-        echo "    sudo update-ca-certificates"
+        echo "  Your browser will show a certificate warning when accessing Cove sites,"
+        echo "  because Cove's local root certificate isn't trusted yet."
         echo ""
-        echo "  For browser-only trust, import the certificate in your browser settings."
+        echo "  Options to resolve:"
+        echo "    1. Click 'Advanced' and 'Proceed' to accept the certificate"
+        echo "    2. Or trust Caddy's root CA certificate system-wide (recommended):"
+        echo "       run 'cove trust' once Cove is running, or follow the steps below"
+        echo ""
+        if [ "$OS" == "macos" ]; then
+            echo "  On macOS, the CA cert is at:"
+            echo "    ~/Library/Application Support/Caddy/pki/authorities/local/root.crt"
+            echo "  Open it in Keychain Access and set it to Always Trust."
+        else
+            echo "  On Linux, the CA certificate is located at:"
+            echo "    ~/.local/share/caddy/pki/authorities/local/root.crt"
+            echo ""
+            if [ "$PKG_MANAGER" = "dnf" ]; then
+                echo "  To trust it system-wide (Fedora/RHEL):"
+                echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /etc/pki/ca-trust/source/anchors/caddy.crt"
+                echo "    sudo update-ca-trust"
+            else
+                echo "  To trust it system-wide (Ubuntu/Debian):"
+                echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"
+                echo "    sudo update-ca-certificates"
+            fi
+            echo ""
+            echo "  For browser-only trust, import the certificate in your browser settings."
+        fi
     fi
-    
+
     if [ "$IS_WSL" = true ]; then
         echo ""
         gum style --foreground yellow "  WSL: Run 'cove wsl-hosts' for Windows hosts file setup instructions."
@@ -21307,8 +26320,7 @@ cove_lan_enable() {
     local site_dir="$SITES_DIR/${site_name}.localhost"
     
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "Error: Site '${site_name}' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
     
     local lan_config="$site_dir/lan_config"
@@ -21509,18 +26521,524 @@ cove_lan() {
             cove_lan_trust "$@"
             ;;
         *)
-            echo "Usage: cove lan <subcommand>"
-            echo ""
-            echo "Manage LAN access to Cove sites for mobile app sync."
-            echo ""
-            echo "Subcommands:"
-            echo "  enable <site>    Enable LAN access for a site"
-            echo "  disable <site>   Disable LAN access for a site"
-            echo "  status           Show which sites have LAN access enabled"
-            echo "  trust            Instructions for trusting Caddy's CA on mobile"
-            exit 0
+            cove_unknown_subcommand lan "$action" "enable disable status trust"
             ;;
     esac
+}
+
+# cove laravel: a Laravel site's background workers. A queue worker
+# (artisan queue:listen, which reloads the app's code for every job) and the
+# scheduler (artisan schedule:work, which runs schedule:run each minute) are
+# what `composer run dev` would start beside `artisan serve`; an app with
+# Reverb can have its websocket server too (artisan reverb:start), on a port
+# of its own that Caddy answers wss://<site>.localhost/app/<key> from. Which ones a
+# site wants is kept in its laravel_workers file; the watchdog starts any
+# that should run and doesn't, so they come back after a crash or a reboot.
+# Each runs in a process group of its own, so stopping one takes the
+# children queue:listen spawns with it. Output goes to logs/laravel-<kind>.log.
+
+LARAVEL_RUN_DIR="$RUN_DIR/laravel"
+LARAVEL_WORKER_KINDS="queue schedule reverb"
+
+# The artisan command a worker runs ($1 the kind), and its arguments ($2 the
+# site, for Reverb's port).
+laravel_worker_command() {
+    case "$1" in
+        queue)    echo "queue:listen" ;;
+        schedule) echo "schedule:work" ;;
+        reverb)   echo "reverb:start" ;;
+    esac
+}
+
+laravel_worker_args() {
+    case "$1" in
+        queue)    echo "queue:listen --tries=1 --timeout=0" ;;
+        schedule) echo "schedule:work" ;;
+        reverb)   echo "reverb:start --host=127.0.0.1 --port=$(laravel_reverb_port "$2")" ;;
+    esac
+}
+
+# The local port a site's Reverb listens on, kept in the site's reverb_port
+# (one of Cove's own files, so a clone gets a port of its own): the one it
+# has, else the first from 8080 up that no other site has and nothing
+# answers on.
+laravel_reverb_port() {
+    local site_dir="$SITES_DIR/$1.localhost" port taken
+    port=$(cat "$site_dir/reverb_port" 2>/dev/null)
+    if [[ "$port" =~ ^[0-9]+$ ]]; then echo "$port"; return 0; fi
+    taken=$(cat "$SITES_DIR"/*.localhost/reverb_port 2>/dev/null)
+    for port in $(seq 8080 8999); do
+        printf '%s\n' "$taken" | grep -qx "$port" && continue
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && continue
+        echo "$port" > "$site_dir/reverb_port" || return 1
+        echo "$port"
+        return 0
+    done
+    return 1
+}
+
+laravel_reverb_available() {
+    [ -d "$SITES_DIR/$1.localhost/vendor/laravel/reverb" ]
+}
+
+# Reverb into an app that hasn't it, as `artisan install:broadcasting
+# --reverb` would, made to work without a terminal: that command boots the
+# app again for reverb:install once broadcasting points at Reverb, which then
+# has no key and fails without a word, and its npm step insists on a TTY. So
+# the keys go into .env first, Composer is Cove's (Linux has no global one),
+# and Echo goes into the front end here. Output in logs/laravel-reverb-install.log.
+laravel_reverb_install() {
+    local site_name="$1" site_dir="$SITES_DIR/$1.localhost" log rand
+    log="$site_dir/logs/laravel-reverb-install.log"
+    mkdir -p "$site_dir/logs"
+    : > "$log"
+    if [ -z "$(laravel_env_get "$site_dir" REVERB_APP_KEY)" ]; then
+        rand() { LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c "$1"; }
+        COVE_ENV_SET="{\"REVERB_APP_ID\":\"$(( (RANDOM * 32768 + RANDOM) % 900000 + 100000 ))\",\"REVERB_APP_KEY\":\"$(rand 20)\",\"REVERB_APP_SECRET\":\"$(rand 20)\"}" laravel_env_set "$site_dir/.env" || return 1
+    fi
+    if ! laravel_reverb_available "$site_name"; then
+        ensure_composer >/dev/null || return 1
+        echo "   - Adding Reverb (composer require laravel/reverb, the broadcasting config, routes/channels.php)…"
+        # Broadcasting off for this run (a real variable beats .env): a try
+        # that failed mid-download leaves .env on reverb and routes/channels.php
+        # in place with no Pusher library, and the app then can't boot to retry.
+        BROADCAST_CONNECTION=null laravel_artisan "$site_dir" install:broadcasting --reverb --without-node --no-interaction --composer="$COMPOSER_PHAR" >>"$log" 2>&1
+        if ! laravel_reverb_available "$site_name"; then
+            gum style --foreground red "❌ Error: Reverb could not be added. See $log"
+            return 1
+        fi
+    fi
+    # reverb:install, which the command above may not have managed: the
+    # config file and the rest of its .env settings (it keeps those there).
+    laravel_artisan "$site_dir" reverb:install --no-interaction >>"$log" 2>&1
+    if [ -f "$site_dir/package.json" ] && ! grep -q '"laravel-echo"' "$site_dir/package.json"; then
+        if cove_find_node && command -v npm >/dev/null 2>&1; then
+            echo "   - Adding Echo to the front end (npm install laravel-echo pusher-js)…"
+            (cd "$site_dir" && PATH="$COVE_TOOLS_DIR:$PATH" PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" npm install --save-dev laravel-echo pusher-js --no-audit --no-fund) >>"$log" 2>&1 \
+                || gum style --foreground yellow "⚠️  npm couldn't add Echo; see $log"
+        else
+            gum style --foreground yellow "⚠️  Node.js isn't installed: add Echo to the front end with npm install --save-dev laravel-echo pusher-js"
+        fi
+    fi
+}
+
+# The front end built again, when there's one and Node to build it, so the
+# browser's Reverb settings (VITE_REVERB_*) take. Quiet; status 1 when there
+# was nothing to build it with, 2 when the build failed.
+laravel_build_front_end() {
+    local site_dir="$SITES_DIR/$1.localhost"
+    [ -f "$site_dir/package.json" ] && grep -qE '"build"[[:space:]]*:' "$site_dir/package.json" || return 1
+    cove_find_node && command -v npm >/dev/null 2>&1 || return 1
+    # Vite plugins may run php artisan: Cove's php comes first on PATH.
+    (cd "$site_dir" && PATH="$COVE_TOOLS_DIR:$PATH" PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" npm run build) >>"$site_dir/logs/laravel-reverb-install.log" 2>&1 || return 2
+}
+
+# Turning Reverb on: the app has it (install:broadcasting --reverb put it
+# there), a port, and .env pointed both ways. The app itself (broadcasting
+# an event) talks to Reverb directly on 127.0.0.1; the browser (Echo) goes
+# through Caddy at wss://<site>.localhost, so https pages can reach it.
+laravel_reverb_enable() {
+    local site_name="$1" site_dir="$SITES_DIR/$1.localhost" key port https
+    if ! laravel_reverb_available "$site_name"; then
+        gum style --foreground red "❌ Error: This app doesn't have Reverb." "Add it, with Echo in the front end, and turn it on: cove laravel $site_name reverb install"
+        return 1
+    fi
+    key=$(laravel_env_get "$site_dir" REVERB_APP_KEY)
+    if ! [[ "$key" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        gum style --foreground red "❌ Error: .env has no REVERB_APP_KEY." "Set Reverb up with: cove artisan $site_name reverb:install"
+        return 1
+    fi
+    if ! port=$(laravel_reverb_port "$site_name"); then
+        gum style --foreground red "❌ Error: No free port between 8080 and 8999 for Reverb."
+        return 1
+    fi
+    https=$(https_port_suffix)
+    https="${https#:}"
+    COVE_ENV_SET="{\"REVERB_HOST\":\"127.0.0.1\",\"REVERB_PORT\":\"$port\",\"REVERB_SCHEME\":\"http\",\"VITE_REVERB_HOST\":\"$site_name.localhost\",\"VITE_REVERB_PORT\":\"${https:-443}\",\"VITE_REVERB_SCHEME\":\"https\"}" laravel_env_set "$site_dir/.env" || return 1
+    laravel_artisan "$site_dir" config:clear >/dev/null 2>&1 || true
+}
+
+# The running worker's pid, or failure. The pid file is checked against the
+# process it names, so a pid reused by something else doesn't count.
+laravel_worker_pid() {
+    local pid args
+    pid=$(cat "$LARAVEL_RUN_DIR/$1-$2.pid" 2>/dev/null) || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    args=$(ps -o args= -p "$pid" 2>/dev/null) || return 1
+    # The site's own artisan, by its full path: another site's worker, or a
+    # process that reused the pid, doesn't count.
+    case "$args" in
+        *"$SITES_DIR/$1.localhost/artisan $(laravel_worker_command "$2")"*) echo "$pid" ;;
+        *) return 1 ;;
+    esac
+}
+
+laravel_worker_wanted() {
+    grep -qx "$2" "$SITES_DIR/$1.localhost/laravel_workers" 2>/dev/null
+}
+
+# While a site is being renamed or deleted, the watchdog leaves its workers
+# alone: a hold in the run dir, taken before they stop and released after
+# (one older than ten minutes is from a run that died, and is ignored).
+laravel_workers_hold() {
+    mkdir -p "$LARAVEL_RUN_DIR" && : > "$LARAVEL_RUN_DIR/$1.hold"
+}
+
+laravel_workers_release() {
+    rm -f "$LARAVEL_RUN_DIR/$1.hold"
+}
+
+laravel_workers_held() {
+    [ -n "$(find "$LARAVEL_RUN_DIR/$1.hold" -mmin -10 2>/dev/null)" ]
+}
+
+# Keeps a worker's log from growing without end: past 5 MB, the last 512 KB
+# stay (written back in place, as the worker holds the file open).
+laravel_worker_trim_log() {
+    local log="$1" tmp
+    [ -f "$log" ] || return 0
+    [ "$(wc -c < "$log" 2>/dev/null | tr -d ' ')" -gt 5242880 ] 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    tail -c 524288 "$log" > "$tmp" && cat "$tmp" > "$log"
+    rm -f "$tmp"
+}
+
+laravel_worker_start() {
+    local site_name="$1" kind="$2" site_dir="$SITES_DIR/$1.localhost"
+    laravel_worker_pid "$site_name" "$kind" >/dev/null && return 0
+    site_is_laravel "$site_dir" || return 1
+    write_php_tools || return 1
+    mkdir -p "$LARAVEL_RUN_DIR" "$site_dir/logs" || return 1
+    laravel_worker_trim_log "$site_dir/logs/laravel-$kind.log"
+    (
+        cd "$site_dir" || exit 1
+        # A process group of its own (job control on), with the pid as its id.
+        set -m
+        PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" \
+            nohup "$COVE_TOOLS_DIR/php" "$site_dir/artisan" $(laravel_worker_args "$kind" "$site_name") >> "$site_dir/logs/laravel-$kind.log" 2>&1 < /dev/null &
+        echo "$!" > "$LARAVEL_RUN_DIR/$site_name-$kind.pid"
+    )
+}
+
+laravel_worker_stop() {
+    local site_name="$1" kind="$2" pid i
+    if pid=$(laravel_worker_pid "$site_name" "$kind"); then
+        # The whole group: queue:listen leaves at once on TERM, but the
+        # queue:work it started finishes the job in hand first.
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+        for i in $(seq 1 30); do
+            kill -0 -- "-$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        kill -KILL -- "-$pid" 2>/dev/null
+    fi
+    rm -f "$LARAVEL_RUN_DIR/$site_name-$kind.pid"
+}
+
+# Every worker of a site stopped (delete, rename, disable); what it wants
+# stays in laravel_workers.
+laravel_workers_stop_site() {
+    local kind
+    for kind in $LARAVEL_WORKER_KINDS; do laravel_worker_stop "$1" "$kind"; done
+}
+
+# A Laravel app's users, through the model its default auth guard's provider
+# names (App\Models\User unless the app changed it): listed, counted with
+# one looked up (check, for cove login), or one added.
+# The script boots the app as artisan would, on the site's PHP; its inputs
+# come by environment (COVE_LU_*), never the command line, and it prints one
+# line of JSON.
+laravel_users_php() {
+cat << 'COVE_LARAVEL_USERS'
+<?php
+// Generated by Cove (commands/laravel): a Laravel app's users, listed or added.
+$out = function ($data, $code = 0) { echo json_encode($data, JSON_UNESCAPED_SLASHES), "\n"; exit($code); };
+try {
+    $base = getcwd();
+    require $base . '/vendor/autoload.php';
+    $app = require $base . '/bootstrap/app.php';
+    $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+    $guard = $app['auth']->guard();
+    if (!method_exists($guard, 'getProvider')) $out(['error' => "This app's default auth guard has no user provider."], 1);
+    $provider = $guard->getProvider();
+    if (!method_exists($provider, 'createModel')) $out(['error' => "This app's users aren't an Eloquent model, so Cove can't list or add them."], 1);
+    $model = $provider->createModel();
+    $table = $model->getTable();
+    $schema = $model->getConnection()->getSchemaBuilder();
+    if (!$schema->hasTable($table)) $out(['error' => "There is no $table table yet: run the migrations first.", 'code' => 'no_table'], 1);
+    $columns = array_flip($schema->getColumnListing($table));
+    $has = function ($c) use ($columns) { return isset($columns[$c]); };
+    $action = getenv('COVE_LU_ACTION') ?: 'list';
+    if ($action === 'check') {
+        // The same lookup the sign-in route makes: an id, or an email.
+        $who = trim((string) getenv('COVE_LU_WHO'));
+        $found = null;
+        if ($who !== '') $found = (ctype_digit($who) ? $model->newQuery()->whereKey($who) : $model->newQuery()->where('email', $who))->exists();
+        $out(['total' => $model->newQuery()->count(), 'found' => $found]);
+    }
+    if ($action === 'list') {
+        $key = $model->getKeyName();
+        $want = array_values(array_filter([$key, 'name', 'email', 'email_verified_at', 'created_at'], $has));
+        $users = [];
+        foreach ($model->newQuery()->orderBy($key)->limit(500)->get($want) as $u) {
+            $users[] = [
+                'id' => $u->getKey(),
+                'name' => $has('name') ? $u->name : null,
+                'email' => $has('email') ? $u->email : null,
+                'verified' => $has('email_verified_at') ? $u->email_verified_at !== null : null,
+                'created' => $has('created_at') && $u->created_at ? (string) $u->created_at : null,
+            ];
+        }
+        $out(['model' => get_class($model), 'total' => $model->newQuery()->count(), 'users' => $users]);
+    }
+    if ($action === 'add') {
+        $email = trim((string) getenv('COVE_LU_EMAIL'));
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) $out(['error' => "'$email' is not an email address."], 1);
+        if (!$has('email') || !$has('password')) $out(['error' => "The $table table has no email or password column, so Cove can't add a user to it."], 1);
+        if ($model->newQuery()->where('email', $email)->exists()) $out(['error' => "There is already a user $email."], 1);
+        $password = (string) getenv('COVE_LU_PASSWORD');
+        $generated = $password === '';
+        if ($generated) $password = method_exists(Illuminate\Support\Str::class, 'password') ? Illuminate\Support\Str::password(16, true, true, false) : bin2hex(random_bytes(8));
+        $name = trim((string) getenv('COVE_LU_NAME'));
+        if ($name === '') $name = ucfirst(strstr($email, '@', true));
+        // Verified from the start, so a verification step doesn't stand in
+        // the way of a local account; the password hashed the app's way.
+        $attrs = ['email' => $email, 'password' => Illuminate\Support\Facades\Hash::make($password)];
+        if ($has('name')) $attrs['name'] = $name;
+        if ($has('email_verified_at')) $attrs['email_verified_at'] = now();
+        $user = $provider->createModel();
+        $user->forceFill($attrs)->save();
+        $out(['id' => $user->getKey(), 'email' => $email, 'name' => $has('name') ? $name : null, 'password' => $generated ? $password : null]);
+    }
+    $out(['error' => 'Unknown action.'], 1);
+} catch (Throwable $e) {
+    $out(['error' => $e->getMessage()], 1);
+}
+COVE_LARAVEL_USERS
+}
+
+# Runs that script in a site ($1 the site name, $2 list, check or add) and
+# prints its JSON line. COVE_LU_WHO, _EMAIL, _NAME and _PASSWORD pass through.
+laravel_users_run() {
+    local site_dir="$SITES_DIR/$1.localhost" script="$APP_DIR/laravel-users.php"
+    write_php_tools || return 1
+    laravel_users_php > "$script.tmp.$$" && mv -f "$script.tmp.$$" "$script" || return 1
+    (cd "$site_dir" && COVE_LU_ACTION="$2" PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" "$COVE_TOOLS_DIR/php" "$script" 2>/dev/null | tail -n 1)
+}
+
+laravel_workers_json() {
+    local site_name="$1" kind pid sep="" out
+    out="{\"site\":\"$site_name\""
+    for kind in $LARAVEL_WORKER_KINDS; do
+        if [ "$kind" = "reverb" ] && ! laravel_reverb_available "$site_name" && ! laravel_worker_wanted "$site_name" reverb; then continue; fi
+        pid=$(laravel_worker_pid "$site_name" "$kind") || pid=""
+        out="$out,\"$kind\":{\"on\":$(laravel_worker_wanted "$site_name" "$kind" && echo true || echo false),\"running\":$([ -n "$pid" ] && echo true || echo false),\"pid\":${pid:-null}}"
+    done
+    echo "$out}"
+}
+
+cove_laravel() {
+    local site_name="" kind="" state="" extra="" user_name="" user_password="${COVE_USER_PASSWORD:-}" format="table" no_reload=false arg
+    while [ $# -gt 0 ]; do
+        arg="$1"; shift
+        # --name, --password and --format take their value after = or apart.
+        case "$arg" in
+            --format|--name|--password)
+                if [ $# -eq 0 ]; then gum style --foreground red "❌ Error: $arg needs a value."; exit 1; fi
+                arg="$arg=$1"; shift ;;
+        esac
+        case "$arg" in
+            --format=*) format="${arg#*=}" ;;
+            --name=*) user_name="${arg#*=}" ;;
+            --password=*) user_password="${arg#*=}" ;;
+            --no-reload) no_reload=true ;;
+            --ensure)
+                # The watchdog: start what should run and doesn't.
+                local f s k
+                for f in "$SITES_DIR"/*.localhost/laravel_workers; do
+                    [ -f "$f" ] || continue
+                    s=$(basename "$(dirname "$f")" .localhost)
+                    laravel_workers_held "$s" && continue
+                    for k in $LARAVEL_WORKER_KINDS; do
+                        if laravel_worker_wanted "$s" "$k"; then
+                            laravel_worker_start "$s" "$k"
+                            laravel_worker_trim_log "$SITES_DIR/$s.localhost/logs/laravel-$k.log"
+                        fi
+                    done
+                done
+                return 0 ;;
+            --stop-all)
+                local p
+                for p in "$LARAVEL_RUN_DIR"/*.pid; do
+                    [ -f "$p" ] || continue
+                    p=$(basename "$p" .pid)
+                    laravel_worker_stop "${p%-*}" "${p##*-}"
+                done
+                return 0 ;;
+            -h|--help)
+                echo "Usage: cove laravel <site> [queue|schedule|reverb] [on|off] [--format=json]"
+                echo "       cove laravel <site> reverb install"
+                echo "       cove laravel <site> users [--format=json]"
+                echo "       cove laravel <site> user add <email> [--name=<name>] [--password=<pw>]"
+                echo ""
+                echo "A Laravel site's background workers and its users. With no arguments,"
+                echo "shows the workers."
+                echo "  queue      artisan queue:listen: runs queued jobs, reloading the app's"
+                echo "             code for each one."
+                echo "  schedule   artisan schedule:work: runs the app's scheduled tasks each"
+                echo "             minute (routes/console.php)."
+                echo "  reverb     artisan reverb:start: the app's websocket server, for an app"
+                echo "             with Reverb (install:broadcasting --reverb). It listens on a"
+                echo "             port of its own; browsers reach it at wss://<site>.localhost,"
+                echo "             through Caddy, and .env is set up for both."
+                echo "A worker that is on keeps running: the watchdog starts it again after a"
+                echo "crash or a reboot. Its output goes to logs/laravel-<worker>.log in the site."
+                echo ""
+                echo "users lists the app's users, through the model its auth config names"
+                echo "(App\\Models\\User in a new app). user add (or users add) creates one,"
+                echo "verified, with a generated password unless one is given"
+                echo "(COVE_USER_PASSWORD works too, and keeps it off the command line);"
+                echo "cove login <site> <email> then signs in as them. --name, --password and"
+                echo "--format take their value after = or apart."
+                echo ""
+                echo "Examples:"
+                echo "  cove laravel myapp"
+                echo "  cove laravel myapp queue on"
+                echo "  cove laravel myapp schedule off"
+                echo "  cove laravel myapp reverb install   (adds Reverb to the app, then turns it on)"
+                echo "  cove laravel myapp reverb on"
+                echo "  cove laravel myapp users"
+                echo "  cove laravel myapp user add you@example.com --name=\"Your Name\""
+                return ;;
+            -*) gum style --foreground red "❌ Error: Unknown option '$arg'."; exit 1 ;;
+            *)
+                if [ -z "$site_name" ]; then site_name="$arg"
+                elif [ -z "$kind" ]; then kind="$arg"
+                elif [ -z "$state" ]; then state="$arg"
+                elif [ -z "$extra" ]; then extra="$arg"
+                fi ;;
+        esac
+    done
+    if [ -z "$site_name" ]; then
+        gum style --foreground red "❌ Error: A site name is required."
+        echo "Usage: cove laravel <site> [queue|schedule|reverb] [on|off]"
+        echo "       cove laravel <site> users"
+        echo "       cove laravel <site> user add <email> [--name=<name>] [--password=<password>]"
+        exit 1
+    fi
+    if ! validate_site_name "$site_name" || ! site_is_laravel "$SITES_DIR/$site_name.localhost"; then
+        site_not_found "$site_name" "Laravel"
+    fi
+    local site_dir="$SITES_DIR/$site_name.localhost"
+
+    # "users add" means "user add"; anything else after "users" is a slip.
+    if [ "$kind" = "users" ] && [ "$state" = "add" ]; then kind="user"; fi
+    if [ "$kind" = "users" ] && [ -n "$state" ]; then
+        gum style --foreground red "❌ Error: Unexpected '$state' after users." "List them: cove laravel $site_name users" "Add one:   cove laravel $site_name user add <email>"
+        exit 1
+    fi
+    if [ "$kind" = "users" ] || [ "$kind" = "user" ]; then
+        local json
+        if [ "$kind" = "user" ]; then
+            if [ "$state" != "add" ] || [ -z "$extra" ]; then
+                gum style --foreground red "❌ Error: Usage: cove laravel $site_name user add <email> [--name=<name>] [--password=<password>]"
+                exit 1
+            fi
+            json=$(COVE_LU_EMAIL="$extra" COVE_LU_NAME="$user_name" COVE_LU_PASSWORD="$user_password" laravel_users_run "$site_name" add)
+        else
+            json=$(laravel_users_run "$site_name" list)
+        fi
+        [ -n "$json" ] || json='{"error":"The app did not answer."}'
+        if [ "$format" = "json" ]; then
+            echo "$json"
+            case "$json" in *'"error"'*) exit 1 ;; esac
+            return
+        fi
+        # The table or the result, read from that JSON on Cove's PHP.
+        COVE_JSON="$json" COVE_KIND="$kind" COVE_SITE="$site_name" "$COVE_TOOLS_DIR/php" -r '
+            $d = json_decode((string) getenv("COVE_JSON"), true);
+            if (!is_array($d)) { fwrite(STDERR, "❌ The app did not answer.\n"); exit(1); }
+            if (isset($d["error"])) { fwrite(STDERR, "❌ " . $d["error"] . "\n"); exit(1); }
+            $site = getenv("COVE_SITE");
+            if (getenv("COVE_KIND") === "user") {
+                echo "✅ Added " . $d["email"] . ($d["name"] ? " (" . $d["name"] . ")" : "") . ", id " . $d["id"] . "\n";
+                if ($d["password"]) echo "   Password: " . $d["password"] . "\n";
+                echo "   Sign in: cove login " . $site . " " . $d["email"] . "\n";
+                exit(0);
+            }
+            if (!$d["users"]) { echo "No users yet. Add one: cove laravel " . $site . " user add you@example.com\n"; exit(0); }
+            printf("  %-6s %-24s %-36s %s\n", "ID", "NAME", "EMAIL", "");
+            foreach ($d["users"] as $u) printf("  %-6s %-24s %-36s %s\n", $u["id"], mb_strimwidth((string) $u["name"], 0, 24, "…"), (string) $u["email"], $u["verified"] === false ? "unverified" : "");
+            if ($d["total"] > count($d["users"])) echo "  … and " . ($d["total"] - count($d["users"])) . " more\n";
+        ' || exit 1
+        return
+    fi
+
+    if [ -n "$kind" ]; then
+        case "$kind" in
+            queue|schedule|reverb) ;;
+            scheduler) kind="schedule" ;;
+            websockets|websocket) kind="reverb" ;;
+            *) gum style --foreground red "❌ Error: Unknown worker '$kind'." "Use queue, schedule or reverb."; exit 1 ;;
+        esac
+        # reverb install: Reverb added to the app, then on, front end built.
+        local built=""
+        if [ "$kind" = "reverb" ] && [ "$state" = "install" ]; then
+            laravel_reverb_install "$site_name" || exit 1
+            state="on"
+            built=pending
+        fi
+        case "$state" in
+            on|start)
+                if [ "$kind" = "reverb" ]; then laravel_reverb_enable "$site_name" || exit 1; fi
+                if [ "$built" = "pending" ]; then
+                    echo "   - Building the front end with Reverb's settings…"
+                    built=yes
+                    laravel_build_front_end "$site_name" || { [ $? -eq 2 ] && built=failed || built=no; }
+                fi
+                grep -qx "$kind" "$site_dir/laravel_workers" 2>/dev/null || echo "$kind" >> "$site_dir/laravel_workers"
+                if ! laravel_worker_start "$site_name" "$kind"; then
+                    gum style --foreground red "❌ Error: Could not start the $kind worker."
+                    exit 1
+                fi ;;
+            off|stop)
+                laravel_worker_stop "$site_name" "$kind"
+                if [ -f "$site_dir/laravel_workers" ]; then
+                    grep -vx "$kind" "$site_dir/laravel_workers" > "$site_dir/laravel_workers.tmp"
+                    if [ -s "$site_dir/laravel_workers.tmp" ]; then mv -f "$site_dir/laravel_workers.tmp" "$site_dir/laravel_workers"; else rm -f "$site_dir/laravel_workers.tmp" "$site_dir/laravel_workers"; fi
+                fi ;;
+            ""|status) ;;
+            *) gum style --foreground red "❌ Error: Expected on or off, not '$state'."; exit 1 ;;
+        esac
+        # Reverb's route in the Caddyfile comes and goes with it.
+        if [ "$kind" = "reverb" ] && [ -n "$state" ] && [ "$state" != "status" ] && [ "$no_reload" = false ]; then
+            cove_reload >/dev/null 2>&1 || gum style --foreground yellow "⚠️  Could not reload Caddy: run cove reload for wss://$site_name.localhost."
+        fi
+        if [ "$kind" = "reverb" ] && { [ "$state" = "on" ] || [ "$state" = "start" ]; } && [ "$format" != "json" ]; then
+            echo "📡 Reverb: wss://$site_name.localhost (port $(laravel_reverb_port "$site_name") on this machine)."
+            if [ "$built" = "failed" ]; then
+                gum style --foreground yellow "⚠️  The front end didn't build; see $site_dir/logs/laravel-reverb-install.log" "   Echo reaches the browser once it does: npm run build, or npm run dev."
+            elif [ "$built" != "yes" ]; then
+                echo "   The browser's settings are in .env (VITE_REVERB_*): build the front end again (npm run build), or run npm run dev."
+            fi
+        fi
+    fi
+
+    if [ "$format" = "json" ]; then
+        laravel_workers_json "$site_name"
+        return
+    fi
+    local k pid line
+    echo "Laravel $(laravel_version "$site_dir") · $site_name.localhost"
+    for k in $LARAVEL_WORKER_KINDS; do
+        if [ "$k" = "reverb" ] && ! laravel_reverb_available "$site_name" && ! laravel_worker_wanted "$site_name" reverb; then continue; fi
+        pid=$(laravel_worker_pid "$site_name" "$k") || pid=""
+        if [ -n "$pid" ]; then line="running (pid $pid)"
+        elif laravel_worker_wanted "$site_name" "$k"; then line="on, not running yet (the watchdog starts it within a minute)"
+        else line="off"
+        fi
+        printf '  %-9s %s\n' "$k" "$line"
+    done
 }
 
 cove_list() {
@@ -21531,12 +27049,22 @@ cove_list() {
             --totals) show_totals=true ;;
             --format=*) format="${arg#*=}" ;;
             --json) format="json" ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown option '$arg'." "Usage: cove list [--totals] [--format=json]" >&2
+                exit 1 ;;
         esac
     done
+    if [ "$format" != table ] && [ "$format" != json ]; then
+        gum style --foreground red "❌ Error: Unknown format '$format'." "Use --format=json, or leave it out for the table." >&2
+        exit 1
+    fi
+    # Colour only for a terminal, and never with NO_COLOR set (no-color.org).
+    local color=0
+    [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && color=1
 
     # PHP script to find, sort, and format the site list with box-drawing characters
     local php_output
-    php_output=$(SITES_DIR="$SITES_DIR" SHOW_TOTALS="$show_totals" LIST_FORMAT="$format" HTTPS_PORT_SUFFIX="$(https_port_suffix)" WPVER_CACHE="$COVE_WPVER_CACHE" frankenphp php-cli -r '
+    php_output=$(SITES_DIR="$SITES_DIR" LIST_COLOR="$color" SHOW_TOTALS="$show_totals" LIST_FORMAT="$format" HTTPS_PORT_SUFFIX="$(https_port_suffix)" WPVER_CACHE="$COVE_WPVER_CACHE" frankenphp php-cli -r '
         function getDirectorySize(string $path): int {
             if (!is_dir($path)) return 0;
             $total_size = 0;
@@ -21607,7 +27135,11 @@ cove_list() {
             $site_path = $sites_dir . "/" . $item;
             if (is_dir($site_path)) {
                 $public_path = $site_path . "/public";
-                $size = $show_totals && is_dir($public_path) ? formatSize(getDirectorySize($public_path)) : null;
+                // A Laravel site is its whole folder (the project), not just public/.
+                $is_laravel = is_file($site_path . "/artisan") && is_file($site_path . "/bootstrap/app.php") && is_file($public_path . "/index.php");
+                $laravel_head = $is_laravel ? @file_get_contents($site_path . "/vendor/laravel/framework/src/Illuminate/Foundation/Application.php", false, null, 0, 16384) : false;
+                $measured = $is_laravel ? $site_path : $public_path;
+                $size = $show_totals && is_dir($measured) ? formatSize(getDirectorySize($measured)) : null;
                 $version = wpVersion($public_path);
                 $status = $version !== null ? ($status_map[$version] ?? null) : null;
                 // The rule Minn Engine uses itself: its install record, or the engine
@@ -21618,10 +27150,11 @@ cove_list() {
                 $sites[] = [
                     "name" => str_replace(".localhost", "", $item),
                     "domain" => "https://" . $item . $port_suffix,
-                    "type" => file_exists($site_path . "/multisite") ? "Multisite" : ($is_minn ? "Minn" : (file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain")),
+                    "type" => file_exists($site_path . "/multisite") ? "Multisite" : ($is_minn ? "Minn" : ($is_laravel ? "Laravel" : (file_exists($site_path . "/public/wp-config.php") ? "WordPress" : "Plain"))),
+                    "laravel_version" => ($laravel_head !== false && preg_match("/const VERSION = \x27([^\x27]+)\x27/", $laravel_head, $lm)) ? $lm[1] : null,
                     "minn_version" => ($minn_head !== false && preg_match("/MINN_ENGINE_VERSION\x27, \x27([^\x27]+)\x27/", $minn_head, $mm)) ? $mm[1] : null,
                     "size" => $size,
-                    "size_bytes" => $show_totals && is_dir($public_path) ? getDirectorySize($public_path) : null,
+                    "size_bytes" => $show_totals && is_dir($measured) ? getDirectorySize($measured) : null,
                     "wp_version" => $version,
                     "wp_status" => $status,
                     "path" => $site_path,
@@ -21647,7 +27180,7 @@ cove_list() {
         // Sort the array: first by type, then by name
         if (getenv("LIST_FORMAT") === "json") {
             usort($sites, fn($a, $b) => strcmp($a["name"], $b["name"]));
-            echo json_encode(array_map(fn($s) => ["name" => $s["name"], "domain" => $s["domain"], "type" => $s["type"], "multisite" => $s["multisite"], "wp_version" => $s["wp_version"], "minn_version" => $s["minn_version"], "wp_status" => $s["wp_status"], "php" => preg_replace("/ pin$/", "", $s["php"]), "php_pinned" => $s["php_pinned"], "path" => $s["path"], "size_bytes" => $s["size_bytes"]], $sites), JSON_UNESCAPED_SLASHES) . "\n";
+            echo json_encode(array_map(fn($s) => ["name" => $s["name"], "domain" => $s["domain"], "type" => $s["type"], "multisite" => $s["multisite"], "wp_version" => $s["wp_version"], "minn_version" => $s["minn_version"], "laravel_version" => $s["laravel_version"], "wp_status" => $s["wp_status"], "php" => preg_replace("/ pin$/", "", $s["php"]), "php_pinned" => $s["php_pinned"], "path" => $s["path"], "size_bytes" => $s["size_bytes"]], $sites), JSON_UNESCAPED_SLASHES) . "\n";
             exit;
         }
         array_multisort(
@@ -21669,18 +27202,25 @@ cove_list() {
         $type_width = 9 + $gap; // "WordPress" + gap
 
         // Sized from the content: versions run from "6.4" to "7.0-RC4 !".
+        // The Version column: what the site runs, WordPress or Laravel or Minn.
+        foreach ($sites as &$site) {
+            if ($site["type"] === "Laravel") $site["wp"] = $site["laravel_version"] ?? "-";
+            elseif ($site["type"] === "Minn") $site["wp"] = $site["minn_version"] ?? "-";
+        }
+        unset($site);
         $wp_width = max(array_map(fn($s) => strlen($s["wp"]), $sites));
-        $wp_width = max($wp_width, 2) + $gap;
+        $wp_width = max($wp_width, 7) + $gap;
 
         $php_width = max(array_map(fn($s) => strlen($s["php"]), $sites));
         $php_width = max($php_width, 3) + $gap;
 
         $size_width = $show_totals ? 11 : 0;
 
-        // ANSI colors
-        $pink = "\033[38;5;212m";
-        $dim = "\033[2m";
-        $reset = "\033[0m";
+        // ANSI colors, for a terminal only
+        $color = getenv("LIST_COLOR") === "1";
+        $pink = $color ? "\033[38;5;212m" : "";
+        $dim = $color ? "\033[2m" : "";
+        $reset = $color ? "\033[0m" : "";
 
         // Box drawing characters
         $tl = "╭"; $tr = "╮"; $bl = "╰"; $br = "╯";
@@ -21698,7 +27238,7 @@ cove_list() {
         $bot_line = $pink . $bl . str_repeat($h, $inner_width) . $br . $reset;
 
         // Header row (white text)
-        $header = $pink . $v . $reset . " " . str_pad("Name", $name_width - 1) . str_pad("Domain", $domain_width) . str_pad("Type", $type_width) . str_pad("WP", $wp_width) . str_pad("PHP", $php_width);
+        $header = $pink . $v . $reset . " " . str_pad("Name", $name_width - 1) . str_pad("Domain", $domain_width) . str_pad("Type", $type_width) . str_pad("Version", $wp_width) . str_pad("PHP", $php_width);
         if ($show_totals) {
             $header .= str_pad("Size", $size_width);
         }
@@ -21958,12 +27498,20 @@ cove_log() {
     fi
     local site_name=""
     local follow_flag=""
+    local which="all"    # all, app (the app's own log) or access (Caddy's)
 
     # Parse arguments
     for arg in "$@"; do
         case "$arg" in
             -f|--follow)
                 follow_flag="-f"
+                ;;
+            --app) which="app" ;;
+            --access) which="access" ;;
+            -*)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                echo "Usage: cove log [site] [--app|--access] [--follow]"
+                exit 1
                 ;;
             *)
                 if [[ -z "$site_name" ]]; then
@@ -21993,36 +27541,36 @@ cove_log() {
     fi
 
     # Normalize site name
-    local site_dir
-    if [[ "$site_name" == *.localhost ]]; then
-        site_dir="$SITES_DIR/$site_name"
-    else
-        site_dir="$SITES_DIR/${site_name}.localhost"
-        site_name="${site_name}.localhost"
-    fi
-
-    if [[ ! -d "$site_dir" ]]; then
-        echo "Site '$site_name' not found."
-        exit 1
-    fi
-
+    site_name="${site_name%.localhost}"
+    validate_site_name "$site_name" && [[ -d "$SITES_DIR/$site_name.localhost" ]] || site_not_found "$site_name"
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    site_name="$site_name.localhost"
     local logs_dir="$site_dir/logs"
-    if [[ ! -d "$logs_dir" ]]; then
-        echo "No logs directory found for '$site_name'."
-        exit 1
+
+    # The app's own log first, where its errors land: the newest file in a
+    # Laravel app's storage/logs (laravel.log, or laravel-<date>.log on the
+    # daily channel), or WordPress's wp-content/debug.log. Then Caddy's
+    # access logs.
+    local app_log=""
+    if site_is_laravel "$site_dir"; then
+        app_log=$(ls -t "$site_dir"/storage/logs/*.log 2>/dev/null | head -1)
+    elif [[ -f "$site_dir/public/wp-content/debug.log" ]]; then
+        app_log="$site_dir/public/wp-content/debug.log"
     fi
 
-    # Find available log files
-    local caddy_log="$logs_dir/caddy.log"
-    local caddy_lan_log="$logs_dir/caddy-lan.log"
-
-    # Determine which logs exist
     local available_logs=()
-    [[ -f "$caddy_log" ]] && available_logs+=("$caddy_log")
-    [[ -f "$caddy_lan_log" ]] && available_logs+=("$caddy_lan_log")
+    [[ "$which" != "access" && -n "$app_log" ]] && available_logs+=("$app_log")
+    if [[ "$which" != "app" ]]; then
+        [[ -f "$logs_dir/caddy.log" ]] && available_logs+=("$logs_dir/caddy.log")
+        [[ -f "$logs_dir/caddy-lan.log" ]] && available_logs+=("$logs_dir/caddy-lan.log")
+    fi
 
     if [[ ${#available_logs[@]} -eq 0 ]]; then
-        echo "No log files found for '$site_name'."
+        if [[ "$which" = "app" ]]; then
+            echo "Nothing logged by the app at $site_name yet."
+        else
+            echo "No log files found for '$site_name'."
+        fi
         exit 1
     fi
 
@@ -22033,7 +27581,7 @@ cove_log() {
         echo "Logs for $site_name (last 50 lines each):"
         for log in "${available_logs[@]}"; do
             echo ""
-            echo "--- $(basename "$log") ---"
+            echo "--- ${log#"$site_dir"/} ---"
             tail -50 "$log"
         done
     fi
@@ -22195,14 +27743,17 @@ cove_login() {
     local user_identifier="" # Optional: the user to log in as
     local subsite_url=""     # Optional: a subsite of a multisite network
     local plain=false        # --plain: print only the URL, for scripts and agents
+    local to=""              # --to: a Laravel site's page to land on
     local arg
     for arg in "$@"; do
         case "$arg" in
             --url=*) subsite_url="${arg#*=}" ;;
+            --to=*) to="${arg#*=}" ;;
+            --user=*) user_identifier="${arg#*=}" ;;
             --plain|--url-only) plain=true ;;
             -*)
                 gum style --foreground red "❌ Error: Unknown option '$arg'."
-                echo "Usage: cove login <site> [<user>] [--url=<subsite-url>]"
+                echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>] [--plain]"
                 exit 1
                 ;;
             *)
@@ -22214,7 +27765,7 @@ cove_login() {
     # 1. Validate that a site name was provided.
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove login <site> [<user>] [--url=<subsite-url>]"
+        echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>] [--plain]"
         exit 1
     fi
 
@@ -22236,8 +27787,11 @@ cove_login() {
 
     # 2. Check if the site exists and is a WordPress installation.
     if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
-        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
-        exit 1
+        if site_is_laravel "$site_dir"; then
+            cove_login_laravel "$site_name" "$user_identifier" "$to" "$plain"
+            return
+        fi
+        site_not_found "$site_name" "WordPress and Laravel"
     fi
 
     # --url picks a subsite of a multisite network: wp-cli then runs in that
@@ -22322,6 +27876,54 @@ cove_login() {
         exit 1
     fi
 }
+# A one-time sign-in link for a Laravel site. The token waits five minutes
+# in ~/Cove/cache/laravel-login (this user's only); the prepend Cove runs
+# before every request (create_whoops_bootstrap) takes it on a request from
+# this machine, boots the app and signs the user in through the app's own
+# auth guard: the user named (an id or an email), or the first one. Then it
+# goes on to --to, the app's dashboard route, or the home page.
+cove_login_laravel() {
+    local site_name="$1" who="$2" to="$3" plain="$4" dir="$COVE_DIR/cache/laravel-login" token url
+    if [ -n "$who" ] && ! [[ "$who" =~ ^[A-Za-z0-9._@+-]{1,120}$ ]]; then
+        gum style --foreground red "❌ Error: '$who' is not a user id or email." >&2
+        exit 1
+    fi
+    if [ -n "$to" ] && { ! [[ "$to" =~ ^/[A-Za-z0-9._~/?=\&%:+,@!-]*$ ]] || [[ "$to" == //* ]]; }; then
+        gum style --foreground red "❌ Error: --to is a path on the site, such as /admin." >&2
+        exit 1
+    fi
+    # Said here, not on the page the link opens: an app with no users yet,
+    # without the one named, or not migrated. Anything else (a guard that
+    # isn't Eloquent's) is left to the sign-in route.
+    local check
+    check=$(COVE_LU_WHO="$who" laravel_users_run "$site_name" check)
+    case "$check" in
+        *'"total":0,'*)
+            gum style --foreground red "❌ Error: $site_name has no users yet. Add one: cove laravel $site_name user add you@example.com" >&2
+            exit 1 ;;
+        *'"found":false'*)
+            gum style --foreground red "❌ Error: No user '$who' in $site_name. List them: cove laravel $site_name users" >&2
+            exit 1 ;;
+        *'"code":"no_table"'*)
+            gum style --foreground red "❌ Error: $site_name has no users table yet: run its migrations (cove artisan $site_name migrate)." >&2
+            exit 1 ;;
+    esac
+    mkdir -p "$dir" && chmod 700 "$dir" || exit 1
+    find "$dir" -type f -mmin +10 -delete 2>/dev/null
+    token=$(openssl rand -hex 16 2>/dev/null)
+    [[ "$token" =~ ^[0-9a-f]{32}$ ]] || token=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    # Every value was checked above: none holds a quote or a backslash.
+    ( umask 077; printf '{"site":"%s","user":"%s","to":"%s","expires":%s}\n' "$site_name" "$who" "$to" "$(( $(date +%s) + 300 ))" > "$dir/$token" ) || exit 1
+    url="$(url_for "$site_name.localhost")/__cove/login/$token"
+    if [ "$plain" = true ]; then
+        echo "$url"
+        return
+    fi
+    local as="$who"
+    [ -n "$as" ] || as="the app's first user"
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🔑 One-time login for $site_name.localhost" "$url" "Signs in as $as; works once, within five minutes, from this machine."
+}
+
 cove_mappings() {
     local site_name="$1"
     local action="$2"
@@ -22338,8 +27940,7 @@ cove_mappings() {
     local mappings_file="$site_dir/mappings"
 
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
 
     # --- 2. List Mappings (Default Action) ---
@@ -22409,9 +28010,11 @@ cove_mappings() {
                 prune_etc_hosts "$domain"
             else
                 gum style --foreground red "❌ Error: Mapping '$domain' not found."
+                exit 1
             fi
         else
-             gum style --foreground red "❌ Error: No mappings exist for this site."
+            gum style --foreground red "❌ Error: No mappings exist for this site."
+            exit 1
         fi
         return 0
     fi
@@ -22434,6 +28037,15 @@ cove_mappings() {
 # uses), because the protocol is JSON and bash has no parser. Its input
 # comes from the environment, never $argv (see ensure_cli_argv_fix).
 
+if false; then : <<'exit 0'
+############################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+exit 0
+fi
 mcp_server_source() {
 cat << 'COVE_MCP_PHP'
 <?php
@@ -22460,13 +28072,14 @@ class ToolError extends Exception {}
 // later call: no editor is offered, and after $timeout seconds it is stopped.
 // Reading ends when the command exits, not at EOF, because a background job
 // it leaves behind (a reload's delayed signal check) keeps the pipe open.
-function cove(array $args, bool $merge = false, int $timeout = 1800): array {
+function cove(array $args, bool $merge = false, int $timeout = 1800, array $env_extra = []): array {
     $cmd = escapeshellarg(COVE_BIN);
     foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string) $a);
     $err = tempnam(sys_get_temp_dir(), 'cove-mcp-');
     $spec = [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => $merge ? ['redirect', 1] : ['file', $err, 'w']];
     $env = getenv();
     $env['EDITOR'] = $env['VISUAL'] = 'false';
+    $env = $env_extra + $env;
     $proc = proc_open($cmd, $spec, $pipes, null, $env);
     if (!is_resource($proc)) { @unlink($err); throw new ToolError('Could not run cove.'); }
     stream_set_blocking($pipes[1], false);
@@ -22551,6 +28164,28 @@ function site_arg(array $a, bool $wordpress = false): string {
     return $s;
 }
 
+// A Laravel site: its folder is the project, with artisan beside public/.
+function laravel_site(string $s): bool {
+    $dir = SITES . "/$s.localhost";
+    return is_file("$dir/artisan") && is_file("$dir/bootstrap/app.php") && is_file("$dir/public/index.php");
+}
+
+function laravel_arg(array $a): string {
+    $s = site_arg($a);
+    if (!laravel_site($s)) throw new ToolError("'$s' is not a Laravel site.");
+    return $s;
+}
+
+// A .env value, quotes removed: enough for the keys this server reads.
+function env_value(string $s, string $key): ?string {
+    $v = null;
+    foreach (@file(SITES . "/$s.localhost/.env", FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+        if (preg_match('/^\s*' . preg_quote($key, '/') . '\s*=\s*(.*)$/', $line, $m)) $v = trim($m[1]);
+    }
+    if ($v !== null && strlen($v) >= 2 && ($v[0] === '"' || $v[0] === "'") && substr($v, -1) === $v[0]) $v = substr($v, 1, -1);
+    return $v;
+}
+
 function int_arg(array $a, string $key, int $default, int $min, int $max): int {
     $v = isset($a[$key]) && is_numeric($a[$key]) ? (int) $a[$key] : $default;
     return max($min, min($max, $v));
@@ -22589,6 +28224,23 @@ function tail_of(string $file, int $bytes = 4194304): string {
     return $data;
 }
 
+// Laravel's log format: an entry starts with "[2026-10-17 06:04:48] local.ERROR:"
+// (the app's timezone, UTC by default), and its stack trace follows.
+function laravel_entries(string $data, int $since): array {
+    $entries = [];
+    $cur = null;
+    foreach (explode("\n", $data) as $line) {
+        if (preg_match('/^\[(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})[^\]]*\]/', $line, $m) && ($t = strtotime(str_replace('T', ' ', $m[1]) . ' UTC')) !== false) {
+            if ($cur !== null) $entries[] = $cur;
+            $cur = ['t' => $t, 'text' => $line];
+        } elseif ($cur !== null && $line !== '') {
+            $cur['text'] .= "\n" . $line;
+        }
+    }
+    if ($cur !== null) $entries[] = $cur;
+    return array_values(array_filter($entries, function ($e) use ($since) { return $e['t'] >= $since; }));
+}
+
 // PHP's log format: an entry starts with "[10-Oct-2026 22:18:01 UTC]", and
 // the lines after it (a stack trace) belong to it.
 function php_entries(string $data, int $since, ?string $must_contain): array {
@@ -22622,6 +28274,55 @@ function log_since(string $file, int $from): string {
     $data = (string) stream_get_contents($fh);
     fclose($fh);
     return $data;
+}
+
+// --- artisan -----------------------------------------------------------------
+
+// What artisan_read runs: artisan commands that only read.
+const ARTISAN_READ = [
+    'about', 'list', 'help', 'env', 'inspire',
+    'route:list', 'migrate:status', 'schedule:list', 'event:list', 'channel:list',
+    'db:show', 'db:table', 'model:show', 'config:show', 'queue:failed',
+];
+
+// Commands that wait on a terminal or run until stopped, and ones that wipe
+// the whole database.
+const ARTISAN_LONG = ['tinker', 'db', 'serve', 'dev', 'pail', 'queue:work', 'queue:listen', 'schedule:work', 'horizon', 'reverb:start', 'octane:start', 'octane:frankenphp'];
+const ARTISAN_WIPE = ['db:wipe', 'migrate:fresh', 'migrate:reset', 'migrate:refresh'];
+
+// The blocked command a name stands for, if any. Artisan takes any
+// unambiguous abbreviation (serv, migrate:fr, m:f) and ignores case, so a
+// name matches when each of its :-parts begins its counterpart's.
+function artisan_names(string $given, array $names): ?string {
+    $g = explode(':', strtolower($given));
+    foreach ($names as $name) {
+        $p = explode(':', $name);
+        if (count($p) !== count($g)) continue;
+        $all = true;
+        foreach ($g as $i => $part) {
+            if ($part === '' || strpos($p[$i], $part) !== 0) { $all = false; break; }
+        }
+        if ($all) return $name;
+    }
+    return null;
+}
+
+function artisan_tokens(array $a): array {
+    $tokens = !empty($a['args']) && is_array($a['args']) ? array_map('strval', array_values($a['args'])) : split_line((string) ($a['command'] ?? ''));
+    if ($tokens && $tokens[0] === 'php') array_shift($tokens);
+    if ($tokens && $tokens[0] === 'artisan') array_shift($tokens);
+    if (!$tokens || $tokens[0] === '' || $tokens[0][0] === '-') throw new ToolError('Give the artisan command as args (["route:list"]) or command ("route:list --json").');
+    // --help anywhere would get Cove's own help for `cove artisan`.
+    if (($h = array_search('--help', $tokens, true)) !== false) { array_splice($tokens, $h, 1); array_unshift($tokens, 'help'); }
+    return $tokens;
+}
+
+function run_artisan(string $site, array $tokens): array {
+    $t0 = microtime(true);
+    [$out, $err, $code] = cove(array_merge(['artisan', $site], $tokens, ['--no-ansi', '--no-interaction']), true, 900);
+    $ms = (int) round((microtime(true) - $t0) * 1000);
+    $out = trim(preg_replace('/\x1b\[[0-9;]*m/', '', (string) $out . ($err !== '' ? "\n" . $err : '')));
+    return text(cut(($out !== '' ? $out : '(no output)') . "\n\n[exit $code · {$ms} ms]"));
 }
 
 // --- WP-CLI ------------------------------------------------------------------
@@ -22814,22 +28515,26 @@ function tools(): array {
     return [
         'list_sites' => [
             'title' => 'List sites',
-            'description' => "Every site in Cove: name, URL (https://<name>.localhost), type (WordPress, Minn, Plain), WordPress and PHP version, multisite, and its folder. A site's files are in <folder>/public.",
+            'description' => "Every site in Cove: name, URL (https://<name>.localhost), type (WordPress, Minn, Laravel, Plain), WordPress or Laravel and PHP version, multisite, and its folder. A site's files are in <folder>/public.",
             'inputSchema' => $obj(['filter' => ['type' => 'string', 'description' => 'Only sites whose name, type or WordPress version contains this.']]),
             'annotations' => $ro,
         ],
         'site_info' => [
             'title' => 'Site details',
-            'description' => "One site in detail: its URL and folders, database name and table prefix, WP_DEBUG, the logs it writes, extra domains, and its twin if it has one.",
+            'description' => "One site in detail: its URL and folders, the database (name and table prefix, or a Laravel app's connection), WP_DEBUG or APP_DEBUG, the logs it writes, a Laravel app's workers, extra domains, and its twin if it has one.",
             'inputSchema' => $obj(['site' => $site], ['site']),
             'annotations' => $ro,
         ],
         'create_site' => [
             'title' => 'Create a site',
-            'description' => "Creates a new local site at https://<name>.localhost with its own database: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a plain static site, or a Minn Engine site. Takes up to a minute.",
+            'description' => "Creates a new local site at https://<name>.localhost: the latest WordPress by default (installed and ready, with a one-time admin login link in the reply), a Laravel application (as `laravel new` makes it, on SQLite unless database says mysql or pgsql; or an existing project from a git URL, folder or archive, set up to run: packages installed, .env written, database made and migrated, front end built), a plain static site (or, with from, any other app served from its public/, nothing in it run), or a Minn Engine site. Takes up to a minute, or a few for an existing project.",
             'inputSchema' => $obj([
                 'name' => ['type' => 'string', 'description' => 'Lowercase letters, numbers and hyphens, e.g. client-demo.'],
-                'type' => ['type' => 'string', 'enum' => ['wordpress', 'plain', 'minn'], 'description' => 'Default wordpress.'],
+                'type' => ['type' => 'string', 'enum' => ['wordpress', 'laravel', 'plain', 'minn'], 'description' => 'Default wordpress.'],
+                'database' => ['type' => 'string', 'enum' => ['sqlite', 'mysql', 'mariadb', 'pgsql'], 'description' => 'Laravel only: sqlite (the default for a new app), a database on Cove\'s MariaDB, or pgsql on Cove\'s PostgreSQL (set up the first time, which takes a few minutes). With from: the one the project names, unless given.'],
+                'from' => ['type' => 'string', 'description' => 'Laravel or plain: an existing project to set up instead of a new one, a git URL (https://…, git@host:path), a folder (copied; the original is left alone) or an archive (.zip, .tar.gz, .tgz or .tar: a file or an https:// link). Not WordPress: that comes in with cove import.'],
+                'branch' => ['type' => 'string', 'description' => 'With a git URL in from: the branch or tag to check out.'],
+                'seed' => ['type' => 'boolean', 'description' => 'Laravel only: run the database seeders after the migrations.'],
                 'wp_version' => ['type' => 'string', 'description' => 'A WordPress version such as 6.8.3, or nightly. Default latest.'],
                 'php' => ['type' => 'string', 'description' => 'Pin an older PHP, e.g. 8.2. Default: the bundled PHP.'],
                 'multisite' => ['type' => 'string', 'enum' => ['subdirectory', 'subdomain'], 'description' => 'Install a multisite network instead of a single site.'],
@@ -22850,8 +28555,8 @@ function tools(): array {
         ],
         'login_link' => [
             'title' => 'One-time login link',
-            'description' => "A one-time link that signs into a WordPress site's admin as an administrator (or the user named), for a browser or a browser-automation tool. Each link works once.",
-            'inputSchema' => $obj(['site' => $site, 'user' => ['type' => 'string', 'description' => 'A user login, email or ID. Default: the first administrator.'], 'url' => ['type' => 'string', 'description' => 'On a multisite network, the subsite to sign into.']], ['site']),
+            'description' => "A one-time link that signs into a WordPress site's admin as an administrator (or the user named), or into a Laravel app as its first user (or the one named, by id or email) through the app's own auth, for a browser or a browser-automation tool. Each link works once.",
+            'inputSchema' => $obj(['site' => $site, 'user' => ['type' => 'string', 'description' => 'A user login, email or ID. Default: the first administrator (WordPress) or the first user (Laravel).'], 'url' => ['type' => 'string', 'description' => 'WordPress: on a multisite network, the subsite to sign into.'], 'to' => ['type' => 'string', 'description' => 'Laravel: the path to land on, e.g. /admin. Default: the dashboard route, or home.']], ['site']),
             'annotations' => $rw,
         ],
         'wp_read' => [
@@ -22897,9 +28602,50 @@ function tools(): array {
             ], ['site']),
             'annotations' => $ro,
         ],
+        'artisan_read' => [
+            'title' => 'Read with artisan',
+            'description' => "Runs an artisan command that only reads, inside a Laravel site: about, route:list, migrate:status, schedule:list, event:list, db:show, db:table, model:show, config:show, queue:failed, list, help. Pass the words after `artisan` as args, e.g. [\"route:list\", \"--json\"]. Anything else is refused: use artisan for that.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'args' => ['type' => 'array', 'items' => ['type' => 'string'], 'description' => 'The arguments after `artisan`, one per item.'],
+                'command' => ['type' => 'string', 'description' => 'Or the same as one line, quotes honoured, e.g. route:list --path=api.'],
+            ], ['site']),
+            'annotations' => $ro,
+        ],
+        'artisan' => [
+            'title' => 'Run artisan',
+            'description' => "Runs any artisan command inside a Laravel site, on the PHP it serves with, e.g. [\"make:model\", \"Post\", \"-m\"] or [\"migrate\"]; for commands that only read, artisan_read needs no approval. Commands that wait on a terminal or run until stopped (tinker, serve, queue:work, schedule:work…) are refused: laravel_workers keeps a queue worker and the scheduler running. So are db:wipe and migrate:fresh/reset/refresh, which wipe the database: take a snapshot first (snapshot_create) and run those in a terminal.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'args' => ['type' => 'array', 'items' => ['type' => 'string'], 'description' => 'The arguments after `artisan`, one per item.'],
+                'command' => ['type' => 'string', 'description' => 'Or the same as one line, quotes honoured. No shell: | ; $( ) are literal.'],
+            ], ['site']),
+            'annotations' => ['readOnlyHint' => false, 'destructiveHint' => true, 'idempotentHint' => false, 'openWorldHint' => false],
+        ],
+        'laravel_workers' => [
+            'title' => 'Laravel workers',
+            'description' => "A Laravel site's queue worker (artisan queue:listen, so queued jobs run), scheduler (artisan schedule:work, so scheduled tasks run each minute) and, for an app with Reverb, its websocket server (artisan reverb:start, reached at wss://<site>.localhost): shows them, or turns one on or off. One that is on keeps running, after a crash or a reboot too. Their output is in the site's logs/laravel-<worker>.log.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'worker' => ['type' => 'string', 'enum' => ['queue', 'schedule', 'reverb'], 'description' => 'Which one to turn on or off. Leave out to see them all. reverb needs the app to have Reverb (cove laravel <site> reverb install adds it).'],
+                'state' => ['type' => 'string', 'enum' => ['on', 'off']],
+            ], ['site']),
+            'annotations' => ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false],
+        ],
+        'laravel_users' => [
+            'title' => 'Laravel users',
+            'description' => "A Laravel app's users, through the user model its auth config names (App\\Models\\User in a new app): lists them, or, given an email, adds one, verified, with the password given or a made-up one it returns. login_link then signs in as any of them.",
+            'inputSchema' => $obj([
+                'site' => $site,
+                'email' => ['type' => 'string', 'description' => 'Adds a user with this email. Leave out to list the users.'],
+                'name' => ['type' => 'string', 'description' => "The new user's name. Default: the email's local part."],
+                'password' => ['type' => 'string', 'description' => "The new user's password. Default: a random one, returned."],
+            ], ['site']),
+            'annotations' => ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => false, 'openWorldHint' => false],
+        ],
         'read_logs' => [
             'title' => 'Read logs',
-            'description' => "Recent log entries: php = PHP errors from Cove's shared error log (just this site's when a site is named), debug = the site's wp-content/debug.log, access = the site's requests (status, method, path, time).",
+            'description' => "Recent log entries: php = PHP errors from Cove's shared error log (just this site's when a site is named), debug = the site's own log (wp-content/debug.log, or a Laravel app's storage/logs), access = the site's requests (status, method, path, time).",
             'inputSchema' => $obj([
                 'site' => $site,
                 'source' => ['type' => 'string', 'enum' => ['php', 'debug', 'access'], 'description' => 'Default php.'],
@@ -22985,7 +28731,7 @@ function tools(): array {
         ],
         'status' => [
             'title' => 'Cove status',
-            'description' => "Whether Cove's web server, MariaDB and Mailpit are answering, and where the dashboard, Adminer and Mailpit are.",
+            'description' => "Whether Cove's web server, MariaDB and Mailpit are answering (and PostgreSQL and Redis, once a Laravel site has had them set up), and where the dashboard, Adminer and Mailpit are.",
             'inputSchema' => $obj([]),
             'annotations' => $ro,
         ],
@@ -23007,7 +28753,7 @@ function call_tool(string $name, array $a): array {
                 }));
             }
             foreach ($sites as &$s) {
-                $s = ['name' => $s['name'], 'url' => $s['domain'], 'type' => $s['type'], 'wp_version' => $s['wp_version'], 'minn_version' => $s['minn_version'], 'multisite' => $s['multisite'], 'php' => $s['php'] . ($s['php_pinned'] ? ' (pinned)' : ''), 'folder' => $s['path']];
+                $s = ['name' => $s['name'], 'url' => $s['domain'], 'type' => $s['type'], 'wp_version' => $s['wp_version'], 'minn_version' => $s['minn_version'], 'laravel_version' => $s['laravel_version'] ?? null, 'multisite' => $s['multisite'], 'php' => $s['php'] . ($s['php_pinned'] ? ' (pinned)' : ''), 'folder' => $s['path']];
                 $s = array_filter($s, function ($v) { return $v !== null; });
             }
             unset($s);
@@ -23027,12 +28773,25 @@ function call_tool(string $name, array $a): array {
                 $info['wp_debug'] = in_array(strtolower((string) wp_config_value($site, 'WP_DEBUG')), ['true', '1'], true);
                 $info['multisite'] = in_array(strtolower((string) wp_config_value($site, 'MULTISITE')), ['true', '1'], true);
                 $info['login'] = 'login_link gives a one-time admin link.';
+            } elseif (laravel_site($site)) {
+                $info['type'] = 'Laravel';
+                $info['files'] = $dir;
+                $app = @file_get_contents("$dir/vendor/laravel/framework/src/Illuminate/Foundation/Application.php", false, null, 0, 16384);
+                if ($app && preg_match("/const VERSION = '([^']+)'/", $app, $m)) $info['laravel_version'] = $m[1];
+                $conn = env_value($site, 'DB_CONNECTION') ?? 'sqlite';
+                $db = env_value($site, 'DB_DATABASE');
+                $info['database'] = $conn === 'sqlite' ? 'SQLite: ' . ($db ? ($db[0] === '/' ? $db : "$dir/$db") : "$dir/database/database.sqlite") : "$conn: " . ($db ?? '?') . ' on ' . (env_value($site, 'DB_HOST') ?? '127.0.0.1');
+                $info['app_debug'] = in_array(strtolower((string) env_value($site, 'APP_DEBUG')), ['true', '1'], true);
+                [$wout] = cove(['laravel', $site, '--format=json']);
+                $workers = json_decode(trim((string) $wout), true);
+                if (is_array($workers)) $info['workers'] = ['queue' => $workers['queue']['running'] ? 'running' : ($workers['queue']['on'] ? 'starting' : 'off'), 'schedule' => $workers['schedule']['running'] ? 'running' : ($workers['schedule']['on'] ? 'starting' : 'off')];
+                $info['commands'] = 'artisan_read and artisan run artisan; laravel_workers runs queued jobs and scheduled tasks; laravel_users lists and adds users.';
             } else {
                 $info['type'] = 'Plain (static files)';
             }
             $pin = trim((string) @file_get_contents("$dir/php_version"));
             if ($pin !== '') $info['php_pinned'] = $pin;
-            $info['logs'] = ['php errors' => COVE_DIR . '/Logs/errors.log (shared by every site)', 'debug' => "$dir/public/wp-content/debug.log", 'access' => "$dir/logs/caddy.log"];
+            $info['logs'] = ['php errors' => COVE_DIR . '/Logs/errors.log (shared by every site)', 'debug' => ($info['type'] === 'Laravel' ? "$dir/storage/logs/laravel.log" : "$dir/public/wp-content/debug.log"), 'access' => "$dir/logs/caddy.log"];
             $maps = @file("$dir/mappings", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
             if ($maps) $info['extra_domains'] = array_values(array_map('trim', $maps));
             $twin = @file_get_contents("$dir/twin");
@@ -23046,9 +28805,35 @@ function call_tool(string $name, array $a): array {
             if (is_dir(SITES . "/$name.localhost")) throw new ToolError("There is already a site named '$name'.");
             $args = ['add', $name];
             $type = (string) ($a['type'] ?? 'wordpress');
-            if ($type === 'plain') $args[] = '--plain';
+            if ($type === 'plain') {
+                $args[] = '--plain';
+                $from = trim((string) ($a['from'] ?? ''));
+                if ($from !== '') {
+                    if (strlen($from) > 500 || $from[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $from)) throw new ToolError('from is a git URL, a folder or an archive.');
+                    $args[] = '--from=' . $from;
+                    if (!empty($a['branch'])) $args[] = '--branch=' . $a['branch'];
+                } elseif (!empty($a['branch'])) throw new ToolError('branch goes with a git URL in from.');
+            }
             elseif ($type === 'minn') $args[] = '--minn';
-            elseif ($type !== 'wordpress') throw new ToolError("type is wordpress, plain or minn.");
+            elseif ($type === 'laravel') {
+                $args[] = 'laravel';
+                if (!empty($a['wp_version']) || !empty($a['multisite'])) throw new ToolError('wp_version and multisite are for WordPress sites.');
+                if (!empty($a['database'])) {
+                    if (!in_array($a['database'], ['sqlite', 'mysql', 'mariadb', 'pgsql'], true)) throw new ToolError('database is sqlite, mysql, mariadb or pgsql.');
+                    $args[] = '--database=' . $a['database'];
+                }
+                $from = trim((string) ($a['from'] ?? ''));
+                if ($from !== '') {
+                    if (strlen($from) > 500 || $from[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $from)) throw new ToolError('from is a git URL, a folder or an archive.');
+                    $args[] = '--from=' . $from;
+                    if (!empty($a['branch'])) $args[] = '--branch=' . $a['branch'];
+                } elseif (!empty($a['branch'])) throw new ToolError('branch goes with a git URL in from.');
+                if (!empty($a['seed'])) $args[] = '--seed';
+            }
+            elseif ($type !== 'wordpress') throw new ToolError("type is wordpress, laravel, plain or minn.");
+            if ($type !== 'laravel' && $type !== 'plain' && !empty($a['from'])) throw new ToolError('from is for Laravel or plain sites.');
+            if ($type !== 'laravel' && !empty($a['seed'])) throw new ToolError('seed is for Laravel sites.');
+            if ($type !== 'laravel' && !empty($a['database'])) throw new ToolError('database is for Laravel sites; WordPress always gets MariaDB.');
             if (!empty($a['wp_version'])) {
                 if (!preg_match('/^(latest|nightly|\d+\.\d+(\.\d+)?([-.][a-zA-Z0-9.]+)?)$/', (string) $a['wp_version'])) throw new ToolError('wp_version is a version such as 6.8.3, or latest or nightly.');
                 $args[] = '--wp-version=' . $a['wp_version'];
@@ -23064,7 +28849,9 @@ function call_tool(string $name, array $a): array {
             [$out, , $code] = cove($args, true);
             $out = clean($out);
             if ($code !== 0 || !is_dir(SITES . "/$name.localhost/public")) throw new ToolError(cut($out) ?: 'cove add failed.');
-            $reply = 'Created ' . url_of($name) . "\nFiles: " . SITES . "/$name.localhost/public";
+            // An app from `from` is the whole folder, its public/ served.
+            $project = $type === 'laravel' || is_file(SITES . "/$name.localhost/cove-from");
+            $reply = 'Created ' . url_of($name) . "\nFiles: " . SITES . "/$name.localhost" . ($project ? ' (the project; public/ is the webroot)' : '/public');
             if (preg_match('~https://\S*wp-login\.php\S*~', $out, $m)) $reply .= "\nOne-time admin login: " . $m[0];
             $lines = explode("\n", $out);
             return text($reply . "\n\n" . implode("\n", array_slice($lines, -25)));
@@ -23090,7 +28877,18 @@ function call_tool(string $name, array $a): array {
             return text($out);
 
         case 'login_link':
-            $site = site_arg($a, true);
+            $site = site_arg($a);
+            if (laravel_site($site)) {
+                // A Laravel app: Cove signs in through the app's own auth.
+                $args = ['login', $site];
+                if (!empty($a['user'])) $args[] = (string) $a['user'];
+                if (!empty($a['to'])) $args[] = '--to=' . $a['to'];
+                $args[] = '--plain';
+                [$out, $err, $code] = cove($args);
+                if ($code !== 0 || !preg_match('~https://\S+/__cove/login/[0-9a-f]{32}~', $out, $m)) throw new ToolError(clean($out . "\n" . $err) ?: 'cove login failed.');
+                return text($m[0] . "\n\nSigns in as " . (!empty($a['user']) ? $a['user'] : "the app's first user") . " through the app's own auth guard, then goes to " . (!empty($a['to']) ? $a['to'] : "its dashboard route, or home") . ". Works once, within five minutes, in a browser on this machine.");
+            }
+            if (!is_file(SITES . "/$site.localhost/public/wp-config.php")) throw new ToolError("'$site' has no admin to sign in to: it is a plain static site.");
             $args = ['login', $site];
             if (!empty($a['user'])) $args[] = (string) $a['user'];
             if (!empty($a['url'])) $args[] = '--url=' . $a['url'];
@@ -23133,6 +28931,55 @@ function call_tool(string $name, array $a): array {
                 throw new ToolError("`wp $pair` can wipe a whole database, which this server leaves to a terminal. Take a snapshot first (snapshot_create) and run it yourself with: cove wp $site …");
             }
             return run_wp($site, $tokens);
+
+        case 'artisan_read':
+            $site = laravel_arg($a);
+            $tokens = artisan_tokens($a);
+            if (!in_array(strtolower($tokens[0]), ARTISAN_READ, true)) throw new ToolError('artisan_read runs only commands that read (route:list, migrate:status, about…). `artisan ' . $tokens[0] . '` is not one of them: use artisan.');
+            return run_artisan($site, $tokens);
+
+        case 'artisan':
+            $site = laravel_arg($a);
+            $tokens = artisan_tokens($a);
+            if ($cmd = artisan_names($tokens[0], ARTISAN_LONG)) throw new ToolError("artisan $cmd waits on a terminal or runs until stopped, so it can't run here." . (in_array($cmd, ['queue:work', 'queue:listen', 'schedule:work'], true) ? ' laravel_workers keeps a queue worker and the scheduler running.' : ''));
+            if ($cmd = artisan_names($tokens[0], ARTISAN_WIPE)) throw new ToolError("`artisan $cmd` wipes the whole database, which this server leaves to a terminal. Take a snapshot first (snapshot_create) and run it yourself with: cove artisan $site $cmd"); 
+            return run_artisan($site, $tokens);
+
+        case 'laravel_workers':
+            $site = laravel_arg($a);
+            $args = ['laravel', $site];
+            if (!empty($a['worker'])) {
+                if (!in_array($a['worker'], ['queue', 'schedule', 'reverb'], true) || !in_array($a['state'] ?? '', ['on', 'off'], true)) throw new ToolError('worker is queue, schedule or reverb, and state is on or off.');
+                array_push($args, $a['worker'], $a['state']);
+            }
+            $args[] = '--format=json';
+            [$out, $err, $code] = cove($args);
+            $w = json_decode(trim((string) $out), true);
+            if ($code !== 0 || !is_array($w)) throw new ToolError(clean($out . "\n" . $err) ?: 'cove laravel failed.');
+            $say = function ($x) { return $x['running'] ? 'running (pid ' . $x['pid'] . ')' : ($x['on'] ? 'on, starting' : 'off'); };
+            return text("queue worker: " . $say($w['queue']) . "\nscheduler: " . $say($w['schedule']) . (isset($w['reverb']) ? "\nreverb: " . $say($w['reverb']) . " (wss://$site.localhost)" : '') . "\nOutput: " . SITES . "/$site.localhost/logs/laravel-<worker>.log");
+
+        case 'laravel_users':
+            $site = laravel_arg($a);
+            $email = trim((string) ($a['email'] ?? ''));
+            if ($email === '') {
+                [$out, $err] = cove(['laravel', $site, 'users', '--format=json']);
+                $d = json_decode(trim((string) $out), true);
+                if (!is_array($d) || isset($d['error'])) throw new ToolError(($d['error'] ?? '') ?: (clean($out . "\n" . $err) ?: 'cove laravel failed.'));
+                if (!$d['users']) return text("$site has no users yet. laravel_users with an email adds one.");
+                $rows = [];
+                foreach ($d['users'] as $u) $rows[] = '#' . $u['id'] . '  ' . $u['email'] . ($u['name'] !== null && $u['name'] !== '' ? '  (' . $u['name'] . ')' : '') . ($u['verified'] === false ? '  unverified' : '');
+                return text(implode("\n", $rows) . ($d['total'] > count($d['users']) ? "\n… and " . ($d['total'] - count($d['users'])) . ' more' : '') . "\n\nModel: " . $d['model']);
+            }
+            if ($email[0] === '-' || !filter_var($email, FILTER_VALIDATE_EMAIL)) throw new ToolError('email is an email address.');
+            $args = ['laravel', $site, 'user', 'add', $email];
+            if (($a['name'] ?? '') !== '') $args[] = '--name=' . $a['name'];
+            $args[] = '--format=json';
+            // The password goes by environment, never on a command line.
+            [$out, $err] = cove($args, false, 300, ['COVE_USER_PASSWORD' => (string) ($a['password'] ?? '')]);
+            $d = json_decode(trim((string) $out), true);
+            if (!is_array($d) || isset($d['error'])) throw new ToolError(($d['error'] ?? '') ?: (clean($out . "\n" . $err) ?: 'cove laravel failed.'));
+            return text('Added ' . $d['email'] . ' (id ' . $d['id'] . ')' . ($d['password'] ? ', password: ' . $d['password'] : '') . '. login_link with user ' . $d['email'] . ' signs in as them.');
 
         case 'check_page':
             $site = site_arg($a);
@@ -23229,6 +29076,12 @@ function call_tool(string $name, array $a): array {
                 if ($site === null && demo_sites() !== null) throw new ToolError('During cove demo, name a site.');
                 $file = COVE_DIR . '/Logs/errors.log';
                 $entries = php_entries(tail_of($file, $site ? 12582912 : 4194304), $since, $site ? "/Sites/$site.localhost/" : null);
+            } elseif ($source === 'debug' && $site !== null && laravel_site($site)) {
+                // A Laravel app's own log: its newest file in storage/logs.
+                $logs = glob(SITES . "/$site.localhost/storage/logs/*.log") ?: [];
+                usort($logs, function ($x, $y) { return filemtime($y) <=> filemtime($x); });
+                $file = $logs[0] ?? SITES . "/$site.localhost/storage/logs/laravel.log";
+                $entries = laravel_entries(tail_of($file), $since);
             } elseif ($source === 'debug') {
                 if ($site === null) throw new ToolError('Name a site for its debug.log.');
                 $file = SITES . "/$site.localhost/public/wp-content/debug.log";
@@ -23405,11 +29258,17 @@ function call_tool(string $name, array $a): array {
                 "Web server (FrankenPHP) on :$https: " . $probe($https),
                 'MariaDB on :3306: ' . $probe(3306),
                 'Mailpit on :8025: ' . $probe(8025),
+            ];
+            // The optional servers, once a Laravel site has had them set up.
+            $pg = (int) ($cfg['PGSQL_PORT'] ?? 0) ?: 5432;
+            if (!empty($cfg['PGSQL_USER'])) $lines[] = "PostgreSQL on :$pg (optional): " . $probe($pg);
+            if (!empty($cfg['REDIS_PORT'])) $lines[] = 'Redis on :' . (int) $cfg['REDIS_PORT'] . ' (optional): ' . $probe((int) $cfg['REDIS_PORT']);
+            $lines = array_merge($lines, [
                 '',
                 'Dashboard: https://cove.localhost' . PORT_SUFFIX,
                 'Adminer: https://db.cove.localhost' . PORT_SUFFIX,
                 'Mailpit: https://mail.cove.localhost' . PORT_SUFFIX,
-            ];
+            ]);
             if (demo_sites() !== null) $lines[] = "\ncove demo is on: only " . implode(', ', demo_sites()) . ' can be used.';
             return text(implode("\n", $lines));
     }
@@ -23474,7 +29333,7 @@ function rpc_error($id, int $code, string $message): array {
     return ['jsonrpc' => '2.0', 'id' => $id, 'error' => ['code' => $code, 'message' => $message]];
 }
 
-const INSTRUCTIONS = "Cove runs local WordPress sites on this machine, each at https://<name>.localhost with its files in ~/Cove/Sites/<name>.localhost/public and a database of its own. Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin, screenshot to see a page, check_page for a page's status and the PHP errors it caused, and read_logs for older errors. wp_read runs WP-CLI commands that only read; wp runs any. Take a snapshot (snapshot_create) before a change you might want to undo, or try it on a copy (clone_site); before editing plugin or theme code, history_save, so history_diff shows the edit and history_rollback can undo it. snapshot_restore and history_rollback each save the current state first. No tool here deletes a site, pulls or pushes one to a remote host, or changes Cove's own settings.";
+const INSTRUCTIONS = "Cove runs local WordPress and Laravel sites on this machine, each at https://<name>.localhost: a WordPress site's files are in ~/Cove/Sites/<name>.localhost/public with a database of its own, and a Laravel site's folder ~/Cove/Sites/<name>.localhost is the project (artisan_read and artisan run artisan, laravel_workers runs its queue and scheduler, laravel_users lists and adds its users). Mail the sites send is caught by Mailpit and never delivered: read_mail finds it, links included. Use login_link to sign in to a WordPress admin or a Laravel app, screenshot to see a page, check_page for a page's status and the PHP errors it caused, and read_logs for older errors. wp_read runs WP-CLI commands that only read; wp runs any. Take a snapshot (snapshot_create) before a change you might want to undo, or try it on a copy (clone_site); before editing plugin or theme code, history_save, so history_diff shows the edit and history_rollback can undo it. snapshot_restore and history_rollback each save the current state first. No tool here deletes a site, pulls or pushes one to a remote host, or changes Cove's own settings.";
 
 function handle(array $msg): ?array {
     $id = $msg['id'] ?? null;
@@ -23570,6 +29429,13 @@ cove_mcp() {
     local list=0
     [ "${1:-}" = "tools" ] && list=1
     [ "$list" = 1 ] && echo "Tools 'cove mcp' offers an agent:"
+    # Typed into a terminal, it would sit waiting for a client's JSON with
+    # no word of why; say so on stderr, which the protocol doesn't use.
+    if [ "$list" = 0 ] && [ -t 0 ]; then
+        echo "cove mcp is a server for an AI agent, and is waiting for one on stdin." >&2
+        echo "Add it to Claude Code with: claude mcp add cove -- cove mcp" >&2
+        echo "See what it offers: cove mcp tools. Press Ctrl+C to stop." >&2
+    fi
     # stdout is the protocol from here on: nothing else may write to it.
     COVE_MCP_BIN="$self" COVE_MCP_VERSION="$COVE_VERSION" COVE_MCP_DIR="$COVE_DIR" \
         COVE_MCP_SITES="$SITES_DIR" COVE_MCP_PORT_SUFFIX="$(https_port_suffix)" COVE_MCP_LIST="$list" \
@@ -24146,30 +30012,22 @@ cove_menubar() {
         disable)
             cove_menubar_disable
             ;;
-        *)
-            echo "Usage: cove menubar <subcommand>"
-            echo ""
-            echo "Manage the menu bar companion app (a native menu bar app on macOS,"
-            echo "a system tray app on Linux desktops). Shows service status at a"
-            echo "glance and can start/stop Cove, open or log in to sites, and open"
-            echo "the Dashboard, Adminer, Mailpit, and logs."
-            echo ""
-            echo "Subcommands:"
-            echo "  enable     Build, install, and launch the menu bar app (also updates it)"
-            echo "  disable    Quit and remove the menu bar app"
-            echo ""
+        "")
+            # The help, then whether the app is on now.
+            display_command_help menubar
             if [ "$OS" == "macos" ] || { [ "$OS" == "linux" ] && [ "$IS_WSL" != true ]; }; then
                 local installed
                 installed=$(menubar_installed_version)
+                echo ""
                 if menubar_is_enabled; then
                     echo "Currently: enabled (v${installed:-unknown})"
                 else
                     echo "Currently: disabled"
                 fi
-                echo ""
             fi
-            echo "Once enabled, 'cove upgrade' keeps the app up to date automatically."
-            exit 0
+            ;;
+        *)
+            cove_unknown_subcommand menubar "$action" "enable disable"
             ;;
     esac
 }
@@ -24205,8 +30063,7 @@ cove_network() {
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
     if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
-        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name" "WordPress"
     fi
 
     local wp_cmd
@@ -24332,26 +30189,570 @@ cove_opcache_restart() {
     fi
 }
 
+# --- Usage by site ----------------------------------------------------------
+#
+# The arena is shared, but OPcache keys every script by its real path, so
+# grouping paths by the ~/Cove/Sites/<name>.localhost folder they sit in says
+# which site holds what. Like cove_opcache_probe, the probe asks the running
+# server from Cove's own docroot.
+#
+# A file that changes while the server runs is compiled again on its next
+# request, and the copy before it stays in the arena as dead weight
+# ("wasted") until FrankenPHP restarts. When the arena fills, OPcache
+# restarts it if the dead weight passes opcache.max_wasted_percentage, but
+# under ZTS that check divides by a memory_consumption that reads 0 in
+# request threads, so any dead weight at all triggers it. That restart runs
+# while other threads still use the memory and aborts the process with
+# "zend_mm_heap corrupted" (php/php-src#22281). So what fills the arena, and
+# which site keeps recompiling, is worth seeing: `sites` and `--watch`.
+if false; then : <<'exit 0'
+#####################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+exit 0
+fi
+cove_opcache_sites_probe_source() {
+    cat <<'PHP'
+<?php
+// Written by `cove opcache sites` and removed when it finishes.
+header('Content-Type: text/plain; charset=utf-8');
+if (!function_exists('opcache_get_status')) { echo "noopcache\n"; exit; }
+$s = @opcache_get_status(true);
+$c = @opcache_get_configuration();
+if (!$s || !$c) { echo "disabled\n"; exit; }
+$cove = dirname(__DIR__, 2);            // this file is in ~/Cove/App/gui
+$sites = $cove . '/Sites/';
+$app = $cove . '/App/';
+$site_of = function (string $path) use ($sites, $app): string {
+    if (strncmp($path, $sites, strlen($sites)) === 0) {
+        $rest = substr($path, strlen($sites));
+        $dir = strstr($rest, '/', true);
+        return preg_replace('/\.localhost$/', '', $dir === false ? $rest : $dir);
+    }
+    return strncmp($path, $app, strlen($app)) === 0 ? '(cove)' : '(other)';
+};
+$st = $s['opcache_statistics'];
+$m = $s['memory_usage'];
+$is = $s['interned_strings_usage'];
+$started = max((int) $st['start_time'], (int) $st['last_restart_time']);
+$summary = [
+    'free' => max(0, (int) $m['free_memory']),
+    'wasted' => max(0, (int) $m['wasted_memory']),
+    'scripts' => (int) $st['num_cached_scripts'],
+    'full' => !empty($s['cache_full']) ? 1 : 0,
+    'started' => $started,
+    'interned_used' => (int) $is['used_memory'],
+    'interned_total' => (int) $is['used_memory'] + (int) $is['free_memory'],
+    'restarts_oom' => (int) $st['oom_restarts'],
+    'restarts_hash' => (int) $st['hash_restarts'],
+    'excluded_compiles' => (int) $st['blacklist_misses'],
+];
+$tsv = fn(array $row) => implode("\t", $row) . "\n";
+$summary_row = array_merge(['summary'], array_values($summary));
+if (($_GET['mode'] ?? '') === 'scripts') {
+    // One line per cached script, for --watch to compare two samples.
+    echo $tsv($summary_row);
+    foreach ($s['scripts'] as $path => $sc) {
+        if (strpbrk($path, "\t\n\r") !== false) continue;
+        echo $tsv([$site_of($path), (int) $sc['timestamp'], (int) $sc['memory_consumption'], $path]);
+    }
+    exit;
+}
+$by = [];
+foreach ($s['scripts'] as $path => $sc) {
+    $name = $site_of($path);
+    $by[$name] ??= ['site' => $name, 'files' => 0, 'bytes' => 0, 'changed_files' => 0, 'changed_bytes' => 0];
+    $by[$name]['files']++;
+    $by[$name]['bytes'] += (int) $sc['memory_consumption'];
+    // Edited or added since the cache started. An edited file was compiled
+    // again, so the copy before it is dead weight now.
+    if ((int) $sc['timestamp'] > $started) {
+        $by[$name]['changed_files']++;
+        $by[$name]['changed_bytes'] += (int) $sc['memory_consumption'];
+    }
+}
+usort($by, fn($a, $b) => $b['bytes'] <=> $a['bytes']);
+$excluded = array_values($c['blacklist'] ?? []);
+if (($_GET['format'] ?? '') === 'json') {
+    echo json_encode(['summary' => $summary, 'sites' => $by, 'excluded' => $excluded], JSON_UNESCAPED_SLASHES), "\n";
+    exit;
+}
+echo $tsv($summary_row);
+foreach ($by as $row) echo $tsv(['site', $row['site'], $row['files'], $row['bytes'], $row['changed_files'], $row['changed_bytes']]);
+foreach ($excluded as $e) echo $tsv(['excluded', $e]);
+PHP
+}
+
+# Writes the probe into Cove's docroot and prints its path. The caller
+# removes it.
+cove_opcache_sites_install_probe() {
+    local probe="$GUI_DIR/_cove_opcache_sites_$$.php"
+    cove_opcache_sites_probe_source > "$probe" 2>/dev/null || return 1
+    echo "$probe"
+}
+
+# cove_opcache_sites_get <probe> <query> <out file>: one answer from the
+# running server, retried like cove_opcache_probe (a request landing during a
+# config reload can hang).
+cove_opcache_sites_get() {
+    local probe="$1" query="$2" out="$3" attempt
+    for attempt in 1 2 3; do
+        if curl -sk --max-time 30 -o "$out" "https://cove.localhost:${HTTPS_PORT}/${probe##*/}?$query" 2>/dev/null \
+            && head -c 8 "$out" | grep -q -E '^(summary|\{)'; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+# Seconds since the epoch as HH:MM:SS (BSD date takes -r, GNU date -d @).
+cove_opcache_hms() {
+    date -r "$1" +%H:%M:%S 2>/dev/null || date -d "@$1" +%H:%M:%S
+}
+
+cove_opcache_sites() {
+    local format="$1" top="$2" probe tmp
+    probe=$(cove_opcache_sites_install_probe) || { gum style --foreground red "❌ Could not write a probe into $GUI_DIR."; exit 1; }
+    tmp=$(mktemp "${TMPDIR:-/tmp}/cove-opcache.XXXXXX") || { rm -f "$probe"; exit 1; }
+    local query="mode=sites"
+    [ "$format" = "json" ] && query="mode=sites&format=json"
+    if ! cove_opcache_sites_get "$probe" "$query" "$tmp"; then
+        rm -f "$probe" "$tmp"
+        gum style --foreground red "❌ The running server did not answer. Is Caddy up?"
+        exit 1
+    fi
+    rm -f "$probe"
+    if [ "$format" = "json" ]; then
+        cat "$tmp"; rm -f "$tmp"; return 0
+    fi
+    local listed
+    listed=$(cove_opcache_exclude_entries | grep -c .)
+    echo ""
+    awk -F'\t' -v now="$(date +%s)" -v arena="$(cove_ini_get opcache.memory_consumption 512)" -v top="$top" -v listed="$listed" '
+        function mb(b) { return sprintf("%.1f", b / 1048576) }
+        function changed(n, b) { return n ? sprintf("%d files · %s MB", n, mb(b)) : "-" }
+        function up(s,  h, m) { h = int(s / 3600); m = int((s % 3600) / 60); return (h ? h "h " : "") m "m" }
+        $1 == "summary" { free = $2; wasted = $3; full = $5; started = $6; iu = $7; it = $8; skipped = $11 }
+        $1 == "site" { n++; name[n] = $2; files[n] = $3; bytes[n] = $4; cf[n] = $5; cb[n] = $6 }
+        $1 == "excluded" { live++ }
+        END {
+            printf "OPcache by site  (%s MB arena · %d MB free · %d MB dead weight · server up %s)\n", arena, free / 1048576, wasted / 1048576, up(now - started)
+            if (full) print "  ❌ FULL: files not cached yet compile on every request"
+            printf "  %-28s %7s %9s   %s\n", "SITE", "FILES", "MB", "CHANGED SINCE START"
+            for (i = 1; i <= n; i++) {
+                if (i > top) { rn++; rf += files[i]; rb += bytes[i]; rcf += cf[i]; rcb += cb[i]; continue }
+                printf "  %-28s %7d %9s   %s\n", substr(name[i], 1, 28), files[i], mb(bytes[i]), changed(cf[i], cb[i])
+            }
+            if (rn) printf "  %-28s %7d %9s   %s\n", rn " more", rf, mb(rb), changed(rcf, rcb)
+            printf "  interned strings: %d of %d MB\n", iu / 1048576, it / 1048576
+            if (live || listed) {
+                printf "  excluded paths: %d in use, %d listed · %d compiles skipped the cache\n", live, listed, skipped
+                if (live != listed) print "  ⚠️  the list changed since the server started: cove opcache exclude apply"
+            }
+        }' "$tmp"
+    rm -f "$tmp"
+    echo ""
+    echo "  Changed = edited or added since the server started. An edited file is"
+    echo "  compiled again and its old copy stays as dead weight until a restart."
+    echo "  See what a run does: cove opcache sites --watch"
+    echo "  Keep a folder out:   cove opcache exclude add <site> <folder>"
+}
+
+# --watch: compare the running server's cache every N seconds and say which
+# site added files and which recompiled them (each recompile leaves the old
+# copy as dead weight). Append-only output, so it can be left running into a
+# log during a test run.
+cove_opcache_watch() {
+    local every="$1" top="$2" probe tmp q_probe q_tmp
+    probe=$(cove_opcache_sites_install_probe) || { gum style --foreground red "❌ Could not write a probe into $GUI_DIR."; exit 1; }
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/cove-opcache-watch.XXXXXX") || { rm -f "$probe"; exit 1; }
+    # Baked in now: by the time EXIT fires these locals are gone.
+    printf -v q_probe '%q' "$probe"
+    printf -v q_tmp '%q' "$tmp"
+    trap "cove_opcache_watch_totals $q_tmp; rm -f $q_probe; rm -rf $q_tmp" EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    : > "$tmp/totals"
+    date +%s > "$tmp/began"
+    echo "Watching OPcache every ${every}s. Ctrl-C stops and prints the totals."
+    local have_prev=false
+    while :; do
+        if cove_opcache_sites_get "$probe" "mode=scripts" "$tmp/cur"; then
+            if $have_prev; then
+                cove_opcache_watch_tick "$tmp" "$top"
+            else
+                awk -F'\t' -v hms="$(date +%H:%M:%S)" 'NR == 1 { printf "%s  %d MB free · dead weight %d MB · %d files%s\n", hms, $2 / 1048576, $3 / 1048576, $4, ($5 ? " · FULL" : ""); exit }' "$tmp/cur"
+            fi
+            mv "$tmp/cur" "$tmp/prev"
+            have_prev=true
+        else
+            echo "$(date +%H:%M:%S)  no answer from the server"
+        fi
+        sleep "$every"
+    done
+}
+
+# One sample against the one before: per site, files new to the cache and
+# files compiled again (whose earlier copy is now dead weight).
+cove_opcache_watch_tick() {
+    local tmp="$1" top="$2"
+    awk -F'\t' -v hms="$(date +%H:%M:%S)" -v top="$top" -v totals="$tmp/totals" '
+        function mb(b) { return sprintf("%.1f", b / 1048576) }
+        function signed(b) { return sprintf("%+.1f", b / 1048576) }
+        NR == FNR {
+            if ($1 == "summary") { pfree = $2; pwasted = $3; pscripts = $4; pstart = $6; next }
+            pts[$4] = $2; pb[$4] = $3; next
+        }
+        $1 == "summary" { free = $2; wasted = $3; scripts = $4; full = $5; start = $6; next }
+        start != pstart { next }
+        !($4 in pts) { addb[$1] += $3; addn[$1]++; seen[$1] = 1; next }
+        pts[$4] != $2 { recb[$1] += pb[$4]; recn[$1]++; seen[$1] = 1 }
+        END {
+            if (start != pstart) {
+                printf "%s  ⚠️  the server restarted, and the cache started again empty (%d MB free)\n", hms, free / 1048576
+                exit
+            }
+            printf "%s  %d MB free (%s) · dead weight %d MB (%s) · %d files (%+d)%s\n", hms, free / 1048576, signed(free - pfree), wasted / 1048576, signed(wasted - pwasted), scripts, scripts - pscripts, (full ? " · FULL" : "")
+            k = 0
+            for (s in seen) {
+                k++; key[k] = s; w[k] = addb[s] + recb[s]
+                printf "%s\t%.0f\t%d\t%.0f\t%d\n", s, addb[s], addn[s], recb[s], recn[s] >> totals
+            }
+            for (i = 1; i <= k; i++) for (j = i + 1; j <= k; j++) if (w[j] > w[i]) { t = w[i]; w[i] = w[j]; w[j] = t; t = key[i]; key[i] = key[j]; key[j] = t }
+            for (i = 1; i <= k && i <= top; i++) {
+                s = key[i]; line = ""
+                if (recn[s]) line = sprintf("%s MB dead weight (%d recompiled)", mb(recb[s]), recn[s])
+                if (addn[s]) line = line (line ? " · " : "") sprintf("+%s MB new (%d files)", mb(addb[s]), addn[s])
+                printf "            %-26s %s\n", substr(s, 1, 26), line
+            }
+            if (k > top) printf "            %d more sites\n", k - top
+        }' "$tmp/prev" "$tmp/cur"
+}
+
+# Called on exit: the whole watch per site, biggest dead weight first.
+cove_opcache_watch_totals() {
+    local tmp="$1" began
+    [ -s "$tmp/totals" ] || return 0
+    began=$(cat "$tmp/began" 2>/dev/null)
+    echo ""
+    echo "Since $(cove_opcache_hms "$began"), by site:"
+    awk -F'\t' '{ ab[$1] += $2; an[$1] += $3; rb[$1] += $4; rn[$1] += $5 }
+        END { for (s in ab) printf "%s\t%.0f\t%d\t%.0f\t%d\n", s, ab[s], an[s], rb[s], rn[s] }' "$tmp/totals" \
+        | sort -t "$(printf '\t')" -k4,4nr -k2,2nr \
+        | awk -F'\t' '{ printf "  %-28s %8.1f MB dead weight (%d recompiled) · %8.1f MB new (%d files)\n", substr($1, 1, 28), $4 / 1048576, $5, $2 / 1048576, $3 }'
+}
+
+# --- Paths OPcache never caches ---------------------------------------------
+#
+# ~/Cove/opcache-exclude.txt becomes opcache.blacklist_filename in the
+# frankenphp{} block (regenerate_caddyfile) whenever it lists anything. PHP
+# reads it once, when the server starts. Each line is a path prefix; * matches
+# within one folder name and ** across folders. A file under an excluded path
+# compiles on every request instead of taking room in the arena: right for
+# code that keeps changing (a suite's scratch plugins, cache folders that hold
+# PHP, a test site that is reset all the time), too slow for a big site's
+# plugins. Sites pinned to an older PHP run on php-fpm, whose OPcache is its
+# own, and ignore the list.
+cove_opcache_exclude_entries() {
+    [ -f "$OPCACHE_EXCLUDE_FILE" ] || return 0
+    grep -v -E '^[[:space:]]*(;|$)' "$OPCACHE_EXCLUDE_FILE"
+}
+
+# cove_opcache_exclude_entry [--existing] <site> [<folder>] | <absolute path>
+# Prints the line for the file. A folder is written as folder/* so it can't
+# also catch a sibling whose name starts the same (cache/ and cache-enabler/).
+# The folder is inside the site's public/, or inside the site's own folder
+# for a project (Laravel, or anything `cove add --from` brought in), whose
+# code mostly lives beside public/. --existing (add) refuses a path with no
+# wildcard that isn't there: a typo would otherwise restart FrankenPHP for
+# every site and exclude nothing. remove leaves it off, as the folder may
+# have gone since it was added.
+cove_opcache_exclude_entry() {
+    local existing=false
+    [ "$1" = "--existing" ] && { existing=true; shift; }
+    local first="$1" second="$2" entry site_root=""
+    if [ -z "$first" ]; then
+        echo "❌ Name a site (and a folder inside it if you like), or give an absolute path." >&2
+        return 1
+    fi
+    case "$first$second" in
+        *$'\n'*|*$'\r'*|*$'\t'*|*\"*)
+            echo "❌ Paths can't contain quotes, tabs or line breaks." >&2
+            return 1 ;;
+    esac
+    if [ "${first:0:1}" = "/" ]; then
+        if [ -n "$second" ]; then
+            echo "❌ Give either an absolute path or <site> <folder>, not both." >&2
+            return 1
+        fi
+        entry="$first"
+    else
+        first="${first%.localhost}"
+        if [ "$first" != "*" ] && [ ! -d "$SITES_DIR/$first.localhost" ]; then
+            echo "❌ No site named '$first'." >&2
+            return 1
+        fi
+        [ "$first" != "*" ] && site_root="$SITES_DIR/$first.localhost"
+        if [ -z "$second" ]; then
+            entry="$SITES_DIR/$first.localhost/"
+        else
+            second="${second#./}"
+            # Where the folder is looked for. Every site ('*') has its own
+            # kind, so it keeps to public/, the one folder they all have.
+            local base="public" where="public/"
+            if [ -n "$site_root" ] && site_is_project "$site_root"; then
+                base="" where=""
+            fi
+            case "/$second/" in
+                //*|*/../*|*/./*)
+                    echo "❌ The folder goes inside the site's ${where:-own }folder: no leading /, no '..'." >&2
+                    return 1 ;;
+            esac
+            entry="$SITES_DIR/$first.localhost/${base:+$base/}$second"
+        fi
+    fi
+    # Refused when it names nothing: only a path without a wildcard can be
+    # looked at, and a trailing / still has to be a folder.
+    case "$entry" in
+        *[*?]*) ;;
+        *)
+            if $existing && [ ! -e "${entry%/}" ]; then
+                echo "❌ Nothing at ${entry%/}. Check the folder's name (a path with * in it is taken as it is)." >&2
+                return 1
+            fi ;;
+    esac
+    # OPcache compares the real path of each file it compiles, so a link on
+    # the way inside a site (a project's public/ links to the folder cove.json
+    # names as its webroot) has to be followed, or the entry never matches.
+    # Resolved up to the first wildcard, from the deepest folder there that
+    # exists. The site's own folder stays as it's spelled, like the Sites
+    # folder above it, and an absolute path is taken as given.
+    if [ -n "$site_root" ]; then
+        local known rest real site_real
+        known="${entry%%[*?]*}"
+        known="${known%/}"
+        while [ "${#known}" -gt "${#site_root}" ] && [ ! -d "$known" ]; do known="${known%/*}"; done
+        real=$(cd "$known" 2>/dev/null && pwd -P)
+        site_real=$(cd "$site_root" 2>/dev/null && pwd -P)
+        case "$real/" in
+            "$site_real"/*)
+                rest="${entry#"$known"}"
+                entry="$site_root${real#"$site_real"}$rest" ;;
+        esac
+    fi
+    # A folder gets /*: one that exists, one written with a trailing /, or a
+    # last name with no dot in it (PHP files have an extension), which covers
+    # paths behind a * that can't be looked at.
+    case "$entry" in
+        */) entry="${entry}*" ;;
+        *[*?]) ;;
+        *) if [ -d "$entry" ]; then
+               entry="$entry/*"
+           elif [ ! -e "$entry" ]; then
+               case "${entry##*/}" in *.*) ;; *) entry="$entry/*" ;; esac
+           fi ;;
+    esac
+    # Refuse what would take every site's code out of the cache: an entry
+    # whose fixed part (up to its first wildcard) stops at or above the Sites
+    # folder, unless the wildcard only stands for the site's name and a
+    # specific folder follows (every site's public/wp-content/cache/).
+    local fixed="${entry%%[*?]*}"
+    case "$SITES_DIR/" in
+        "$fixed"*)
+            local refuse=true rest rest_fixed
+            case "$entry" in
+                "$SITES_DIR"/*/*)
+                    rest="${entry#"$SITES_DIR"/}"
+                    rest="${rest#*/}"
+                    rest_fixed="${rest%%[*?]*}"
+                    case "$rest_fixed" in
+                        ""|public|public/) ;;
+                        *) refuse=false ;;
+                    esac ;;
+            esac
+            if $refuse; then
+                echo "❌ '$entry' would take every site out of the cache." >&2
+                return 1
+            fi ;;
+    esac
+    echo "$entry"
+}
+
+# Offer the restart an exclusion list needs (PHP reads it once, at start).
+cove_opcache_exclude_restart() {
+    local auto_yes="$1" no_restart="$2"
+    if ! [ -t 0 ] && ! $auto_yes; then no_restart=true; fi
+    if $no_restart; then
+        echo "ℹ️  Not restarting. The list applies on the next full restart: cove opcache exclude apply --yes"
+        return 0
+    fi
+    echo "PHP reads the list once, when it starts, so this needs a full restart of"
+    echo "FrankenPHP (every local site is served by that one process; requests in"
+    echo "flight are dropped, a few seconds of downtime)."
+    if $auto_yes || gum confirm "Restart FrankenPHP now?"; then
+        cove_opcache_restart
+        echo "✅ FrankenPHP restarted with the new list."
+    else
+        echo "⏭️  Skipped. Apply it later with: cove opcache exclude apply --yes"
+    fi
+}
+
+cove_opcache_exclude() {
+    local action="$1" auto_yes="$2" no_restart="$3" entry
+    shift 3
+    case "$action" in
+        list)
+            echo ""
+            gum style --foreground "212" --bold "OPcache exclusions"
+            echo "  $OPCACHE_EXCLUDE_FILE"
+            local listed
+            listed=$(cove_opcache_exclude_entries)
+            if [ -z "$listed" ]; then
+                echo "  (none) Add one: cove opcache exclude add <site> [<folder>]"
+            else
+                printf '%s\n' "$listed" | sed 's/^/    /'
+            fi
+            local probe tmp
+            probe=$(cove_opcache_sites_install_probe) || return 0
+            tmp=$(mktemp "${TMPDIR:-/tmp}/cove-opcache.XXXXXX") || { rm -f "$probe"; return 0; }
+            if cove_opcache_sites_get "$probe" "mode=sites" "$tmp"; then
+                local live skipped
+                live=$(awk -F'\t' '$1 == "excluded" { print $2 }' "$tmp" | sort)
+                skipped=$(awk -F'\t' '$1 == "summary" { print $11 }' "$tmp")
+                if [ "$live" = "$(printf '%s\n' "$listed" | sed 's:/$::' | grep . | sort)" ]; then
+                    [ -n "$listed" ] && echo "  ✅ in use by the running server · ${skipped:-0} compiles skipped the cache since it started"
+                else
+                    echo "  ⚠️  the running server uses a different list. Apply this one: cove opcache exclude apply"
+                fi
+            else
+                echo "  (could not read the running server)"
+            fi
+            rm -f "$probe" "$tmp"
+            ;;
+        add)
+            entry=$(cove_opcache_exclude_entry --existing "$@") || exit 1
+            if cove_opcache_exclude_entries | grep -q -x -F -- "$entry"; then
+                echo "ℹ️  Already excluded: $entry"
+                return 0
+            fi
+            if [ ! -f "$OPCACHE_EXCLUDE_FILE" ]; then
+                cat > "$OPCACHE_EXCLUDE_FILE" <<'EOF'
+; Paths FrankenPHP's OPcache never caches (opcache.blacklist_filename).
+; One per line, each a path prefix: a folder is written as folder/* so it
+; covers everything inside it. * matches within one folder name, ** across
+; folders. Lines starting with ; are comments. Managed by
+; `cove opcache exclude`; after editing by hand, run `cove opcache exclude apply`.
+EOF
+            elif [ -n "$(tail -c 1 "$OPCACHE_EXCLUDE_FILE")" ]; then
+                echo >> "$OPCACHE_EXCLUDE_FILE"
+            fi
+            printf '%s\n' "$entry" >> "$OPCACHE_EXCLUDE_FILE"
+            echo "✅ Excluded: $entry"
+            echo "   Files under it compile on every request instead of taking room in the cache."
+            regenerate_caddyfile
+            cove_opcache_exclude_restart "$auto_yes" "$no_restart"
+            ;;
+        remove)
+            local candidate found=""
+            entry=$(cove_opcache_exclude_entry "$@" 2>/dev/null) || entry="$1"
+            for candidate in "$entry" "$entry/*" "${entry%/\*}" "$1"; do
+                if cove_opcache_exclude_entries | grep -q -x -F -- "$candidate"; then
+                    found="$candidate"; break
+                fi
+            done
+            if [ -z "$found" ]; then
+                echo "❌ Not in the list: $entry" >&2
+                cove_opcache_exclude list "$auto_yes" "$no_restart" >&2
+                exit 1
+            fi
+            local tmp
+            tmp=$(mktemp "$OPCACHE_EXCLUDE_FILE.XXXXXX") || exit 1
+            grep -v -x -F -- "$found" "$OPCACHE_EXCLUDE_FILE" > "$tmp"
+            mv "$tmp" "$OPCACHE_EXCLUDE_FILE"
+            echo "✅ No longer excluded: $found"
+            regenerate_caddyfile
+            cove_opcache_exclude_restart "$auto_yes" "$no_restart"
+            ;;
+        apply)
+            regenerate_caddyfile
+            cove_opcache_exclude_restart "$auto_yes" "$no_restart"
+            ;;
+    esac
+}
+
 cove_opcache() {
     local action="show" mem="" interned="" files="" auto_yes=false no_restart=false
+    local watch="" top=15 format="table" ex_action="" ex_args=()
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) display_command_help opcache; exit 0 ;;
-            show) action="show"; shift ;;
+            show) [ "$action" = "exclude" ] && ex_args+=("$1") || action="show"; shift ;;
             set)
                 action="set"
                 mem="$2"
                 shift 2 || { gum style --foreground red "❌ 'set' needs a size in MB (e.g. cove opcache set 2048)"; exit 1; }
                 ;;
-            --interned) interned="$2"; shift 2 ;;
+            sites) [ "$action" = "exclude" ] && ex_args+=("$1") || action="sites"; shift ;;
+            exclude)
+                action="exclude"; shift
+                case "${1:-}" in
+                    list|add|remove|apply) ex_action="$1"; shift ;;
+                    ""|-*) ex_action="list" ;;
+                    *) gum style --foreground red "❌ Unknown exclude action: $1 (list, add, remove or apply)"; exit 1 ;;
+                esac
+                ;;
+            --watch) watch=60; shift ;;
+            --watch=*) watch="${1#*=}"; shift ;;
+            --top=*) top="${1#*=}"; shift ;;
+            --format=*) format="${1#*=}"; shift ;;
+            --interned) [ $# -ge 2 ] || { gum style --foreground red "❌ --interned needs a value."; exit 1; }; interned="$2"; shift 2 ;;
             --interned=*) interned="${1#*=}"; shift ;;
-            --files) files="$2"; shift 2 ;;
+            --files) [ $# -ge 2 ] || { gum style --foreground red "❌ --files needs a value."; exit 1; }; files="$2"; shift 2 ;;
             --files=*) files="${1#*=}"; shift ;;
             --no-restart) no_restart=true; shift ;;
             -y|--yes) auto_yes=true; shift ;;
-            *) gum style --foreground red "❌ Unknown option: $1"; echo "Usage: cove opcache [show | set <mb> [--interned <mb>] [--files <n>] [--no-restart] [--yes]]"; exit 1 ;;
+            -*) gum style --foreground red "❌ Unknown option: $1"; echo "Usage: cove opcache [show | sites [--watch[=<seconds>]] | exclude [list | add | remove | apply] | set <mb> …]  (cove opcache --help)"; exit 1 ;;
+            *)
+                if [ "$action" = "exclude" ]; then
+                    ex_args+=("$1"); shift
+                else
+                    gum style --foreground red "❌ Unknown option: $1"; echo "Usage: cove opcache [show | sites [--watch[=<seconds>]] | exclude [list | add | remove | apply] | set <mb> …]  (cove opcache --help)"; exit 1
+                fi
+                ;;
         esac
     done
+
+    if [ "$action" = "sites" ]; then
+        if [[ ! "$top" =~ ^[0-9]+$ ]] || [ "$top" -lt 1 ]; then
+            gum style --foreground red "❌ --top must be a whole number, 1 or more."; exit 1
+        fi
+        if [ -n "$watch" ]; then
+            if [[ ! "$watch" =~ ^[0-9]+$ ]] || [ "$watch" -lt 5 ]; then
+                gum style --foreground red "❌ --watch takes a number of seconds, 5 or more (default 60)."; exit 1
+            fi
+            cove_opcache_watch "$watch" "$top"
+            return
+        fi
+        case "$format" in table|json) ;; *) gum style --foreground red "❌ --format is table or json."; exit 1 ;; esac
+        cove_opcache_sites "$format" "$top"
+        return
+    fi
+
+    if [ "$action" = "exclude" ]; then
+        if [ "$ex_action" = "list" ] || [ "$ex_action" = "apply" ]; then
+            [ ${#ex_args[@]} -gt 0 ] && { gum style --foreground red "❌ '$ex_action' takes no arguments."; exit 1; }
+        fi
+        if [ ${#ex_args[@]} -gt 2 ]; then
+            gum style --foreground red "❌ Too many arguments. Quote a path with * in it: cove opcache exclude add '*' wp-content/cache"
+            exit 1
+        fi
+        cove_opcache_exclude "$ex_action" "$auto_yes" "$no_restart" ${ex_args[@]+"${ex_args[@]}"}
+        return
+    fi
 
     if [ "$action" = "show" ]; then
         local cfg mem_c int_c files_c
@@ -24382,6 +30783,10 @@ cove_opcache() {
         fi
         echo "    scripts ${cached}/${maxf} · hits ${hits} · misses ${misses} · hit rate ${hit}%"
         echo "    interned strings ${ipct}% of ${imb} MB"
+        local excluded_n
+        excluded_n=$(cove_opcache_exclude_entries | grep -c .)
+        [ "$excluded_n" -gt 0 ] && echo "    excluded paths: ${excluded_n} (cove opcache exclude)"
+        echo "  by site: cove opcache sites"
         if [ "$full" = "1" ]; then
             echo ""
             echo "  Raise it: cove opcache set $(( mem_c * 2 )) --interned $(( int_c * 2 ))"
@@ -24440,16 +30845,15 @@ cove_path() {
     local site_name="$1"
 
     if [ -z "$site_name" ]; then
-        gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove path <name>"
+        gum style --foreground red "❌ Error: A site name is required." >&2
+        echo "Usage: cove path <name>" >&2
         exit 1
     fi
 
     local site_dir="$SITES_DIR/$site_name.localhost/public"
 
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
 
     echo "$site_dir"
@@ -24552,8 +30956,7 @@ cove_php() {
     site_name="${site_name%.localhost}"
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
 
     # Show mode: no version argument.
@@ -24569,7 +30972,7 @@ cove_php() {
     fi
 
     # Unpin: back to FrankenPHP.
-    if [ "$requested" == "default" ]; then
+    if [ "$requested" == "default" ] || [ "$requested" == "unpin" ]; then
         if [ ! -f "$site_dir/php_version" ]; then
             echo "ℹ️  $site_name.localhost already uses Cove's default PHP."
             return 0
@@ -24628,6 +31031,42 @@ cove_php() {
         "URL: $warm_url"
 }
 
+# Laravel sites whose .env APP_URL is their own Cove address (on whatever
+# port), so it should follow a port change; one set by hand is left alone.
+laravel_sites_following_port() {
+    local d name url
+    for d in "$SITES_DIR"/*.localhost; do
+        site_is_laravel "$d" && [ -f "$d/.env" ] || continue
+        name=$(basename "$d" .localhost)
+        url=$(laravel_env_get "$d" APP_URL)
+        [[ "$url" =~ ^https://$name\.localhost(:[0-9]+)?/?$ ]] && echo "$name"
+    done
+}
+
+# Those sites' APP_URL on the new HTTPS port, and Reverb's VITE_REVERB_PORT
+# with it: the browser's half, which reaches it at the next front-end build.
+update_laravel_site_urls_for_port_change() {
+    local name d set rebuild=""
+    for name in $(laravel_sites_following_port); do
+        d="$SITES_DIR/$name.localhost"
+        set="{\"APP_URL\":\"$(url_for "$name.localhost")\""
+        # Only Reverb as Cove set it up, behind the site's own address: an
+        # app running its own on localhost:8080 keeps that port.
+        if [ -n "$(laravel_env_get "$d" VITE_REVERB_PORT)" ] && [ "$(laravel_env_get "$d" VITE_REVERB_HOST)" = "$name.localhost" ]; then
+            set="$set,\"VITE_REVERB_PORT\":\"$HTTPS_PORT\""
+            rebuild="$rebuild $name"
+        fi
+        if COVE_ENV_SET="$set}" laravel_env_set "$d/.env"; then
+            laravel_artisan "$d" config:clear >/dev/null 2>&1 || true
+            echo "   • $name.localhost (Laravel): APP_URL → $(url_for "$name.localhost")"
+        fi
+    done
+    if [ -n "$rebuild" ]; then
+        echo "   Build the front end again so Reverb's browser settings follow (npm run build):$rebuild"
+    fi
+    return 0
+}
+
 cove_ports() {
     # -----------------------------------------------------------------
     #  cove ports
@@ -24652,12 +31091,32 @@ cove_ports() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --http)
+                # The port can follow as the next word; at the end of the
+                # line, shift 2 would fail and loop for ever.
+                if [ $# -lt 2 ]; then
+                    gum style --foreground red "❌ Error: --http needs a port, e.g. --http=8080."
+                    exit 1
+                fi
                 explicit_http="$2"
                 shift 2
                 ;;
+            --http=*)
+                explicit_http="${1#*=}"
+                shift
+                ;;
             --https)
+                # The port can follow as the next word; at the end of the
+                # line, shift 2 would fail and loop for ever.
+                if [ $# -lt 2 ]; then
+                    gum style --foreground red "❌ Error: --https needs a port, e.g. --https=8080."
+                    exit 1
+                fi
                 explicit_https="$2"
                 shift 2
+                ;;
+            --https=*)
+                explicit_https="${1#*=}"
+                shift
                 ;;
             --skip-urls)
                 skip_urls=true
@@ -24677,7 +31136,7 @@ cove_ports() {
                 ;;
             *)
                 gum style --foreground red "❌ Unknown option: $1"
-                echo "Usage: cove ports [--http PORT] [--https PORT] [--skip-urls] [--dry-run] [--yes]"
+                echo "Usage: cove ports [--http=PORT] [--https=PORT] [--skip-urls] [--dry-run] [--yes]"
                 exit 1
                 ;;
         esac
@@ -24803,6 +31262,10 @@ cove_ports() {
         if ! $any_wp; then
             echo "(No WordPress sites to update.)"
         fi
+        local lv
+        for lv in $(laravel_sites_following_port); do
+            echo "   • ${lv}.localhost (Laravel): APP_URL → $(port_url_for "$lv.localhost" "$HTTPS_PORT")"
+        done
     elif $skip_urls; then
         echo ""
         gum style --faint "(--skip-urls: WordPress databases will NOT be updated)"
@@ -24846,6 +31309,7 @@ cove_ports() {
         echo ""
         echo "🔄 Updating WordPress site URLs..."
         update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT"
+        update_laravel_site_urls_for_port_change
     fi
 
     echo ""
@@ -24859,6 +31323,84 @@ cove_ports() {
     if [ "$HTTPS_PORT" != "443" ]; then
         gum style --faint "   Dashboard: $(url_for cove.localhost)"
     fi
+}
+
+# `cove postgres`: the PostgreSQL that Laravel sites on --database=pgsql use.
+# With no arguments, how it is; install sets it up (the first such site does
+# that too); start and stop; psql opens a shell as Cove's role.
+cove_postgres() {
+    local action="${1:-}"
+    # One Cove found running (Postgres.app, its own Homebrew service) is
+    # started and stopped by whatever runs it.
+    case "$action" in
+        start|stop)
+            if [ "$OS" = "macos" ] && cove_pg_configured && [ -z "$(config_get PGSQL_FORMULA)" ]; then
+                echo "Cove uses the PostgreSQL it found running on 127.0.0.1:$(cove_pg_port); $action it where it came from (Postgres.app, brew services…)." >&2
+                exit 1
+            fi ;;
+    esac
+    case "$action" in
+        ""|status)
+            if ! cove_pg_configured; then
+                echo "PostgreSQL isn't set up for Cove yet."
+                echo "It is the first time a Laravel site asks for it (cove add myapp laravel --database=pgsql),"
+                echo "or now with: cove postgres install"
+                return 0
+            fi
+            local state="❌ Stopped" version="" dbs=""
+            if cove_pg_ready; then
+                state="✅ Running"
+                version=$(cove_pg_psql postgres -c 'SHOW server_version' 2>/dev/null | cut -d' ' -f1)
+                dbs=$(cove_pg_psql postgres -F ' ' -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY datname" 2>/dev/null)
+            fi
+            echo "  PostgreSQL:   $state${version:+ ($version)}"
+            echo "  Address:      127.0.0.1:$(cove_pg_port), role $(config_get PGSQL_USER)"
+            [ -n "$(config_get PGSQL_FORMULA)" ] && echo "  Formula:      $(config_get PGSQL_FORMULA) (Homebrew)"
+            if [ -n "$dbs" ]; then
+                echo "  Databases:"
+                printf '%s\n' "$dbs" | sed 's/^/    /'
+            fi
+            ;;
+        install)
+            ensure_postgres
+            ;;
+        start)
+            cove_pg_start
+            cove_pg_wait_ready "" 20 && echo "✅ PostgreSQL is running." || { echo "❌ PostgreSQL did not start." >&2; exit 1; }
+            ;;
+        stop)
+            cove_pg_configured || { echo "PostgreSQL isn't set up for Cove yet." >&2; exit 1; }
+            cove_pg_stop
+            echo "✅ PostgreSQL stopped. Laravel sites on it can't reach their database until: cove postgres start"
+            ;;
+        psql)
+            shift
+            # Setup and start messages on stderr, apart from psql's own output.
+            ensure_postgres >&2 || exit 1
+            # A database first, if one is named; flags (--help, -c …) go to psql.
+            local db="postgres" psql
+            if [ $# -gt 0 ] && [[ "$1" != -* ]]; then db="$1"; shift; fi
+            psql=$(cove_pg_tool psql) || exit 1
+            PGPASSWORD="$(config_get PGSQL_PASSWORD)" exec "$psql" -h 127.0.0.1 -p "$(cove_pg_port)" -U "$(config_get PGSQL_USER)" -d "$db" "$@"
+            ;;
+        -h|--help|help)
+            echo "Usage: cove postgres [status|install|start|stop|psql [database]]"
+            echo ""
+            echo "The PostgreSQL server for Laravel sites made with --database=pgsql. Cove sets"
+            echo "it up the first time a site asks for it (Homebrew's postgresql@17 on macOS, the"
+            echo "distro's package on Linux), or uses one already running on 127.0.0.1:5432."
+            echo ""
+            echo "  status       Whether it runs, its version and its databases (the default)."
+            echo "  install      Sets it up now."
+            echo "  start, stop  Starts or stops it. PostgreSQL is optional, so cove enable and"
+            echo "               cove disable leave it alone."
+            echo "  psql [db]    A psql shell as Cove's role, on the database 'postgres' by default."
+            ;;
+        *)
+            echo "Usage: cove postgres [status|install|start|stop|psql [database]]" >&2
+            exit 1
+            ;;
+    esac
 }
 
 # --- Proxy Storage Directory ---
@@ -25106,28 +31648,7 @@ cove_proxy() {
             cove_proxy_delete "$@"
             ;;
         *)
-            echo "Usage: cove proxy <subcommand>"
-            echo ""
-            echo "Manage standalone reverse proxy entries in the Caddyfile."
-            echo "These are top-level server blocks, useful for exposing local services"
-            echo "via Tailscale or other external domains."
-            echo ""
-            echo "Subcommands:"
-            echo "  add <name> <domain> <target>   Add a new reverse proxy entry"
-            echo "  list                           List all proxy entries"
-            echo "  delete <name>                  Delete a proxy entry"
-            echo ""
-            echo "Flags:"
-            echo "  --no-tls   Disable TLS for this proxy (add only)"
-            echo "  --force    Skip confirmation prompts (add overwrite, delete)"
-            echo ""
-            echo "Examples:"
-            echo "  cove proxy add opencode myhost.tailnet.ts.net 127.0.0.1:4096"
-            echo "  cove proxy add api api.example.com localhost:3000 --no-tls"
-            echo "  cove proxy add api api.example.com localhost:3000 --force"
-            echo "  cove proxy list"
-            echo "  cove proxy delete opencode --force"
-            exit 0
+            cove_unknown_subcommand proxy "$action" "add list ls delete rm"
             ;;
     esac
 }
@@ -25787,6 +32308,77 @@ cove_push() {
     # --- 9. Finalize ---
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✨ All done! Your site has been pushed successfully." "Remote URL: ${remote_url}"
 }
+# `cove redis`: the Redis that Laravel sites keep their cache, sessions or
+# queue in. With no arguments, how it is; install sets it up (an app set up
+# with cove add --from that uses it does that too); start and stop; cli
+# opens redis-cli.
+cove_redis() {
+    # One Cove found running is started and stopped by whatever runs it.
+    case "${1:-}" in
+        start|stop)
+            if [ "$OS" = "macos" ] && cove_redis_configured && [ -z "$(config_get REDIS_FORMULA)" ]; then
+                echo "Cove uses the Redis it found running on 127.0.0.1:$(cove_redis_port); $1 it where it came from." >&2
+                exit 1
+            fi ;;
+    esac
+    case "${1:-}" in
+        ""|status)
+            if ! cove_redis_configured; then
+                echo "Redis isn't set up for Cove yet."
+                echo "It is when an app that uses it is set up (cove add myapp --from=…), or now with: cove redis install"
+                return 0
+            fi
+            local state="❌ Stopped" info="" cli
+            cli=$(command -v redis-cli || command -v valkey-cli)
+            if cove_redis_ready; then
+                state="✅ Running"
+                [ -n "$cli" ] && info=$("$cli" -h 127.0.0.1 -p "$(cove_redis_port)" info server 2>/dev/null | tr -d '\r' | sed -nE 's/^(redis|valkey)_version:(.*)$/\1 \2/p' | head -n 1)
+            fi
+            echo "  Redis:        $state${info:+ ($info)}"
+            echo "  Address:      127.0.0.1:$(cove_redis_port), no password (loopback only)"
+            if cove_redis_ready && [ -n "$cli" ]; then
+                local keys
+                keys=$("$cli" -h 127.0.0.1 -p "$(cove_redis_port)" info keyspace 2>/dev/null | grep '^db' | tr -d '\r')
+                if [ -n "$keys" ]; then echo "  Keys:         $keys"; fi
+            fi
+            ;;
+        install) ensure_redis ;;
+        start)
+            cove_redis_start
+            cove_redis_wait_ready "" 20 && echo "✅ Redis is running." || { echo "❌ Redis did not start." >&2; exit 1; }
+            ;;
+        stop)
+            cove_redis_configured || { echo "Redis isn't set up for Cove yet." >&2; exit 1; }
+            cove_redis_stop
+            echo "✅ Redis stopped. Laravel sites that keep their cache, sessions or queue in it fail until: cove redis start"
+            ;;
+        cli)
+            shift
+            # Setup and start messages on stderr, apart from redis-cli's output.
+            ensure_redis >&2 || exit 1
+            local cli
+            cli=$(command -v redis-cli || command -v valkey-cli) || { echo "❌ redis-cli isn't installed." >&2; exit 1; }
+            exec "$cli" -h 127.0.0.1 -p "$(cove_redis_port)" "$@"
+            ;;
+        -h|--help|help)
+            echo "Usage: cove redis [status|install|start|stop|cli [command…]]"
+            echo ""
+            echo "The Redis server Laravel sites use for their cache, sessions and queues. Cove"
+            echo "sets it up the first time a site needs it (Homebrew's redis on macOS, the"
+            echo "distro's redis or valkey on Linux), or uses one already running on 127.0.0.1:6379."
+            echo "Each site's keys carry its own prefix (cove:<site>:): a rename moves them and a"
+            echo "delete removes them."
+            echo ""
+            echo "  status       Whether it runs, its version and its keys (the default)."
+            echo "  install      Sets it up now."
+            echo "  start, stop  Starts or stops it. Redis is optional, so cove enable and cove"
+            echo "               disable leave it alone."
+            echo "  cli [args]   redis-cli on Cove's Redis."
+            ;;
+        *) echo "Usage: cove redis [status|install|start|stop|cli [command…]]" >&2; exit 1 ;;
+    esac
+}
+
 cove_reload() {
     # Keep the watchdog's copy of cove current with the file just run.
     [ -f "$COVE_DIR/watchdog.sh" ] && refresh_watchdog_copy >/dev/null
@@ -25874,6 +32466,12 @@ cove_rename() {
         exit 1
     fi
 
+    if [ $# -gt 2 ]; then
+        gum style --foreground red "❌ Error: Unknown option '$3'."
+        echo "Usage: cove rename <old-name> <new-name>"
+        exit 1
+    fi
+
     if [ "$old_name" == "$new_name" ]; then
          gum style --foreground red "❌ Error: The new name must be different from the old name."
          exit 1
@@ -25881,8 +32479,7 @@ cove_rename() {
 
     local old_site_dir="$SITES_DIR/$old_name.localhost"
     if [ ! -d "$old_site_dir" ]; then
-        gum style --foreground red "❌ Error: Site '$old_name.localhost' not found."
-        exit 1
+        site_not_found "$old_name"
     fi
 
     # Validate the new_name using the same rules as the 'add' command
@@ -25915,7 +32512,32 @@ cove_rename() {
     echo "🔄 Renaming '$old_name.localhost' to '$new_name.localhost'..."
 
     # --- Rename Directory ---
-    mv "$old_site_dir" "$new_site_dir"
+    # A Laravel site's workers run in the folder under the old name; they
+    # start again under the new one below. Both names are held: once the
+    # folder has moved, the watchdog would otherwise start the workers it
+    # wants under the new name while the database and .env are still on
+    # their way. Which ones were running is kept, for an abort to put back.
+    local kind running=""
+    for kind in $LARAVEL_WORKER_KINDS; do
+        laravel_worker_pid "$old_name" "$kind" >/dev/null && running="$running $kind"
+    done
+    laravel_workers_hold "$old_name"
+    laravel_workers_hold "$new_name"
+    laravel_workers_stop_site "$old_name"
+    # Every abort from here: the folder back under the old name (once it
+    # has moved), both holds released, and the workers that were running
+    # started again there.
+    _cove_rename_abort() {
+        [ -d "$new_site_dir" ] && [ ! -e "$old_site_dir" ] && mv "$new_site_dir" "$old_site_dir"
+        laravel_workers_release "$new_name"
+        laravel_workers_release "$old_name"
+        for kind in $running; do laravel_worker_start "$old_name" "$kind"; done
+        exit 1
+    }
+    if ! mv "$old_site_dir" "$new_site_dir"; then
+        gum style --foreground red "❌ Error: Could not rename the folder $old_site_dir."
+        _cove_rename_abort
+    fi
     echo "   - Directory renamed."
 
     # --- Handle WordPress Specifics ---
@@ -25927,43 +32549,50 @@ cove_rename() {
         local wp_cmd
         wp_cmd=$(get_wp_cmd "$new_site_dir")
         
-        local old_db_name
-        old_db_name=$(echo "cove_$old_name" | tr -c '[:alnum:]_' '_')
-        local new_db_name
-        new_db_name=$(echo "cove_$new_name" | tr -c '[:alnum:]_' '_')
-        local temp_sql_dump
-        temp_sql_dump=$(mktemp) || {
-            gum style --foreground red "❌ Error: Could not create a temporary file for the database dump."
-            mv "$new_site_dir" "$old_site_dir"
-            exit 1
-        }
-        trap 'rm -f "$temp_sql_dump"' EXIT
+        # The database follows the name only when it is the one Cove made
+        # (either spelling, see cove_db_is_sites); one wp-config.php was
+        # pointed at by hand stays as it is.
+        local old_db_name="" new_db_name
+        new_db_name=$(cove_db_name "$new_name")
+        if old_db_name=$(wp_cove_db "$new_site_dir" "$old_name"); then
+            if cove_db_exists "$new_db_name"; then
+                gum style --foreground red "❌ Error: A database named '$new_db_name' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
+                _cove_rename_abort # Reverts the directory rename
+            fi
+            local temp_sql_dump
+            temp_sql_dump=$(mktemp) || {
+                gum style --foreground red "❌ Error: Could not create a temporary file for the database dump."
+                _cove_rename_abort
+            }
+            trap 'rm -f "$temp_sql_dump"' EXIT
 
-        echo "   - Backing up old database '$old_db_name'..."
-        if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$old_db_name" > "$temp_sql_dump"; then
-            gum style --foreground red "❌ Error: Failed to dump the old database. Aborting."
-            mv "$new_site_dir" "$old_site_dir" # Revert directory rename
-            exit 1
-        fi
+            echo "   - Backing up old database '$old_db_name'..."
+            if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$old_db_name" > "$temp_sql_dump"; then
+                gum style --foreground red "❌ Error: Failed to dump the old database. Aborting."
+                _cove_rename_abort # Reverts the directory rename
+            fi
 
-        echo "   - Creating and importing to new database '$new_db_name'..."
-        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
-        # Gate the destructive DROP below on a verified import + config update.
-        # Previously the import was unchecked, so a failed import (disk full,
-        # packet size) still fell through to dropping the old database — losing
-        # the site's only good copy. On failure here, abort with the old
-        # database and wp-config left intact.
-        if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" "$new_db_name" < "$temp_sql_dump"; then
-            gum style --foreground red "❌ Error: Failed to import into '$new_db_name'. Aborting; old database left intact."
-            mv "$new_site_dir" "$old_site_dir" # Revert directory rename
-            exit 1
-        fi
+            echo "   - Creating and importing to new database '$new_db_name'..."
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\`;"
+            # Gate the destructive DROP below on a verified import + config update.
+            # Previously the import was unchecked, so a failed import (disk full,
+            # packet size) still fell through to dropping the old database — losing
+            # the site's only good copy. On failure here, abort with the old
+            # database and wp-config left intact.
+            if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" "$new_db_name" < "$temp_sql_dump"; then
+                gum style --foreground red "❌ Error: Failed to import into '$new_db_name'. Aborting; old database left intact."
+                MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$new_db_name\`;"
+                _cove_rename_abort # Reverts the directory rename
+            fi
 
-        echo "   - Updating wp-config.php..."
-        if ! (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet); then
-            gum style --foreground red "❌ Error: Failed to update wp-config.php. Aborting; old database left intact."
-            mv "$new_site_dir" "$old_site_dir" # Revert directory rename
-            exit 1
+            echo "   - Updating wp-config.php..."
+            if ! (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet); then
+                gum style --foreground red "❌ Error: Failed to update wp-config.php. Aborting; old database left intact."
+                MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$new_db_name\`;"
+                _cove_rename_abort # Reverts the directory rename
+            fi
+        else
+            echo "   - Keeping the database wp-config.php names (not one Cove made for '$old_name')."
         fi
 
         echo "   - Running search-replace for site URL..."
@@ -25985,8 +32614,32 @@ cove_rename() {
                 gum style --foreground yellow "⚠️  Could not update DOMAIN_CURRENT_SITE in wp-config.php."
         fi
 
-        echo "   - Dropping old database '$old_db_name'..."
-        MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
+        if [ -n "$old_db_name" ]; then
+            echo "   - Dropping old database '$old_db_name'..."
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$old_db_name\`;"
+        fi
+    elif site_is_laravel "$new_site_dir"; then
+        # A Laravel site's database follows the name only when it is the one
+        # Cove made: copied, .env pointed at the copy, then the old one dropped.
+        source_config
+        local old_laravel_db="" old_laravel_server=""
+        old_laravel_db=$(laravel_cove_db "$new_site_dir" "$old_name")
+        old_laravel_server=$(laravel_db_server "$new_site_dir")
+        if ! laravel_take_database "$new_site_dir" "$old_name" "$new_name" >/dev/null; then
+            gum style --foreground red "❌ Error: Failed to copy the Laravel site's database. Aborting; old database left intact."
+            _cove_rename_abort
+        fi
+        # Its keys in Cove's Redis move with the prefix (queued jobs too),
+        # while its workers are held; read before retarget changes it.
+        local moves_redis=false
+        [ "$(laravel_env_get "$new_site_dir" REDIS_PREFIX)" = "$(cove_redis_prefix "$old_name")" ] && moves_redis=true
+        laravel_retarget "$new_site_dir" "$old_name" "$new_name" "$old_site_dir" || \
+            gum style --foreground yellow "⚠️  Could not update APP_URL in .env; verify it under the new name."
+        [ "$moves_redis" = true ] && cove_redis_move "$(cove_redis_prefix "$old_name")" "$(cove_redis_prefix "$new_name")"
+        if [ -n "$old_laravel_db" ]; then
+            echo "   - Dropping old database '$old_laravel_db'..."
+            cove_server_db_drop "$old_laravel_server" "$old_laravel_db"
+        fi
     fi
 
     # --- Snapshots and the dashboard preview follow the name ---
@@ -26019,6 +32672,11 @@ cove_rename() {
     regenerate_caddyfile
     prune_etc_hosts "$old_name.localhost"
 
+    for kind in $LARAVEL_WORKER_KINDS; do
+        laravel_worker_wanted "$new_name" "$kind" && laravel_worker_start "$new_name" "$kind"
+    done
+    laravel_workers_release "$new_name"
+    laravel_workers_release "$old_name"
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: $(url_for "$new_name.localhost")"
 }
 # Site previews: a headless capture of a site's front page by whichever
@@ -26193,7 +32851,10 @@ cove_screenshot() {
             --max=*)    max="${arg#*=}" ;;
             --idle-only) idle_only=1 ;;
             -h|--help)
-                echo "Usage: cove screenshot <site> [--out=<file.png>] [--path=/<page>] [--width=1280] [--height=800]"
+                echo "Usage: cove screenshot <site> [--out=<file.png>] [--path=/<page>]"
+                echo "                              [--width=1280] [--height=800]"
+                echo "       cove screenshot --check"
+                echo "       cove screenshot --sweep [--max=N] [--idle-only]"
                 echo ""
                 echo "Captures the site's front page with a headless Chromium-family browser"
                 echo "(Chrome, Chromium, Brave, Edge, Arc, Vivaldi). Without --out the image"
@@ -26226,7 +32887,7 @@ cove_screenshot() {
     fi
     if [ -z "$site_name" ]; then
         gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove screenshot <site> [--out=<file.png>]"
+        echo "Usage: cove screenshot <site> [--out=<file.png>] [--path=/<page>]"
         exit 1
     fi
     if ! validate_site_name "$site_name"; then
@@ -26234,8 +32895,7 @@ cove_screenshot() {
         exit 1
     fi
     if [ ! -d "$SITES_DIR/$site_name.localhost/public" ]; then
-        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
     if ! [[ "$width" =~ ^[0-9]{3,4}$ ]] || ! [[ "$height" =~ ^[0-9]{3,4}$ ]]; then
         gum style --foreground red "❌ Error: --width and --height take a number of pixels."
@@ -26377,7 +33037,7 @@ cove_share() {
             -h|--help) display_command_help share; exit 0 ;;
             -*)
                 gum style --foreground red "Error: Unknown option: $1" >&2
-                echo "Usage: cove share [<name>] [--yes] [--background] [stop]" >&2
+                echo "Usage: cove share [<name>] [--yes] [--background] [--format=json] | cove share <name> stop" >&2
                 exit 1
                 ;;
             *) [ -z "$site_name" ] && site_name="$1"; shift ;;
@@ -26442,8 +33102,7 @@ cove_share() {
     local site_dir="$SITES_DIR/${site_name}.localhost"
     
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "Error: Site '${site_name}.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
     # Already shared in the background: say where, do not start a second tunnel.
     if [ -f "$share_dir/$site_name" ]; then
@@ -26985,8 +33644,9 @@ cove_signals() {
     esac
 }
 
-# Snapshots: a point-in-time copy of a site's public/ tree and its database
-# under ~/Cove/Snapshots/<site>/<id>/, restorable in place. The tree is a
+# Snapshots: a point-in-time copy of a site's public/ tree (a Laravel site's
+# whole project, as project/) and its database under
+# ~/Cove/Snapshots/<site>/<id>/, restorable in place. The tree is a
 # copy-on-write clone where the filesystem allows (APFS, btrfs, xfs), so
 # taking one costs seconds and only the blocks that later change take room.
 # A restore first takes a snapshot of its own, so it can itself be undone.
@@ -27008,6 +33668,14 @@ snapshot_size_bytes() {
     echo $(( ${kb:-0} * 1024 ))
 }
 
+# A snapshot's files: public/, or project/ for a Laravel site, whose code
+# lives beside its webroot. Prints which, or fails for neither. A project is
+# zipped with its links kept as links (public/storage is one, which import
+# repoints); a WordPress tree has them followed, so symlinked plugins travel.
+snapshot_files() {
+    if [ -d "$1/project" ]; then echo project; elif [ -d "$1/public" ]; then echo public; else return 1; fi
+}
+
 snapshot_json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | tr -d '\n\r'
 }
@@ -27015,23 +33683,26 @@ snapshot_json_escape() {
 # meta.json for one snapshot directory, on one line.
 snapshot_meta_json() {
     local dir="$1"
-    local id created note auto wp files_bytes db_bytes
+    local id created note auto wp laravel files_bytes db_bytes
     id=$(basename "$dir")
     created=$(sed -n 's/^created=//p' "$dir/meta" 2>/dev/null)
     note=$(sed -n 's/^note=//p' "$dir/meta" 2>/dev/null)
     auto=$(sed -n 's/^auto=//p' "$dir/meta" 2>/dev/null)
     wp=$(sed -n 's/^wp=//p' "$dir/meta" 2>/dev/null)
-    files_bytes=$(snapshot_size_bytes "$dir/public")
+    laravel=$(sed -n 's/^laravel=//p' "$dir/meta" 2>/dev/null)
+    files_bytes=$(snapshot_size_bytes "$dir/$(snapshot_files "$dir")")
     db_bytes=0
     [ -f "$dir/db.sql" ] && db_bytes=$(stat -f%z "$dir/db.sql" 2>/dev/null || stat -c%s "$dir/db.sql" 2>/dev/null || echo 0)
-    printf '{"id":"%s","created":%s,"note":"%s","auto":%s,"wp":"%s","files_bytes":%s,"db_bytes":%s,"has_db":%s}' \
+    printf '{"id":"%s","created":%s,"note":"%s","auto":%s,"wp":"%s","laravel":"%s","files_bytes":%s,"db_bytes":%s,"has_db":%s}' \
         "$id" "${created:-0}" "$(snapshot_json_escape "$note")" "$([ "$auto" == "1" ] && echo true || echo false)" \
-        "$(snapshot_json_escape "$wp")" "$files_bytes" "$db_bytes" "$([ -f "$dir/db.sql" ] && echo true || echo false)"
+        "$(snapshot_json_escape "$wp")" "$(snapshot_json_escape "$laravel")" "$files_bytes" "$db_bytes" "$([ -f "$dir/db.sql" ] && echo true || echo false)"
 }
 
-# snapshot_create <site> <note> <auto:0|1>  → prints the new id on stdout (last line)
+# snapshot_create <site> <note> <auto:0|1> [project]  → prints the new id on
+# stdout (last line). "project" takes a Laravel site's whole folder even when
+# it no longer looks like one, as a restore of a project snapshot does.
 snapshot_create() {
-    local site_name="$1" note="$2" auto="${3:-0}"
+    local site_name="$1" note="$2" auto="${3:-0}" want="${4:-}"
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
     local id
@@ -27045,7 +33716,7 @@ snapshot_create() {
     # Snapshots hold whole sites and their databases: this user only.
     chmod 700 "$SNAPSHOTS_DIR" 2>/dev/null
 
-    local wp_version=""
+    local wp_version="" kind="" laravel_ver="" db_server=""
     if [ -f "$public_dir/wp-config.php" ]; then
         local dump_cmd
         if ! dump_cmd=$(snapshot_dump_cmd); then
@@ -27073,10 +33744,63 @@ snapshot_create() {
         rm -f "$dest/.dump-err"
         chmod 600 "$dest/db.sql"
         wp_version=$(sed -n "s/^\$wp_version = '\([^']*\)';/\1/p" "$public_dir/wp-includes/version.php" 2>/dev/null | head -n 1)
+    elif [ "$want" = "project" ] || site_is_project "$site_dir"; then
+        # The whole project; an SQLite database rides along inside it. A
+        # Laravel app's MariaDB one is dumped only when it is the one Cove
+        # made. Another app (from `cove add --from`) is its folder alone.
+        kind="project"
+        if site_is_laravel "$site_dir"; then
+            kind="laravel"
+            laravel_ver=$(laravel_version "$site_dir")
+        fi
+        local dump_cmd db_name
+        if db_name=$(laravel_cove_db "$site_dir" "$site_name") && [ "$(laravel_db_server "$site_dir")" = "pgsql" ]; then
+            # PostgreSQL's: plain SQL from pg_dump; meta says which server.
+            if ! ensure_postgres >&2; then
+                rm -rf "$dest"
+                return 1
+            fi
+            echo "   Dumping database '$db_name'…" >&2
+            if ! cove_pg_dump "$db_name" > "$dest/db.sql" 2>"$dest/.dump-err"; then
+                local err; err=$(tail -n 2 "$dest/.dump-err")
+                rm -rf "$dest"
+                gum style --foreground red "❌ Error: The database dump failed." "$err" >&2
+                return 1
+            fi
+            rm -f "$dest/.dump-err"
+            chmod 600 "$dest/db.sql"
+            db_server="pgsql"
+        elif [ -n "$db_name" ]; then
+            if ! dump_cmd=$(snapshot_dump_cmd); then
+                rm -rf "$dest"
+                gum style --foreground red "❌ Error: Neither mariadb-dump nor mysqldump could be found." >&2
+                return 1
+            fi
+            source_config
+            echo "   Dumping database '$db_name'…" >&2
+            if ! MYSQL_PWD="$DB_PASSWORD" "$dump_cmd" -u"$DB_USER" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "$db_name" > "$dest/db.sql" 2>"$dest/.dump-err"; then
+                local err; err=$(tail -n 2 "$dest/.dump-err")
+                rm -rf "$dest"
+                gum style --foreground red "❌ Error: The database dump failed." "$err" >&2
+                return 1
+            fi
+            rm -f "$dest/.dump-err"
+            chmod 600 "$dest/db.sql"
+        else
+            case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
+                mysql|mariadb|pgsql) echo "   ⚠️  .env names a database Cove didn't make for this site, so the snapshot holds the files only." >&2 ;;
+            esac
+        fi
     fi
 
     echo "   Copying files…" >&2
-    if ! cove_copy_tree "$public_dir" "$dest/public"; then
+    local copied=true
+    if [ "$kind" = "laravel" ] || [ "$kind" = "project" ]; then
+        cove_copy_project "$site_dir" "$dest/project" || copied=false
+    else
+        cove_copy_tree "$public_dir" "$dest/public" || copied=false
+    fi
+    if [ "$copied" = false ]; then
         rm -rf "$dest"
         gum style --foreground red "❌ Error: Could not copy the site's files." >&2
         return 1
@@ -27086,6 +33810,13 @@ snapshot_create() {
         echo "note=$note"
         echo "auto=$auto"
         echo "wp=$wp_version"
+        # The site it was taken from, so a restore after a rename can point
+        # the site's own settings at its new name.
+        echo "site=$site_name"
+        echo "folder=$site_dir"
+        [ -n "$kind" ] && echo "kind=$kind"
+        [ -n "$laravel_ver" ] && echo "laravel=$laravel_ver"
+        [ -n "$db_server" ] && echo "db_server=$db_server"
     } > "$dest/meta"
     echo "$id"
 }
@@ -27095,28 +33826,78 @@ snapshot_restore() {
     local site_name="$1" id="$2"
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
-    local src="$SNAPSHOTS_DIR/$site_name/$id"
-    if [ ! -d "$src/public" ]; then
+    local src="$SNAPSHOTS_DIR/$site_name/$id" files
+    if ! files=$(snapshot_files "$src"); then
         gum style --foreground red "❌ Error: Snapshot '$id' not found for '$site_name.localhost'." >&2
+        return 1
+    fi
+
+    # A failed swap's leftovers hold the only copy of some files: refused
+    # before anything is touched, the database included.
+    if [ "$files" = "project" ] && [ -e "$site_dir/.project.replaced" ]; then
+        gum style --foreground red "❌ Error: $site_dir/.project.replaced is left from an earlier restore." "Move its contents back into the site folder first; nothing was changed." >&2
         return 1
     fi
 
     # The way back: today's state, taken before anything is touched.
     echo "📸 Taking a snapshot of the current state first…" >&2
     local safety
-    safety=$(snapshot_create "$site_name" "before restoring $id" 1) || return 1
+    safety=$(snapshot_create "$site_name" "before restoring $id" 1 "$( [ "$files" = "project" ] && echo project)") || return 1
     safety="${safety##*$'\n'}"
     echo "   Saved as $safety." >&2
 
-    if [ -f "$src/db.sql" ]; then
+    local db_server
+    db_server=$(sed -n 's/^db_server=//p' "$src/meta" 2>/dev/null)
+    if [ -f "$src/db.sql" ] && [ "$files" = "project" ] && [ "$db_server" = "pgsql" ]; then
+        # A Laravel site's PostgreSQL database, as for MariaDB below: saved
+        # first when the snapshot just taken doesn't hold it, then made new.
+        local db_name safety_dir
+        ensure_postgres >&2 || return 1
+        db_name=$(cove_db_name "$site_name")
+        safety_dir="$SNAPSHOTS_DIR/$site_name/$safety"
+        if [ ! -f "$safety_dir/db.sql" ] && cove_pg_db_exists "$db_name"; then
+            if ! cove_pg_dump "$db_name" > "$safety_dir/db.sql" 2>/dev/null; then
+                rm -f "$safety_dir/db.sql"
+                gum style --foreground red "❌ Error: Could not save the database '$db_name' before replacing it." >&2
+                return 1
+            fi
+            chmod 600 "$safety_dir/db.sql"
+            echo "db_server=pgsql" >> "$safety_dir/meta"
+        fi
+        echo "   Restoring database '$db_name'…" >&2
+        if ! cove_server_db_drop pgsql "$db_name" || ! cove_server_db_create pgsql "$db_name"; then
+            gum style --foreground red "❌ Error: Could not recreate the database." >&2
+            return 1
+        fi
+        if ! cove_pg_load "$db_name" < "$src/db.sql"; then
+            gum style --foreground red "❌ Error: The database import failed. The files were not touched; snapshot $safety holds the state from before." >&2
+            return 1
+        fi
+    elif [ -f "$src/db.sql" ]; then
         local client wp_cmd db_name
         if ! client=$(snapshot_client_cmd); then
             gum style --foreground red "❌ Error: Neither mariadb nor mysql could be found." >&2
             return 1
         fi
         source_config
-        wp_cmd=$(get_wp_cmd "$site_dir")
-        db_name=$( (cd "$public_dir" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        if [ "$files" = "project" ]; then
+            # Back into the database Cove keeps for this Laravel site. .env
+            # may name another one now, in which case the snapshot just taken
+            # doesn't hold this one: it gets a copy before it is replaced.
+            db_name=$(cove_db_name "$site_name")
+            local safety_dir="$SNAPSHOTS_DIR/$site_name/$safety" dump_cmd
+            if [ ! -f "$safety_dir/db.sql" ] && cove_db_exists "$db_name" && dump_cmd=$(snapshot_dump_cmd); then
+                if ! MYSQL_PWD="$DB_PASSWORD" "$dump_cmd" -u"$DB_USER" --max_allowed_packet=512M --default-character-set=utf8mb4 --add-drop-table --single-transaction --quick --lock-tables=false "$db_name" > "$safety_dir/db.sql" 2>/dev/null; then
+                    rm -f "$safety_dir/db.sql"
+                    gum style --foreground red "❌ Error: Could not save the database '$db_name' before replacing it." >&2
+                    return 1
+                fi
+                chmod 600 "$safety_dir/db.sql"
+            fi
+        else
+            wp_cmd=$(get_wp_cmd "$site_dir")
+            db_name=$( (cd "$public_dir" && $wp_cmd config get DB_NAME --skip-plugins --skip-themes 2>/dev/null) )
+        fi
         if [ -z "$db_name" ]; then
             gum style --foreground red "❌ Error: Could not read DB_NAME from wp-config.php." >&2
             return 1
@@ -27135,6 +33916,29 @@ snapshot_restore() {
     fi
 
     echo "   Restoring files…" >&2
+    if [ "$files" = "project" ]; then
+        if ! snapshot_swap_project "$site_dir" "$src/project"; then
+            gum style --foreground red "❌ Error: Could not put the snapshot's files back. Snapshot $safety holds the state from before." >&2
+            return 1
+        fi
+        # Taken under another name (before a rename): its .env names that
+        # site's address, folder and database.
+        local from
+        from=$(sed -n 's/^site=//p' "$src/meta" 2>/dev/null)
+        local from_dir
+        from_dir=$(sed -n 's/^folder=//p' "$src/meta" 2>/dev/null)
+        [ -n "$from_dir" ] || from_dir="$SITES_DIR/$from.localhost"
+        if [ -n "$from" ] && [ "$from" != "$site_name" ]; then
+            laravel_retarget "$site_dir" "$from" "$site_name" "$from_dir" || true
+        fi
+        if [ -f "$src/db.sql" ]; then
+            case "$(laravel_env_get "$site_dir" DB_CONNECTION)" in
+                mysql|mariadb|pgsql) COVE_ENV_SET="{\"DB_DATABASE\":$(cove_json_str "$db_name")}" laravel_env_set "$site_dir/.env" || true ;;
+            esac
+        fi
+        echo "$safety"
+        return 0
+    fi
     local staging="$site_dir/.public.restoring"
     rm -rf "$staging"
     if ! cove_copy_tree "$src/public" "$staging"; then
@@ -27150,6 +33954,63 @@ snapshot_restore() {
         (cd "$public_dir" && $wp_cmd cache flush --skip-plugins --skip-themes >/dev/null 2>&1) || true
     fi
     echo "$safety"
+}
+
+# Puts a snapshot's Laravel project back into a site folder ($1, from $2):
+# a copy is staged beside it, the folder's entries move aside (Cove's own
+# files stay), the copy's move in, and what moved aside is removed.
+snapshot_swap_project() {
+    local site_dir="$1" from="$2" staging="$1/.project.restoring" old="$1/.project.replaced" entry name
+    # A .project.replaced still here is a failed swap's only copy of the
+    # files: never thrown away, the restore stops instead.
+    if [ -e "$old" ]; then
+        echo "   $old is left from an earlier restore; move its contents back first." >&2
+        return 1
+    fi
+    rm -rf "$staging"
+    if ! cove_copy_tree "$from" "$staging"; then
+        rm -rf "$staging"
+        return 1
+    fi
+    mkdir "$old" || return 1
+    for entry in "$site_dir"/* "$site_dir"/.[!.]* "$site_dir"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name="${entry##*/}"
+        case " $COVE_SITE_OWN .project.restoring .project.replaced " in *" $name "*) continue ;; esac
+        if ! mv "$entry" "$old/"; then
+            snapshot_swap_back "$site_dir" "$old" "$staging" 0
+            return 1
+        fi
+    done
+    for entry in "$staging"/* "$staging"/.[!.]* "$staging"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        if ! mv "$entry" "$site_dir/"; then
+            snapshot_swap_back "$site_dir" "$old" "$staging" 1
+            return 1
+        fi
+    done
+    rm -rf "$staging" "$old"
+}
+
+# Undoes a half-done swap. When the snapshot's files had started moving in
+# ($4 = 1), everything in the folder but Cove's own files came from it (the
+# rest was moved aside), so it goes; then what was moved aside comes back.
+snapshot_swap_back() {
+    local site_dir="$1" old="$2" staging="$3" moved_in="$4" entry name
+    if [ "$moved_in" = 1 ]; then
+        for entry in "$site_dir"/* "$site_dir"/.[!.]* "$site_dir"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            name="${entry##*/}"
+            case " $COVE_SITE_OWN .project.restoring .project.replaced " in *" $name "*) continue ;; esac
+            rm -rf "$entry"
+        done
+    fi
+    for entry in "$old"/* "$old"/.[!.]* "$old"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        mv "$entry" "$site_dir/" || return 1
+    done
+    rm -rf "$staging"
+    rmdir "$old" 2>/dev/null
 }
 
 cove_snapshot() {
@@ -27197,8 +34058,7 @@ cove_snapshot() {
     fi
     local site_dir="$SITES_DIR/$site_name.localhost"
     if [ ! -d "$site_dir/public" ]; then
-        gum style --foreground red "❌ Error: Site '$site_name.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
     [ -z "$sub" ] && sub="create"
     if [ -n "$id" ] && ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]]; then
@@ -27226,7 +34086,7 @@ cove_snapshot() {
                 local first=1 d
                 for d in "${dirs[@]}"; do
                     d="${d%/}"
-                    [ -d "$d/public" ] || continue
+                    snapshot_files "$d" >/dev/null || continue
                     [ $first -eq 1 ] || printf ','
                     first=0
                     snapshot_meta_json "$d"
@@ -27242,12 +34102,12 @@ cove_snapshot() {
             local d
             for d in "${dirs[@]}"; do
                 d="${d%/}"
-                [ -d "$d/public" ] || continue
+                snapshot_files "$d" >/dev/null || continue
                 local created note auto bytes
                 created=$(sed -n 's/^created=//p' "$d/meta" 2>/dev/null)
                 note=$(sed -n 's/^note=//p' "$d/meta" 2>/dev/null)
                 auto=$(sed -n 's/^auto=//p' "$d/meta" 2>/dev/null)
-                bytes=$(( $(snapshot_size_bytes "$d/public") + $( [ -f "$d/db.sql" ] && (stat -f%z "$d/db.sql" 2>/dev/null || stat -c%s "$d/db.sql") || echo 0 ) ))
+                bytes=$(( $(snapshot_size_bytes "$d/$(snapshot_files "$d")") + $( [ -f "$d/db.sql" ] && (stat -f%z "$d/db.sql" 2>/dev/null || stat -c%s "$d/db.sql") || echo 0 ) ))
                 printf "  %-22s  %-19s  %-9s  %s%s\n" "$(basename "$d")" "$(date -r "${created:-0}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@${created:-0}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$(awk -v b="$bytes" 'BEGIN{ s="B"; if (b>=1073741824){b/=1073741824; s="GB"} else if (b>=1048576){b/=1048576; s="MB"} else if (b>=1024){b/=1024; s="KB"}; printf (b>=10||s=="B") ? "%d %s" : "%.1f %s", b, s }')" "$note" "$([ "$auto" == "1" ] && echo ' (auto)')"
             done
             ;;
@@ -27256,7 +34116,7 @@ cove_snapshot() {
                 gum style --foreground red "❌ Error: Which snapshot? cove snapshot $site_name restore <id>"
                 exit 1
             fi
-            echo "⏪ Restoring '$site_name.localhost' to $id…" >&2
+            echo "⏪ Restoring '$site_name.localhost' to ${id}…" >&2
             local safety
             safety=$(snapshot_restore "$site_name" "$id") || exit 1
             safety="${safety##*$'\n'}"
@@ -27270,7 +34130,7 @@ cove_snapshot() {
                 exit 1
             fi
             local src="$SNAPSHOTS_DIR/$site_name/$id"
-            if [ ! -d "$src/public" ]; then
+            if ! snapshot_files "$src" >/dev/null; then
                 gum style --foreground red "❌ Error: Snapshot '$id' not found."
                 exit 1
             fi
@@ -27279,11 +34139,11 @@ cove_snapshot() {
             if command -v zip >/dev/null 2>&1; then archive="${out:-$src/$site_name-$id.zip}"; else archive="${out:-$src/$site_name-$id.tar.gz}"; fi
             local tmp="$archive.tmp"
             rm -f "$tmp"
-            if [ "$format" != "json" ]; then echo "📦 Packing snapshot $id…"; fi
+            if [ "$format" != "json" ]; then echo "📦 Packing snapshot ${id}…"; fi
             if [[ "$archive" == *.zip ]]; then
-                ( umask 077; cd "$src" && zip -qr -X "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
+                ( umask 077; cd "$src" && zip -qr -X $( [ "$(snapshot_files .)" = project ] && echo -y ) "$tmp" "$(snapshot_files .)" $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: zip failed."; exit 1; }
             else
-                ( umask 077; cd "$src" && tar -czf "$tmp" public $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: tar failed."; exit 1; }
+                ( umask 077; cd "$src" && tar -czf "$tmp" "$(snapshot_files .)" $( [ -f db.sql ] && echo db.sql ) meta ) || { rm -f "$tmp"; gum style --foreground red "❌ Error: tar failed."; exit 1; }
             fi
             mv -f "$tmp" "$archive"
             local bytes
@@ -27365,6 +34225,17 @@ cove_status() {
         fi
     fi
     
+    # PostgreSQL and Redis, once a Laravel site has had them set up.
+    local pg_status="" redis_status=""
+    if cove_pg_configured; then
+        pg_status="❌ Stopped"
+        cove_pg_ready && pg_status="✅ Running"
+    fi
+    if cove_redis_configured; then
+        redis_status="❌ Stopped"
+        cove_redis_ready && redis_status="✅ Running"
+    fi
+
     # Native php-fpm units for sites pinned to an older PHP (`cove php`).
     # One row per version with an installed unit; nothing pinned = no rows.
     local fpm_lines=""
@@ -27396,6 +34267,8 @@ cove_status() {
         [[ "$caddy_status" == *Running* ]] && echo "caddy=running" || echo "caddy=stopped"
         [[ "$mariadb_status" == *Running* ]] && echo "mariadb=running" || echo "mariadb=stopped"
         [[ "$mailpit_status" == *Running* ]] && echo "mailpit=running" || echo "mailpit=stopped"
+        if [ -n "$pg_status" ]; then [[ "$pg_status" == *Running* ]] && echo "postgres=running" || echo "postgres=stopped"; fi
+        if [ -n "$redis_status" ]; then [[ "$redis_status" == *Running* ]] && echo "redis=running" || echo "redis=stopped"; fi
         [ -n "$fpm_porcelain" ] && printf '%s' "$fpm_porcelain"
         return 0
     fi
@@ -27404,6 +34277,10 @@ cove_status() {
     echo "  Caddy Server: $caddy_status"
     echo "  MariaDB:      $mariadb_status"
     echo "  Mailpit:      $mailpit_status"
+    # Optional: started on demand by the sites that use them, and left
+    # alone by cove enable and disable.
+    [ -n "$pg_status" ] && echo "  PostgreSQL:   $pg_status (optional)"
+    [ -n "$redis_status" ] && echo "  Redis:        $redis_status (optional)"
     [ -n "$fpm_lines" ] && printf '%s' "$fpm_lines"
     echo ""
 
@@ -27425,6 +34302,8 @@ cove_status() {
         gum style --border normal --margin "1" --padding "1 2" --border-foreground "yellow" \
             "⚠️  Some services are stopped." \
             "Run 'cove enable' to start them."
+        # So a script can tell (--porcelain stays 0: the menu bar reads it).
+        return 1
     fi
 }
 # --- Tailscale Configuration ---
@@ -27585,29 +34464,7 @@ cove_tailscale() {
             cove_tailscale_status
             ;;
         *)
-            echo "Usage: cove tailscale <subcommand>"
-            echo ""
-            echo "Expose all Cove sites to your Tailscale network via port-based routing."
-            echo "This allows devices on your Tailnet (like your iPhone) to access"
-            echo "your local development sites."
-            echo ""
-            echo "Your Tailscale hostname is automatically detected when you run 'enable'."
-            echo "Each site gets a unique port (starting at 9001), so you can access them at:"
-            echo "  https://<your-tailscale-hostname>:<port>"
-            echo ""
-            echo "Subcommands:"
-            echo "  enable     Enable Tailscale access (auto-detects hostname)."
-            echo "             --dashboard also shares the Cove dashboard and Adminer,"
-            echo "             which can run commands on this machine."
-            echo "  disable    Disable Tailscale access"
-            echo "  status     Show current Tailscale configuration and URLs"
-            echo ""
-            echo "Examples:"
-            echo "  cove tailscale enable"
-            echo "  cove tailscale enable --dashboard"
-            echo "  cove tailscale status"
-            echo "  cove tailscale disable"
-            exit 0
+            cove_unknown_subcommand tailscale "$action" "enable disable status"
             ;;
     esac
 }
@@ -29181,9 +36038,7 @@ cove_transfer() {
             transfer_local probe "$target" ${extra[@]+"${extra[@]}"}
             ;;
         *)
-            echo "Usage: cove transfer probe [site] [--tenant=<id>]"
-            echo ""
-            echo "Reports which tools the backup/restore engine will use here."
+            cove_unknown_subcommand transfer "$sub" "probe"
             ;;
     esac
 }
@@ -29319,6 +36174,8 @@ cove_trust() {
                 "Re-run 'cove trust' once Cove is running to try again."
         fi
     fi
+    # cove install prints the manual trust steps only when this failed.
+    return "$trust_rc"
 }
 
 # A twin: a second domain that serves another folder of the same site, the
@@ -29387,8 +36244,7 @@ cove_twin() {
     local site_host="$site_name.localhost"
     local site_dir="$SITES_DIR/$site_host"
     if [ ! -d "$site_dir/public" ]; then
-        gum style --foreground red "❌ Error: Site '$site_host' not found."
-        exit 1
+        site_not_found "$site_host"
     fi
 
     case "${action:-show}" in
@@ -29508,6 +36364,334 @@ cove_twin() {
     esac
 }
 
+# Takes Cove's local root certificate out of the system's trust store by its
+# file, which works with the web server stopped (asked without one, untrust
+# fetches it from the running server's admin API), then out of the browsers'
+# certificate databases on Linux, where `cove trust` put it as "Cove Local
+# Authority".
+cove_untrust_root() {
+    local root="" ok=false db
+    if [ "$OS" = "macos" ]; then
+        root="$HOME/Library/Application Support/Caddy/pki/authorities/local/root.crt"
+    else
+        root="${XDG_DATA_HOME:-$HOME/.local/share}/caddy/pki/authorities/local/root.crt"
+        [ -f "$root" ] || root=$(find /usr/local/share/ca-certificates -maxdepth 1 -name 'Caddy_Local_Authority*.crt' 2>/dev/null | head -1)
+    fi
+    if command -v "$CADDY_CMD" >/dev/null 2>&1 || [ -x "$CADDY_CMD" ]; then
+        if [ -n "$root" ] && [ -f "$root" ]; then
+            { "$CADDY_CMD" untrust --cert "$root" &>/dev/null || $SUDO_CMD "$CADDY_CMD" untrust --cert "$root" &>/dev/null; } && ok=true
+        else
+            { "$CADDY_CMD" untrust &>/dev/null || $SUDO_CMD "$CADDY_CMD" untrust &>/dev/null; } && ok=true
+        fi
+    fi
+    if [ "$OS" = "linux" ] && command -v certutil >/dev/null 2>&1; then
+        while IFS= read -r db; do
+            [ -n "$db" ] && certutil -D -d sql:"$(dirname "$db")" -n "Cove Local Authority" &>/dev/null
+        done < <(find "$HOME/.pki" "$HOME/.mozilla/firefox" "$HOME/snap" "$HOME/.var/app" -name 'cert9.db' 2>/dev/null)
+    fi
+    $ok
+}
+
+# `cove uninstall`: Cove's services, background jobs, menu bar app and
+# /etc/hosts lines go, then the cove command itself. The sites in ~/Cove and
+# their databases stay unless --purge, which deletes every site the way
+# `cove delete` does (files, the MariaDB or PostgreSQL database Cove made for
+# it, Redis keys) and then ~/Cove. The packages Cove installed (MariaDB,
+# Mailpit, FrankenPHP, gum, WP-CLI, PostgreSQL, Redis) stay either way, since
+# other things may use them: the summary names them with the command that
+# removes them.
+cove_uninstall() {
+    local purge=false dry_run=false yes=false arg
+    # A Cove that never finished installing may have no gum: plain text and
+    # prompts stand in for it, so it can still be taken out.
+    if ! command -v gum >/dev/null 2>&1; then
+        gum() {
+            local a
+            case "$1" in
+                style)
+                    shift
+                    while [ $# -gt 0 ]; do
+                        case "$1" in
+                            --*=*) shift ;;
+                            --*) shift; [ $# -gt 0 ] && shift ;;
+                            *) printf '%s\n' "$1"; shift ;;
+                        esac
+                    done ;;
+                confirm) printf '%s [y/N] ' "$2" >&2; read -r a; [[ "$a" == [Yy]* ]] ;;
+                input) printf '%s: ' "${3:-}" >&2; read -r a; printf '%s\n' "$a" ;;
+            esac
+        }
+    fi
+
+    for arg in "$@"; do
+        case "$arg" in
+            --purge) purge=true ;;
+            --dry-run) dry_run=true ;;
+            --yes|-y) yes=true ;;
+            -h|--help) display_command_help uninstall; return 0 ;;
+            *)
+                gum style --foreground red "❌ Error: Unknown option '$arg'."
+                echo "Usage: cove uninstall [--purge] [--dry-run] [--yes]"
+                exit 1 ;;
+        esac
+    done
+
+    # The copy to remove: this script when it's the installed `cove`, else the
+    # one on PATH. Never a cove.sh run from a checkout of the source.
+    local cove_bin=""
+    if [ "$(basename "$0")" = "cove" ]; then
+        cove_bin="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/cove"
+    fi
+    [ -f "$cove_bin" ] || cove_bin=$(command -v cove 2>/dev/null)
+    [ -n "$cove_bin" ] && [ -f "$cove_bin" ] || cove_bin="$BIN_DIR/cove"
+
+    # Folders whose names Cove couldn't have made (My_Site.localhost, made by
+    # hand) are kept apart: cove delete refuses such a name, which would stop
+    # the purge at every run, and Cove never made a database for one. With
+    # --purge they go with the rest of $COVE_DIR.
+    local sites=() odd_sites=() d n
+    for d in "$SITES_DIR"/*.localhost; do
+        [ -d "$d" ] || continue
+        n=$(basename "$d" .localhost)
+        if validate_site_name "$n"; then
+            sites+=("$n")
+        else
+            odd_sites+=("$n.localhost")
+        fi
+    done
+    # Cove's MariaDB drop-in (write_mariadb_config), found by the line it
+    # starts with in each place it can have been written, so a cove.cnf of
+    # the user's own is never touched.
+    local mariadb_cnfs=() cnf cnf_places
+    if [ "$OS" = "macos" ]; then
+        cnf_places=("${BIN_DIR%/bin}/etc/my.cnf.d/cove.cnf")
+    else
+        cnf_places=(/etc/mysql/mariadb.conf.d/99-cove.cnf /etc/my.cnf.d/cove.cnf /etc/mysql/conf.d/cove.cnf)
+    fi
+    for cnf in "${cnf_places[@]}"; do
+        [ -f "$cnf" ] && head -n 1 "$cnf" 2>/dev/null | grep -q '^# Managed by Cove' && mariadb_cnfs+=("$cnf")
+    done
+    local lan_agents=() f
+    if [ "$OS" = "macos" ]; then
+        for f in "$HOME"/Library/LaunchAgents/com.cove.*.lan.plist; do
+            [ -f "$f" ] && lan_agents+=("$f")
+        done
+    fi
+    local shares=()
+    for f in "$APP_DIR"/share/*; do
+        [ -f "$f" ] && shares+=("$(basename "$f")")
+    done
+    local hosts=() h
+    while IFS= read -r h; do
+        [ -n "$h" ] && grep -qE "^127\.0\.0\.1[[:space:]]+${h//./\\.}[[:space:]]*$" /etc/hosts 2>/dev/null && hosts+=("$h")
+    done < <(cove_required_hosts 2>/dev/null)
+
+    echo "Cove uninstall will:"
+    if $purge; then
+        echo "  • Delete all ${#sites[@]} sites: their files, the databases Cove made for them, and their Redis keys"
+        [ ${#odd_sites[@]} -gt 0 ] && echo "  • Delete ${#odd_sites[@]} folder(s) Cove didn't make, with $COVE_DIR (no database is looked for): ${odd_sites[*]}"
+    fi
+    echo "  • Stop Cove's services (FrankenPHP, Mailpit, MariaDB, the watchdog, Laravel workers) and take them out of $([ "$OS" = macos ] && echo launchd || echo "systemd (their units removed)")"
+    [ ${#shares[@]} -gt 0 ] && echo "  • End ${#shares[@]} background share(s)"
+    [ ${#lan_agents[@]} -gt 0 ] && echo "  • Stop ${#lan_agents[@]} LAN (Bonjour) advertisement(s)"
+    menubar_is_enabled 2>/dev/null && echo "  • Remove the menu bar app"
+    [ ${#hosts[@]} -gt 0 ] && echo "  • Take Cove's ${#hosts[@]} line(s) out of /etc/hosts (cove.localhost, ${hosts[1]:-}…)"
+    if $purge; then
+        echo "  • Remove Cove's local certificate authority from the system's trust store"
+        [ ${#mariadb_cnfs[@]} -gt 0 ] && echo "  • Remove Cove's MariaDB settings (${mariadb_cnfs[*]})"
+        echo "  • Delete $COVE_DIR (backups, snapshots, logs, settings)"
+    else
+        echo "  • Keep $COVE_DIR (${#sites[@]} sites, backups, snapshots) and the sites' databases"
+    fi
+    echo "  • Remove the cove command ($cove_bin)"
+
+    if $dry_run; then
+        echo ""
+        echo "Dry run: nothing was changed."
+        return 0
+    fi
+
+    if ! $yes; then
+        if [ ! -t 0 ]; then
+            gum style --foreground red "❌ Error: No terminal to confirm on." "Run it again with --yes to uninstall without asking."
+            exit 1
+        fi
+        echo ""
+        if $purge; then
+            local typed
+            typed=$(gum input --placeholder "Type delete to remove every site and $COVE_DIR")
+            if [ "$typed" != "delete" ]; then
+                echo "🚫 Uninstall cancelled."
+                exit 1
+            fi
+        elif ! gum confirm "Uninstall Cove?"; then
+            echo "🚫 Uninstall cancelled."
+            exit 1
+        fi
+    fi
+    echo ""
+
+    # Sites first, while MariaDB and PostgreSQL answer: started here when
+    # they're down, as a database that can't be dropped would be left with
+    # nothing to find it by. Each delete runs in a subshell, as cove_delete
+    # exits on an error, and counts only when the folder and the database
+    # Cove made for it are both gone. A WordPress database wp-config.php was
+    # pointed at by hand isn't Cove's, so it stays and is named at the end.
+    local failed=() kept_dbs=() s sd db server hand
+    if $purge && [ ${#sites[@]} -gt 0 ]; then
+        source_config
+        if ! mariadb_wait_ready 1; then
+            echo "🗄️ Starting MariaDB to delete the sites' databases…"
+            if [ "$OS" = "macos" ]; then
+                start_macos_mariadb &>/dev/null
+            else
+                $SUDO_CMD systemctl start "$(get_mariadb_service_name)" &>/dev/null
+            fi
+            if ! mariadb_wait_ready 20; then
+                gum style --foreground red "❌ Error: MariaDB isn't answering, so the sites' databases can't be deleted. Nothing was changed." "Start it with: cove enable. Then run cove uninstall --purge again."
+                exit 1
+            fi
+        fi
+        cove_pg_configured && ensure_postgres >/dev/null 2>&1
+        local pg_up=false
+        cove_pg_configured && cove_pg_ready && pg_up=true
+        for s in "${sites[@]}"; do
+            echo "🗑️  Deleting $s.localhost…"
+            sd="$SITES_DIR/$s.localhost" db="" server=mariadb hand=""
+            if [ -f "$sd/public/wp-config.php" ]; then
+                db=$(wp_site_db "$sd")
+                if [ -n "$db" ] && ! cove_db_is_sites "$db" "$s"; then hand="$db"; db=""; fi
+            elif site_is_laravel "$sd" && db=$(laravel_cove_db "$sd" "$s"); then
+                server=$(laravel_db_server "$sd")
+            else
+                db=""
+            fi
+            # A PostgreSQL site while PostgreSQL won't start: left exactly as
+            # it is, as deleting its folder would leave the database with
+            # nothing to find it by. (cove delete keeps it too, and fails.)
+            if [ -n "$db" ] && [ "$server" = pgsql ] && ! $pg_up; then
+                echo "   - PostgreSQL isn't answering, so $s.localhost and its database stay."
+                failed+=("$s")
+                continue
+            fi
+            if ! ( cove_delete "$s" --force --no-reload ) >/dev/null 2>&1 || [ -d "$sd" ] \
+                || { [ -n "$db" ] && [ "$server" = pgsql ] && ! cove_pg_ready; } \
+                || { [ -n "$db" ] && cove_server_db_exists "$server" "$db"; }; then
+                failed+=("$s")
+            fi
+            [ -n "$hand" ] && kept_dbs+=("$hand")
+        done
+        # Cove stays to try again with: its config holds the database password.
+        if [ ${#failed[@]} -gt 0 ]; then
+            gum style --foreground red "❌ These sites couldn't be fully deleted: ${failed[*]}" "Cove is still installed. See what stops one with: cove delete <site>" "Then run cove uninstall --purge again."
+            exit 1
+        fi
+    fi
+
+    for s in "${shares[@]}"; do
+        ( cove_share "$s" stop ) >/dev/null 2>&1
+    done
+    if [ ${#lan_agents[@]} -gt 0 ]; then
+        echo "📡 Stopping LAN advertisements…"
+        for f in "${lan_agents[@]}"; do
+            launchctl unload "$f" &>/dev/null
+            rm -f "$f"
+        done
+    fi
+    if menubar_is_enabled 2>/dev/null; then
+        ( cove_menubar_disable ) 2>&1 | sed 's/^/   /'
+    fi
+
+    # Before the web server stops, so a certificate file that has gone
+    # missing can still be asked of it.
+    if $purge; then
+        echo "🔐 Removing Cove's certificate authority from the trust store (may ask for your password)..."
+        cove_untrust_root \
+            || gum style --foreground yellow "   - ⚠️ Couldn't remove it; Keychain Access (macOS) or update-ca-certificates (Linux) can."
+    fi
+
+    cove_disable
+    if [ "$OS" = "linux" ]; then
+        echo "   - Removing Cove's systemd units..."
+        local unit
+        for unit in cove-watchdog.timer cove-watchdog.service cove.service mailpit.service; do
+            $SUDO_CMD systemctl disable --now "$unit" &>/dev/null || true
+            $SUDO_CMD rm -f "/etc/systemd/system/$unit"
+        done
+        # Install masked the frankenphp package's own unit to keep it off
+        # ports 80 and 443; the package is the user's again.
+        $SUDO_CMD systemctl unmask frankenphp.service &>/dev/null || true
+        $SUDO_CMD systemctl daemon-reload &>/dev/null || true
+    fi
+
+    [ ${#hosts[@]} -gt 0 ] && prune_etc_hosts --all "${hosts[@]}"
+
+    # What couldn't be removed is named at the end rather than reported as
+    # gone. A file this account can't remove gets one try with sudo: on
+    # macOS too, where SUDO_CMD is empty (Cove runs as the user there) and a
+    # root-owned leftover would otherwise be retried as the same user.
+    local left=()
+    cove_uninstall_rm() {
+        rm -rf "$1" 2>/dev/null
+        if [ -e "$1" ] && [ "$(id -u)" != "0" ]; then
+            if [ -t 0 ]; then
+                sudo rm -rf "$1" 2>/dev/null
+            else
+                sudo -n rm -rf "$1" 2>/dev/null
+            fi
+        fi
+        [ -e "$1" ] && left+=("$1")
+        return 0
+    }
+
+    if $purge; then
+        # Cove's MariaDB settings go with the rest of Cove: the collations
+        # pinned for Cove's backups and the loopback-only listen address. The
+        # server is back on its package's own settings at its next restart.
+        # Without --purge they stay, as the sites' databases do: Cove is
+        # likely to be installed again over them, and the drop-in keeps
+        # MariaDB off the network meanwhile (Homebrew's listens everywhere).
+        for cnf in "${mariadb_cnfs[@]}"; do
+            echo "🗄️ Removing Cove's MariaDB settings ($cnf)..."
+            cove_uninstall_rm "$cnf"
+        done
+        # Only ever the folder Cove made in this account's home.
+        if [ -n "$HOME" ] && [ "$COVE_DIR" = "$HOME/Cove" ] && [ -d "$COVE_DIR" ]; then
+            echo "🧹 Deleting $COVE_DIR..."
+            cove_uninstall_rm "$COVE_DIR"
+        fi
+    fi
+
+    # Last, the script that is running: bash keeps reading the open file.
+    if [ -f "$cove_bin" ]; then
+        cove_uninstall_rm "$cove_bin"
+    fi
+
+    echo ""
+    local done_lines=("✅ Cove is uninstalled.")
+    if [ ${#left[@]} -gt 0 ]; then
+        done_lines=("⚠️ Cove is uninstalled, but these couldn't be removed:" "${left[@]/#/  }" "Remove them with: sudo rm -rf ${left[*]}" "")
+    fi
+    if $purge; then
+        [ ${#kept_dbs[@]} -gt 0 ] && done_lines+=("These databases weren't made by Cove, so they stay in MariaDB: ${kept_dbs[*]}")
+        [ ${#odd_sites[@]} -gt 0 ] && done_lines+=("Deleted with $COVE_DIR, as folders Cove didn't make (any database of theirs is yours to drop): ${odd_sites[*]}")
+    else
+        done_lines+=("Your sites are still in $COVE_DIR, and their databases in MariaDB." "rm -rf $COVE_DIR removes the files; the databases stay until you drop them.")
+        [ ${#mariadb_cnfs[@]} -gt 0 ] && done_lines+=("Cove's MariaDB settings stay with them: ${mariadb_cnfs[*]}" "cove uninstall --purge removes them; so does deleting the file.")
+    fi
+    done_lines+=("" "The packages Cove installed are still there, for anything else that uses them:")
+    if [ "$OS" = "macos" ]; then
+        local fp
+        fp=$(command -v frankenphp 2>/dev/null)
+        done_lines+=("  brew uninstall gum mariadb mailpit wp-cli   (plus postgresql@17 and redis if Cove set them up)")
+        [ -n "$fp" ] && done_lines+=("  $([ -w "$(dirname "$fp")" ] || echo "sudo ")rm $fp")
+    else
+        done_lines+=("  sudo $PKG_MANAGER remove frankenphp 'php-zts-*' mariadb-server   (plus postgresql and redis if Cove set them up)")
+        done_lines+=("  sudo rm /usr/local/bin/mailpit /usr/local/bin/gum /usr/local/bin/wp")
+    fi
+    gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "${done_lines[@]}"
+}
+
 upgrade_frankenphp() {
     local frankenphp_path
     frankenphp_path=$(command -v frankenphp)
@@ -29620,105 +36804,10 @@ upgrade_frankenphp() {
     return 0
 }
 
-cove_upgrade() {
-    local auto_yes=false
-    for arg in "$@"; do
-        case "$arg" in
-            --yes|-y|--force) auto_yes=true ;;
-        esac
-    done
-    # Non-interactive callers have no TTY — auto-yes so the Adminer prompt
-    # (only shown when the local version can't be parsed) doesn't hang.
-    [ -t 0 ] || auto_yes=true
-
-    echo "🔎 Checking for the latest version of Cove..."
-
-    local download_url="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
-    local temp_script
-    temp_script=$(mktemp "${TMPDIR:-/tmp}/cove.sh.latest.XXXXXX") || return 1
-    local install_path
-
-    # Find the real path of the currently running script. $0 is authoritative:
-    # when cove runs via a shell alias or absolute path, `command -v cove`
-    # finds whatever happens to sit in PATH — possibly a different, older
-    # copy. (A stale v1.8 in /opt/homebrew/bin once answered a v1.11
-    # upgrade's post-upgrade/reload calls: "Unknown command 'post-upgrade'",
-    # plus a reload through three-versions-old generators.) PATH lookup is
-    # only the fallback when $0 is unusable.
-    install_path="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")"
-    if [ ! -f "$install_path" ]; then
-        install_path=$(command -v cove)
-    fi
-    if [ -z "$install_path" ]; then
-        install_path="/usr/local/bin/cove" # Fallback to default
-    fi
-
-    # 1. Download the latest script
-    echo "   - Downloading latest Cove script from GitHub..."
-    if ! curl -L --fail --progress-bar "$download_url" -o "$temp_script"; then
-        echo "❌ Error: Failed to download the latest version. Please check your connection."
-        rm -f "$temp_script" 2>/dev/null
-        return 1
-    fi
-
-    # 2. Make it executable
-    chmod 755 "$temp_script"
-
-    # 3. Get the new version from the downloaded script
-    local new_version
-    new_version=$("$temp_script" version | awk '{print $3}')
-
-    if [ -z "$new_version" ]; then
-        echo "❌ Error: Could not determine the version from the downloaded script."
-        rm -f "$temp_script" 2>/dev/null
-        return 1
-    fi
-
-    # 4. Get the current version from the running script
-    local current_version="$COVE_VERSION"
-    echo "   - Current Cove version:         $current_version"
-    echo "   - Latest available Cove version: $new_version"
-
-    # 5. Compare versions
-    local latest
-    latest=$(printf '%s\n' "$current_version" "$new_version" | sort -V | tail -n1)
-
-    if [[ "$latest" == "$current_version" ]] && [[ "$new_version" != "$current_version" ]]; then
-         echo "✅ Your current Cove version ($current_version) is newer than the latest release ($new_version). No action taken."
-         rm -f "$temp_script" 2>/dev/null
-    elif [[ "$latest" == "$current_version" ]]; then
-        echo "✅ You are already using the latest version of Cove."
-        rm -f "$temp_script" 2>/dev/null
-    else
-        # 6. Perform the Cove upgrade
-        echo "🚀 Upgrading Cove to version $new_version..."
-
-        # The install dir is root-owned on Linux. Escalate for just this copy
-        # rather than asking the user to run the whole upgrade under sudo — a
-        # root-run upgrade lands in /root/Cove (see the guard at the top of
-        # main). cp over the existing file keeps its root ownership; mv would
-        # hand the binary to whoever downloaded it.
-        local replaced=false
-        if [ -w "$(dirname "$install_path")" ] && [ -w "$install_path" ]; then
-            mv "$temp_script" "$install_path" && replaced=true
-        elif [ -n "$SUDO_CMD" ]; then
-            echo "   - Replacing $install_path (requires sudo — you may be prompted)..."
-            if $SUDO_CMD cp "$temp_script" "$install_path" && $SUDO_CMD chmod 755 "$install_path"; then
-                replaced=true
-            fi
-            rm -f "$temp_script" 2>/dev/null
-        fi
-
-        if [ "$replaced" != true ]; then
-            echo "❌ Error: Failed to replace the old script at '$install_path'."
-            rm -f "$temp_script" 2>/dev/null
-        else
-            echo "✅ Cove has been successfully upgraded to version $new_version!"
-            echo "   Run 'cove version' to see the new version."
-        fi
-    fi
-
-    # --- New Section: FrankenPHP Upgrade Check ---
+# FrankenPHP's check for `cove upgrade`: the newest release replaces the one
+# installed. A failure here ends only this check, never the upgrade, whose
+# post-upgrade refresh has to run either way.
+cove_upgrade_frankenphp_check() {
     echo ""
     echo "🔎 Checking for FrankenPHP updates..."
 
@@ -29774,16 +36863,21 @@ cove_upgrade() {
         echo "✅ FrankenPHP is already up to date."
     fi
     
-    # --- Adminer Upgrade Check ---
+}
+
+# Adminer's: brought up to the newest release, or fetched when it's missing.
+# $1 is true to fetch one of unknown version without asking.
+cove_upgrade_adminer_check() {
+    local auto_yes="${1:-false}"
     echo ""
     echo "🔎 Checking for Adminer updates..."
     
     local adminer_file="$ADMINER_DIR/adminer-core.php"
-    if [ ! -f "$adminer_file" ]; then
-        echo "   - ⚠️ Adminer not found. Skipping update check."
-        return 0
-    fi
-    
+    # Missing (a download that failed at install), it's fetched below as one
+    # of an unknown version would be, without asking.
+    local adminer_missing=false
+    [ -f "$adminer_file" ] || { echo "   - ⚠️ Adminer isn't installed."; adminer_missing=true; auto_yes=true; }
+
     # Get current Adminer version from the file (portable — BSD grep has no -P/\K)
     local current_adminer_version
     current_adminer_version=$(LC_ALL=C sed -nE 's/.*VERSION="([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$adminer_file" 2>/dev/null | head -1)
@@ -29792,7 +36886,7 @@ cove_upgrade() {
     fi
     
     if [ -z "$current_adminer_version" ]; then
-        echo "   - ⚠️ Could not determine current Adminer version."
+        $adminer_missing || echo "   - ⚠️ Could not determine current Adminer version."
         current_adminer_version="unknown"
     fi
     
@@ -29821,9 +36915,13 @@ cove_upgrade() {
         
         if [ "$adminer_needs_upgrade" == "true" ]; then
             echo "🚀 Upgrading Adminer to version $latest_adminer_version..."
-            if curl -sL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file"; then
+            # Saved beside it and moved into place, so a failed download
+            # (--fail keeps an HTTP error page out) leaves the old one working.
+            if curl -fsSL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file.new" \
+                && mv -f "$adminer_file.new" "$adminer_file"; then
                 echo "✅ Adminer upgraded successfully."
             else
+                rm -f "$adminer_file.new"
                 echo "❌ Failed to download Adminer $latest_adminer_version."
             fi
         else
@@ -29839,13 +36937,136 @@ cove_upgrade() {
         fi
         if $do_download; then
             echo "🚀 Downloading Adminer $latest_adminer_version..."
-            if curl -sL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file"; then
+            mkdir -p "$ADMINER_DIR"
+            if curl -fsSL "https://github.com/vrana/adminer/releases/download/v${latest_adminer_version}/adminer-${latest_adminer_version}.php" -o "$adminer_file.new" \
+                && mv -f "$adminer_file.new" "$adminer_file"; then
                 echo "✅ Adminer downloaded successfully."
             else
+                rm -f "$adminer_file.new"
                 echo "❌ Failed to download Adminer $latest_adminer_version."
             fi
         fi
     fi
+}
+
+cove_upgrade() {
+    local auto_yes=false
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y|--force) auto_yes=true ;;
+        esac
+    done
+    # Non-interactive callers have no TTY — auto-yes so the Adminer prompt
+    # (only shown when the local version can't be parsed) doesn't hang.
+    [ -t 0 ] || auto_yes=true
+
+    echo "🔎 Checking for the latest version of Cove..."
+
+    local download_url="https://github.com/anchorhost/cove/releases/latest/download/cove.sh"
+    local temp_script
+    temp_script=$(mktemp "${TMPDIR:-/tmp}/cove.sh.latest.XXXXXX") || return 1
+    local install_path
+
+    # Find the real path of the currently running script. $0 is authoritative:
+    # when cove runs via a shell alias or absolute path, `command -v cove`
+    # finds whatever happens to sit in PATH — possibly a different, older
+    # copy. (A stale v1.8 in /opt/homebrew/bin once answered a v1.11
+    # upgrade's post-upgrade/reload calls: "Unknown command 'post-upgrade'",
+    # plus a reload through three-versions-old generators.) PATH lookup is
+    # only the fallback when $0 is unusable.
+    install_path="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")"
+    if [ ! -f "$install_path" ]; then
+        install_path=$(command -v cove)
+    fi
+    if [ -z "$install_path" ]; then
+        install_path="$BIN_DIR/cove" # Where the installer puts it: /opt/homebrew/bin on Apple Silicon
+    fi
+
+    # 1. Download the latest script
+    echo "   - Downloading latest Cove script from GitHub..."
+    if ! curl -L --fail --progress-bar "$download_url" -o "$temp_script"; then
+        echo "❌ Error: Failed to download the latest version. Please check your connection."
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    fi
+
+    # 2. Make it executable
+    chmod 755 "$temp_script"
+
+    # 3. Get the new version from the downloaded script
+    local new_version
+    new_version=$("$temp_script" version | awk '{print $3}')
+
+    if [ -z "$new_version" ]; then
+        echo "❌ Error: Could not determine the version from the downloaded script."
+        rm -f "$temp_script" 2>/dev/null
+        return 1
+    fi
+
+    # 4. Get the current version from the running script
+    local current_version="$COVE_VERSION"
+    echo "   - Current Cove version:         $current_version"
+    echo "   - Latest available Cove version: $new_version"
+
+    # 5. Compare versions
+    local latest
+    latest=$(printf '%s\n' "$current_version" "$new_version" | sort -V | tail -n1)
+
+    if [[ "$latest" == "$current_version" ]] && [[ "$new_version" != "$current_version" ]]; then
+         echo "✅ Your current Cove version ($current_version) is newer than the latest release ($new_version). No action taken."
+         rm -f "$temp_script" 2>/dev/null
+    elif [[ "$latest" == "$current_version" ]]; then
+        echo "✅ You are already using the latest version of Cove."
+        rm -f "$temp_script" 2>/dev/null
+    else
+        # 6. Perform the Cove upgrade
+        echo "🚀 Upgrading Cove to version $new_version..."
+
+        # The new script goes in beside the old one as $install_path.new and
+        # is renamed over it, so it's a new file rather than the old one
+        # rewritten. Bash reads a script as it runs it, and this process is
+        # still running the old one: written into in place, it went on at its
+        # old byte offset in the new text once main returned, running whatever
+        # was there (a 2.4 upgrade landed in the middle of cove proxy delete).
+        # A rename leaves the old file intact under this process. The copy
+        # comes first because $TMPDIR is often another filesystem, where mv
+        # copies into the existing file instead of renaming.
+        #
+        # The install dir is root-owned on Linux. Escalate for just these two
+        # steps rather than asking the user to run the whole upgrade under
+        # sudo — a root-run upgrade lands in /root/Cove (see the guard at the
+        # top of main). install run under sudo makes the .new file root's, so
+        # the binary stays root-owned; moving the download in would hand it
+        # to whoever downloaded it.
+        local replaced=false
+        local staged="$install_path.new"
+        if [ -w "$(dirname "$install_path")" ] && [ -w "$install_path" ]; then
+            if cp "$temp_script" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$install_path"; then
+                replaced=true
+            else
+                rm -f "$staged" 2>/dev/null
+            fi
+        elif [ -n "$SUDO_CMD" ]; then
+            echo "   - Replacing $install_path (requires sudo — you may be prompted)..."
+            if $SUDO_CMD install -m 755 "$temp_script" "$staged" && $SUDO_CMD mv -f "$staged" "$install_path"; then
+                replaced=true
+            else
+                $SUDO_CMD rm -f "$staged" 2>/dev/null
+            fi
+        fi
+        rm -f "$temp_script" 2>/dev/null
+
+        if [ "$replaced" != true ]; then
+            echo "❌ Error: Failed to replace the old script at '$install_path'."
+            rm -f "$temp_script" 2>/dev/null
+        else
+            echo "✅ Cove has been successfully upgraded to version $new_version!"
+            echo "   Run 'cove version' to see the new version."
+        fi
+    fi
+
+    cove_upgrade_frankenphp_check || true
+    cove_upgrade_adminer_check "$auto_yes" || true
 
     # Always refresh the Cove Adminer theme + entry point. Pre-1.10 installs
     # shipped the Catppuccin CSS and a bare index.php without the head()
@@ -29929,8 +37150,8 @@ cove_url() {
     #  Basic validation – the command requires exactly one argument.
     # -------------------------------------------------------------
     if [ -z "$site_name" ]; then
-        gum style --foreground red "❌ Error: A site name is required."
-        echo "Usage: cove url <site>"
+        gum style --foreground red "❌ Error: A site name is required." >&2
+        echo "Usage: cove url <site>" >&2
         exit 1
     fi
 
@@ -29939,8 +37160,7 @@ cove_url() {
     # -------------------------------------------------------------
     local site_dir="${SITES_DIR}/${site_name}.localhost"
     if [ ! -d "$site_dir" ]; then
-        gum style --foreground red "❌ Error: Site '${site_name}.localhost' not found."
-        exit 1
+        site_not_found "$site_name"
     fi
 
     # -------------------------------------------------------------
@@ -29956,11 +37176,15 @@ cove_wp() {
     if [ -z "$site_name" ] || [ "$site_name" == "--help" ] || [ "$site_name" == "-h" ]; then
         echo "Usage: cove wp <site> <wp-cli arguments…>"
         echo ""
-        echo "Runs WP-CLI inside a site from anywhere, on the PHP the site is pinned to."
+        echo "Runs WP-CLI inside a WordPress site from anywhere, on the PHP the site"
+        echo "runs on (its 'cove php' pin, if it has one). A --help after the site name"
+        echo "is WP-CLI's own."
+        echo ""
         echo "Examples:"
         echo "  cove wp mysite plugin list"
         echo "  cove wp mysite option get siteurl"
         echo "  cove wp mysite user create dev dev@mysite.localhost --role=editor"
+        echo "  cove wp mysite plugin list --help"
         [ -z "$site_name" ] && exit 1
         return
     fi
@@ -29974,8 +37198,11 @@ cove_wp() {
     local site_dir="$SITES_DIR/$site_name.localhost"
     local public_dir="$site_dir/public"
     if [ ! -d "$site_dir" ] || [ ! -f "$public_dir/wp-config.php" ]; then
-        gum style --foreground red "❌ Error: WordPress site '$site_name.localhost' not found."
-        exit 1
+        if site_is_laravel "$site_dir"; then
+            gum style --foreground red "❌ Error: '$site_name.localhost' is a Laravel site." "Its command line is artisan: cove artisan $site_name <command>"
+            exit 1
+        fi
+        site_not_found "$site_name" "WordPress"
     fi
 
     local wp_cmd
@@ -30306,7 +37533,8 @@ static const NSInteger kServiceRowStartIndex = 2;
 // Post a notification for a service that died out from under a running stack.
 // Suppressed when: states aren't established yet, the user just acted through
 // the menu (start/stop churn), or EVERYTHING went down at once — that shape is
-// almost always a deliberate `cove disable` from a terminal, not a crash.
+// almost always a deliberate `cove disable` from a terminal, not a crash
+// (everything here being Cove's own services, without PostgreSQL and Redis).
 // A stop must also survive TWO consecutive polls before it notifies: a service
 // mid-restart (terminal-run `cove enable`, the multi-minute service churn of
 // `cove upgrade`) is back up by the next poll and never alarms.
@@ -30324,9 +37552,12 @@ static const NSInteger kServiceRowStartIndex = 2;
         return;
     }
 
+    // Only Cove's own services count here. PostgreSQL and Redis aren't
+    // stopped by `cove disable`, so one still up doesn't make a disable look
+    // like everything else crashing at once.
     BOOL anyStillRunning = NO;
-    for (NSNumber *running in newStates.allValues) {
-        if (running.boolValue) {
+    for (NSString *key in newStates) {
+        if (![self isOptionalServiceKey:key] && newStates[key].boolValue) {
             anyStillRunning = YES;
             break;
         }
@@ -30406,6 +37637,8 @@ static const NSInteger kServiceRowStartIndex = 2;
     if ([key isEqualToString:@"caddy"])   { return @"Caddy"; }
     if ([key isEqualToString:@"mariadb"]) { return @"MariaDB"; }
     if ([key isEqualToString:@"mailpit"]) { return @"Mailpit"; }
+    if ([key isEqualToString:@"postgres"]) { return @"PostgreSQL"; }
+    if ([key isEqualToString:@"redis"])   { return @"Redis"; }
     if ([key hasPrefix:@"php-fpm-"]) {
         return [NSString stringWithFormat:@"PHP-FPM %@",
                 [key substringFromIndex:[@"php-fpm-" length]]];
@@ -30417,10 +37650,17 @@ static const NSInteger kServiceRowStartIndex = 2;
     return self.serviceStates[key].boolValue;
 }
 
+// PostgreSQL and Redis are there for the Laravel sites that asked for them,
+// run by Homebrew (or found running), not by cove enable/disable: shown, but
+// not counted towards whether Cove itself is running.
+- (BOOL)isOptionalServiceKey:(NSString *)key {
+    return [key isEqualToString:@"postgres"] || [key isEqualToString:@"redis"];
+}
+
 - (NSInteger)runningServiceCount {
     NSInteger count = 0;
-    for (NSNumber *running in self.serviceStates.allValues) {
-        if (running.boolValue) {
+    for (NSString *key in self.serviceStates) {
+        if (![self isOptionalServiceKey:key] && self.serviceStates[key].boolValue) {
             count++;
         }
     }
@@ -30432,7 +37672,7 @@ static const NSInteger kServiceRowStartIndex = 2;
         return NO;
     }
     for (NSString *key in self.serviceKeys) {
-        if (!self.serviceStates[key].boolValue) {
+        if (![self isOptionalServiceKey:key] && !self.serviceStates[key].boolValue) {
             return NO;
         }
     }
@@ -31515,7 +38755,11 @@ LOG_FILE = os.path.join(LOGS_DIR, "menubar.log")
 REFRESH_SECONDS = 20
 UPDATE_CHECK_SECONDS = 86400
 CORE_SERVICES = ("caddy", "mariadb", "mailpit")
-SERVICE_NAMES = {"caddy": "Caddy", "mariadb": "MariaDB", "mailpit": "Mailpit"}
+# Started on demand by the Laravel sites that use them: listed, never counted,
+# so a stopped one doesn't make Cove look partly down (as in the macOS app).
+OPTIONAL_SERVICES = ("postgres", "redis")
+SERVICE_NAMES = {"caddy": "Caddy", "mariadb": "MariaDB", "mailpit": "Mailpit",
+                 "postgres": "PostgreSQL", "redis": "Redis"}
 URL_PATTERN = re.compile(r"https://[A-Za-z0-9.:/_?=&%~#+!@-]+")
 SITE_NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 
@@ -31722,12 +38966,13 @@ class CoveTray:
             return self.busy
         if not self.states_known:
             return "Cove status unavailable" if self.last_error else "Checking Cove…"
-        count = sum(1 for value in self.states.values() if value)
+        counted = [key for key in self.states if key not in OPTIONAL_SERVICES]
+        count = sum(1 for key in counted if self.states.get(key))
         if self.all_running():
             return "Cove is running"
         if count == 0:
             return "Cove is stopped"
-        return f"Cove: {count} of {len(self.states)} services running"
+        return f"Cove: {count} of {len(counted)} services running"
 
     def render(self):
         self.summary_item.set_label(self.summary_text())
@@ -31776,7 +39021,7 @@ class CoveTray:
             icon = "cove-logo-partial"
         elif all_up:
             icon = "cove-logo"
-        elif any(self.states.values()):
+        elif any(v for k, v in self.states.items() if k not in OPTIONAL_SERVICES):
             icon = "cove-logo-partial"
         else:
             icon = "cove-logo-stopped"
@@ -31853,9 +39098,11 @@ class CoveTray:
     # Mirrors the macOS app: a service that is newly stopped is held for one
     # more poll before it alarms, everything-stopped-at-once is treated as a
     # deliberate `cove disable`, and nothing fires within 20s of our own action.
+    # "Everything" is Cove's own services: `cove disable` leaves PostgreSQL and
+    # Redis running, and one still up mustn't make the disable look like a crash.
     def notify_unexpected_stops(self, old_states, new_states):
         if not self.states_known or time.monotonic() - self.last_user_action < 20.0 \
-                or not any(new_states.values()):
+                or not any(v for k, v in new_states.items() if k not in OPTIONAL_SERVICES):
             self.pending_stops.clear()
             return
         still_pending = set()
@@ -33654,5 +40901,5 @@ cat <<'COVE_ADMINER_JS_EOF'
 COVE_ADMINER_JS_EOF
 }
 
-#  Pass all script arguments to the main function.
-main "$@"
+#  Pass all script arguments to the main function, then stop reading.
+main "$@"; exit $?
