@@ -72,7 +72,7 @@ render_report() {
     local raw
     raw=$(ssh "$BOX" "cat $REMOTE_DIR/matrix/results.txt 2>/dev/null; [ -f $REMOTE_DIR/matrix/DONE ] && echo '__DONE__'; [ -f $REMOTE_DIR/matrix/PARKED ] && echo '__PARKED__'")
     if [ -z "$raw" ]; then
-        echo "No matrix results found on $BOX — has a run been started?"
+        echo "No matrix results found on the test box — has a run been started?"
         exit 2
     fi
     local done_flag=false
@@ -108,11 +108,11 @@ render_report() {
     fails=$(grep -c '|FAIL$' <<<"$raw" || true)
     echo ""
     if ! $done_flag; then
-        echo "⏳ Run still in progress ('…' = no result yet). Logs: $BOX:$REMOTE_DIR/matrix/*.log"
+        echo "⏳ Run still in progress ('…' = no result yet). Logs: the test box, $REMOTE_DIR/matrix/*.log"
         exit 2
     elif [ "$fails" -gt 0 ]; then
         echo "❌ $fails check(s) failed. Containers left RUNNING for inspection —"
-        echo "   logs: $BOX:$REMOTE_DIR/matrix/*.log · park when done: ./test-matrix.sh down"
+        echo "   logs: the test box, $REMOTE_DIR/matrix/*.log · park when done: ./test-matrix.sh down"
         exit 1
     else
         if grep -q '__PARKED__' <<<"$raw"; then
@@ -673,7 +673,7 @@ touch "$D/DONE"
 RUNNER_EOF
 
 # --- Deploy + launch ---
-echo "📦 Deploying candidate build + runner to $BOX..."
+echo "📦 Deploying candidate build + runner to the test box..."
 scp -q "$SCRIPT_DIR/cove.sh" "$SCRIPT_DIR/install-cove.sh" "$RUNNER" "$BOX:$REMOTE_DIR/"
 ssh "$BOX" "mv $REMOTE_DIR/$(basename "$RUNNER") $REMOTE_DIR/matrix-runner.sh && chmod +x $REMOTE_DIR/matrix-runner.sh && rm -rf $REMOTE_DIR/matrix && (setsid nohup $REMOTE_DIR/matrix-runner.sh > $REMOTE_DIR/matrix-runner.out 2>&1 < /dev/null &) && echo '🚀 Matrix launched.'"
 rm -f "$RUNNER"
