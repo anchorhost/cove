@@ -16,7 +16,17 @@ cove_directive_add_or_update() {
             --rules=*) arg_rules="${1#*=}"; have_rules=true; shift ;;
             --file=*) arg_file="${1#*=}"; shift ;;
             -h|--help) display_command_help directive; exit 0 ;;
+            # Before the name, a dash word is a mistyped option. After it,
+            # it's part of rules typed as words: `header -Server` removes a
+            # header, and has to reach the rules rather than stop the command.
             -*)
+                if [ -n "$site_name" ]; then
+                    if ! $have_rules; then arg_rules="$1"; have_rules=true
+                    else arg_rules="$arg_rules $1"
+                    fi
+                    shift
+                    continue
+                fi
                 gum style --foreground red "❌ Unknown option: $1"
                 echo "Usage: cove directive <add|update> <name> [rules | --rules \"...\" | --file <path>]"
                 exit 1

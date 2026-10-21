@@ -401,9 +401,11 @@ class CoveTray:
     # Mirrors the macOS app: a service that is newly stopped is held for one
     # more poll before it alarms, everything-stopped-at-once is treated as a
     # deliberate `cove disable`, and nothing fires within 20s of our own action.
+    # "Everything" is Cove's own services: `cove disable` leaves PostgreSQL and
+    # Redis running, and one still up mustn't make the disable look like a crash.
     def notify_unexpected_stops(self, old_states, new_states):
         if not self.states_known or time.monotonic() - self.last_user_action < 20.0 \
-                or not any(new_states.values()):
+                or not any(v for k, v in new_states.items() if k not in OPTIONAL_SERVICES):
             self.pending_stops.clear()
             return
         still_pending = set()

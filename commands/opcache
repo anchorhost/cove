@@ -331,13 +331,21 @@ cove_opcache_exclude_entries() {
     grep -v -E '^[[:space:]]*(;|$)' "$OPCACHE_EXCLUDE_FILE"
 }
 
-# cove_opcache_exclude_entry <site> [<folder inside public/>] | <absolute path>
+# cove_opcache_exclude_entry [--existing] <site> [<folder>] | <absolute path>
 # Prints the line for the file. A folder is written as folder/* so it can't
 # also catch a sibling whose name starts the same (cache/ and cache-enabler/).
+# The folder is inside the site's public/, or inside the site's own folder
+# for a project (Laravel, or anything `cove add --from` brought in), whose
+# code mostly lives beside public/. --existing (add) refuses a path with no
+# wildcard that isn't there: a typo would otherwise restart FrankenPHP for
+# every site and exclude nothing. remove leaves it off, as the folder may
+# have gone since it was added.
 cove_opcache_exclude_entry() {
-    local first="$1" second="$2" entry
+    local existing=false
+    [ "$1" = "--existing" ] && { existing=true; shift; }
+    local first="$1" second="$2" entry site_root=""
     if [ -z "$first" ]; then
-        echo "❌ Name a site (and a folder inside its public/ if you like), or give an absolute path." >&2
+        echo "❌ Name a site (and a folder inside it if you like), or give an absolute path." >&2
         return 1
     fi
     case "$first$second" in
@@ -357,17 +365,53 @@ cove_opcache_exclude_entry() {
             echo "❌ No site named '$first'." >&2
             return 1
         fi
+        [ "$first" != "*" ] && site_root="$SITES_DIR/$first.localhost"
         if [ -z "$second" ]; then
             entry="$SITES_DIR/$first.localhost/"
         else
             second="${second#./}"
+            # Where the folder is looked for. Every site ('*') has its own
+            # kind, so it keeps to public/, the one folder they all have.
+            local base="public" where="public/"
+            if [ -n "$site_root" ] && site_is_project "$site_root"; then
+                base="" where=""
+            fi
             case "/$second/" in
                 //*|*/../*|*/./*)
-                    echo "❌ The folder goes inside the site's public/ folder: no leading /, no '..'." >&2
+                    echo "❌ The folder goes inside the site's ${where:-own }folder: no leading /, no '..'." >&2
                     return 1 ;;
             esac
-            entry="$SITES_DIR/$first.localhost/public/$second"
+            entry="$SITES_DIR/$first.localhost/${base:+$base/}$second"
         fi
+    fi
+    # Refused when it names nothing: only a path without a wildcard can be
+    # looked at, and a trailing / still has to be a folder.
+    case "$entry" in
+        *[*?]*) ;;
+        *)
+            if $existing && [ ! -e "${entry%/}" ]; then
+                echo "❌ Nothing at ${entry%/}. Check the folder's name (a path with * in it is taken as it is)." >&2
+                return 1
+            fi ;;
+    esac
+    # OPcache compares the real path of each file it compiles, so a link on
+    # the way inside a site (a project's public/ links to the folder cove.json
+    # names as its webroot) has to be followed, or the entry never matches.
+    # Resolved up to the first wildcard, from the deepest folder there that
+    # exists. The site's own folder stays as it's spelled, like the Sites
+    # folder above it, and an absolute path is taken as given.
+    if [ -n "$site_root" ]; then
+        local known rest real site_real
+        known="${entry%%[*?]*}"
+        known="${known%/}"
+        while [ "${#known}" -gt "${#site_root}" ] && [ ! -d "$known" ]; do known="${known%/*}"; done
+        real=$(cd "$known" 2>/dev/null && pwd -P)
+        site_real=$(cd "$site_root" 2>/dev/null && pwd -P)
+        case "$real/" in
+            "$site_real"/*)
+                rest="${entry#"$known"}"
+                entry="$site_root${real#"$site_real"}$rest" ;;
+        esac
     fi
     # A folder gets /*: one that exists, one written with a trailing /, or a
     # last name with no dot in it (PHP files have an extension), which covers
@@ -459,7 +503,7 @@ cove_opcache_exclude() {
             rm -f "$probe" "$tmp"
             ;;
         add)
-            entry=$(cove_opcache_exclude_entry "$@") || exit 1
+            entry=$(cove_opcache_exclude_entry --existing "$@") || exit 1
             if cove_opcache_exclude_entries | grep -q -x -F -- "$entry"; then
                 echo "ℹ️  Already excluded: $entry"
                 return 0

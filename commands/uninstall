@@ -79,9 +79,31 @@ cove_uninstall() {
     [ -f "$cove_bin" ] || cove_bin=$(command -v cove 2>/dev/null)
     [ -n "$cove_bin" ] && [ -f "$cove_bin" ] || cove_bin="$BIN_DIR/cove"
 
-    local sites=() d
+    # Folders whose names Cove couldn't have made (My_Site.localhost, made by
+    # hand) are kept apart: cove delete refuses such a name, which would stop
+    # the purge at every run, and Cove never made a database for one. With
+    # --purge they go with the rest of $COVE_DIR.
+    local sites=() odd_sites=() d n
     for d in "$SITES_DIR"/*.localhost; do
-        [ -d "$d" ] && sites+=("$(basename "$d" .localhost)")
+        [ -d "$d" ] || continue
+        n=$(basename "$d" .localhost)
+        if validate_site_name "$n"; then
+            sites+=("$n")
+        else
+            odd_sites+=("$n.localhost")
+        fi
+    done
+    # Cove's MariaDB drop-in (write_mariadb_config), found by the line it
+    # starts with in each place it can have been written, so a cove.cnf of
+    # the user's own is never touched.
+    local mariadb_cnfs=() cnf cnf_places
+    if [ "$OS" = "macos" ]; then
+        cnf_places=("${BIN_DIR%/bin}/etc/my.cnf.d/cove.cnf")
+    else
+        cnf_places=(/etc/mysql/mariadb.conf.d/99-cove.cnf /etc/my.cnf.d/cove.cnf /etc/mysql/conf.d/cove.cnf)
+    fi
+    for cnf in "${cnf_places[@]}"; do
+        [ -f "$cnf" ] && head -n 1 "$cnf" 2>/dev/null | grep -q '^# Managed by Cove' && mariadb_cnfs+=("$cnf")
     done
     local lan_agents=() f
     if [ "$OS" = "macos" ]; then
@@ -101,6 +123,7 @@ cove_uninstall() {
     echo "Cove uninstall will:"
     if $purge; then
         echo "  • Delete all ${#sites[@]} sites: their files, the databases Cove made for them, and their Redis keys"
+        [ ${#odd_sites[@]} -gt 0 ] && echo "  • Delete ${#odd_sites[@]} folder(s) Cove didn't make, with $COVE_DIR (no database is looked for): ${odd_sites[*]}"
     fi
     echo "  • Stop Cove's services (FrankenPHP, Mailpit, MariaDB, the watchdog, Laravel workers) and take them out of $([ "$OS" = macos ] && echo launchd || echo "systemd (their units removed)")"
     [ ${#shares[@]} -gt 0 ] && echo "  • End ${#shares[@]} background share(s)"
@@ -109,6 +132,7 @@ cove_uninstall() {
     [ ${#hosts[@]} -gt 0 ] && echo "  • Take Cove's ${#hosts[@]} line(s) out of /etc/hosts (cove.localhost, ${hosts[1]:-}…)"
     if $purge; then
         echo "  • Remove Cove's local certificate authority from the system's trust store"
+        [ ${#mariadb_cnfs[@]} -gt 0 ] && echo "  • Remove Cove's MariaDB settings (${mariadb_cnfs[*]})"
         echo "  • Delete $COVE_DIR (backups, snapshots, logs, settings)"
     else
         echo "  • Keep $COVE_DIR (${#sites[@]} sites, backups, snapshots) and the sites' databases"
@@ -163,6 +187,8 @@ cove_uninstall() {
             fi
         fi
         cove_pg_configured && ensure_postgres >/dev/null 2>&1
+        local pg_up=false
+        cove_pg_configured && cove_pg_ready && pg_up=true
         for s in "${sites[@]}"; do
             echo "🗑️  Deleting $s.localhost…"
             sd="$SITES_DIR/$s.localhost" db="" server=mariadb hand=""
@@ -173,6 +199,14 @@ cove_uninstall() {
                 server=$(laravel_db_server "$sd")
             else
                 db=""
+            fi
+            # A PostgreSQL site while PostgreSQL won't start: left exactly as
+            # it is, as deleting its folder would leave the database with
+            # nothing to find it by. (cove delete keeps it too, and fails.)
+            if [ -n "$db" ] && [ "$server" = pgsql ] && ! $pg_up; then
+                echo "   - PostgreSQL isn't answering, so $s.localhost and its database stay."
+                failed+=("$s")
+                continue
             fi
             if ! ( cove_delete "$s" --force --no-reload ) >/dev/null 2>&1 || [ -d "$sd" ] \
                 || { [ -n "$db" ] && [ "$server" = pgsql ] && ! cove_pg_ready; } \
@@ -226,25 +260,58 @@ cove_uninstall() {
 
     [ ${#hosts[@]} -gt 0 ] && prune_etc_hosts --all "${hosts[@]}"
 
+    # What couldn't be removed is named at the end rather than reported as
+    # gone. A file this account can't remove gets one try with sudo: on
+    # macOS too, where SUDO_CMD is empty (Cove runs as the user there) and a
+    # root-owned leftover would otherwise be retried as the same user.
+    local left=()
+    cove_uninstall_rm() {
+        rm -rf "$1" 2>/dev/null
+        if [ -e "$1" ] && [ "$(id -u)" != "0" ]; then
+            if [ -t 0 ]; then
+                sudo rm -rf "$1" 2>/dev/null
+            else
+                sudo -n rm -rf "$1" 2>/dev/null
+            fi
+        fi
+        [ -e "$1" ] && left+=("$1")
+        return 0
+    }
+
     if $purge; then
+        # Cove's MariaDB settings go with the rest of Cove: the collations
+        # pinned for Cove's backups and the loopback-only listen address. The
+        # server is back on its package's own settings at its next restart.
+        # Without --purge they stay, as the sites' databases do: Cove is
+        # likely to be installed again over them, and the drop-in keeps
+        # MariaDB off the network meanwhile (Homebrew's listens everywhere).
+        for cnf in "${mariadb_cnfs[@]}"; do
+            echo "🗄️ Removing Cove's MariaDB settings ($cnf)..."
+            cove_uninstall_rm "$cnf"
+        done
         # Only ever the folder Cove made in this account's home.
         if [ -n "$HOME" ] && [ "$COVE_DIR" = "$HOME/Cove" ] && [ -d "$COVE_DIR" ]; then
             echo "🧹 Deleting $COVE_DIR..."
-            rm -rf "$COVE_DIR" 2>/dev/null || $SUDO_CMD rm -rf "$COVE_DIR"
+            cove_uninstall_rm "$COVE_DIR"
         fi
     fi
 
     # Last, the script that is running: bash keeps reading the open file.
     if [ -f "$cove_bin" ]; then
-        rm -f "$cove_bin" 2>/dev/null || $SUDO_CMD rm -f "$cove_bin"
+        cove_uninstall_rm "$cove_bin"
     fi
 
     echo ""
     local done_lines=("✅ Cove is uninstalled.")
+    if [ ${#left[@]} -gt 0 ]; then
+        done_lines=("⚠️ Cove is uninstalled, but these couldn't be removed:" "${left[@]/#/  }" "Remove them with: sudo rm -rf ${left[*]}" "")
+    fi
     if $purge; then
         [ ${#kept_dbs[@]} -gt 0 ] && done_lines+=("These databases weren't made by Cove, so they stay in MariaDB: ${kept_dbs[*]}")
+        [ ${#odd_sites[@]} -gt 0 ] && done_lines+=("Deleted with $COVE_DIR, as folders Cove didn't make (any database of theirs is yours to drop): ${odd_sites[*]}")
     else
         done_lines+=("Your sites are still in $COVE_DIR, and their databases in MariaDB." "rm -rf $COVE_DIR removes the files; the databases stay until you drop them.")
+        [ ${#mariadb_cnfs[@]} -gt 0 ] && done_lines+=("Cove's MariaDB settings stay with them: ${mariadb_cnfs[*]}" "cove uninstall --purge removes them; so does deleting the file.")
     fi
     done_lines+=("" "The packages Cove installed are still there, for anything else that uses them:")
     if [ "$OS" = "macos" ]; then

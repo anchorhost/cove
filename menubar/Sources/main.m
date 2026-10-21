@@ -219,7 +219,8 @@ static const NSInteger kServiceRowStartIndex = 2;
 // Post a notification for a service that died out from under a running stack.
 // Suppressed when: states aren't established yet, the user just acted through
 // the menu (start/stop churn), or EVERYTHING went down at once — that shape is
-// almost always a deliberate `cove disable` from a terminal, not a crash.
+// almost always a deliberate `cove disable` from a terminal, not a crash
+// (everything here being Cove's own services, without PostgreSQL and Redis).
 // A stop must also survive TWO consecutive polls before it notifies: a service
 // mid-restart (terminal-run `cove enable`, the multi-minute service churn of
 // `cove upgrade`) is back up by the next poll and never alarms.
@@ -237,9 +238,12 @@ static const NSInteger kServiceRowStartIndex = 2;
         return;
     }
 
+    // Only Cove's own services count here. PostgreSQL and Redis aren't
+    // stopped by `cove disable`, so one still up doesn't make a disable look
+    // like everything else crashing at once.
     BOOL anyStillRunning = NO;
-    for (NSNumber *running in newStates.allValues) {
-        if (running.boolValue) {
+    for (NSString *key in newStates) {
+        if (![self isOptionalServiceKey:key] && newStates[key].boolValue) {
             anyStillRunning = YES;
             break;
         }

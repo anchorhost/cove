@@ -674,6 +674,10 @@ INI
             echo "🔄 Updating WordPress site URLs to new HTTPS port..."
             update_wp_site_urls_for_port_change "$original_https" "$HTTPS_PORT"
         fi
+        # Laravel sites have no wp-config.php, so they're looked for on their
+        # own: an APP_URL left on the old port sends every redirect and asset
+        # URL to a port nothing listens on. It names only the sites it changes.
+        update_laravel_site_urls_for_port_change
     fi
 
     # Show post-install guidance: the ports when they aren't the defaults,
