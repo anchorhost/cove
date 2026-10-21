@@ -10700,6 +10700,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     // A closed field lets Enter submit the form as usual.
                     if (!st.open) return;
                     if (e.key === 'Enter') e.preventDefault();
+                    // Tabbing past an action list (query history) runs nothing.
+                    else if (opts.action) { close(); return; }
                     if (!choose(matches()[st.index])) close();
                 } else if (e.key === 'Escape' && st.open) {
                     e.preventDefault();
