@@ -328,21 +328,39 @@ cove_upgrade() {
         # 6. Perform the Cove upgrade
         echo "🚀 Upgrading Cove to version $new_version..."
 
-        # The install dir is root-owned on Linux. Escalate for just this copy
-        # rather than asking the user to run the whole upgrade under sudo — a
-        # root-run upgrade lands in /root/Cove (see the guard at the top of
-        # main). cp over the existing file keeps its root ownership; mv would
-        # hand the binary to whoever downloaded it.
+        # The new script goes in beside the old one as $install_path.new and
+        # is renamed over it, so it's a new file rather than the old one
+        # rewritten. Bash reads a script as it runs it, and this process is
+        # still running the old one: written into in place, it went on at its
+        # old byte offset in the new text once main returned, running whatever
+        # was there (a 2.4 upgrade landed in the middle of cove proxy delete).
+        # A rename leaves the old file intact under this process. The copy
+        # comes first because $TMPDIR is often another filesystem, where mv
+        # copies into the existing file instead of renaming.
+        #
+        # The install dir is root-owned on Linux. Escalate for just these two
+        # steps rather than asking the user to run the whole upgrade under
+        # sudo — a root-run upgrade lands in /root/Cove (see the guard at the
+        # top of main). install run under sudo makes the .new file root's, so
+        # the binary stays root-owned; moving the download in would hand it
+        # to whoever downloaded it.
         local replaced=false
+        local staged="$install_path.new"
         if [ -w "$(dirname "$install_path")" ] && [ -w "$install_path" ]; then
-            mv "$temp_script" "$install_path" && replaced=true
+            if cp "$temp_script" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$install_path"; then
+                replaced=true
+            else
+                rm -f "$staged" 2>/dev/null
+            fi
         elif [ -n "$SUDO_CMD" ]; then
             echo "   - Replacing $install_path (requires sudo — you may be prompted)..."
-            if $SUDO_CMD cp "$temp_script" "$install_path" && $SUDO_CMD chmod 755 "$install_path"; then
+            if $SUDO_CMD install -m 755 "$temp_script" "$staged" && $SUDO_CMD mv -f "$staged" "$install_path"; then
                 replaced=true
+            else
+                $SUDO_CMD rm -f "$staged" 2>/dev/null
             fi
-            rm -f "$temp_script" 2>/dev/null
         fi
+        rm -f "$temp_script" 2>/dev/null
 
         if [ "$replaced" != true ]; then
             echo "❌ Error: Failed to replace the old script at '$install_path'."

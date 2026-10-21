@@ -21,7 +21,9 @@
 #                      log rotation settings →
 #                      container reboot survival
 #    B (one apt/dnf):  previous GitHub release → candidate + post-upgrade
-#    C (one apt/dnf):  install + add as a non-root sudo user
+#    C (one apt/dnf):  install + add as a non-root sudo user →
+#                      the previous release's own `cove upgrade` to the
+#                      candidate, as that user
 # ====================================================
 
 set -uo pipefail
@@ -574,6 +576,7 @@ lane_c() { # non-root user + sudo — the path most real Linux users hit
             res "$c" sudo_install FAIL
             res "$c" sudo_add SKIP
             res "$c" sudo_upgrade SKIP
+            res "$c" sudo_upgrade_prev SKIP
             return
         fi
         if cx "$c" su - dev -c 'cove add usr1' && [ "$(http_code "$c" usr1)" = "200" ]; then
@@ -594,6 +597,60 @@ lane_c() { # non-root user + sudo — the path most real Linux users hit
             res "$c" sudo_upgrade PASS
         else
             res "$c" sudo_upgrade FAIL
+        fi
+        # The previous release's own `cove upgrade`, run by this user, to the
+        # candidate. With the install dir root's, releases up to 2.4 sudo cp
+        # the download over the script they are still running, and bash reads
+        # on from their size as an offset into the new file when main returns:
+        # the candidate's landing pad has to be there to end it (compile.sh,
+        # 5b). The download is the one thing faked: a curl in /usr/local/bin,
+        # ahead of the real one on Cove's PATH, hands over the candidate for
+        # Cove's release URL and passes everything else to /usr/bin/curl. The
+        # previous release's version gets a 0 for its first digit, the same
+        # length, so the candidate counts as newer even before its version
+        # bump without moving the offset. It passes when the upgrade exits 0
+        # without a stray "command not found" or syntax error, and leaves the
+        # candidate in place, root's and 755, with no .new beside it.
+        if cx "$c" bash -c 'curl -fsSL https://github.com/anchorhost/cove/releases/latest/download/cove.sh -o /root/prev-cove.sh' \
+            && cx "$c" bash -s <<'PREV_UPGRADE'
+set -e
+sed -i 's/^COVE_VERSION="[0-9]/COVE_VERSION="0/' /root/prev-cove.sh
+install -m 755 -o root -g root /root/prev-cove.sh /usr/local/bin/cove
+install -m 644 /home/dev/cove.sh /usr/local/share/cove-candidate.sh
+cat > /usr/local/bin/curl <<'CURL_STUB'
+#!/bin/bash
+# test-matrix stub: Cove's release download gets the candidate build.
+out="" prev="" release=false
+for a in "$@"; do
+    case "$a" in */anchorhost/cove/releases/*/cove.sh) release=true ;; esac
+    [ "$prev" = "-o" ] && out="$a"
+    prev="$a"
+done
+if $release && [ -n "$out" ]; then
+    exec cp /usr/local/share/cove-candidate.sh "$out"
+fi
+exec /usr/bin/curl "$@"
+CURL_STUB
+chmod 755 /usr/local/bin/curl
+PREV_UPGRADE
+        then
+            local up_rc=0
+            cx "$c" su - dev -c 'cove upgrade --yes < /dev/null' > "$D/$c-sudo-upgrade-prev.out" 2>&1 || up_rc=$?
+            cat "$D/$c-sudo-upgrade-prev.out"
+            cx "$c" rm -f /usr/local/bin/curl
+            if [ "$up_rc" = 0 ] \
+                && ! grep -qE 'syntax error|: command not found' "$D/$c-sudo-upgrade-prev.out" \
+                && cx "$c" cmp -s /usr/local/bin/cove /usr/local/share/cove-candidate.sh \
+                && [ "$(cx "$c" stat -c '%U %a' /usr/local/bin/cove)" = "root 755" ] \
+                && ! cx "$c" test -e /usr/local/bin/cove.new; then
+                res "$c" sudo_upgrade_prev PASS
+            else
+                echo "sudo_upgrade_prev: cove upgrade exited $up_rc"
+                res "$c" sudo_upgrade_prev FAIL
+            fi
+        else
+            cx "$c" rm -f /usr/local/bin/curl
+            res "$c" sudo_upgrade_prev FAIL
         fi
     } >> "$L" 2>&1
 }
