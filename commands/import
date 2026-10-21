@@ -197,7 +197,7 @@ cove_import_app() {
         exit 1
     fi
     local outside
-    outside=$(cove_links_outside "$src")
+    outside=$(cove_links_outside "$src" "$([ "$kind" = app ] && echo "$site_dir" || echo "$site_dir/public")")
     if [ -n "$outside" ]; then
         gum style --foreground red "❌ Error: The archive has links that point outside the site, so it isn't used:" "$outside"
         exit 1
@@ -246,8 +246,23 @@ cove_import_laravel() {
     fi
 
     echo "📦 Importing $(basename "$archive"), a Laravel site, into '$site_name.localhost'…"
+    local names
+    case "$archive" in
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then names=$(unzip -Z1 "$archive" 2>/dev/null); else names=""; fi ;;
+        *) names=$(tar -tzf "$archive" 2>/dev/null) ;;
+    esac
+    if printf '%s\n' "$names" | grep -qE '^/|(^|/)\.\.(/|$)|\\'; then
+        gum style --foreground red "❌ Error: The archive has files that would land outside its own folder (an absolute path or ..), so it isn't unpacked."
+        exit 1
+    fi
     mkdir -p "$COVE_DIR/cache" || exit 1
     work=$(mktemp -d "$COVE_DIR/cache/import-$site_name.XXXXXX") || exit 1
+    # A Ctrl-C or a kill partway through leaves nothing: the work folder,
+    # and the database once it is made, until the site is in place (see
+    # cove_new_site_cleanup).
+    COVE_FROM_WORK="" COVE_NEW_WORK="$work" COVE_NEW_DB=""
+    trap cove_new_site_cleanup EXIT
     echo "   - Unpacking…"
     case "$archive" in
         *.zip)
@@ -267,6 +282,24 @@ cove_import_laravel() {
     from=$(sed -n 's/^site=//p' "$work/meta" 2>/dev/null)
     from_dir=$(sed -n 's/^folder=//p' "$work/meta" 2>/dev/null)
 
+    # Held to --from's rules, as an app's backup is: no links out of it, none
+    # of Cove's own names at its top. storage:link makes public/storage an
+    # absolute link into the old folder (meta's folder=), which
+    # laravel_retarget would point at the new one after the move: done here
+    # instead, for every link into the old folder, so the check sees where
+    # they will lead.
+    local link target old_dir="${from_dir:-$SITES_DIR/$from.localhost}" outside
+    while IFS= read -r -d '' link; do
+        target=$(readlink "$link")
+        [[ "$target" == "$old_dir/"* ]] && ln -sfn "$site_dir/${target#"$old_dir"/}" "$link"
+    done < <(find "$work/project" -type l -print0 2>/dev/null)
+    outside=$(cove_links_outside "$work/project" "$site_dir")
+    if [ -n "$outside" ]; then
+        gum style --foreground red "❌ Error: The archive has links that point outside the site, so it isn't used:" "$outside"
+        exit 1
+    fi
+    cove_from_check_names "$work/project" "The archive" || exit 1
+
     # The dump's server: PostgreSQL when meta says so, MariaDB otherwise.
     local server="mariadb"
     [ "$(sed -n 's/^db_server=//p' "$work/meta" 2>/dev/null)" = "pgsql" ] && server="pgsql"
@@ -284,10 +317,12 @@ cove_import_laravel() {
         fi
         echo "   - Restoring its database into '$db_name'…"
         local loaded=false
+        # The trap drops it from the moment it exists until the site is in place.
         if [ "$server" = "pgsql" ]; then
-            cove_server_db_create pgsql "$db_name" && cove_pg_load "$db_name" < "$work/db.sql" && loaded=true
+            cove_server_db_create pgsql "$db_name" && COVE_NEW_DB="pgsql $db_name" \
+                && cove_pg_load "$db_name" < "$work/db.sql" && loaded=true
         else
-            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+            MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" && COVE_NEW_DB="mariadb $db_name" \
                 && MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" --max_allowed_packet=512M "$db_name" < "$work/db.sql" && loaded=true
         fi
         if [ "$loaded" != true ]; then
@@ -305,6 +340,8 @@ cove_import_laravel() {
         gum style --foreground red "❌ Error: Could not move the project into $site_dir."
         exit 1
     fi
+    # In place: the database is the site's now.
+    COVE_NEW_DB=""
     rm -rf "$work"
     mkdir -p "$site_dir/logs"
     [ -n "$php_pin" ] && echo "$php_pin" > "$site_dir/php_version"

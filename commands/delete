@@ -94,19 +94,26 @@ cove_delete() {
         # Only the database Cove made for the site: one .env was pointed at
         # by hand may be shared, or someone else's.
         local db_name server
-        # Its keys in Cove's Redis, when the prefix is the one Cove gave it.
-        [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "$(cove_redis_prefix "$site_name")" ] && cove_redis_forget "$(cove_redis_prefix "$site_name")"
         if db_name=$(laravel_cove_db "$site_dir" "$site_name"); then
             server=$(laravel_db_server "$site_dir")
             echo "🗄️ Deleting database: $db_name"
+            # A PostgreSQL that won't start is a database that can't be
+            # dropped, as with MariaDB: the site stays, and with it the way
+            # back to the database (uninstall --purge counts on the failure).
             if [ "$server" = "pgsql" ] && ! ensure_postgres >/dev/null; then
-                gum style --foreground yellow "⚠️  PostgreSQL isn't running, so '$db_name' stays. Drop it later: cove postgres psql, then DROP DATABASE $db_name;"
-            elif ! cove_server_db_drop "$server" "$db_name"; then
+                laravel_workers_release "$site_name"
+                gum style --foreground red "❌ Error: PostgreSQL isn't running, so the database '$db_name' can't be deleted and the site stays as it is." "Start it (see: cove status), then delete the site again."
+                exit 1
+            fi
+            if ! cove_server_db_drop "$server" "$db_name"; then
                 laravel_workers_release "$site_name"
                 gum style --foreground red "❌ Error: Could not delete the database '$db_name', so the site stays as it is." "Is $([ "$server" = pgsql ] && echo PostgreSQL || echo MariaDB) running? See: cove status"
                 exit 1
             fi
         fi
+        # Its keys in Cove's Redis, when the prefix is the one Cove gave it:
+        # only once the database is gone, as a site that stays keeps them.
+        [ "$(laravel_env_get "$site_dir" REDIS_PREFIX)" = "$(cove_redis_prefix "$site_name")" ] && cove_redis_forget "$(cove_redis_prefix "$site_name")"
     fi
 
     # Don't trust the bare rm — a pre-1.10 dashboard-created site would be

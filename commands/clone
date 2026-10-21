@@ -97,6 +97,38 @@ laravel_take_database() {
     esac
 }
 
+# A Laravel clone's Reverb settings ($1 the clone's folder, $2 its source's,
+# $3 its name). .env came
+# over as it was, so the clone's app would broadcast to the source's Reverb
+# (its REVERB_PORT is the source's reverb_port, a file of Cove's that isn't
+# copied) under the source's app id, key and secret, which reach the
+# source's browsers. The port goes, as on a site that hasn't turned Reverb
+# on (cove laravel <site> reverb on gives the clone one of its own), and
+# the app gets keys of its own, made the way laravel_reverb_install makes
+# them. A front end already built has the old key in it, so it needs
+# building again. A site without Reverb is left as it is.
+cove_clone_reverb() {
+    local new_dir="$1" source_dir="$2" new_name="$3" pairs=() port rand_id keys=false
+    port=$(cat "$source_dir/reverb_port" 2>/dev/null)
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$(laravel_env_get "$new_dir" REVERB_PORT)" = "$port" ]; then
+        pairs+=("\"REVERB_PORT\":null")
+    fi
+    if [ -n "$(laravel_env_get "$new_dir" REVERB_APP_KEY)" ]; then
+        keys=true
+        rand_id=$(( (RANDOM * 32768 + RANDOM) % 900000 + 100000 ))
+        pairs+=("\"REVERB_APP_ID\":\"$rand_id\"" "\"REVERB_APP_KEY\":\"$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 20)\"" "\"REVERB_APP_SECRET\":\"$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 20)\"")
+    fi
+    [ "${#pairs[@]}" -gt 0 ] || return 0
+    if ! COVE_ENV_SET="{$(IFS=,; echo "${pairs[*]}")}" laravel_env_set "$new_dir/.env"; then
+        gum style --foreground yellow "⚠️  Could not give the clone Reverb settings of its own; its .env still names the source's Reverb (REVERB_PORT, REVERB_APP_*)."
+        return 0
+    fi
+    echo "   - Gave the clone Reverb settings of its own (cove laravel $new_name reverb on gives it a port too)."
+    if [ "$keys" = true ] && [ -d "$new_dir/public/build" ]; then
+        gum style --foreground yellow "⚠️  The clone's built front end still has the source's Reverb key: build it again (npm run build in $new_dir)."
+    fi
+}
+
 cove_clone() {
     cd ~/
     local source_name="$1"
@@ -292,6 +324,7 @@ cove_clone() {
         fi
         laravel_retarget "$new_dir" "$source_name" "$new_name" "$source_dir" || \
             gum style --foreground yellow "⚠️  Could not update APP_URL in the clone's .env."
+        cove_clone_reverb "$new_dir" "$source_dir" "$new_name"
         # An SQLite file named by a full path outside the folder isn't copied.
         local sqlite_path
         sqlite_path=$(laravel_env_get "$new_dir" DB_DATABASE)

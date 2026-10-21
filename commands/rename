@@ -56,10 +56,31 @@ cove_rename() {
 
     # --- Rename Directory ---
     # A Laravel site's workers run in the folder under the old name; they
-    # start again under the new one below.
+    # start again under the new one below. Both names are held: once the
+    # folder has moved, the watchdog would otherwise start the workers it
+    # wants under the new name while the database and .env are still on
+    # their way. Which ones were running is kept, for an abort to put back.
+    local kind running=""
+    for kind in $LARAVEL_WORKER_KINDS; do
+        laravel_worker_pid "$old_name" "$kind" >/dev/null && running="$running $kind"
+    done
     laravel_workers_hold "$old_name"
+    laravel_workers_hold "$new_name"
     laravel_workers_stop_site "$old_name"
-    mv "$old_site_dir" "$new_site_dir"
+    # Every abort from here: the folder back under the old name (once it
+    # has moved), both holds released, and the workers that were running
+    # started again there.
+    _cove_rename_abort() {
+        [ -d "$new_site_dir" ] && [ ! -e "$old_site_dir" ] && mv "$new_site_dir" "$old_site_dir"
+        laravel_workers_release "$new_name"
+        laravel_workers_release "$old_name"
+        for kind in $running; do laravel_worker_start "$old_name" "$kind"; done
+        exit 1
+    }
+    if ! mv "$old_site_dir" "$new_site_dir"; then
+        gum style --foreground red "❌ Error: Could not rename the folder $old_site_dir."
+        _cove_rename_abort
+    fi
     echo "   - Directory renamed."
 
     # --- Handle WordPress Specifics ---
@@ -79,22 +100,19 @@ cove_rename() {
         if old_db_name=$(wp_cove_db "$new_site_dir" "$old_name"); then
             if cove_db_exists "$new_db_name"; then
                 gum style --foreground red "❌ Error: A database named '$new_db_name' already exists, perhaps left by an earlier site." "Remove it (Adminer, or the dashboard's SQL console) or choose another name."
-                mv "$new_site_dir" "$old_site_dir" # Revert directory rename
-                exit 1
+                _cove_rename_abort # Reverts the directory rename
             fi
             local temp_sql_dump
             temp_sql_dump=$(mktemp) || {
                 gum style --foreground red "❌ Error: Could not create a temporary file for the database dump."
-                mv "$new_site_dir" "$old_site_dir"
-                exit 1
+                _cove_rename_abort
             }
             trap 'rm -f "$temp_sql_dump"' EXIT
 
             echo "   - Backing up old database '$old_db_name'..."
             if ! MYSQL_PWD="$DB_PASSWORD" mysqldump -u "$DB_USER" "$old_db_name" > "$temp_sql_dump"; then
                 gum style --foreground red "❌ Error: Failed to dump the old database. Aborting."
-                mv "$new_site_dir" "$old_site_dir" # Revert directory rename
-                exit 1
+                _cove_rename_abort # Reverts the directory rename
             fi
 
             echo "   - Creating and importing to new database '$new_db_name'..."
@@ -107,16 +125,14 @@ cove_rename() {
             if ! MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" "$new_db_name" < "$temp_sql_dump"; then
                 gum style --foreground red "❌ Error: Failed to import into '$new_db_name'. Aborting; old database left intact."
                 MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$new_db_name\`;"
-                mv "$new_site_dir" "$old_site_dir" # Revert directory rename
-                exit 1
+                _cove_rename_abort # Reverts the directory rename
             fi
 
             echo "   - Updating wp-config.php..."
             if ! (cd "$new_site_dir/public" && $wp_cmd config set DB_NAME "$new_db_name" --quiet); then
                 gum style --foreground red "❌ Error: Failed to update wp-config.php. Aborting; old database left intact."
                 MYSQL_PWD="$DB_PASSWORD" mysql -u "$DB_USER" -e "DROP DATABASE IF EXISTS \`$new_db_name\`;"
-                mv "$new_site_dir" "$old_site_dir" # Revert directory rename
-                exit 1
+                _cove_rename_abort # Reverts the directory rename
             fi
         else
             echo "   - Keeping the database wp-config.php names (not one Cove made for '$old_name')."
@@ -154,8 +170,7 @@ cove_rename() {
         old_laravel_server=$(laravel_db_server "$new_site_dir")
         if ! laravel_take_database "$new_site_dir" "$old_name" "$new_name" >/dev/null; then
             gum style --foreground red "❌ Error: Failed to copy the Laravel site's database. Aborting; old database left intact."
-            mv "$new_site_dir" "$old_site_dir"
-            exit 1
+            _cove_rename_abort
         fi
         # Its keys in Cove's Redis move with the prefix (queued jobs too),
         # while its workers are held; read before retarget changes it.
@@ -200,10 +215,10 @@ cove_rename() {
     regenerate_caddyfile
     prune_etc_hosts "$old_name.localhost"
 
-    local kind
     for kind in $LARAVEL_WORKER_KINDS; do
         laravel_worker_wanted "$new_name" "$kind" && laravel_worker_start "$new_name" "$kind"
     done
+    laravel_workers_release "$new_name"
     laravel_workers_release "$old_name"
     gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Site renamed successfully!" "New URL: $(url_for "$new_name.localhost")"
 }

@@ -283,19 +283,28 @@ cove_add() {
         exit 1
     fi
 
+    # Set first, so a Ctrl-C (or a kill, such as the MCP server's time
+    # limit) partway through a long download or Composer install leaves
+    # nothing behind: the work folder in ~/Cove/cache and, until the site is
+    # in place, the database made for it (see cove_new_site_cleanup).
+    COVE_FROM_WORK="" COVE_NEW_WORK="" COVE_NEW_DB=""
+    if [ -n "$from" ] || [ "$site_type" == "laravel" ]; then
+        trap cove_new_site_cleanup EXIT
+    fi
+
     # A project for --from is staged before anything is created, too: a
     # failed clone or download, or a bad archive, leaves no site behind.
+    # What is shown of its address has no credentials (cove_from_redact).
+    local from_shown=""
     if [ -n "$from" ]; then
-        # Set first, so a Ctrl-C during a long download leaves nothing in
-        # ~/Cove/cache (COVE_FROM_WORK is known once the folder exists).
-        trap 'rm -rf "$COVE_FROM_WORK"' EXIT
+        from_shown=$(cove_from_redact "$from")
         cove_from_stage "$site_name" "$from" "$branch" "$([ "$site_type" = plain ] && echo keep-deps)" || exit 1
-        cove_from_check_names "$COVE_FROM_STAGE" "$from" || exit 1
+        cove_from_check_names "$COVE_FROM_STAGE" "$from_shown" || exit 1
         if [ "$from_detect" = true ]; then
             if site_is_laravel "$COVE_FROM_STAGE"; then site_type="laravel"; else site_type="plain"; fi
         fi
         if [ "$site_type" == "plain" ] && { [ -n "$database" ] || [ "$seed" = true ]; }; then
-            gum style --foreground red "❌ Error: --database and --seed are for Laravel apps, and $from isn't one."
+            gum style --foreground red "❌ Error: --database and --seed are for Laravel apps, and $from_shown isn't one."
             exit 1
         fi
     fi
@@ -316,11 +325,11 @@ cove_add() {
         echo "➕ Creating $site_type site: $full_hostname"
     fi
     if [ "$site_type" == "laravel" ] && [ -n "$from" ]; then
-        cove_add_laravel_from "$site_name" "$site_dir" "$from" "$branch" "$database" "$php_pin" "$seed" || exit 1
+        cove_add_laravel_from "$site_name" "$site_dir" "$from_shown" "$branch" "$database" "$php_pin" "$seed" || exit 1
     elif [ "$site_type" == "laravel" ]; then
         cove_add_laravel "$site_name" "$site_dir" "$database" "$php_pin" "$seed" || exit 1
     elif [ "$site_type" == "plain" ] && [ -n "$from" ]; then
-        cove_add_app_from "$site_name" "$site_dir" "$from" "$branch" "$php_pin" || exit 1
+        cove_add_app_from "$site_name" "$site_dir" "$from_shown" "$branch" "$php_pin" || exit 1
     fi
     mkdir -p "$site_dir/public" "$site_dir/logs"
     if [ -n "$php_pin" ]; then
@@ -526,17 +535,34 @@ PHP
         [ "$db_line" = "Database: SQLite, " ] && db_line="Database: SQLite, database/database.sqlite"
         [ "$conn" = "sqlite" ] || db_line="Database: $(cove_db_name "$site_name") on Cove's MariaDB ($conn)"
         [ "$conn" = "pgsql" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's PostgreSQL"
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") set up from $from" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "What the tools printed: $site_dir/logs/laravel-setup.log" "${COVE_ADD_NOTES[@]}"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") set up from $from_shown" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "What the tools printed: $site_dir/logs/laravel-setup.log" "${COVE_ADD_NOTES[@]}"
     elif [ "$site_type" == "plain" ] && [ -n "$from" ]; then
         local next_line=""
         [ -n "$COVE_ADD_NEXT" ] && next_line="Next, in the site folder: $COVE_ADD_NEXT"
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ App set up from $from" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" ${next_line:+"$next_line"} "${COVE_ADD_NOTES[@]}"
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ App set up from $from_shown" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" ${next_line:+"$next_line"} "${COVE_ADD_NOTES[@]}"
     elif [ "$site_type" == "laravel" ]; then
         local db_line="Database: SQLite, database/database.sqlite"
         [ "$database" != "sqlite" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's MariaDB ($database)"
         [ "$database" = "pgsql" ] && db_line="Database: $(cove_db_name "$site_name") on Cove's PostgreSQL"
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "✅ Laravel $(laravel_version "$site_dir") Installed" "URL: $(url_for "$full_hostname")" "Folder: $site_dir" "$db_line" "Mail lands in Cove's mailbox: $(url_for "mail.cove.localhost")" "Artisan: cove artisan $site_name <command>" "Queued jobs run once a worker is going: cove laravel $site_name queue on"
     fi
+}
+
+# The EXIT trap while a site is made (cove add, a Laravel import): whatever a
+# Ctrl-C or a kill partway through would leave goes. The work folders under
+# ~/Cove/cache (COVE_FROM_WORK, COVE_NEW_WORK), and the database made for
+# the site (COVE_NEW_DB, "<server> <name>"), which is set only once Cove has
+# created it and emptied again once the site is in place, so a database
+# that was there before, or one a finished site uses, is never dropped.
+cove_new_site_cleanup() {
+    local server name
+    if [ -n "${COVE_NEW_DB:-}" ]; then
+        read -r server name <<< "$COVE_NEW_DB"
+        [ -n "$name" ] && cove_server_db_drop "$server" "$name" >/dev/null 2>&1
+    fi
+    [ -n "${COVE_FROM_WORK:-}" ] && rm -rf "$COVE_FROM_WORK"
+    [ -n "${COVE_NEW_WORK:-}" ] && rm -rf "$COVE_NEW_WORK"
+    return 0
 }
 
 # Creates a Laravel application for `cove add <name> laravel` the way
@@ -565,6 +591,7 @@ cove_add_laravel() {
     mkdir -p "$COVE_DIR/cache" || return 1
     local work
     work=$(mktemp -d "$COVE_DIR/cache/laravel-new-$site_name.XXXXXX") || return 1
+    COVE_NEW_WORK="$work"
     local stage="$work/app" log="$work/install.log"
 
     if [ "$database" != "sqlite" ]; then
@@ -575,6 +602,8 @@ cove_add_laravel() {
             rm -rf "$work"
             return 1
         fi
+        # Dropped again by the EXIT trap until the app is in place.
+        COVE_NEW_DB="$server $db_name"
     fi
 
     (
@@ -650,6 +679,8 @@ cove_add_laravel() {
         rm -rf "$work"
         return 1
     fi
+    # In place: the database is the site's now.
+    COVE_NEW_DB=""
     rm -rf "$work"
 }
 
@@ -714,8 +745,11 @@ cove_find_node() {
 # Laravel. A repository's or an archive's links have to stay inside it.
 cove_from_stage() {
     local site_name="$1" source="$2" branch="$3" keep_deps="$4"
-    local kind="" src="" work stage log archive="" ext=""
+    local kind="" src="" work stage log archive="" ext="" shown
     COVE_FROM_WORK="" COVE_FROM_STAGE="" COVE_FROM_KIND="" COVE_FROM_SRC="" COVE_FROM_LOG=""
+    # What is printed of an address: the output can end up with an agent
+    # (Cove's MCP server returns it), so never its credentials.
+    shown=$(cove_from_redact "$source")
 
     # macOS keeps Documents, Desktop and Downloads from apps it hasn't been
     # told to trust, Cove's web server among them: started from the
@@ -749,17 +783,17 @@ cove_from_stage() {
         kind=archive
         case "${BASH_REMATCH[1]}" in zip|ZIP) ext=zip ;; *) ext=tar ;; esac
         if [[ "$source" != https://* ]]; then
-            gum style --foreground red "❌ Error: An archive is downloaded over https:// only." "$source"
+            gum style --foreground red "❌ Error: An archive is downloaded over https:// only." "$shown"
             return 1
         fi
     elif [[ "$source" =~ ^(https?|ssh|git|file)://[^[:space:]]+$ ]] || [[ "$source" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^[:space:]]+$ ]]; then
         kind=git
         if ! command -v git >/dev/null 2>&1; then
-            gum style --foreground red "❌ Error: git isn't installed, so Cove can't clone $source."
+            gum style --foreground red "❌ Error: git isn't installed, so Cove can't clone $shown."
             return 1
         fi
     else
-        gum style --foreground red "❌ Error: --from is a folder, a git repository's address, or an archive." "There is no folder '$source', and it isn't an https://, ssh:// or git@host:path address, or a .zip / .tar.gz file or https:// link."
+        gum style --foreground red "❌ Error: --from is a folder, a git repository's address, or an archive." "There is no folder '$shown', and it isn't an https://, ssh:// or git@host:path address, or a .zip / .tar.gz file or https:// link."
         return 1
     fi
     if [ -n "$branch" ]; then
@@ -781,7 +815,7 @@ cove_from_stage() {
     : > "$log"
 
     if [ "$kind" = git ]; then
-        echo "   - Cloning ${source}…"
+        echo "   - Cloning ${shown}…"
         # Nothing can stop to ask for a password when no one is there to
         # answer (the dashboard, an agent): git and ssh fail instead.
         if ! (
@@ -799,10 +833,15 @@ cove_from_stage() {
                 git -c protocol.ext.allow=never clone --quiet -- "$source" "$stage"
             fi
         ) >>"$log" 2>&1; then
-            gum style --foreground red "❌ Error: git could not clone $source:"
-            tail -n 8 "$log" | sed 's/^/   /'
+            gum style --foreground red "❌ Error: git could not clone $shown:"
+            tail -n 8 "$log" | cove_from_redact_lines | sed 's/^/   /'
             rm -rf "$work"
             return 1
+        fi
+        # The clone keeps the address it came from as origin, credentials
+        # and all, in .git/config: kept without them, as cove-from is.
+        if [ "$shown" != "$source" ]; then
+            git -C "$stage" config remote.origin.url "$shown" 2>>"$log"
         fi
     elif [ "$kind" = folder ]; then
         # A Laravel project's vendor/ and node_modules/ are installed again
@@ -836,11 +875,11 @@ cove_from_stage() {
         if [ -f "$source" ]; then
             cp "$source" "$archive" || { rm -rf "$work"; return 1; }
         else
-            echo "   - Downloading ${source}…"
+            echo "   - Downloading ${shown}…"
             # https all the way, redirects included (GitHub's release links
             # redirect to its CDN), and nothing past 2 GB.
             if ! curl -fsSL --proto '=https' --proto-redir '=https' --max-filesize 2147483648 --retry 2 -o "$archive" "$source" 2>>"$log"; then
-                gum style --foreground red "❌ Error: Could not download $source." "$(tail -n 2 "$log")"
+                gum style --foreground red "❌ Error: Could not download $shown." "$(tail -n 2 "$log" | cove_from_redact_lines)"
                 rm -rf "$work"
                 return 1
             fi
@@ -860,12 +899,37 @@ cove_from_stage() {
             names=$(tar -tf "$archive" 2>>"$log")
         fi
         if [ $? -ne 0 ] || [ -z "$names" ]; then
-            gum style --foreground red "❌ Error: $source isn't an archive Cove can open."
+            gum style --foreground red "❌ Error: $shown isn't an archive Cove can open."
             rm -rf "$work"
             return 1
         fi
         if printf '%s\n' "$names" | grep -qE '^/|(^|/)\.\.(/|$)|\\'; then
-            gum style --foreground red "❌ Error: $source has files that would land outside its own folder (an absolute path or ..), so it isn't unpacked."
+            gum style --foreground red "❌ Error: $shown has files that would land outside its own folder (an absolute path or ..), so it isn't unpacked."
+            rm -rf "$work"
+            return 1
+        fi
+        # The download stops at 2 GB, but what is inside can be far bigger (a
+        # few MB of zip can hold terabytes of zeros), so what it unpacks to is
+        # held to the same 2 GB: past that, an archive is a mistake or a bomb
+        # rather than a project. Counted by unpacking to a pipe, never to
+        # disk, which stops a byte past the limit; without unzip, from the
+        # sizes the zip declares.
+        local limit=2147483648 size
+        if [ "$ext" = zip ] && ! command -v unzip >/dev/null 2>&1; then
+            size=$(COVE_ZIP="$archive" $(cove_php_cmd) -r '$z = new ZipArchive(); if ($z->open(getenv("COVE_ZIP")) !== true) exit(1); $n = 0; for ($i = 0; $i < $z->numFiles; $i++) { $s = $z->statIndex($i); $n += $s ? $s["size"] : 0; } echo $n;' 2>>"$log")
+        elif [ "$ext" = zip ]; then
+            size=$(unzip -p "$archive" 2>>"$log" </dev/null | head -c $((limit + 1)) | wc -c)
+        else
+            size=$(tar -xOf "$archive" 2>>"$log" | head -c $((limit + 1)) | wc -c)
+        fi
+        size="${size//[[:space:]]/}"
+        if ! [[ "$size" =~ ^[0-9]+$ ]]; then
+            gum style --foreground red "❌ Error: $shown isn't an archive Cove can open."
+            rm -rf "$work"
+            return 1
+        fi
+        if [ "$size" -gt "$limit" ]; then
+            gum style --foreground red "❌ Error: $shown unpacks to more than 2 GB, so it isn't unpacked." "A project that big comes in as a folder or a git repository instead."
             rm -rf "$work"
             return 1
         fi
@@ -885,7 +949,7 @@ cove_from_stage() {
         rc=$?
         rm -f "$archive"
         if [ "$rc" -ne 0 ]; then
-            gum style --foreground red "❌ Error: Could not unpack $source." "$(tail -n 3 "$log")"
+            gum style --foreground red "❌ Error: Could not unpack $shown." "$(tail -n 3 "$log")"
             rm -rf "$work"
             return 1
         fi
@@ -910,9 +974,9 @@ cove_from_stage() {
     # your own is copied as it is.
     if [ "$kind" != folder ]; then
         local outside
-        outside=$(cove_links_outside "$stage" 2>>"$log")
+        outside=$(cove_links_outside "$stage" "$SITES_DIR/$site_name.localhost" 2>>"$log")
         if [ -n "$outside" ]; then
-            gum style --foreground red "❌ Error: $source has links that point outside the project, so it isn't used:" "$outside"
+            gum style --foreground red "❌ Error: $shown has links that point outside the project, so it isn't used:" "$outside"
             rm -rf "$work"
             return 1
         fi
@@ -921,20 +985,80 @@ cove_from_stage() {
     COVE_FROM_WORK="$work" COVE_FROM_STAGE="$stage" COVE_FROM_KIND="$kind" COVE_FROM_SRC="$src" COVE_FROM_LOG="$log"
 }
 
-# The links in a project ($1) that lead outside it, up to three, one per line
-# as "path -> target"; nothing when there are none. A dangling one counts
-# when it names an absolute path.
+# The links in a project ($1) that would lead outside it once it is a site,
+# up to three, one per line as "path -> target"; nothing when there are
+# none. A project is checked where it is staged, a folder deeper
+# (~/Cove/cache/from-x.XXXX/app) than its home ($2, ~/Cove/Sites/x.localhost),
+# so a ../../.. that lands nowhere here could land in your home there. Each
+# target is followed from the project's own top instead, the way the system
+# would follow it (through the project's other links, so a .. after a link
+# to a shallower folder climbs from there), and whether or not it exists:
+# any step above the top is outside. An absolute target is inside only when
+# it names the project, where it is or at its home. A project that can't be
+# read through counts as having one, so nothing unchecked gets through.
 cove_links_outside() {
-    COVE_STAGE="$1" $(cove_php_cmd) -r '
+    local found
+    found=$(COVE_STAGE="$1" COVE_HOME="${2:-}" $(cove_php_cmd) -r '
         $root = realpath(getenv("COVE_STAGE"));
+        if ($root === false) exit(1);
+        $homes = [$root];
+        $home = rtrim((string) getenv("COVE_HOME"), "/");
+        if ($home !== "") {
+            $homes[] = $home;
+            $up = realpath(dirname($home));
+            if ($up !== false) $homes[] = $up . "/" . basename($home);
+        }
+        // What an absolute target names past the project folder, or null
+        // when it is somewhere else.
+        $within = function ($abs) use ($homes) {
+            foreach ($homes as $h) {
+                if ($abs === $h) return "";
+                if (strpos($abs, $h . "/") === 0) return substr($abs, strlen($h) + 1);
+            }
+            return null;
+        };
+        // Follows a target from a folder ($at, its names below the top);
+        // false as soon as it would leave. A loop of links counts as leaving.
+        $inside = function (array $at, $to) use ($root, $within) {
+            $todo = [];
+            $hops = 0;
+            while ($to !== null) {
+                if ($to !== "" && $to[0] === "/") {
+                    $to = $within($to);
+                    if ($to === null) return false;
+                    $at = [];
+                }
+                $todo = array_merge(explode("/", $to), $todo);
+                $to = null;
+                while ($todo && $to === null) {
+                    $name = array_shift($todo);
+                    if ($name === "" || $name === ".") continue;
+                    if ($name === "..") {
+                        if (!$at) return false;
+                        array_pop($at);
+                        continue;
+                    }
+                    $at[] = $name;
+                    $path = $root . "/" . implode("/", $at);
+                    if (is_link($path)) {
+                        if (++$hops > 40) return false;
+                        $to = (string) readlink($path);
+                        array_pop($at);
+                    }
+                }
+            }
+            return true;
+        };
         $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
         foreach ($it as $f) {
             if (!$f->isLink()) continue;
-            $to = realpath($f->getPathname());
+            $rel = substr($f->getPathname(), strlen($root) + 1);
             $link = (string) readlink($f->getPathname());
-            $out = $to === false ? $link !== "" && $link[0] === "/" : $to !== $root && strpos($to, $root . "/") !== 0;
-            if ($out) echo substr($f->getPathname(), strlen($root) + 1), " -> ", $link, "\n";
-        }' | head -n 3
+            $at = explode("/", $rel);
+            array_pop($at);
+            if (!$inside($at, $link)) echo $rel, " -> ", $link, "\n";
+        }') || found="(its links could not all be checked)"
+    printf '%s' "$found" | head -n 3
 }
 
 # A project's top-level names that Cove keeps for a site's own files
@@ -953,12 +1077,39 @@ cove_from_check_names() {
     done
 }
 
+# An address for --from as it may be shown or kept: without a URL's
+# user:password@, query string or fragment, any of which can hold a token
+# (https://<token>@github.com/…, a signed download's ?X-Amz-Signature=).
+# An ssh:// address keeps its user name, which is how ssh logs in rather
+# than a secret, but not a password after it. A folder, a file or a
+# git@host:path address is left as it is.
+cove_from_redact() {
+    local url="$1" rest auth user
+    case "$url" in *://*) ;; *) printf '%s' "$url"; return 0 ;; esac
+    url="${url%%[?#]*}"
+    rest="${url#*://}"
+    auth="${rest%%/*}"
+    if [[ "$auth" == *@* ]]; then
+        user=""
+        case "$url" in ssh://*) user="${auth%@*}"; user="${user%%:*}@" ;; esac
+        url="${url%%://*}://$user${auth##*@}${rest#"$auth"}"
+    fi
+    printf '%s' "$url"
+}
+
+# The same for what git or curl printed (stdin to stdout): any URL's
+# credentials and query go, wherever they are in a line.
+cove_from_redact_lines() {
+    sed -E 's|([A-Za-z][A-Za-z0-9+.-]*://)[^/?#[:space:]]*@|\1|g; s|(://[^?#[:space:]]*)[?#][^[:space:]]*|\1|g'
+}
+
 # Where a site came from, kept as <site>/cove-from (and what makes it a
-# project for clone and snapshot). A URL's user:password@ is left out.
+# project for clone and snapshot). A URL's credentials, query and fragment
+# are left out (cove_from_redact).
 cove_from_record() {
     local dest="$1" source="$2" kind="$3" branch="$4"
     [ "$kind" = folder ] && source="$COVE_FROM_SRC"
-    source=$(printf '%s' "$source" | sed -E 's#^([a-z]+://)[^/@]*@#\1#')
+    source=$(cove_from_redact "$source")
     {
         echo "kind=$kind"
         echo "source=$source"
@@ -1160,6 +1311,8 @@ cove_add_laravel_from() {
         [ "$conn" = "pgsql" ] && server="pgsql"
         db_name=$(cove_db_name "$site_name")
         cove_laravel_create_db "$db_name" "$server" || { db_name=""; _cove_from_fail; return 1; }
+        # Dropped again by the EXIT trap until the app is in place.
+        COVE_NEW_DB="$server $db_name"
     fi
 
     echo "   - Setting up .env for Cove…"
@@ -1173,6 +1326,17 @@ cove_add_laravel_from() {
     fi
     # key:generate fills APP_KEY in, but only where the line is.
     grep -qE '^[[:space:]]*APP_KEY[[:space:]]*=' .env || set="$set,\"APP_KEY\":\"\""
+    # Redis is always Cove's, with a key prefix of the site's own, written
+    # now, before anything boots the app: the Redis .env names may be the
+    # project's real one, and Laravel clears a Redis cache with FLUSHDB, the
+    # whole database. When the app keeps its cache, sessions or queue there,
+    # Cove's is set up if it isn't yet.
+    local uses="" redis_ok=false
+    for k in CACHE_STORE CACHE_DRIVER SESSION_DRIVER QUEUE_CONNECTION; do
+        [ "$(laravel_env_get "$stage" "$k")" = "redis" ] && uses="$uses $k"
+    done
+    [ -n "$uses" ] && ensure_redis >>"$log" 2>&1 && redis_ok=true
+    set="$set,$(cove_redis_site_env "$site_name")"
     if [ "$conn" = "sqlite" ]; then
         # Switched from a server database: its settings would name a file.
         [ "$was" = "sqlite" ] || set="$set,\"DB_HOST\":null,\"DB_PORT\":null,\"DB_DATABASE\":null,\"DB_USERNAME\":null,\"DB_PASSWORD\":null"
@@ -1232,6 +1396,9 @@ cove_add_laravel_from() {
         _cove_from_fail
         return 1
     fi
+    # In place: the database is the site's now, and stays with it while the
+    # rest is set up (a failure from here on is a note).
+    COVE_NEW_DB=""
     mkdir -p "$site_dir/logs"
     mv -f "$log" "$site_dir/logs/laravel-setup.log"
     log="$site_dir/logs/laravel-setup.log"
@@ -1272,7 +1439,11 @@ cove_add_laravel_from() {
     if [ -z "$(laravel_env_get "$site_dir" APP_KEY)" ] && ! _cove_from_artisan key:generate; then
         COVE_ADD_NOTES+=("⚠️  artisan key:generate failed: $(_cove_from_why)")
     fi
-    _cove_from_artisan optimize:clear
+    # Compiled views from another machine name its folders. Not
+    # optimize:clear, which clears the cache store too: on Redis that is a
+    # FLUSHDB of a database other sites share. The config, route and event
+    # caches went with bootstrap/cache above.
+    _cove_from_artisan view:clear
     echo "   - Running migrations…"
     if ! _cove_from_artisan migrate --force; then
         COVE_ADD_NOTES+=("⚠️  The migrations failed: $(_cove_from_why)" "   Fix it, then: cove artisan $site_name migrate")
@@ -1319,23 +1490,14 @@ cove_add_laravel_from() {
         fi
     fi
 
-    # Redis, when the app keeps its cache, sessions or queue there: Cove's,
-    # set up if it isn't yet, with a key prefix of the site's own.
-    local uses=""
-    for k in CACHE_STORE CACHE_DRIVER SESSION_DRIVER QUEUE_CONNECTION; do
-        [ "$(laravel_env_get "$site_dir" "$k")" = "redis" ] && uses="$uses $k"
-    done
-    if [ -n "$uses" ]; then
-        if ensure_redis >>"$log" 2>&1 && COVE_ENV_SET="{$(cove_redis_site_env "$site_name")}" laravel_env_set "$site_dir/.env"; then
-            COVE_ADD_NOTES+=("ℹ️  Its${uses} use Redis: Cove's, on 127.0.0.1:$(cove_redis_port), keys prefixed $(cove_redis_prefix "$site_name").")
-            if ! COVE_PHP_BIN="$native" "$php" -r 'exit(extension_loaded("redis") ? 0 : 1);' 2>/dev/null && [ ! -d vendor/predis/predis ] && [ "$(laravel_env_get "$site_dir" REDIS_CLIENT)" != "predis" ]; then
-                COVE_ADD_NOTES+=("⚠️  This PHP has no redis extension: add the predis client (cove composer $site_name require predis/predis) and set REDIS_CLIENT=predis.")
-            fi
-        else
-            COVE_ADD_NOTES+=("⚠️  Its${uses} use Redis, which Cove couldn't start (see logs/laravel-setup.log): set them to database or file in .env.")
+    # Redis, set up for Cove's with the rest of .env above.
+    if [ -n "$uses" ] && [ "$redis_ok" = true ]; then
+        COVE_ADD_NOTES+=("ℹ️  Its${uses} use Redis: Cove's, on 127.0.0.1:$(cove_redis_port), keys prefixed $(cove_redis_prefix "$site_name").")
+        if ! COVE_PHP_BIN="$native" "$php" -r 'exit(extension_loaded("redis") ? 0 : 1);' 2>/dev/null && [ ! -d vendor/predis/predis ] && [ "$(laravel_env_get "$site_dir" REDIS_CLIENT)" != "predis" ]; then
+            COVE_ADD_NOTES+=("⚠️  This PHP has no redis extension: add the predis client (cove composer $site_name require predis/predis) and set REDIS_CLIENT=predis.")
         fi
-    else
-        COVE_ENV_SET="{\"REDIS_PREFIX\":$(cove_json_str "$(cove_redis_prefix "$site_name")")}" laravel_env_set "$site_dir/.env" >/dev/null 2>&1
+    elif [ -n "$uses" ]; then
+        COVE_ADD_NOTES+=("⚠️  Its${uses} use Redis, which Cove couldn't start (see logs/laravel-setup.log): set them to database or file in .env.")
     fi
     [ "$kind" = folder ] && [ "$conn" != "sqlite" ] && COVE_ADD_NOTES+=("ℹ️  The database started empty: the migrations made its tables, and none of the original's rows came along.")
     cd ~/ || true
