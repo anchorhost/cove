@@ -521,7 +521,7 @@ function tools(): array {
         'login_link' => [
             'title' => 'One-time login link',
             'description' => "A one-time link that signs into a WordPress site's admin as an administrator (or the user named), or into a Laravel app as its first user (or the one named, by id or email) through the app's own auth, for a browser or a browser-automation tool. Each link works once.",
-            'inputSchema' => $obj(['site' => $site, 'user' => ['type' => 'string', 'description' => 'A user login, email or ID. Default: the first administrator (WordPress) or the first user (Laravel).'], 'url' => ['type' => 'string', 'description' => 'WordPress: on a multisite network, the subsite to sign into.'], 'to' => ['type' => 'string', 'description' => 'Laravel: the path to land on, e.g. /admin. Default: the dashboard route, or home.']], ['site']),
+            'inputSchema' => $obj(['site' => $site, 'user' => ['type' => 'string', 'description' => 'A user login, email or ID. Default: the first administrator (WordPress) or the first user (Laravel).'], 'url' => ['type' => 'string', 'description' => 'WordPress: on a multisite network, the subsite to sign into.'], 'to' => ['type' => 'string', 'description' => 'Laravel and Minn Engine: the path to land on, e.g. /admin. Default: the dashboard route or home (Laravel), Minn Admin (Minn Engine).']], ['site']),
             'annotations' => $rw,
         ],
         'wp_read' => [
@@ -857,12 +857,14 @@ function call_tool(string $name, array $a): array {
             $args = ['login', $site];
             if (!empty($a['user'])) $args[] = (string) $a['user'];
             if (!empty($a['url'])) $args[] = '--url=' . $a['url'];
+            // A Minn Engine site lands on the page named; plain WordPress ignores it.
+            if (!empty($a['to'])) $args[] = '--to=' . $a['to'];
             $args[] = '--plain';
             [$out, $err, $code] = cove($args, true);
             $out = clean($out);
-            if ($code !== 0 || !preg_match('~https?://\S+wp-login\.php\S*~', $out, $m)) throw new ToolError($out ?: 'cove login failed.');
+            if ($code !== 0 || !preg_match('~https?://\S+(?:wp-login\.php|/minn-admin/login\?)\S*~', $out, $m)) throw new ToolError($out ?: 'cove login failed.');
             // Anything cove login said first: it rewrote the site's stored URLs, or couldn't.
-            $said = trim(preg_replace('~^.*wp-login\.php.*$~m', '', $out));
+            $said = trim(preg_replace('~^.*(?:wp-login\.php|/minn-admin/login\?).*$~m', '', $out));
             // WordPress builds the link from the home URL in the database. A
             // site imported without its URLs rewritten still names its live
             // domain, and signing in there would leave this machine.

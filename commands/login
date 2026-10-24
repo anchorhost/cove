@@ -5,7 +5,7 @@
 # Rewrite them to this site's own address, as `cove import` and `cove pull`
 # do, after saving the database to the site's private/ folder. Only a plain
 # single site: a multisite network keeps its domains in tables of its own, a
-# Minn Engine site has no WordPress to run search-replace, and WP_HOME or
+# Minn Engine site can't run the PHP that reads them, and WP_HOME or
 # WP_SITEURL win over the database anyway; those get a warning instead, as
 # does a copy of another Cove site still sharing that site's database. An
 # address the site answers on here (a mapping, its twin) is left alone.
@@ -154,7 +154,7 @@ cove_login() {
     local user_identifier="" # Optional: the user to log in as
     local subsite_url=""     # Optional: a subsite of a multisite network
     local plain=false        # --plain: print only the URL, for scripts and agents
-    local to=""              # --to: a Laravel site's page to land on
+    local to=""              # --to: a Laravel or Minn Engine site's page to land on
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -203,6 +203,11 @@ cove_login() {
             return
         fi
         site_not_found "$site_name" "WordPress and Laravel"
+    fi
+
+    if site_is_minn "$public_dir" && minn_mints_logins "$site_dir"; then
+        cove_login_minn "$site_name" "$site_dir" "$user_identifier" "$subsite_url" "$to" "$plain"
+        return
     fi
 
     # --url picks a subsite of a multisite network: wp-cli then runs in that
@@ -287,6 +292,64 @@ cove_login() {
         exit 1
     fi
 }
+# Whether a Minn Engine site's own engine mints sign-in links (`minn login`,
+# engine 0.2.0 and later). Older engines get the WP-CLI path, whose
+# `wp user login` they answer themselves.
+minn_mints_logins() {
+    local bin="$1/public/minn/bin/minn"
+    [ -f "$bin" ] || return 1
+    $(cove_php_cmd "$1") "$bin" help 2>/dev/null | grep -q "minn login"
+}
+
+# A one-time sign-in link for a Minn Engine site, minted by the engine
+# itself: `minn login` reads wp-config.php as text and writes the token
+# straight to the database, so neither WP-CLI nor the WordPress runtime takes
+# part and the link works whatever the site's MINN_WP_API says. Nothing is
+# written into the site either: the engine redeems its own links, so the
+# CaptainCore Helper mu-plugin is not needed for this. The link opens Minn's
+# sign-in page and lands in Minn Admin, or on --to.
+cove_login_minn() {
+    local site_name="$1" site_dir="$2" who="$3" subsite_url="$4" to="$5" plain="$6"
+    local public_dir="$site_dir/public" fd=1 out json url user roles
+    local -a args=(login "$public_dir")
+    [ "$plain" = true ] && fd=2
+    if [ -n "$subsite_url" ]; then
+        gum style --foreground red "❌ Error: '$site_name.localhost' runs Minn Engine, which serves a single site, so --url does not apply."
+        exit 1
+    fi
+    if [ -n "$to" ] && { ! [[ "$to" =~ ^/[A-Za-z0-9._~/?=\&%:+,@!-]*$ ]] || [[ "$to" == //* ]]; }; then
+        gum style --foreground red "❌ Error: --to is a path on the site, such as /minn-admin/content."
+        exit 1
+    fi
+    [ -n "$who" ] && args+=("$who")
+    [ -n "$to" ] && args+=("--to=$to")
+    args+=(--format=json)
+    [ "$plain" = true ] || echo "🔎 Asking Minn Engine for a one-time login for '$site_name.localhost'..."
+    if ! out=$(cd "$public_dir" && $(cove_php_cmd "$site_dir") "$public_dir/minn/bin/minn" "${args[@]}" 2>&1 </dev/null); then
+        out=$(printf '%s\n' "$out" | grep -m1 '^Error: ')
+        gum style --foreground red "❌ ${out:-Error: Minn Engine could not mint a login link.}"
+        exit 1
+    fi
+    json=$(printf '%s\n' "$out" | grep '^{' | tail -n 1)
+    url=$(printf '%s' "$json" | sed -nE 's/.*"url":"([^"]+)".*/\1/p')
+    user=$(printf '%s' "$json" | sed -nE 's/.*"user":"((\\.|[^"\\])*)".*/\1/p')
+    roles=$(printf '%s' "$json" | sed -nE 's/.*"roles":\[([^]]*)\].*/\1/p' | tr -d '"' | sed 's/,/, /g')
+    if [ -z "$url" ]; then
+        gum style --foreground red "❌ Error: Minn Engine did not hand back a login link."
+        exit 1
+    fi
+    # A named user may hold any role, as on WordPress: say so when it is not
+    # an administrator.
+    if [ -n "$who" ] && [[ ", $roles, " != *", administrator, "* ]]; then
+        echo "⚠️  '$user' is not an administrator (roles: ${roles:-none})." >&"$fd"
+    fi
+    if [ "$plain" = true ]; then
+        echo "$url"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🔗 One-Time Login URL for '$user'" "$url"
+    fi
+}
+
 # A one-time sign-in link for a Laravel site. The token waits five minutes
 # in ~/Cove/cache/laravel-login (this user's only); the prepend Cove runs
 # before every request (create_whoops_bootstrap) takes it on a request from

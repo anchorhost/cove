@@ -362,15 +362,15 @@ cove_clone() {
     fi
 
     if [ "$is_wordpress" = true ]; then
-        local wp_cmd_final admin_login one_time_login_url
-        wp_cmd_final=$(get_wp_cmd "$new_dir")
-        # Unlike a fresh install there is no known admin username here, so pick
-        # the first administrator out of the cloned database.
-        admin_login=$($wp_cmd_final user list --role=administrator --field=user_login --number=1 --path="$new_dir/public/" 2>/dev/null </dev/null | head -1)
+        local one_time_login_url=""
         # Credentials come from the source site, so they are deliberately not
         # printed here — a one-time link is the useful thing to hand back.
-        if [ -n "$admin_login" ]; then
-            one_time_login_url=$($wp_cmd_final user login "$admin_login" --path="$new_dir/public/" 2>/dev/null </dev/null | head -1)
+        # `cove login` picks the clone's first administrator and mints it the
+        # way the site wants (a Minn Engine site mints its own).
+        if one_time_login_url=$("$0" login "$new_name" --plain 2>/dev/null </dev/null); then
+            one_time_login_url=$(printf '%s\n' "$one_time_login_url" | tail -n 1)
+        else
+            one_time_login_url=""
         fi
         [ -n "$one_time_login_url" ] || one_time_login_url="(no administrator found — log in as you would on '$source_name')"
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \

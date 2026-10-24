@@ -7101,7 +7101,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Parse the command's output to find the URL.
                 foreach ($output_lines as $line) {
-                    if (strpos($line, 'https://') !== false && (strpos($line, '/wp-login.php') !== false || strpos($line, '/__cove/login/') !== false)) {
+                    if (strpos($line, 'https://') !== false && (strpos($line, '/wp-login.php') !== false || strpos($line, '/minn-admin/login?') !== false || strpos($line, '/__cove/login/') !== false)) {
                         // Clean the line from any "gum" box characters.
                         $login_url = trim(preg_replace('/[│└┌]/u', '', $line));
                         break;
@@ -19300,8 +19300,9 @@ display_command_help() {
         login)
             echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>] [--plain]"
             echo ""
-            echo "Prints a one-time login link for a WordPress or Laravel site."
+            echo "Prints a one-time login link for a WordPress, Minn Engine or Laravel site."
             echo "WordPress: if no user is specified, the first available administrator."
+            echo "Minn Engine: the same, minted by the engine itself (no WP-CLI needed)."
             echo "Laravel: the user is an id or email (default: the app's first user),"
             echo "signed in through the app's own auth guard. The link works once, within"
             echo "five minutes, and only from this machine."
@@ -19313,8 +19314,9 @@ display_command_help() {
             echo "  --url=<url>    (Optional, WordPress) On a multisite network, the subsite"
             echo "                 to log in to, e.g. --url=https://mysite.localhost/store/"
             echo "                 (see 'cove network')."
-            echo "  --to=<path>    (Optional, Laravel) The page to land on, e.g. --to=/admin."
-            echo "                 Default: the app's dashboard route, or the home page."
+            echo "  --to=<path>    (Optional, Laravel and Minn Engine) The page to land on,"
+            echo "                 e.g. --to=/admin. Default: the app's dashboard route or"
+            echo "                 the home page (Laravel), Minn Admin (Minn Engine)."
             echo "  --plain        Print only the link, for scripts (--url-only works too)."
             ;;
         wp)
