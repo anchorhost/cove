@@ -9019,6 +9019,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .mail-part:hover { color: var(--text); background: var(--panel-hover); }
         .mail-part.is-active { color: var(--text); background: var(--panel); border-color: var(--panel-border); }
         .mail-bar-note { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .mail-msg-bar .mail-images { padding: 0.2rem 0.5rem; font-size: 0.7rem; margin-left: -0.4rem; }
         .mail-msg-actions { margin-left: auto; display: flex; gap: 0.35rem; }
         .mail-msg-actions .pill { padding: 0.26rem 0.6rem; font-size: 0.74rem; }
         .mail-frame { display: block; width: 100%; border: 0; background: #fff; min-height: 240px; color-scheme: light; }
@@ -9850,6 +9851,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                                     <button type="button" class="mail-part" role="tab" data-part="headers">headers</button>
                                 </div>
                                 <span class="mail-bar-note" id="mailRemoteNote" style="display: none;"></span>
+                                <button type="button" class="pill mail-images" id="btnMailImages" style="display: none;" title="Load this message's remote images (the sender's server sees the request)">load images</button>
                                 <div class="mail-msg-actions">
                                     <button type="button" class="pill" id="btnMailUnread">mark unread</button>
                                     <button type="button" class="pill" id="btnMailDelete">delete</button>
@@ -9859,7 +9861,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             <div class="mail-msg-body">
                                 <!-- No scripts, no forms, no remote loads: the sandbox denies
                                      script execution, and the CSP injected into the srcdoc
-                                     limits images to inline parts served via /mail-api/.
+                                     limits images to inline parts served via /mail-api/
+                                     and Cove's own *.localhost sites, until "load images".
                                      allow-same-origin is what lets the frame be measured
                                      (and 'self' resolve for those inline parts); with no
                                      allow-scripts nothing inside can act on that origin.
@@ -10934,7 +10937,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 query: '', site: null, unreadOnly: false,
                 loading: false, loaded: false, error: null,
                 selectedId: null, msg: null, msgLoading: false, msgError: null,
-                part: 'html', headers: null, renderedId: null, remoteBlocked: 0,
+                part: 'html', headers: null, renderedId: null, remoteBlocked: 0, remoteAllowed: false,
                 deleteArmed: false, armTimer: null, searchTimer: null, syncTimer: null,
                 seq: 0, ws: null, pollTimer: null, wsRetry: null, info: null,
             },
@@ -13385,8 +13388,10 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // URLs here. A CSP inside the document keeps everything else out —
             // the sandbox already denies scripts and forms; this also stops
             // remote images, fonts and stylesheets so a message never phones
-            // home when opened.
-            mailHtmlDoc(msg) {
+            // home when opened. Images from Cove's own *.localhost sites load,
+            // since they never leave this machine; any other image waits for
+            // "load images" (remoteAllowed, reset per message).
+            mailHtmlDoc(msg, allowRemote) {
                 let html = msg.HTML || '';
                 for (const p of (msg.Inline || [])) {
                     if (!p.ContentID) continue;
@@ -13394,12 +13399,47 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     html = html.split('cid:' + p.ContentID).join(url);
                 }
                 html = html.replace(/<script[\s\S]*?<\/script\s*>/gi, '').replace(/<meta[^>]+http-equiv[^>]*>/gi, '');
-                const csp = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'none'";
+                const img = "'self' data: https://localhost:* http://localhost:* https://*.localhost:* http://*.localhost:*" + (allowRemote ? ' https: http:' : '');
+                const csp = "default-src 'none'; img-src " + img + "; style-src 'unsafe-inline'; form-action 'none'";
                 const head = '<meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + csp + '"><base target="_blank">'
                     + '<style>html{color-scheme:light}body{margin:0;padding:16px;background:#fff;color:#1a1c1b;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',system-ui,sans-serif;line-height:1.45}</style>';
                 if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, (t) => t + head);
                 if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, (t) => t + '<head>' + head + '</head>');
                 return '<!doctype html><html><head>' + head + '</head><body>' + html + '</body></html>';
+            },
+
+            // Draws the HTML part into the sandboxed frame, sizes the frame to
+            // it, and counts the images the CSP held back (any http(s) image
+            // not on a *.localhost host).
+            loadMailFrame(msg) {
+                const m = this.mail;
+                const frame = $id('mailFrame');
+                frame.style.height = '';
+                if (!msg.HTML) {
+                    frame.onload = null;
+                    frame.srcdoc = '';
+                    return;
+                }
+                frame.onload = () => {
+                    try {
+                        const d = frame.contentDocument;
+                        const h = Math.max(d.documentElement.scrollHeight, d.body ? d.body.scrollHeight : 0);
+                        frame.style.height = Math.min(Math.max(h + 8, 240), 6000) + 'px';
+                        const remote = (src) => {
+                            if (!/^(https?:)?\/\//i.test(src || '')) return false;
+                            try { return !/(^|\.)localhost$/i.test(new URL(src, 'https://cove.localhost').hostname); } catch (e) { return true; }
+                        };
+                        m.remoteBlocked = m.remoteAllowed ? 0
+                            : [...d.querySelectorAll('img[src], [background]')].filter(el => remote(el.getAttribute('src') || el.getAttribute('background'))).length;
+                        this.renderMailReader();
+                        // Images that load later change the height.
+                        if (m.remoteAllowed) d.querySelectorAll('img').forEach(i => i.addEventListener('load', () => {
+                            const h2 = Math.max(d.documentElement.scrollHeight, d.body ? d.body.scrollHeight : 0);
+                            frame.style.height = Math.min(Math.max(h2 + 8, 240), 6000) + 'px';
+                        }, { once: true }));
+                    } catch (e) {}
+                };
+                frame.srcdoc = this.mailHtmlDoc(msg, m.remoteAllowed);
             },
 
             renderMail() {
@@ -13484,6 +13524,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (m.renderedId !== msg.ID) {
                     m.renderedId = msg.ID;
                     m.remoteBlocked = 0;
+                    m.remoteAllowed = false;
                     $id('mailMsgSubject').textContent = msg.Subject || '(no subject)';
                     const meta = [['from', this.mailAddrFull(msg.From)], ['to', (msg.To || []).map(a => this.mailAddrFull(a)).join(', ')]];
                     if (msg.Cc && msg.Cc.length) meta.push(['cc', msg.Cc.map(a => this.mailAddrFull(a)).join(', ')]);
@@ -13499,23 +13540,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             + '<button type="button" class="mail-link-copy" data-url="' + this.escapeHtml(u) + '" title="Copy link">copy</button></span>';
                     }).join('');
 
-                    const frame = $id('mailFrame');
-                    frame.style.height = '';
-                    if (msg.HTML) {
-                        frame.onload = () => {
-                            try {
-                                const d = frame.contentDocument;
-                                const h = Math.max(d.documentElement.scrollHeight, d.body ? d.body.scrollHeight : 0);
-                                frame.style.height = Math.min(Math.max(h + 8, 240), 6000) + 'px';
-                                m.remoteBlocked = d.querySelectorAll('img[src^="http"], img[src^="//"]').length;
-                                this.renderMailReader();
-                            } catch (e) {}
-                        };
-                        frame.srcdoc = this.mailHtmlDoc(msg);
-                    } else {
-                        frame.onload = null;
-                        frame.srcdoc = '';
-                    }
+                    this.loadMailFrame(msg);
                     $id('mailText').innerHTML = msg.Text ? this.linkify(msg.Text) : '<span style="color: var(--text-faint)">(no text part)</span>';
 
                     const att = $id('mailAttachments');
@@ -13542,6 +13567,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const note = $id('mailRemoteNote');
                 show(note, m.part === 'html' && m.remoteBlocked > 0);
                 note.textContent = m.remoteBlocked + ' remote image' + (m.remoteBlocked === 1 ? '' : 's') + ' blocked';
+                show($id('btnMailImages'), m.part === 'html' && m.remoteBlocked > 0);
             },
 
             renderMailFooter() {
@@ -13666,6 +13692,14 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     else if (this.mail.selectedId) this.mailSetRead([this.mail.selectedId], false);
                 });
                 $id('btnMailDelete').addEventListener('click', () => { if (this.mail.selectedId) this.mailDelete([this.mail.selectedId]); });
+                $id('btnMailImages').addEventListener('click', () => {
+                    const m = this.mail;
+                    if (!m.msg) return;
+                    m.remoteAllowed = true;
+                    m.remoteBlocked = 0;
+                    this.loadMailFrame(m.msg);
+                    this.renderMailReader();
+                });
                 $id('btnMailBack').addEventListener('click', () => this.closeMail());
                 $id('mailMsgLinks').addEventListener('click', (e) => {
                     const b = e.target.closest('.mail-link-copy');

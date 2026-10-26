@@ -4,6 +4,7 @@
 
 ### 🛠️ Improvements & Changes
 
+* **Mail view loads images on request:** a message's images from your own `*.localhost` sites now show straight away, since they never leave this machine, and a **load images** button beside the "remote images blocked" note loads the rest for that message only. The next message opens with them blocked again.
 * **Minn Engine sites mint their own login links:** `cove login` on a Minn Engine site asks the engine for the link (`minn login`, engine 0.2.0 and later), which reads `wp-config.php` as text and writes the token itself. No WP-CLI, no WordPress runtime and no CaptainCore Helper mu-plugin take part, so the link works even when the site sets `MINN_WP_API` to `off`. The link opens Minn's own sign-in page and lands in Minn Admin, or on `--to=<path>`, which now works for Minn Engine sites as it does for Laravel. A named user who isn't an administrator still gets a warning, and `--url` says plainly that a Minn Engine site has no subsites. Older engines keep the WP-CLI path. The dashboard's login buttons and the MCP `login_link` tool (which takes `to` for Minn Engine too) accept the new link. `cove clone` now mints its link through `cove login`, so a cloned Minn Engine site gets the engine's link rather than the helper's shorter one.
 
 ## [2.5] - 2026-10-20
