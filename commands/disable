@@ -31,6 +31,9 @@ cove_disable() {
             launchctl unload "$fpm_plist" &>/dev/null
         done
         pkill -f "Cove/php-fpm/.*/php-fpm\.conf" &>/dev/null || true
+        # Stopped stays stopped after a restart: the login agent (cove
+        # autostart) skips its loads while this is here.
+        touch "$AUTOSTART_STOPPED_FILE"
     fi
 
     # Stop services on Linux

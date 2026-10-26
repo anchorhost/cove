@@ -18,6 +18,10 @@ cove_enable() {
 
         # Native php-fpm units for any sites pinned to an older PHP.
         sync_php_fpm_services
+
+        # The login agent that loads all of the above after a restart
+        # (unless `cove autostart off`).
+        autostart_sync
     fi
     
     if [ "$OS" == "linux" ]; then

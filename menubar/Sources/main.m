@@ -75,6 +75,7 @@ static const NSInteger kServiceRowStartIndex = 2;
 @property(nonatomic, strong) NSMenuItem *dashboardItem;
 @property(nonatomic, strong) NSMenuItem *adminerItem;
 @property(nonatomic, strong) NSMenuItem *mailpitItem;
+@property(nonatomic, strong) NSMenuItem *autostartItem;
 @property(nonatomic, strong) NSMenuItem *launchItem;
 @property(nonatomic, strong) NSMenuItem *versionItem;
 @end
@@ -583,7 +584,13 @@ static const NSInteger kServiceRowStartIndex = 2;
 
     [self.menu addItem:[NSMenuItem separatorItem]];
 
-    self.launchItem = [[NSMenuItem alloc] initWithTitle:@"Launch at Login"
+    self.autostartItem = [[NSMenuItem alloc] initWithTitle:@"Start Cove at Login"
+                                                    action:@selector(toggleAutostart)
+                                             keyEquivalent:@""];
+    self.autostartItem.target = self;
+    [self.menu addItem:self.autostartItem];
+
+    self.launchItem = [[NSMenuItem alloc] initWithTitle:@"Open Menu Bar at Login"
                                                  action:@selector(toggleLaunchAtLogin)
                                           keyEquivalent:@""];
     self.launchItem.target = self;
@@ -637,6 +644,8 @@ static const NSInteger kServiceRowStartIndex = 2;
     self.adminerItem.enabled = [self serviceRunning:@"caddy"];
     self.mailpitItem.enabled = [self serviceRunning:@"mailpit"];
 
+    self.autostartItem.state = [self autostartEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    self.autostartItem.enabled = !self.busy;
     self.launchItem.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
         ? NSControlStateValueOn
         : NSControlStateValueOff;
@@ -1263,6 +1272,36 @@ static const NSInteger kServiceRowStartIndex = 2;
 }
 
 #pragma mark - Housekeeping
+
+// `cove autostart` keeps a login agent in LaunchAgents while it's on; its
+// presence is the setting, so no status poll is needed to show it.
+- (BOOL)autostartEnabled {
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:
+                      @"Library/LaunchAgents/com.cove.autostart.plist"];
+    return [[NSFileManager defaultManager] fileExistsAtPath:path];
+}
+
+- (void)toggleAutostart {
+    if (self.busy) {
+        return;
+    }
+    NSString *setting = [self autostartEnabled] ? @"off" : @"on";
+    __weak typeof(self) weakSelf = self;
+    [self runCoveWithArguments:@[@"autostart", setting]
+                       timeout:30.0
+                    completion:^(int status, NSString *output, NSError *error) {
+        (void)output;
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+        if (status != 0) {
+            [strongSelf showErrorWithTitle:@"Start Cove at Login"
+                                   message:error.localizedDescription ?: @"Unable to change the setting."];
+        }
+        [strongSelf updateMenu];
+    }];
+}
 
 - (void)toggleLaunchAtLogin {
     SMAppService *service = SMAppService.mainAppService;

@@ -1,0 +1,152 @@
+cove_autostart() {
+    local action="${1:-status}"
+
+    if [ "$OS" != "macos" ]; then
+        echo "On Linux, cove enable registers systemd units that start at boot, and cove disable takes them out."
+        return 0
+    fi
+
+    case "$action" in
+        on)
+            config_unset AUTOSTART
+            install_autostart_agent
+            echo "✅ Cove will start at login."
+            if [ -f "$AUTOSTART_STOPPED_FILE" ]; then
+                echo "   Cove is stopped right now (cove disable), so the next login leaves it stopped. cove enable starts it."
+            fi
+            ;;
+        off)
+            config_set AUTOSTART off
+            remove_autostart_agent
+            echo "✅ Cove won't start at login. Start it with cove enable or from the menu bar app."
+            ;;
+        status)
+            if [ -f "$AUTOSTART_PLIST" ]; then
+                echo "Autostart: on. Cove starts at login ($AUTOSTART_PLIST)."
+                if [ -f "$AUTOSTART_STOPPED_FILE" ]; then
+                    echo "Cove is stopped (cove disable), so the next login leaves it stopped."
+                fi
+            else
+                echo "Autostart: off. Turn it on with: cove autostart on"
+            fi
+            ;;
+        *)
+            echo "Usage: cove autostart [on|off|status]" >&2
+            return 1
+            ;;
+    esac
+}
+
+# --- Autostart helpers (macOS) ---
+# Cove's launchd jobs (FrankenPHP, Mailpit, the watchdog, php-fpm pools) live
+# in ~/Cove and are loaded by path, and launchd only loads the files in
+# ~/Library/LaunchAgents at login, so before this they all stayed down after
+# a restart. Rather than move every plist (each reader globs ~/Cove), one
+# small agent in LaunchAgents runs a script at login that loads them. Moving
+# the plists would also show each one as its own item under System Settings →
+# Login Items; this way there's one. MariaDB is Homebrew's (brew services
+# registers it at login already); the script starts it only when it isn't up.
+#
+# `cove disable` leaves AUTOSTART_STOPPED_FILE behind so a stopped Cove stays
+# stopped after a restart (as on Linux, where disable takes the units out);
+# start_caddy_service clears it, so whatever brings Cove up again counts.
+
+AUTOSTART_LABEL="com.cove.autostart"
+AUTOSTART_PLIST="$HOME/Library/LaunchAgents/$AUTOSTART_LABEL.plist"
+AUTOSTART_SCRIPT="$COVE_DIR/autostart.sh"
+AUTOSTART_STOPPED_FILE="$COVE_DIR/.disabled"
+
+# Install (or refresh) the login agent unless the user turned autostart off.
+# Called by enable and post-upgrade. Autostart is on unless AUTOSTART=off.
+autostart_sync() {
+    [ "$OS" = "macos" ] || return 0
+    if [ "$(config_get AUTOSTART)" = "off" ]; then
+        remove_autostart_agent
+        return 0
+    fi
+    install_autostart_agent
+}
+
+write_autostart_script() {
+    local svc_cmd=""
+    if [ "$MAC_BREW" = "nb" ]; then
+        svc_cmd=$(command -v nb 2>/dev/null)
+    else
+        svc_cmd=$(command -v brew 2>/dev/null)
+    fi
+
+    cat > "$AUTOSTART_SCRIPT.new" << EOM
+#!/bin/bash
+# Written by Cove (cove autostart); rewritten by cove enable and upgrades.
+# Run once at login by $AUTOSTART_PLIST.
+# Loads the services cove enable left in $COVE_DIR, which launchd does not
+# load by itself. Stays out of the way after a cove disable.
+cove_dir="$COVE_DIR"
+svc_cmd="$svc_cmd"
+
+echo "\$(date '+%Y-%m-%d %H:%M:%S') login"
+if [ -f "\$cove_dir/.disabled" ]; then
+    echo "   Cove was stopped with cove disable; leaving it stopped."
+    exit 0
+fi
+
+if ! pgrep -qx mariadbd && ! pgrep -qx mysqld && [ -n "\$svc_cmd" ]; then
+    "\$svc_cmd" services start mariadb
+fi
+
+# A saved "<pid> up <n>" line from before the restart could match a new
+# FrankenPHP that got the same pid (see install_watchdog_service).
+rm -f "\$cove_dir/.watchdog.state"
+
+# The watchdog last, once what it watches is loaded.
+for plist in "\$cove_dir"/com.cove.php-fpm-*.plist "\$cove_dir/com.cove.mailpit.plist" \\
+    "\$cove_dir/com.cove.caddy.plist" "\$cove_dir/com.cove.watchdog.plist"; do
+    [ -f "\$plist" ] || continue
+    launchctl load "\$plist"
+done
+EOM
+    chmod 755 "$AUTOSTART_SCRIPT.new"
+    mv "$AUTOSTART_SCRIPT.new" "$AUTOSTART_SCRIPT"
+}
+
+# Write the login agent. Not loaded now: it only has work to do at login,
+# and loading it here would run the script against a Cove that's already up.
+install_autostart_agent() {
+    [ "$OS" = "macos" ] || return 0
+    mkdir -p "$LOGS_DIR" "$(dirname "$AUTOSTART_PLIST")"
+    write_autostart_script
+
+    cat > "$AUTOSTART_PLIST.new" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>Label</key>
+        <string>$AUTOSTART_LABEL</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>/bin/bash</string>
+                <string>$AUTOSTART_SCRIPT</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardOutPath</key>
+        <string>$LOGS_DIR/autostart.log</string>
+        <key>StandardErrorPath</key>
+        <string>$LOGS_DIR/autostart.log</string>
+</dict>
+</plist>
+EOM
+    # Unchanged files stay put: macOS announces a new or changed login item.
+    if cmp -s "$AUTOSTART_PLIST.new" "$AUTOSTART_PLIST"; then
+        rm -f "$AUTOSTART_PLIST.new"
+    else
+        mv "$AUTOSTART_PLIST.new" "$AUTOSTART_PLIST"
+    fi
+}
+
+remove_autostart_agent() {
+    [ "$OS" = "macos" ] || return 0
+    launchctl unload "$AUTOSTART_PLIST" &>/dev/null || true
+    rm -f "$AUTOSTART_PLIST" "$AUTOSTART_SCRIPT"
+}

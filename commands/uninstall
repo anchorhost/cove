@@ -245,6 +245,7 @@ cove_uninstall() {
     fi
 
     cove_disable
+    remove_autostart_agent
     if [ "$OS" = "linux" ]; then
         echo "   - Removing Cove's systemd units..."
         local unit

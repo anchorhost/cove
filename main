@@ -3802,6 +3802,8 @@ start_caddy_service() {
 
     if [ "$OS" == "macos" ]; then
         local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
+        # Cove is up again, so the next login starts it (cove autostart).
+        rm -f "$AUTOSTART_STOPPED_FILE"
         launchctl unload "$caddy_plist_path" &>/dev/null
         "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
         write_caddy_plist || true
@@ -18980,6 +18982,7 @@ show_general_help() {
     help_section "Services & PHP"
     help_cmd enable "Starts Cove's services: Caddy, MariaDB and Mailpit."
     help_cmd disable "Stops Cove's background services."
+    [ "$OS" == "macos" ] && help_cmd autostart "Starts Cove at login: on, off or status."
     help_cmd reload "Regenerates the Caddyfile and reloads Caddy."
     help_cmd memory "Shows or raises PHP's memory_limit across Cove's PHPs."
     help_cmd opcache "FrankenPHP's shared OPcache: show, sites, exclude, set."
@@ -19455,6 +19458,20 @@ display_command_help() {
             echo "  add      --domain defaults to wp.<site>.localhost, --root to wp-reference;"
             echo "           --as-site names one more domain that always answers as the site"
             echo "  remove   stop serving the twin"
+            ;;
+        autostart)
+            echo "Usage: cove autostart [on|off|status]"
+            echo ""
+            echo "Start Cove's services at login (macOS). On by default: cove enable"
+            echo "and upgrades put a login agent in ~/Library/LaunchAgents that loads"
+            echo "FrankenPHP, Mailpit, the watchdog and any php-fpm pools when you log in."
+            echo "After cove disable, Cove stays stopped across restarts until cove enable."
+            echo ""
+            echo "  on       start Cove at login"
+            echo "  off      don't; remembered across upgrades (AUTOSTART=off in ~/Cove/config)"
+            echo "  status   show the current setting (the default)"
+            echo ""
+            echo "On Linux, cove enable and disable already turn the systemd units on and off."
             ;;
         lan)
             echo "Usage: cove lan <subcommand>"
@@ -20058,6 +20075,9 @@ main() {
             # enabling it, and only when MENUBAR_VERSION changed. No-op on
             # Linux and for users without the app installed.
             menubar_refresh_if_enabled
+            # Before this, nothing of Cove's but MariaDB came back after a
+            # restart on macOS. On by default, like the Linux units.
+            autostart_sync
             ;;
         status)
             check_dependencies
@@ -20149,6 +20169,9 @@ main() {
         lan)
             check_dependencies
             cove_lan "$@"
+            ;;
+        autostart)
+            cove_autostart "$@"
             ;;
         ports)
             check_dependencies
