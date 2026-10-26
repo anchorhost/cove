@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### ✨ New Features
+
+* **Cove starts at login on macOS:** after a restart, only MariaDB used to come back. FrankenPHP, Mailpit, the watchdog and any php-fpm pools stayed down until you ran `cove enable` or clicked **Start Cove**, because their launchd files live in `~/Cove` and launchd only loads the ones in `~/Library/LaunchAgents` at login. `cove enable` and the upgrade now add one login agent there (`com.cove.autostart`, the one item that appears under System Settings → Login Items) that loads them when you log in, and starts MariaDB if Homebrew hasn't. It's on by default, as Cove's systemd units already are on Linux. `cove autostart off` turns it off and the setting survives upgrades; `cove autostart on` turns it back on, and `cove autostart` shows the setting. A Cove stopped with `cove disable` stays stopped after a restart until something starts it again. The menu bar app has a **Start Cove at Login** toggle, and its own login item is now labelled **Open Menu Bar at Login**, so the two aren't confused. `cove uninstall` removes the agent.
+
 ### 🛠️ Improvements & Changes
 
 * **Mail view loads images on request:** a message's images from your own `*.localhost` sites now show straight away, since they never leave this machine, and a **load images** button beside the "remote images blocked" note loads the rest for that message only. The next message opens with them blocked again.
