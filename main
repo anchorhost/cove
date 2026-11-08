@@ -9022,6 +9022,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .mail-part.is-active { color: var(--text); background: var(--panel); border-color: var(--panel-border); }
         .mail-bar-note { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
         .mail-msg-bar .mail-images { padding: 0.2rem 0.5rem; font-size: 0.7rem; margin-left: -0.4rem; }
+        .mail-msg-bar .mail-scheme { padding: 0.2rem 0.5rem; font-size: 0.7rem; }
+        .mail-msg-bar .mail-scheme.is-dark { background: #1c1c1e; color: #e8e8ea; border-color: #1c1c1e; }
         .mail-msg-actions { margin-left: auto; display: flex; gap: 0.35rem; }
         .mail-msg-actions .pill { padding: 0.26rem 0.6rem; font-size: 0.74rem; }
         .mail-frame { display: block; width: 100%; border: 0; background: #fff; min-height: 240px; color-scheme: light; }
@@ -9852,6 +9854,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                                     <button type="button" class="mail-part" role="tab" data-part="text">text</button>
                                     <button type="button" class="mail-part" role="tab" data-part="headers">headers</button>
                                 </div>
+                                <button type="button" class="pill mail-scheme" id="btnMailScheme" title="Preview the message as a mail app in light or dark mode shows it">light</button>
                                 <span class="mail-bar-note" id="mailRemoteNote" style="display: none;"></span>
                                 <button type="button" class="pill mail-images" id="btnMailImages" style="display: none;" title="Load this message's remote images (the sender's server sees the request)">load images</button>
                                 <div class="mail-msg-actions">
@@ -10940,6 +10943,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 loading: false, loaded: false, error: null,
                 selectedId: null, msg: null, msgLoading: false, msgError: null,
                 part: 'html', headers: null, renderedId: null, remoteBlocked: 0, remoteAllowed: false,
+                scheme: (() => { try { return localStorage.getItem('cove-mail-scheme') === 'dark' ? 'dark' : 'light'; } catch (e) { return 'light'; } })(),
                 deleteArmed: false, armTimer: null, searchTimer: null, syncTimer: null,
                 seq: 0, ws: null, pollTimer: null, wsRetry: null, info: null,
             },
@@ -13393,7 +13397,13 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // home when opened. Images from Cove's own *.localhost sites load,
             // since they never leave this machine; any other image waits for
             // "load images" (remoteAllowed, reset per message).
-            mailHtmlDoc(msg, allowRemote) {
+            //
+            // scheme 'dark' previews the message as a mail app in dark mode
+            // shows it: the message's prefers-color-scheme rules are rewritten
+            // to match (dark) or never match (light) whatever the dashboard's
+            // own theme is, and a message with no colours of its own gets a
+            // dark page, as Apple Mail gives it.
+            mailHtmlDoc(msg, allowRemote, scheme) {
                 let html = msg.HTML || '';
                 for (const p of (msg.Inline || [])) {
                     if (!p.ContentID) continue;
@@ -13401,10 +13411,13 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     html = html.split('cid:' + p.ContentID).join(url);
                 }
                 html = html.replace(/<script[\s\S]*?<\/script\s*>/gi, '').replace(/<meta[^>]+http-equiv[^>]*>/gi, '');
+                const dark = scheme === 'dark';
+                html = html.replace(/\(\s*prefers-color-scheme\s*:\s*(dark|light)\s*\)/gi, (t, want) =>
+                    (want.toLowerCase() === 'dark') === dark ? '(min-width: 0px)' : '(max-width: 0px)');
                 const img = "'self' data: https://localhost:* http://localhost:* https://*.localhost:* http://*.localhost:*" + (allowRemote ? ' https: http:' : '');
                 const csp = "default-src 'none'; img-src " + img + "; style-src 'unsafe-inline'; form-action 'none'";
                 const head = '<meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + csp + '"><base target="_blank">'
-                    + '<style>html{color-scheme:light}body{margin:0;padding:16px;background:#fff;color:#1a1c1b;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',system-ui,sans-serif;line-height:1.45}</style>';
+                    + '<style>html{color-scheme:' + (dark ? 'dark' : 'light') + '}body{margin:0;padding:16px;background:' + (dark ? '#1c1c1e' : '#fff') + ';color:' + (dark ? '#e8e8ea' : '#1a1c1b') + ';font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',system-ui,sans-serif;line-height:1.45}' + (dark ? 'a{color:#6fa8ff}' : '') + '</style>';
                 if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, (t) => t + head);
                 if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, (t) => t + '<head>' + head + '</head>');
                 return '<!doctype html><html><head>' + head + '</head><body>' + html + '</body></html>';
@@ -13441,7 +13454,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                         }, { once: true }));
                     } catch (e) {}
                 };
-                frame.srcdoc = this.mailHtmlDoc(msg, m.remoteAllowed);
+                frame.style.colorScheme = m.scheme;
+                frame.srcdoc = this.mailHtmlDoc(msg, m.remoteAllowed, m.scheme);
             },
 
             renderMail() {
@@ -13570,6 +13584,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 show(note, m.part === 'html' && m.remoteBlocked > 0);
                 note.textContent = m.remoteBlocked + ' remote image' + (m.remoteBlocked === 1 ? '' : 's') + ' blocked';
                 show($id('btnMailImages'), m.part === 'html' && m.remoteBlocked > 0);
+                const sb = $id('btnMailScheme');
+                show(sb, m.part === 'html' && !!msg.HTML);
+                sb.textContent = m.scheme === 'dark' ? '☾ dark' : '☀ light';
+                sb.classList.toggle('is-dark', m.scheme === 'dark');
+                sb.setAttribute('aria-pressed', m.scheme === 'dark' ? 'true' : 'false');
             },
 
             renderMailFooter() {
@@ -13700,6 +13719,13 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     m.remoteAllowed = true;
                     m.remoteBlocked = 0;
                     this.loadMailFrame(m.msg);
+                    this.renderMailReader();
+                });
+                $id('btnMailScheme').addEventListener('click', () => {
+                    const m = this.mail;
+                    m.scheme = m.scheme === 'dark' ? 'light' : 'dark';
+                    try { localStorage.setItem('cove-mail-scheme', m.scheme); } catch (e) {}
+                    if (m.msg) this.loadMailFrame(m.msg);
                     this.renderMailReader();
                 });
                 $id('btnMailBack').addEventListener('click', () => this.closeMail());
