@@ -22,9 +22,19 @@
 # is re-applied once per pid: the watchdog runs it when a server first turns
 # healthy, and `cove reload` keeps the process, so a reload never loses it.
 
-# GNU timeout is not on stock macOS; run bare when it is missing.
+# GNU timeout is not on stock macOS; run bare when it is missing. A debugger
+# stops its target while attached, and one killed by the timeout (or anything
+# else) before it detaches leaves the server stopped: every site hangs with
+# the process in state T (seen 2026-11-08, after two reloads nine seconds
+# apart). So the server always gets a SIGCONT afterwards, which does nothing
+# to a process that is already running. $1 is the target pid.
 cove_signals_to() {
+    local pid="$1" rc
+    shift
     if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else "$@"; fi
+    rc=$?
+    kill -CONT "$pid" 2>/dev/null
+    return $rc
 }
 
 # One debugger at a time. Two attaches on the same process (the watchdog's
@@ -70,7 +80,7 @@ cove_signals_read() {
     local pid="$1" dbg out
     dbg=$(cove_signals_debugger) || return 1
     if [ "$OS" = "macos" ]; then
-        out=$(cove_signals_to "$dbg" -p "$pid" --batch \
+        out=$(cove_signals_to "$pid" "$dbg" -p "$pid" --batch \
             -o 'expr -l c -- unsigned long cove_sa[4]; (int)sigaction(11, 0, cove_sa); (void*)cove_sa[0]' \
             -o 'expr -l c -- (void*)*(void**)&php_parallel_old_sigsegv_action' \
             -o 'process detach' -o 'quit' 2>/dev/null) || return 1
@@ -79,7 +89,7 @@ cove_signals_read() {
         cur=$(echo "$out" | sed -n 's/^(void \*) \$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 1p)
         go=$(echo "$out"  | sed -n 's/^(void \*) \$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 2p)
     else
-        out=$(cove_signals_to "$dbg" -p "$pid" -batch -q \
+        out=$(cove_signals_to "$pid" "$dbg" -p "$pid" -batch -q \
             -ex 'set confirm off' \
             -ex 'set $cove_sa = (unsigned long*)malloc(64)' \
             -ex 'call (int)sigaction(11, 0, $cove_sa)' \
@@ -100,11 +110,11 @@ cove_signals_apply() {
     local pid="$1" dbg
     dbg=$(cove_signals_debugger) || return 1
     if [ "$OS" = "macos" ]; then
-        cove_signals_to "$dbg" -p "$pid" --batch \
+        cove_signals_to "$pid" "$dbg" -p "$pid" --batch \
             -o 'expr -l c -- (int)sigaction(11, (void*)&php_parallel_old_sigsegv_action, (void*)0)' \
             -o 'process detach' -o 'quit' >/dev/null 2>&1 || return 1
     else
-        cove_signals_to "$dbg" -p "$pid" -batch -q -ex 'set confirm off' \
+        cove_signals_to "$pid" "$dbg" -p "$pid" -batch -q -ex 'set confirm off' \
             -ex 'call (int)sigaction(11, &php_parallel_old_sigsegv_action, 0)' \
             -ex 'detach' -ex 'quit' >/dev/null 2>&1 || return 1
     fi
