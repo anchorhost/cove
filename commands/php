@@ -58,8 +58,12 @@ cove_php_overview() {
             [ -d "$site_path/public" ] || continue
             site_name=$(basename "$site_path")
             ver=$(site_php_version "$site_path")
+            local dbg=""
+            site_xdebug_on "$site_path" && dbg=", Xdebug on"
             if [ -n "$ver" ]; then
-                printf "  %-42s %s\n" "$site_name" "$ver (php-fpm)"
+                printf "  %-42s %s\n" "$site_name" "$ver (php-fpm$dbg)"
+            elif [ -n "$dbg" ]; then
+                printf "  %-42s %s\n" "$site_name" "default (php-fpm$dbg)"
             else
                 printf "  %-42s %s\n" "$site_name" "default"
             fi
@@ -81,6 +85,17 @@ cove_php_overview() {
             echo "  No native php-fpm services active. Pin one with: cove php <site> 8.2"
         fi
     fi
+}
+
+# A site with Xdebug on keeps it across a PHP change: make sure the new
+# version ($2) has a build, which takes a few seconds the first time. A
+# failed build leaves the site on that PHP without Xdebug, and says so.
+cove_php_xdebug_follow() {
+    site_xdebug_on "$1" || return 0
+    if ! xdebug_ensure "$2"; then
+        echo "⚠️  Xdebug stays off until PHP $2 has a build: cove xdebug install $2" >&2
+    fi
+    return 0
 }
 
 cove_php() {
@@ -117,6 +132,7 @@ cove_php() {
             return 0
         fi
         rm -f "$site_dir/php_version"
+        cove_php_xdebug_follow "$site_dir" "$(normalize_php_version "$(frankenphp_php_version)")"
         regenerate_caddyfile
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
             "✅ $site_name.localhost back on Cove's default PHP $(frankenphp_php_version)" \
@@ -140,6 +156,7 @@ cove_php() {
         echo "ℹ️  PHP $ver is Cove's default (FrankenPHP); nothing to pin."
         if [ -f "$site_dir/php_version" ]; then
             rm -f "$site_dir/php_version"
+            cove_php_xdebug_follow "$site_dir" "$ver"
             regenerate_caddyfile
             echo "   Removed the existing pin."
         fi
@@ -152,6 +169,7 @@ cove_php() {
 
     echo "📌 Pinning $site_name.localhost to PHP $ver (native php-fpm behind FrankenPHP)..."
     echo "$ver" > "$site_dir/php_version"
+    cove_php_xdebug_follow "$site_dir" "$ver"
     regenerate_caddyfile
 
     # Same warm-poll as cove add: the reload is synchronous, but give the new

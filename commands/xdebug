@@ -1,0 +1,349 @@
+# cove xdebug — step debugging, profiling and tracing for a site.
+#
+# FrankenPHP's PHP is static and loads no extensions, so a site with Xdebug
+# on is served by a native Homebrew php-fpm at the site's PHP with Xdebug
+# loaded, in a pool of its own (see site_fpm_key and the Xdebug block in
+# main). Cove builds the extension from PECL's source into
+# ~/Cove/App/xdebug/<ver>/ with that PHP's phpize: nothing is added to
+# Homebrew's php.ini, so no other PHP on the machine loads it.
+
+# The newest stable Xdebug release that supports PHP $1 (major.minor), from
+# PECL's release list and each release's PHP range. Prints the version.
+xdebug_pick_release() {
+    local ver="$1" releases rel deps min max checked=0
+    releases=$(curl -fsSL --max-time 20 "https://pecl.php.net/rest/r/xdebug/allreleases.xml" 2>/dev/null \
+        | grep -o '<v>[^<]*</v><s>stable</s>' | sed 's/<v>\([^<]*\)<.*/\1/') || return 1
+    for rel in $releases; do
+        [[ "$rel" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        checked=$((checked + 1))
+        [ "$checked" -le 40 ] || break
+        deps=$(curl -fsSL --max-time 20 "https://pecl.php.net/rest/r/xdebug/deps.$rel.txt" 2>/dev/null) || continue
+        min=$(printf '%s' "$deps" | grep -o '"php";a:[0-9]*:{[^}]*}' | grep -o '"min";s:[0-9]*:"[^"]*"' | sed 's/.*:"\([^"]*\)"/\1/')
+        max=$(printf '%s' "$deps" | grep -o '"php";a:[0-9]*:{[^}]*}' | grep -o '"max";s:[0-9]*:"[^"]*"' | sed 's/.*:"\([^"]*\)"/\1/')
+        [ -n "$min" ] || continue
+        # Compare major.minor only: "8.5" against "8.0.0" … "8.5.99".
+        if [ "$(printf '%s\n%s\n' "$(normalize_php_version "$min")" "$ver" | sort -t. -k1,1n -k2,2n | head -1)" = "$(normalize_php_version "$min")" ]; then
+            if [ -z "$max" ] || [ "$(printf '%s\n%s\n' "$ver" "$(normalize_php_version "$max")" | sort -t. -k1,1n -k2,2n | head -1)" = "$ver" ]; then
+                echo "$rel"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# Build Xdebug for PHP $1 into $XDEBUG_DIR/$1/xdebug.so. Progress on stderr,
+# the compiler's output in ~/Cove/Logs/xdebug-build.log. Returns non-zero
+# (and leaves any earlier build in place) when anything fails.
+xdebug_build() {
+    local ver="$1" prefix rel work log tarball names dest
+    prefix=$(php_fpm_prefix_for "$ver")
+    if [ -z "$prefix" ] || [ ! -x "$prefix/bin/phpize" ]; then
+        gum style --foreground red "❌ php@$ver isn't installed with phpize; can't build Xdebug for it." >&2
+        return 1
+    fi
+    if ! command -v autoconf >/dev/null 2>&1; then
+        echo "📦 Building Xdebug needs autoconf; installing it with Homebrew..." >&2
+        brew install autoconf >&2 || { gum style --foreground red "❌ 'brew install autoconf' failed." >&2; return 1; }
+    fi
+    if ! command -v make >/dev/null 2>&1 || ! command -v cc >/dev/null 2>&1; then
+        gum style --foreground red "❌ Building Xdebug needs a C compiler. Install Apple's command line tools: xcode-select --install" >&2
+        return 1
+    fi
+    echo "🔎 Finding the Xdebug release for PHP $ver..." >&2
+    if ! rel=$(xdebug_pick_release "$ver"); then
+        gum style --foreground red "❌ Couldn't find an Xdebug release for PHP $ver on pecl.php.net." >&2
+        return 1
+    fi
+    mkdir -p "$COVE_DIR/cache" "$LOGS_DIR" "$XDEBUG_DIR/$ver"
+    log="$LOGS_DIR/xdebug-build.log"
+    work=$(mktemp -d "$COVE_DIR/cache/xdebug-build-$ver.XXXXXX") || return 1
+    tarball="$work/xdebug-$rel.tgz"
+    echo "⬇️  Downloading Xdebug $rel..." >&2
+    if ! curl -fsSL --proto '=https' --max-time 120 -o "$tarball" "https://pecl.php.net/get/xdebug-$rel.tgz"; then
+        rm -rf "$work"
+        gum style --foreground red "❌ The download from pecl.php.net failed." >&2
+        return 1
+    fi
+    # Refuse an archive with absolute or parent-relative names before
+    # unpacking anything.
+    names=$(tar -tzf "$tarball" 2>/dev/null) || { rm -rf "$work"; gum style --foreground red "❌ The Xdebug download isn't a readable archive." >&2; return 1; }
+    if printf '%s\n' "$names" | grep -qE '^/|(^|/)\.\.(/|$)'; then
+        rm -rf "$work"
+        gum style --foreground red "❌ The Xdebug archive has unsafe paths; not unpacking it." >&2
+        return 1
+    fi
+    tar -xzf "$tarball" -C "$work" || { rm -rf "$work"; return 1; }
+    if [ ! -f "$work/xdebug-$rel/config.m4" ]; then
+        rm -rf "$work"
+        gum style --foreground red "❌ The Xdebug archive isn't laid out as expected (no xdebug-$rel/config.m4)." >&2
+        return 1
+    fi
+    echo "🔨 Building Xdebug $rel for PHP $ver (about 15 seconds)..." >&2
+    {
+        echo "=== $(date '+%Y-%m-%d %H:%M:%S') Xdebug $rel for PHP $ver ($prefix)"
+    } >> "$log"
+    if ! ( cd "$work/xdebug-$rel" \
+        && "$prefix/bin/phpize" \
+        && ./configure --with-php-config="$prefix/bin/php-config" \
+        && make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" ) >> "$log" 2>&1; then
+        rm -rf "$work"
+        gum style --foreground red "❌ The Xdebug build failed; see $log" >&2
+        return 1
+    fi
+    # Make sure this PHP loads it before putting it in place.
+    if ! "$prefix/bin/php" -n -d zend_extension="$work/xdebug-$rel/modules/xdebug.so" -r 'exit(extension_loaded("xdebug") ? 0 : 1);' >> "$log" 2>&1; then
+        rm -rf "$work"
+        gum style --foreground red "❌ PHP $ver wouldn't load the Xdebug it built; see $log" >&2
+        return 1
+    fi
+    dest="$XDEBUG_DIR/$ver"
+    cp "$work/xdebug-$rel/modules/xdebug.so" "$dest/xdebug.so.new" && mv "$dest/xdebug.so.new" "$dest/xdebug.so" || { rm -rf "$work"; return 1; }
+    printf 'version=%s\napi=%s\nphp=%s\nbuilt=%s\n' "$rel" \
+        "$(basename "$("$prefix/bin/php-config" --extension-dir)")" \
+        "$("$prefix/bin/php-config" --version)" "$(date '+%Y-%m-%d %H:%M:%S')" > "$dest/build-info"
+    rm -rf "$work"
+    echo "✅ Xdebug $rel built for PHP $ver." >&2
+    return 0
+}
+
+# Make sure PHP $1 has php-fpm and a loadable Xdebug build.
+xdebug_ensure() {
+    local ver="$1"
+    ensure_php_formula "$ver" || return 1
+    [ -n "$(xdebug_so_for "$ver")" ] && return 0
+    xdebug_build "$ver"
+}
+
+xdebug_supported() {
+    if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+        gum style --foreground red "❌ Xdebug currently requires macOS with Homebrew." \
+            "FrankenPHP's bundled PHP can't load extensions, so Cove runs a debugged site on a native php-fpm, which it sets up only with Homebrew today." >&2
+        return 1
+    fi
+}
+
+# Turning Xdebug on or off reloads Caddy; wait for the site to answer again.
+xdebug_warm() {
+    local url="$1"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        curl -ks --max-time 1 -o /dev/null "$url/" 2>/dev/null && break
+        sleep 0.2
+    done
+}
+
+# How a request starts a session, in a sentence.
+xdebug_start_hint() {
+    if [ "$(xdebug_setting start)" = "yes" ]; then
+        echo "Every request starts a session (cove xdebug start trigger to change)."
+    else
+        echo "Start a session with the XDEBUG_SESSION cookie (any Xdebug browser extension) or ?XDEBUG_SESSION=1."
+    fi
+}
+
+cove_xdebug_overview() {
+    local format="$1" site_path name ver key builds="" sites=() so first=true
+    for site_path in "$SITES_DIR"/*.localhost; do
+        [ -d "$site_path" ] && site_xdebug_on "$site_path" && sites+=("$site_path")
+    done
+    if [ "$format" = "json" ]; then
+        printf '{"mode":"%s","start":"%s","port":%s,"sites":[' "$(xdebug_setting mode)" "$(xdebug_setting start)" "$(xdebug_setting port)"
+        for site_path in "${sites[@]}"; do
+            name=$(basename "$site_path" .localhost)
+            key=$(site_fpm_key "$site_path")
+            $first || printf ','
+            first=false
+            printf '{"site":"%s","php":"%s","active":%s}' "$name" "$(site_php_minor "$site_path")" "$([[ "$key" == *-xdebug ]] && echo true || echo false)"
+        done
+        printf '],"builds":['
+        first=true
+        for so in "$XDEBUG_DIR"/*/xdebug.so; do
+            [ -f "$so" ] || continue
+            ver=$(basename "$(dirname "$so")")
+            $first || printf ','
+            first=false
+            printf '{"php":"%s","xdebug":"%s","loadable":%s}' "$ver" "$(sed -n 's/^version=//p' "$XDEBUG_DIR/$ver/build-info" 2>/dev/null)" "$([ -n "$(xdebug_so_for "$ver")" ] && echo true || echo false)"
+        done
+        printf ']}\n'
+        return 0
+    fi
+    echo "🐞 Xdebug: mode $(xdebug_setting mode), start $(xdebug_setting start), IDE port $(xdebug_setting port)"
+    echo ""
+    if [ "${#sites[@]}" -eq 0 ]; then
+        echo "  No sites have Xdebug on. Turn it on with: cove xdebug <site> on"
+    else
+        for site_path in "${sites[@]}"; do
+            name=$(basename "$site_path")
+            ver=$(site_php_minor "$site_path")
+            key=$(site_fpm_key "$site_path")
+            if [[ "$key" == *-xdebug ]]; then
+                printf "  %-42s %s\n" "$name" "PHP $ver (php-fpm with Xdebug)"
+            else
+                printf "  %-42s %s\n" "$name" "PHP $ver, no Xdebug build yet: cove xdebug install $ver"
+            fi
+        done
+    fi
+    for so in "$XDEBUG_DIR"/*/xdebug.so; do
+        [ -f "$so" ] || continue
+        ver=$(basename "$(dirname "$so")")
+        if [ -n "$(xdebug_so_for "$ver")" ]; then
+            builds+="  PHP $ver: Xdebug $(sed -n 's/^version=//p' "$XDEBUG_DIR/$ver/build-info" 2>/dev/null)"$'\n'
+        else
+            builds+="  PHP $ver: stale after a Homebrew upgrade; rebuild with cove xdebug install $ver"$'\n'
+        fi
+    done
+    if [ -n "$builds" ]; then
+        echo ""
+        echo "Builds (~/Cove/App/xdebug):"
+        printf '%s' "$builds"
+    fi
+}
+
+# cove xdebug mode|start|port [<value>]: show or change one of Cove's
+# Xdebug settings, then reload so running pools pick it up.
+cove_xdebug_setting_cmd() {
+    local what="$1" value="$2" key
+    case "$what" in
+        mode) key=XDEBUG_MODE ;;
+        start) key=XDEBUG_START ;;
+        port) key=XDEBUG_PORT ;;
+    esac
+    if [ -z "$value" ]; then
+        xdebug_setting "$what"
+        return 0
+    fi
+    case "$what" in
+        mode)
+            value=$(printf '%s' "$value" | tr -d ' ')
+            if ! [[ "$value" =~ ^(off|develop|coverage|debug|gcstats|profile|trace)(,(develop|coverage|debug|gcstats|profile|trace))*$ ]]; then
+                cove_err "❌ Error: Unknown Xdebug mode '$value'." "Use a comma list of: debug, develop, profile, trace, coverage, gcstats (or off)."
+                exit 1
+            fi
+            ;;
+        start)
+            case "$value" in
+                trigger) ;;
+                yes|always) value=yes ;;
+                *) cove_err "❌ Error: Use 'trigger' (a cookie or ?XDEBUG_SESSION=1 starts a session) or 'always'."; exit 1 ;;
+            esac
+            ;;
+        port)
+            if ! [[ "$value" =~ ^[0-9]{1,5}$ ]] || [ "$((10#$value))" -lt 1 ] || [ "$((10#$value))" -gt 65535 ]; then
+                cove_err "❌ Error: '$value' isn't a port number."
+                exit 1
+            fi
+            value=$((10#$value))
+            ;;
+    esac
+    config_set "$key" "$value"
+    echo "✅ Xdebug $what is now $(xdebug_setting "$what")."
+    local site_path any=false
+    for site_path in "$SITES_DIR"/*.localhost; do
+        site_xdebug_on "$site_path" && any=true && break
+    done
+    if [ "$any" = true ]; then
+        regenerate_caddyfile >/dev/null
+        echo "   Restarted the Xdebug php-fpm pools with it."
+    fi
+}
+
+cove_xdebug() {
+    local args=() format=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --format=*) format="${1#*=}"; shift ;;
+            --json) format="json"; shift ;;
+            -h|--help) display_command_help xdebug; exit 0 ;;
+            -*) cove_err "❌ Error: Unknown option: $1" "Usage: cove xdebug [<site> [on|off]] | mode|start|port [<value>] | install [<php version>]"; exit 1 ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    set -- "${args[@]}"
+
+    case "${1:-}" in
+        "")
+            cove_xdebug_overview "$format"
+            return 0
+            ;;
+        mode|start|port)
+            cove_xdebug_setting_cmd "$1" "${2:-}"
+            return 0
+            ;;
+        install)
+            xdebug_supported || exit 1
+            local ver
+            if [ -n "${2:-}" ]; then
+                ver=$(normalize_php_version "$2")
+                [ -n "$ver" ] || { cove_err "❌ Error: Invalid PHP version '$2'." "Use a version like 8.3."; exit 1; }
+            else
+                ver=$(normalize_php_version "$(frankenphp_php_version)")
+            fi
+            ensure_php_formula "$ver" || exit 1
+            xdebug_build "$ver" || exit 1
+            # Sites already waiting on this build move onto it now.
+            regenerate_caddyfile >/dev/null
+            return 0
+            ;;
+    esac
+
+    local site_name="${1%.localhost}" action="${2:-}"
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if ! validate_site_name "$site_name" || [ ! -d "$site_dir" ]; then
+        site_not_found "$site_name"
+        exit 1
+    fi
+    local ver
+    ver=$(site_php_minor "$site_dir")
+
+    case "$action" in
+        "")
+            if site_xdebug_on "$site_dir"; then
+                if [[ "$(site_fpm_key "$site_dir")" == *-xdebug ]]; then
+                    echo "Xdebug is on for $site_name.localhost (PHP $ver, IDE port $(xdebug_setting port))."
+                else
+                    echo "Xdebug is on for $site_name.localhost, but PHP $ver has no Xdebug build yet: cove xdebug install $ver"
+                fi
+            else
+                echo "Xdebug is off for $site_name.localhost."
+            fi
+            ;;
+        on)
+            xdebug_supported || exit 1
+            if ! xdebug_ensure "$ver"; then
+                exit 1
+            fi
+            touch "$site_dir/xdebug"
+            regenerate_caddyfile
+            local url
+            url=$(url_for "$site_name.localhost")
+            xdebug_warm "$url"
+            local cli_hint="CLI: XDEBUG_SESSION=1 cove wp $site_name <command>"
+            site_is_laravel "$site_dir" && cli_hint="CLI: XDEBUG_SESSION=1 cove artisan $site_name <command>"
+            [ -f "$site_dir/public/wp-config.php" ] || site_is_laravel "$site_dir" || cli_hint=""
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+                "🐞 Xdebug is on for $site_name.localhost (PHP $ver, mode $(xdebug_setting mode))" \
+                "Have your IDE listen on port $(xdebug_setting port)." \
+                "$(xdebug_start_hint)" \
+                ${cli_hint:+"$cli_hint"} \
+                "Turn it off with: cove xdebug $site_name off"
+            ;;
+        off)
+            if ! site_xdebug_on "$site_dir"; then
+                echo "ℹ️  Xdebug is already off for $site_name.localhost."
+                return 0
+            fi
+            rm -f "$site_dir/xdebug"
+            regenerate_caddyfile
+            xdebug_warm "$(url_for "$site_name.localhost")"
+            if [ -n "$(site_php_version "$site_dir")" ]; then
+                echo "✅ Xdebug is off for $site_name.localhost; it's back on its pinned PHP $ver."
+            else
+                echo "✅ Xdebug is off for $site_name.localhost; it's back on FrankenPHP."
+            fi
+            ;;
+        *)
+            cove_unknown_subcommand xdebug "$action" "on off"
+            exit 1
+            ;;
+    esac
+}
