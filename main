@@ -3212,6 +3212,36 @@ EOM
     cove_ini_set auto_prepend_file "\"$fix\""
 }
 
+# MariaDB's local socket on Linux, or nothing. WordPress's DB_HOST
+# 'localhost' makes mysqli use a Unix socket, and where PHP looks for it is
+# compiled in: the distributions' php-zts packages know their own MariaDB's
+# path, but FrankenPHP's static binary (Arch, and anywhere the installer fell
+# back to it) looks in /tmp/mysql.sock and finds nothing, so every site
+# answered "Error establishing a database connection". Asks MariaDB for its
+# socket first, then tries the usual places.
+cove_mysql_socket() {
+    [ "$OS" = "linux" ] || return 0
+    local sock candidate
+    if command -v my_print_defaults >/dev/null 2>&1; then
+        sock=$(my_print_defaults mysqld 2>/dev/null | sed -n 's/^--socket=//p' | tail -1)
+        [ -S "$sock" ] && { echo "$sock"; return 0; }
+    fi
+    for candidate in /run/mysqld/mysqld.sock /var/run/mysqld/mysqld.sock /var/lib/mysql/mysql.sock; do
+        [ -S "$candidate" ] && { echo "$candidate"; return 0; }
+    done
+    return 0
+}
+
+# The CLI's half of cove_mysql_socket: ~/Cove/php.ini (PHPRC for wp-cli and
+# every PHP Cove runs from a terminal) points mysqli and PDO at the socket.
+ensure_cli_mysql_socket() {
+    local sock
+    sock=$(cove_mysql_socket)
+    [ -n "$sock" ] || return 0
+    cove_ini_set mysqli.default_socket "\"$sock\""
+    cove_ini_set pdo_mysql.default_socket "\"$sock\""
+}
+
 # The CLI side of the same: $PHP_INI_FILE (~/Cove/php.ini, PHPRC for wp-cli
 # and every other PHP Cove runs from a terminal) sets no sendmail_path, so
 # wp_mail() from `cove wp` went to /usr/sbin/sendmail, which can deliver for
@@ -4335,6 +4365,7 @@ regenerate_caddyfile() {
     # `php_ini session.save_path` exists before FrankenPHP tries to use it.
     mkdir -p "$COVE_DIR/cache/sessions" "$RUN_DIR" 2>/dev/null
     ensure_cli_argv_fix
+    ensure_cli_mysql_socket
     # Converge native php-fpm services with the sites' php_version pins BEFORE
     # writing the config that points at their sockets.
     sync_php_fpm_services
@@ -4365,6 +4396,12 @@ regenerate_caddyfile() {
     # Paths OPcache never caches (cove opcache exclude), only while the list
     # has something in it.
     local opcache_exclude_directive=""
+    # MariaDB's socket for mysqli and PDO (see cove_mysql_socket).
+    local mysql_socket_directive="" mysql_socket
+    mysql_socket=$(cove_mysql_socket)
+    if [ -n "$mysql_socket" ]; then
+        mysql_socket_directive="        php_ini mysqli.default_socket \"$mysql_socket\""$'\n'"        php_ini pdo_mysql.default_socket \"$mysql_socket\""$'\n'
+    fi
     if [ -f "$OPCACHE_EXCLUDE_FILE" ] && grep -q -v -E '^[[:space:]]*(;|$)' "$OPCACHE_EXCLUDE_FILE"; then
         opcache_exclude_directive="        php_ini opcache.blacklist_filename \"$OPCACHE_EXCLUDE_FILE\""$'\n'
     fi
@@ -4446,7 +4483,7 @@ ${opcache_exclude_directive}        # See the disabled_fns note above: opcache_r
         # unwritable and Adminer spams session_start warnings every
         # request.
         php_ini session.save_path "$COVE_DIR/cache/sessions"
-    }
+${mysql_socket_directive}    }
     order php_server before file_server
     servers {
         # HTTP/1.1 and HTTP/2. The h1-only pin this replaces dated from
@@ -20391,6 +20428,7 @@ main() {
             # invoked via the on-disk binary here. Not part of the public CLI.
             # First: WP-CLI fails under FrankenPHP 1.13.0 until it is in place.
             ensure_cli_argv_fix
+            ensure_cli_mysql_socket
             deploy_whoops
             create_whoops_bootstrap
             refresh_all_mu_plugins
