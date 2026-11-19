@@ -103,11 +103,20 @@ EOM
     # on the watchdog install's exit code (which is almost always 0 even when a
     # bad Caddyfile kept FrankenPHP from starting). Poll briefly — the admin
     # endpoint binds early but not instantly, especially on large installs.
-    local caddy_up=false
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
+    # A ~140-site Caddyfile under a load average of 50 took 14 s to load
+    # (2026-11-12), so allow up to 60 s while the process is still alive, and
+    # say "still starting" rather than "failed" if it hasn't answered by then.
+    local caddy_up=false caddy_alive=false i
+    for (( i = 0; i < 120; i++ )); do
         if is_caddy_running; then caddy_up=true; break; fi
-        sleep 0.3
+        if [ "$i" -ge 10 ] && ! pgrep -f "frankenphp run --config $CADDYFILE_PATH" &>/dev/null; then
+            break
+        fi
+        sleep 0.5
     done
+    if [ "$caddy_up" = false ] && pgrep -f "frankenphp run --config $CADDYFILE_PATH" &>/dev/null; then
+        caddy_alive=true
+    fi
 
     if [ "$caddy_up" = true ]; then
         echo ""
@@ -133,6 +142,8 @@ EOM
             echo ""
             echo "  Note: WSL IP may change on restart. Run 'cove wsl-hosts' to get updated commands."
         fi
+    elif [ "$caddy_alive" = true ]; then
+        gum style --foreground yellow "⏳ Caddy is still starting (the machine is busy). Run 'cove status' in a minute; $LOGS_DIR/caddy-process.log shows progress."
     else
         gum style --foreground red "❌ Caddy server failed to start. Check $LOGS_DIR/caddy-process.log for errors."
     fi
