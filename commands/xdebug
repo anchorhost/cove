@@ -159,7 +159,10 @@ xdebug_ensure_native_linux() {
     fi
     cmd=$(xdebug_linux_packages "$ver" | xdebug_join_install)
     have=$(native_php_versions_linux)
-    echo "📦 Xdebug runs a debugged site on a native php-fpm at PHP $ver, which isn't installed.${have:+ (Installed: PHP $have.)}" >&2
+    case " $have " in
+        *" $ver "*) echo "📦 Xdebug needs PHP $ver's php-fpm and its development files (phpize), which aren't installed yet." >&2 ;;
+        *) echo "📦 Xdebug runs a debugged site on a native php-fpm at PHP $ver, which isn't installed.${have:+ (Installed: PHP $have.)}" >&2 ;;
+    esac
     if [ ! -t 0 ] || [ ! -t 1 ]; then
         gum style --foreground red "❌ Install it from a terminal, then turn Xdebug on again:" "   $cmd" >&2
         return 1
