@@ -159,6 +159,10 @@ restore() {
 }
 
 cx() { local c=$1; shift; timeout 600 incus exec "$c" -- "$@"; }
+# Installs get longer: apt's mariadb-server alone took 6.5 min while all six
+# containers were installing at once (2026-11-19), and the box's mirror jobs
+# can slow its disk further.
+cx_install() { local c=$1; shift; timeout 1500 incus exec "$c" -- "$@"; }
 
 # Site checks retry a few times — a curl fired immediately after a Caddy
 # reload (add/clone/rename all trigger one) can race the reload and see a
@@ -191,7 +195,7 @@ lane_a() {
         incus file push "$SRC/cove.sh" "$c/root/cove.sh"
         incus file push "$SRC/install-cove.sh" "$c/root/install-cove.sh"
 
-        if cx "$c" bash /root/install-cove.sh --dev && cx "$c" cove version | grep -q "Cove version"; then
+        if cx_install "$c" bash /root/install-cove.sh --dev && cx "$c" cove version | grep -q "Cove version"; then
             res "$c" install PASS
         else
             res "$c" install FAIL
@@ -479,7 +483,7 @@ LOGROTATE
         # An "IDE" (php-cli on port 9003) gets a session from a page with
         # the trigger, none without, and one from `cove wp`. Left on, so the
         # reboot below shows the watchdog bringing the pool back.
-        if cx "$c" bash -s <<'XDEBUGCHECK'
+        if cx_install "$c" bash -s <<'XDEBUGCHECK'
 fail() { echo "xdebug: $*" >&2; exit 1; }
 pub=/root/Cove/Sites/alpha.localhost/public
 if cove xdebug alpha on </dev/null >/tmp/xd-first.log 2>&1; then fail "on worked before php-fpm was installed"; fi
@@ -587,7 +591,7 @@ lane_b() { # previous release -> candidate + post-upgrade
         incus file push "$SRC/install-cove.sh" "$c/root/install-cove.sh"
         # Install the PREVIOUS (latest published) release via the fixed installer
         if ! cx "$c" bash -c 'curl -fsSL https://github.com/anchorhost/cove/releases/latest/download/cove.sh -o /root/cove.sh' \
-            || ! cx "$c" bash /root/install-cove.sh --dev; then
+            || ! cx_install "$c" bash /root/install-cove.sh --dev; then
             res "$c" upgrade_prev FAIL
             res "$c" upgrade_post SKIP
             res "$c" upgrade_site SKIP
@@ -636,7 +640,7 @@ lane_c() { # non-root user + sudo — the path most real Linux users hit
         incus file push "$SRC/cove.sh" "$c/home/dev/cove.sh"
         incus file push "$SRC/install-cove.sh" "$c/home/dev/install-cove.sh"
         cx "$c" chown -R dev:dev /home/dev
-        if cx "$c" su - dev -c 'bash /home/dev/install-cove.sh --dev' && cx "$c" su - dev -c 'cove version' | grep -q "Cove version"; then
+        if cx_install "$c" su - dev -c 'bash /home/dev/install-cove.sh --dev' && cx "$c" su - dev -c 'cove version' | grep -q "Cove version"; then
             res "$c" sudo_install PASS
         else
             res "$c" sudo_install FAIL
