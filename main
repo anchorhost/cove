@@ -413,6 +413,65 @@ php_fpm_sock_for() {
     echo "$RUN_DIR/php-$1.sock"
 }
 
+# One tool of a native PHP, by major.minor: $2 is fpm, php, phpize or
+# php-config. Echoes its path, or nothing when that PHP (or that tool) isn't
+# installed. On macOS it's Homebrew's php@<ver>. On Linux it's what the
+# distribution installed: Arch's php and php-fpm (/usr/bin), Debian and
+# Ubuntu's versioned names (php8.3, php-fpm8.3, phpize8.3), Fedora's
+# /usr/sbin/php-fpm, Remi's /opt/remi/php83. Only a binary that reports that
+# version counts, and never FrankenPHP.
+native_php_tool() {
+    local ver="$1" tool="$2" prefix nn c real got
+    case "$ver" in [578].[0-9]|[578].[0-9][0-9]) ;; *) return 0 ;; esac
+    if [ "$OS" = "macos" ]; then
+        prefix=$(php_fpm_prefix_for "$ver")
+        [ -n "$prefix" ] || return 0
+        case "$tool" in
+            fpm) c="$prefix/sbin/php-fpm" ;;
+            *) c="$prefix/bin/$tool" ;;
+        esac
+        [ -x "$c" ] && echo "$c"
+        return 0
+    fi
+    [ "$OS" = "linux" ] || return 0
+    nn="${ver//./}"
+    local cands=()
+    case "$tool" in
+        fpm) cands=("/usr/sbin/php-fpm$ver" "/opt/remi/php$nn/root/usr/sbin/php-fpm" /usr/sbin/php-fpm /usr/bin/php-fpm) ;;
+        php) cands=("/usr/bin/php$ver" "/opt/remi/php$nn/root/usr/bin/php" /usr/bin/php) ;;
+        phpize) cands=("/usr/bin/phpize$ver" "/opt/remi/php$nn/root/usr/bin/phpize" /usr/bin/phpize) ;;
+        php-config) cands=("/usr/bin/php-config$ver" "/opt/remi/php$nn/root/usr/bin/php-config" /usr/bin/php-config) ;;
+        *) return 0 ;;
+    esac
+    for c in "${cands[@]}"; do
+        [ -x "$c" ] || continue
+        real=$(readlink -f "$c" 2>/dev/null || echo "$c")
+        case "$real" in *frankenphp*) continue ;; esac
+        case "$tool" in
+            fpm) got=$("$c" -n -v 2>/dev/null | sed -n '1s/^PHP \([0-9]*\.[0-9]*\).*/\1/p') ;;
+            php) got=$("$c" -n -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null) ;;
+            phpize) got=$("${c%phpize*}php-config${c##*phpize}" --version 2>/dev/null | sed -n 's/^\([0-9]*\.[0-9]*\).*/\1/p') ;;
+            php-config) got=$("$c" --version 2>/dev/null | sed -n 's/^\([0-9]*\.[0-9]*\).*/\1/p') ;;
+        esac
+        if [ "$got" = "$ver" ]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# The major.minor of every native PHP Linux has installed (for messages).
+native_php_versions_linux() {
+    local c v
+    for c in /usr/bin/php /usr/bin/php[578].[0-9]* /opt/remi/php*/root/usr/bin/php; do
+        [ -x "$c" ] || continue
+        case "$(readlink -f "$c" 2>/dev/null)" in *frankenphp*) continue ;; esac
+        v=$("$c" -n -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null)
+        [ -n "$v" ] && echo "$v"
+    done | sort -u | paste -sd' ' -
+}
+
 # The PHP version FrankenPHP bundles (e.g. "8.5.2"), parsed from its banner.
 frankenphp_php_version() {
     frankenphp version 2>/dev/null | sed -n 's/.*PHP \([0-9][0-9.]*\).*/\1/p'
@@ -468,30 +527,88 @@ xdebug_setting() {
     echo "$v"
 }
 
-# The Xdebug build for a PHP version, when there is one that this Homebrew
-# PHP can load: the build records the extension directory of the PHP it was
-# compiled against (the module API number is in its name), and a Homebrew
-# upgrade that changes it makes the build stale.
+# A native PHP's extension build id, e.g. "API20250925,NTS": what an
+# extension has to be compiled against to load.
+native_php_build_id() {
+    local php
+    php=$(native_php_tool "$1" php)
+    [ -n "$php" ] || return 0
+    "$php" -n -i 2>/dev/null | sed -n 's/^PHP Extension Build => //p' | head -1
+}
+
+# The Xdebug build for a PHP version, when there is one that this native PHP
+# can load: the build records the extension build id of the PHP it was
+# compiled against (build=; older macOS builds only have api=, the extension
+# directory's name, which carries it), and an upgrade that changes it makes
+# the build stale.
 xdebug_so_for() {
-    local ver="$1" prefix so api
+    local ver="$1" so config info want
     so="$XDEBUG_DIR/$ver/xdebug.so"
     [ -f "$so" ] || return 0
-    prefix=$(php_fpm_prefix_for "$ver")
-    [ -n "$prefix" ] || return 0
-    api=$(sed -n 's/^api=//p' "$XDEBUG_DIR/$ver/build-info" 2>/dev/null)
-    [ -n "$api" ] && [ "$api" = "$(basename "$("$prefix/bin/php-config" --extension-dir 2>/dev/null)")" ] || return 0
+    config=$(native_php_tool "$ver" php-config)
+    [ -n "$config" ] || return 0
+    info="$XDEBUG_DIR/$ver/build-info"
+    want=$(sed -n 's/^build=//p' "$info" 2>/dev/null)
+    if [ -n "$want" ]; then
+        [ "$want" = "$(native_php_build_id "$ver")" ] || return 0
+    else
+        want=$(sed -n 's/^api=//p' "$info" 2>/dev/null)
+        [ -n "$want" ] && [ "$want" = "$(basename "$("$config" --extension-dir 2>/dev/null)")" ] || return 0
+    fi
     echo "$so"
 }
 
+# The extensions a native PHP on Linux should load for WordPress and Laravel
+# that its own ini leaves off: Arch's php ships mysqli, pdo_mysql, zip, exif,
+# bcmath and others as modules, all commented out in /etc/php/php.ini.
+# Prints "extension=<name>" for each module that's in the extension folder
+# and not loaded already; nothing on Debian and Fedora (their conf.d loads
+# every installed module) or macOS.
+native_php_extension_lines() {
+    local ver="$1" php dir loaded ext
+    [ "$OS" = "linux" ] || return 0
+    php=$(native_php_tool "$ver" php)
+    [ -n "$php" ] || return 0
+    # Without PHPRC (Cove exports it for FrankenPHP's CLI), as the pool and
+    # the CLI wrapper run it, so this PHP reads its own php.ini.
+    dir=$(env -u PHPRC "$php" -r 'echo ini_get("extension_dir");' 2>/dev/null)
+    [ -d "$dir" ] || return 0
+    loaded=" $(env -u PHPRC "$php" -m 2>/dev/null | tr 'A-Z\n' 'a-z ') "
+    for ext in mysqli pdo_mysql pdo_sqlite sqlite3 pdo_pgsql pgsql curl zip exif gd intl bcmath iconv sodium gettext gmp sockets bz2 calendar ftp soap xsl igbinary redis imagick; do
+        [ -f "$dir/$ext.so" ] || continue
+        case "$loaded" in *" $ext "*) continue ;; esac
+        echo "extension=$ext"
+    done
+}
+
+# PHP_INI_SCAN_DIR for a native PHP with Cove's extra conf.d ($2): on macOS,
+# Homebrew's conf.d then Cove's; on Linux a leading ":" keeps the folder
+# each SAPI was built with (Debian's fpm/conf.d for php-fpm, cli/conf.d for
+# php) and adds Cove's after it.
+native_php_scan_dir() {
+    local ver="$1" extra="$2" config
+    if [ "$OS" = "macos" ]; then
+        config=$(native_php_tool "$ver" php-config)
+        echo "$("$config" --ini-dir 2>/dev/null):$extra"
+    else
+        echo ":$extra"
+    fi
+}
+
 # Write the ini (and the CLI wrapper) that loads a version's Xdebug build;
-# php-fpm and the CLI both find the ini through PHP_INI_SCAN_DIR, after
-# Homebrew's own conf.d. Echoes the folder holding the ini. Rewritten on every
-# reload, so a changed setting lands with the next php-fpm restart.
+# php-fpm and the CLI both find the ini through PHP_INI_SCAN_DIR, after the
+# PHP's own conf.d. Echoes the folder holding the ini. Rewritten on every
+# reload, so a changed setting lands with the next php-fpm restart. On Linux
+# the folder also holds cove.ini: the extensions the distribution's ini
+# leaves off, MariaDB's socket, Mailpit's sendmail and Cove's memory limit.
+# There the pool and the CLI wrapper run without PHPRC, so the PHP reads its
+# own php.ini whoever starts it (a terminal, the dashboard, the watchdog).
 write_xdebug_ini() {
-    local ver="$1" so prefix conf_dir tmp
+    local ver="$1" so php conf_dir tmp sock
     so=$(xdebug_so_for "$ver")
     [ -n "$so" ] || return 1
-    prefix=$(php_fpm_prefix_for "$ver")
+    php=$(native_php_tool "$ver" php)
+    [ -n "$php" ] || return 1
     conf_dir="$XDEBUG_DIR/$ver/conf.d"
     mkdir -p "$conf_dir" "$COVE_DIR/cache/xdebug" "$LOGS_DIR"
     tmp="$conf_dir/xdebug.ini.tmp"
@@ -511,13 +628,31 @@ xdebug.log = $LOGS_DIR/xdebug.log
 xdebug.log_level = 3
 EOM
     if cmp -s "$tmp" "$conf_dir/xdebug.ini"; then rm -f "$tmp"; else mv "$tmp" "$conf_dir/xdebug.ini"; fi
+    if [ "$OS" = "linux" ]; then
+        tmp="$conf_dir/cove.ini.tmp"
+        {
+            echo "; Auto-generated by Cove (write_xdebug_ini in main): what this PHP's own"
+            echo "; ini leaves off, for the sites it serves with Xdebug."
+            native_php_extension_lines "$ver"
+            echo "sendmail_path = \"$(write_sendmail_wrapper "$(command -v mailpit)")\""
+            echo "memory_limit = $(cove_ini_get memory_limit 1G)"
+            sock=$(cove_mysql_socket)
+            if [ -n "$sock" ]; then
+                echo "mysqli.default_socket = \"$sock\""
+                echo "pdo_mysql.default_socket = \"$sock\""
+            fi
+        } > "$tmp"
+        if cmp -s "$tmp" "$conf_dir/cove.ini"; then rm -f "$tmp"; else mv "$tmp" "$conf_dir/cove.ini"; fi
+    fi
     # The php a pinned site's CLI tools run (cove wp, artisan, composer) when
-    # an Xdebug trigger is in the environment: Homebrew's php plus this ini.
+    # an Xdebug trigger is in the environment: the native php plus this ini.
     tmp="$XDEBUG_DIR/$ver/php.tmp"
+    local unset_rc=""
+    [ "$OS" = "linux" ] && unset_rc="env -u PHPRC "
     cat > "$tmp" << EOM
 #!/bin/sh
 # Auto-generated by Cove (write_xdebug_ini in main): PHP $ver with Xdebug.
-PHP_INI_SCAN_DIR="$("$prefix/bin/php-config" --ini-dir 2>/dev/null):$conf_dir" exec "$prefix/bin/php" "\$@"
+PHP_INI_SCAN_DIR="$(native_php_scan_dir "$ver" "$conf_dir")" exec $unset_rc"$php" "\$@"
 EOM
     chmod +x "$tmp"
     if cmp -s "$tmp" "$XDEBUG_DIR/$ver/php"; then rm -f "$tmp"; else mv "$tmp" "$XDEBUG_DIR/$ver/php"; fi
@@ -2789,6 +2924,17 @@ if [ \$((now_s - \$(cat "\$lv_stamp" 2>/dev/null || echo 0))) -ge 60 ] && ls "$S
     echo "\$now_s" > "\$lv_stamp"
     "$watchdog_cove" laravel --ensure >/dev/null 2>&1
 fi
+# Native php-fpm pools on Linux (a site with cove xdebug on): Cove starts
+# them itself, so any whose start script is there and whose process isn't
+# (a crash, a reboot) is started again. macOS pools are launchd's.
+for fpm_start in "$PHP_FPM_DIR"/*/start; do
+    [ -x "\$fpm_start" ] || continue
+    fpm_key=\$(basename "\$(dirname "\$fpm_start")")
+    fpm_pid=\$(cat "$RUN_DIR/php-fpm-\$fpm_key.pid" 2>/dev/null)
+    if [ -z "\$fpm_pid" ] || ! kill -0 "\$fpm_pid" 2>/dev/null; then
+        "\$fpm_start" >> "$LOGS_DIR/php-fpm-\$fpm_key.log" 2>&1
+    fi
+done
 last_s=\$(cat "\$sweep_stamp" 2>/dev/null || echo 0)
 if [ \$((now_s - last_s)) -ge 300 ]; then
     mkdir -p "$COVE_DIR/cache/screenshots"
@@ -3459,12 +3605,22 @@ write_php_fpm_config() {
     local mailpit_path
     mailpit_path=$(command -v mailpit)
     mkdir -p "$conf_dir" "$RUN_DIR" "$LOGS_DIR" "$COVE_DIR/cache/sessions"
+    # launchd keeps a macOS pool in the foreground; on Linux Cove starts the
+    # pool itself and finds it again by its pid file (see php_fpm_pool_pid).
+    local daemon_lines="daemonize = no"
+    [ "$OS" = "linux" ] && daemon_lines="daemonize = yes
+pid = $RUN_DIR/php-fpm-$ver.pid"
+    # MariaDB's socket where PHP wouldn't find it by itself (Linux).
+    local socket_lines="" sock
+    sock=$(cove_mysql_socket)
+    [ -n "$sock" ] && socket_lines="php_admin_value[mysqli.default_socket] = $sock
+php_admin_value[pdo_mysql.default_socket] = $sock"
     cat > "$conf_dir/php-fpm.conf" << EOM
 [global]
 ; Auto-generated by Cove (write_php_fpm_config in main). Do not edit —
 ; regenerated on every pin, reload, and post-upgrade.
 error_log = $LOGS_DIR/php-fpm-$ver.log
-daemonize = no
+$daemon_lines
 
 [cove]
 listen = $RUN_DIR/php-$ver.sock
@@ -3488,6 +3644,7 @@ php_admin_value[memory_limit] = $(cove_ini_get memory_limit 1G)
 php_admin_value[upload_max_filesize] = $(cove_ini_get upload_max_filesize 1G)
 php_admin_value[post_max_size] = $(cove_ini_get post_max_size 1G)
 php_admin_value[session.save_path] = $COVE_DIR/cache/sessions
+$socket_lines
 EOM
     echo "$conf_dir/php-fpm.conf"
 }
@@ -3500,28 +3657,29 @@ install_php_fpm_service() {
     # $1 is a pool key: "<ver>", or "<ver>-xdebug" (see site_fpm_key).
     local ver="$1"
     local php_ver="${ver%-xdebug}"
-    local prefix
-    prefix=$(php_fpm_prefix_for "$php_ver")
-    if [ -z "$prefix" ]; then
-        echo "   ⚠️  php@$php_ver (php-fpm) not found; sites pinned to $php_ver fall back to FrankenPHP." >&2
+    local fpm_bin
+    fpm_bin=$(native_php_tool "$php_ver" fpm)
+    if [ -z "$fpm_bin" ]; then
+        echo "   ⚠️  php-fpm for PHP $php_ver not found; sites using it fall back to FrankenPHP." >&2
         return 1
     fi
 
-    # The Xdebug pool finds Cove's xdebug.ini after Homebrew's conf.d. Its
+    # The Xdebug pool finds Cove's xdebug.ini after the PHP's own conf.d. Its
     # contents count as config: a changed mode or port restarts the pool.
-    local env_block="" xdebug_conf="" old_ini="" new_ini=""
+    local env_block="" xdebug_conf="" old_ini="" new_ini="" scan_dir=""
     if [ "$ver" != "$php_ver" ]; then
-        old_ini=$(cat "$XDEBUG_DIR/$php_ver/conf.d/xdebug.ini" 2>/dev/null)
+        old_ini=$(cat "$XDEBUG_DIR/$php_ver/conf.d/"*.ini 2>/dev/null)
         if ! xdebug_conf=$(write_xdebug_ini "$php_ver"); then
             echo "   ⚠️  No Xdebug build for PHP $php_ver; run: cove xdebug install $php_ver" >&2
             return 1
         fi
-        new_ini=$(cat "$xdebug_conf/xdebug.ini")
+        new_ini=$(cat "$xdebug_conf/"*.ini)
+        scan_dir=$(native_php_scan_dir "$php_ver" "$xdebug_conf")
         env_block="
         <key>EnvironmentVariables</key>
         <dict>
                 <key>PHP_INI_SCAN_DIR</key>
-                <string>$("$prefix/bin/php-config" --ini-dir 2>/dev/null):$xdebug_conf</string>
+                <string>$scan_dir</string>
         </dict>"
     fi
 
@@ -3531,6 +3689,11 @@ install_php_fpm_service() {
     write_php_fpm_config "$ver" >/dev/null
     local new_conf
     new_conf=$(cat "$conf_path")
+
+    if [ "$OS" = "linux" ]; then
+        php_fpm_pool_install_linux "$ver" "$fpm_bin" "$scan_dir" "$old_conf$old_ini" "$new_conf$new_ini"
+        return
+    fi
 
     local label="com.cove.php-fpm-$ver"
     local plist_path="$COVE_DIR/$label.plist"
@@ -3550,7 +3713,7 @@ install_php_fpm_service() {
         <string>$label</string>
         <key>ProgramArguments</key>
         <array>
-                <string>$prefix/sbin/php-fpm</string>
+                <string>$fpm_bin</string>
                 <string>--nodaemonize</string>
                 <string>--fpm-config</string>
                 <string>$conf_path</string>
@@ -3581,9 +3744,73 @@ EOM
 # re-pin instant.
 remove_php_fpm_service() {
     local ver="$1"
+    if [ "$OS" = "linux" ]; then
+        php_fpm_pool_stop "$ver"
+        rm -f "$PHP_FPM_DIR/$ver/start"
+        return 0
+    fi
     local plist_path="$COVE_DIR/com.cove.php-fpm-$ver.plist"
     launchctl unload "$plist_path" &>/dev/null || true
     rm -f "$plist_path" "$RUN_DIR/php-$ver.sock"
+}
+
+# --- Linux pools ---
+# No service manager here: a system unit per pool would need sudo on every
+# reload. Cove starts each pool's php-fpm itself (daemonized, as the user
+# running Cove) from $PHP_FPM_DIR/<key>/start, finds it again by
+# $RUN_DIR/php-fpm-<key>.pid, and the watchdog starts any pool whose start
+# script is there and whose process isn't (a crash, a reboot).
+
+# The running master's pid for a pool, or nothing.
+php_fpm_pool_pid() {
+    local key="$1" pid
+    pid=$(cat "$RUN_DIR/php-fpm-$key.pid" 2>/dev/null)
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    # A recycled pid belongs to something else: the master's title names
+    # its config.
+    if [ -r "/proc/$pid/cmdline" ] && ! tr '\0' ' ' < "/proc/$pid/cmdline" | grep -qF "$PHP_FPM_DIR/$key/php-fpm.conf"; then
+        return 0
+    fi
+    echo "$pid"
+}
+
+php_fpm_pool_stop() {
+    local key="$1" pid i
+    pid=$(php_fpm_pool_pid "$key")
+    if [ -n "$pid" ]; then
+        kill -QUIT "$pid" 2>/dev/null
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
+    fi
+    rm -f "$RUN_DIR/php-fpm-$key.pid" "$RUN_DIR/php-$key.sock"
+}
+
+# Write the pool's start script and (re)start it when the script, config or
+# ini changed or it isn't running. $4/$5 = the config + ini before and after.
+php_fpm_pool_install_linux() {
+    local key="$1" fpm_bin="$2" scan_dir="$3" old="$4" new="$5"
+    local start="$PHP_FPM_DIR/$key/start" root_flag="" script
+    # php-fpm refuses to run as root without -R (a root install: containers,
+    # some servers).
+    [ "$(id -u)" -eq 0 ] && root_flag=" -R"
+    script="#!/bin/sh
+# Auto-generated by Cove (php_fpm_pool_install_linux in main): starts the
+# $key php-fpm pool. The watchdog runs it when the pool isn't running.
+${scan_dir:+PHP_INI_SCAN_DIR='$scan_dir' }exec env -u PHPRC '$fpm_bin' --fpm-config '$PHP_FPM_DIR/$key/php-fpm.conf'$root_flag"
+    if [ "$old" == "$new" ] && [ "$(cat "$start" 2>/dev/null)" == "$script" ] && [ -n "$(php_fpm_pool_pid "$key")" ]; then
+        return 0
+    fi
+    printf '%s\n' "$script" > "$start.tmp" && chmod +x "$start.tmp" && mv "$start.tmp" "$start"
+    php_fpm_pool_stop "$key"
+    if ! "$start" >> "$LOGS_DIR/php-fpm-$key.log" 2>&1; then
+        echo "   ⚠️  php-fpm for $key didn't start; see $LOGS_DIR/php-fpm-$key.log" >&2
+        return 1
+    fi
+    return 0
 }
 
 # Reconcile running php-fpm units against what sites actually pin. Called
@@ -3596,17 +3823,23 @@ sync_php_fpm_services() {
     if [ -d "$SITES_DIR" ]; then
         for site_path in "$SITES_DIR"/*; do
             [ -d "$site_path" ] || continue
-            if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+            if [ "$OS" != "linux" ] && { [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; }; then
                 ver=$(site_php_version "$site_path")
                 [ -n "$ver" ] && echo "   ⚠️  $(basename "$site_path") pins PHP $ver, but per-site PHP requires Homebrew on macOS; serving with FrankenPHP." >&2
-                site_xdebug_on "$site_path" && echo "   ⚠️  $(basename "$site_path") has Xdebug on, but Xdebug requires Homebrew on macOS; serving with FrankenPHP." >&2
+                site_xdebug_on "$site_path" && echo "   ⚠️  $(basename "$site_path") has Xdebug on, but Xdebug needs Homebrew on macOS or Linux; serving with FrankenPHP." >&2
                 continue
             fi
             # The pool the site's handler points at (pinned, Xdebug, or none).
             ver=$(site_fpm_key "$site_path")
             if [ -z "$ver" ]; then
                 ver=$(site_php_version "$site_path")
-                [ -n "$ver" ] && echo "   ⚠️  php@$ver (php-fpm) not found; $(basename "$site_path") falls back to FrankenPHP." >&2
+                if [ -n "$ver" ]; then
+                    if [ "$OS" = "linux" ]; then
+                        echo "   ⚠️  $(basename "$site_path") pins PHP $ver, but per-site PHP requires Homebrew on macOS; serving with FrankenPHP." >&2
+                    else
+                        echo "   ⚠️  php@$ver (php-fpm) not found; $(basename "$site_path") falls back to FrankenPHP." >&2
+                    fi
+                fi
                 site_xdebug_on "$site_path" && echo "   ⚠️  No Xdebug build for $(basename "$site_path")'s PHP; run: cove xdebug $(basename "$site_path" .localhost) on" >&2
                 continue
             fi
@@ -3617,6 +3850,21 @@ sync_php_fpm_services() {
         done
     fi
 
+    if [ "$OS" = "linux" ]; then
+        for ver in $needed; do
+            install_php_fpm_service "$ver" || true
+        done
+        local start
+        for start in "$PHP_FPM_DIR"/*/start; do
+            [ -f "$start" ] || continue
+            ver=$(basename "$(dirname "$start")")
+            case "$needed" in
+                *" $ver "*) ;;
+                *) remove_php_fpm_service "$ver" ;;
+            esac
+        done
+        return 0
+    fi
     if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
         return 0
     fi
@@ -6268,7 +6516,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         $__xd_start = in_array((string) ($__xd_cfg['XDEBUG_START'] ?? ''), ['1', 'yes'], true) ? 'yes' : 'trigger';
         $__xd_port = (int) ($__xd_cfg['XDEBUG_PORT'] ?? 0);
         if ($__xd_port < 1 || $__xd_port > 65535) $__xd_port = 9003;
-        $xdebug = ['supported' => $supported, 'mode' => $__xd_mode, 'start' => $__xd_start, 'port' => $__xd_port, 'builds' => []];
+        // Xdebug also runs on Linux, on the distribution's php-fpm (the CLI
+        // offers to install it), though per-site pins don't yet.
+        $xdebug = ['supported' => $supported || PHP_OS_FAMILY === 'Linux', 'mode' => $__xd_mode, 'start' => $__xd_start, 'port' => $__xd_port, 'builds' => []];
         foreach (glob($user_home . '/Cove/App/xdebug/*/build-info') ?: [] as $__xd_info) {
             $__xd_ver = basename(dirname($__xd_info));
             if (preg_match('/^version=(.+)$/m', (string) @file_get_contents($__xd_info), $__xd_m)) $xdebug['builds'][$__xd_ver] = trim($__xd_m[1]);
@@ -7488,8 +7738,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $response['message'] = 'Invalid site name provided.';
                 break;
             }
-            if (PHP_OS_FAMILY !== 'Darwin') {
-                $response['message'] = 'Xdebug currently requires macOS with Homebrew.';
+            if (PHP_OS_FAMILY !== 'Darwin' && PHP_OS_FAMILY !== 'Linux') {
+                $response['message'] = 'Xdebug needs Homebrew on macOS, or Linux.';
                 break;
             }
             $flag_file = $sitedir . '/' . $site_name . '.localhost/xdebug';
@@ -7499,6 +7749,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             $pin_file = $sitedir . '/' . $site_name . '.localhost/php_version';
             $xd_ver = is_file($pin_file) ? trim((string) @file_get_contents($pin_file)) : preg_replace('/^(\d+\.\d+).*$/', '$1', PHP_VERSION);
+            // Linux: the distribution's php-fpm has to be there first, and
+            // installing it takes a password, so that happens in a terminal
+            // (the CLI offers it). Same places native_php_tool looks.
+            if ($xdebug_on && PHP_OS_FAMILY === 'Linux') {
+                $__xd_nn = str_replace('.', '', $xd_ver);
+                $__xd_fpm = false;
+                foreach (['/usr/sbin/php-fpm' . $xd_ver, '/opt/remi/php' . $__xd_nn . '/root/usr/sbin/php-fpm', '/usr/sbin/php-fpm', '/usr/bin/php-fpm'] as $__xd_c) {
+                    if (is_executable($__xd_c)) { $__xd_fpm = true; break; }
+                }
+                if (!$__xd_fpm) {
+                    $response['message'] = 'Xdebug needs PHP ' . $xd_ver . "'s php-fpm. Run cove xdebug " . $site_name . ' on in a terminal: it offers to install it.';
+                    break;
+                }
+            }
             $needs_build = $xdebug_on && !is_file($user_home . '/Cove/App/xdebug/' . $xd_ver . '/xdebug.so');
             $apply_log = $user_home . '/Cove/cache/xdebug-apply-' . $site_name . '.log';
             shell_exec(sprintf('HOME=%s %s xdebug %s %s > %s 2>&1 &',
@@ -19325,7 +19589,7 @@ show_general_help() {
     help_cmd path "Prints the path to a site's public folder."
     help_cmd url "Prints a site's HTTPS URL."
     help_cmd php "Pins a site to an older PHP (macOS, with Homebrew)."
-    help_cmd xdebug "Turns Xdebug on for a site, for step debugging (macOS)."
+    help_cmd xdebug "Turns Xdebug on for a site, for step debugging."
     echo ""
     help_section "WordPress"
     help_cmd wp "Runs WP-CLI inside a site from anywhere."
@@ -20017,13 +20281,14 @@ display_command_help() {
             echo "       cove xdebug port [<port>]"
             echo "       cove xdebug install [<php version>]"
             echo ""
-            echo "Step debugging, profiling and tracing with Xdebug, on macOS with Homebrew."
-            echo "FrankenPHP's PHP can't load extensions, so a site with Xdebug on is served"
-            echo "by a native php-fpm at the site's own PHP (its pin, or Cove's default) with"
-            echo "Xdebug loaded, in a pool of its own: other sites stay as fast as before."
-            echo "The first 'on' for a PHP version installs php@<version> if needed and"
+            echo "Step debugging, profiling and tracing with Xdebug, on macOS (Homebrew) and"
+            echo "Linux. FrankenPHP's PHP can't load extensions, so a site with Xdebug on is"
+            echo "served by a native php-fpm at the site's own PHP (its pin, or Cove's default)"
+            echo "with Xdebug loaded, in a pool of its own: other sites stay as fast as before."
+            echo "The first 'on' for a PHP version installs that PHP if needed (php@<version>"
+            echo "from Homebrew; on Linux the distribution's php-fpm, from a terminal) and"
             echo "builds Xdebug from pecl.php.net (about 15 seconds), into ~/Cove/App/xdebug."
-            echo "Nothing is added to Homebrew's php.ini."
+            echo "Nothing is added to the PHP's own php.ini."
             echo ""
             echo "Commands:"
             echo "  cove xdebug                  Settings, sites with Xdebug on, and builds."

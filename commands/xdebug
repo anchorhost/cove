@@ -1,11 +1,12 @@
 # cove xdebug — step debugging, profiling and tracing for a site.
 #
 # FrankenPHP's PHP is static and loads no extensions, so a site with Xdebug
-# on is served by a native Homebrew php-fpm at the site's PHP with Xdebug
-# loaded, in a pool of its own (see site_fpm_key and the Xdebug block in
-# main). Cove builds the extension from PECL's source into
-# ~/Cove/App/xdebug/<ver>/ with that PHP's phpize: nothing is added to
-# Homebrew's php.ini, so no other PHP on the machine loads it.
+# on is served by a native php-fpm at the site's PHP with Xdebug loaded, in
+# a pool of its own (see site_fpm_key and the Xdebug block in main): Homebrew's
+# php@<ver> on macOS, the distribution's php-fpm on Linux. Cove builds the
+# extension from PECL's source into ~/Cove/App/xdebug/<ver>/ with that PHP's
+# phpize: nothing is added to the PHP's own ini, so no other use of that PHP
+# on the machine loads it.
 
 # The newest stable Xdebug release that supports PHP $1 (major.minor), from
 # PECL's release list and each release's PHP range. Prints the version.
@@ -36,18 +37,31 @@ xdebug_pick_release() {
 # the compiler's output in ~/Cove/Logs/xdebug-build.log. Returns non-zero
 # (and leaves any earlier build in place) when anything fails.
 xdebug_build() {
-    local ver="$1" prefix rel work log tarball names dest
-    prefix=$(php_fpm_prefix_for "$ver")
-    if [ -z "$prefix" ] || [ ! -x "$prefix/bin/phpize" ]; then
-        gum style --foreground red "❌ php@$ver isn't installed with phpize; can't build Xdebug for it." >&2
+    local ver="$1" phpize config php rel work log tarball names dest
+    phpize=$(native_php_tool "$ver" phpize)
+    config=$(native_php_tool "$ver" php-config)
+    php=$(native_php_tool "$ver" php)
+    if [ -z "$phpize" ] || [ -z "$config" ] || [ -z "$php" ]; then
+        if [ "$OS" = "macos" ]; then
+            gum style --foreground red "❌ php@$ver isn't installed with phpize; can't build Xdebug for it." >&2
+        else
+            gum style --foreground red "❌ PHP $ver's phpize isn't installed; can't build Xdebug for it." \
+                "Install: $(xdebug_linux_packages "$ver" | xdebug_join_install)" >&2
+        fi
         return 1
     fi
-    if ! command -v autoconf >/dev/null 2>&1; then
-        echo "📦 Building Xdebug needs autoconf; installing it with Homebrew..." >&2
-        brew install autoconf >&2 || { gum style --foreground red "❌ 'brew install autoconf' failed." >&2; return 1; }
-    fi
-    if ! command -v make >/dev/null 2>&1 || ! command -v cc >/dev/null 2>&1; then
-        gum style --foreground red "❌ Building Xdebug needs a C compiler. Install Apple's command line tools: xcode-select --install" >&2
+    if [ "$OS" = "macos" ]; then
+        if ! command -v autoconf >/dev/null 2>&1; then
+            echo "📦 Building Xdebug needs autoconf; installing it with Homebrew..." >&2
+            brew install autoconf >&2 || { gum style --foreground red "❌ 'brew install autoconf' failed." >&2; return 1; }
+        fi
+        if ! command -v make >/dev/null 2>&1 || ! command -v cc >/dev/null 2>&1; then
+            gum style --foreground red "❌ Building Xdebug needs a C compiler. Install Apple's command line tools: xcode-select --install" >&2
+            return 1
+        fi
+    elif ! command -v autoconf >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1 || ! command -v cc >/dev/null 2>&1; then
+        gum style --foreground red "❌ Building Xdebug needs autoconf, make and a C compiler." \
+            "Install: $(xdebug_linux_packages "$ver" | xdebug_join_install)" >&2
         return 1
     fi
     echo "🔎 Finding the Xdebug release for PHP $ver..." >&2
@@ -81,44 +95,108 @@ xdebug_build() {
     fi
     echo "🔨 Building Xdebug $rel for PHP $ver (about 15 seconds)..." >&2
     {
-        echo "=== $(date '+%Y-%m-%d %H:%M:%S') Xdebug $rel for PHP $ver ($prefix)"
+        echo "=== $(date '+%Y-%m-%d %H:%M:%S') Xdebug $rel for PHP $ver ($phpize)"
     } >> "$log"
     if ! ( cd "$work/xdebug-$rel" \
-        && "$prefix/bin/phpize" \
-        && ./configure --with-php-config="$prefix/bin/php-config" \
-        && make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" ) >> "$log" 2>&1; then
+        && "$phpize" \
+        && ./configure --with-php-config="$config" \
+        && make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)" ) >> "$log" 2>&1; then
         rm -rf "$work"
         gum style --foreground red "❌ The Xdebug build failed; see $log" >&2
         return 1
     fi
     # Make sure this PHP loads it before putting it in place.
-    if ! "$prefix/bin/php" -n -d zend_extension="$work/xdebug-$rel/modules/xdebug.so" -r 'exit(extension_loaded("xdebug") ? 0 : 1);' >> "$log" 2>&1; then
+    if ! "$php" -n -d zend_extension="$work/xdebug-$rel/modules/xdebug.so" -r 'exit(extension_loaded("xdebug") ? 0 : 1);' >> "$log" 2>&1; then
         rm -rf "$work"
         gum style --foreground red "❌ PHP $ver wouldn't load the Xdebug it built; see $log" >&2
         return 1
     fi
     dest="$XDEBUG_DIR/$ver"
     cp "$work/xdebug-$rel/modules/xdebug.so" "$dest/xdebug.so.new" && mv "$dest/xdebug.so.new" "$dest/xdebug.so" || { rm -rf "$work"; return 1; }
-    printf 'version=%s\napi=%s\nphp=%s\nbuilt=%s\n' "$rel" \
-        "$(basename "$("$prefix/bin/php-config" --extension-dir)")" \
-        "$("$prefix/bin/php-config" --version)" "$(date '+%Y-%m-%d %H:%M:%S')" > "$dest/build-info"
+    printf 'version=%s\napi=%s\nbuild=%s\nphp=%s\nbuilt=%s\n' "$rel" \
+        "$(basename "$("$config" --extension-dir)")" "$(native_php_build_id "$ver")" \
+        "$("$config" --version)" "$(date '+%Y-%m-%d %H:%M:%S')" > "$dest/build-info"
     rm -rf "$work"
     echo "✅ Xdebug $rel built for PHP $ver." >&2
+    return 0
+}
+
+# The packages that give Linux PHP $1 with php-fpm and phpize, plus what
+# building Xdebug needs, for this distribution's package manager, one a line.
+# The distribution's own PHP: when it's another version, the message after
+# the install says so.
+xdebug_linux_packages() {
+    local ver="$1"
+    case "$PKG_MANAGER" in
+        pacman) printf '%s\n' php php-fpm php-gd php-sodium base-devel autoconf ;;
+        apt) printf '%s\n' "php$ver-fpm" "php$ver-dev" "php$ver-mysql" "php$ver-curl" "php$ver-gd" "php$ver-intl" "php$ver-mbstring" "php$ver-xml" "php$ver-zip" build-essential autoconf ;;
+        dnf) printf '%s\n' php-fpm php-devel php-mysqlnd php-gd php-intl php-mbstring php-xml php-pecl-zip gcc make autoconf ;;
+    esac
+}
+
+# The install command for the packages on stdin.
+xdebug_join_install() {
+    local pkgs
+    pkgs=$(paste -sd' ' -)
+    case "$PKG_MANAGER" in
+        pacman) echo "sudo pacman -S --needed $pkgs" ;;
+        apt) echo "sudo apt install $pkgs" ;;
+        dnf) echo "sudo dnf install $pkgs" ;;
+    esac
+}
+
+# Linux: make sure PHP $1 is installed natively with php-fpm and phpize,
+# offering to install the distribution's packages from a terminal. Without a
+# terminal (the dashboard) it says what to run instead.
+xdebug_ensure_native_linux() {
+    local ver="$1" cmd have
+    if [ -n "$(native_php_tool "$ver" fpm)" ] && [ -n "$(native_php_tool "$ver" php)" ] && [ -n "$(native_php_tool "$ver" phpize)" ]; then
+        return 0
+    fi
+    cmd=$(xdebug_linux_packages "$ver" | xdebug_join_install)
+    have=$(native_php_versions_linux)
+    echo "📦 Xdebug runs a debugged site on a native php-fpm at PHP $ver, which isn't installed.${have:+ (Installed: PHP $have.)}" >&2
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        gum style --foreground red "❌ Install it from a terminal, then turn Xdebug on again:" "   $cmd" >&2
+        return 1
+    fi
+    if ! gum confirm "Run: $cmd ?"; then
+        echo "Aborted." >&2
+        return 1
+    fi
+    local pkgs=()
+    while IFS= read -r p; do pkgs+=("$p"); done < <(xdebug_linux_packages "$ver")
+    case "$PKG_MANAGER" in
+        pacman) $SUDO_CMD pacman -S --needed --noconfirm "${pkgs[@]}" ;;
+        apt) $SUDO_CMD apt-get install -y "${pkgs[@]}" ;;
+        dnf) $SUDO_CMD dnf install -y "${pkgs[@]}" ;;
+    esac || { gum style --foreground red "❌ The install failed." >&2; return 1; }
+    if [ -z "$(native_php_tool "$ver" fpm)" ] || [ -z "$(native_php_tool "$ver" phpize)" ]; then
+        have=$(native_php_versions_linux)
+        gum style --foreground red "❌ PHP $ver's php-fpm still isn't there.${have:+ The distribution installed PHP $have.}" \
+            "Cove's PHP is $ver, and a debugged site keeps the PHP it runs." >&2
+        return 1
+    fi
     return 0
 }
 
 # Make sure PHP $1 has php-fpm and a loadable Xdebug build.
 xdebug_ensure() {
     local ver="$1"
-    ensure_php_formula "$ver" || return 1
+    if [ "$OS" = "linux" ]; then
+        xdebug_ensure_native_linux "$ver" || return 1
+    else
+        ensure_php_formula "$ver" || return 1
+    fi
     [ -n "$(xdebug_so_for "$ver")" ] && return 0
     xdebug_build "$ver"
 }
 
 xdebug_supported() {
+    [ "$OS" = "linux" ] && return 0
     if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
-        gum style --foreground red "❌ Xdebug currently requires macOS with Homebrew." \
-            "FrankenPHP's bundled PHP can't load extensions, so Cove runs a debugged site on a native php-fpm, which it sets up only with Homebrew today." >&2
+        gum style --foreground red "❌ Xdebug needs Homebrew on macOS, or Linux." \
+            "FrankenPHP's bundled PHP can't load extensions, so Cove runs a debugged site on a native php-fpm." >&2
         return 1
     fi
 }
@@ -189,7 +267,7 @@ cove_xdebug_overview() {
         if [ -n "$(xdebug_so_for "$ver")" ]; then
             builds+="  PHP $ver: Xdebug $(sed -n 's/^version=//p' "$XDEBUG_DIR/$ver/build-info" 2>/dev/null)"$'\n'
         else
-            builds+="  PHP $ver: stale after a Homebrew upgrade; rebuild with cove xdebug install $ver"$'\n'
+            builds+="  PHP $ver: stale after a PHP upgrade; rebuild with cove xdebug install $ver"$'\n'
         fi
     done
     if [ -n "$builds" ]; then
@@ -278,7 +356,11 @@ cove_xdebug() {
             else
                 ver=$(normalize_php_version "$(frankenphp_php_version)")
             fi
-            ensure_php_formula "$ver" || exit 1
+            if [ "$OS" = "linux" ]; then
+                xdebug_ensure_native_linux "$ver" || exit 1
+            else
+                ensure_php_formula "$ver" || exit 1
+            fi
             xdebug_build "$ver" || exit 1
             # Sites already waiting on this build move onto it now.
             regenerate_caddyfile >/dev/null
@@ -314,6 +396,12 @@ cove_xdebug() {
             fi
             touch "$site_dir/xdebug"
             regenerate_caddyfile
+            # The site is only on Xdebug once its handler points at the pool.
+            if [[ "$(site_fpm_key "$site_dir")" != *-xdebug ]]; then
+                gum style --foreground red "❌ $site_name.localhost is still on its usual PHP: PHP $ver's Xdebug build doesn't load." \
+                    "Rebuild it with: cove xdebug install $ver" >&2
+                exit 1
+            fi
             local url
             url=$(url_for "$site_name.localhost")
             xdebug_warm "$url"
