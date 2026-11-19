@@ -18,6 +18,7 @@
 
 ### 🔒 Security & Bug Fixes
 
+* **Sites reach MariaDB on Linux with FrankenPHP's static binary:** WordPress's `DB_HOST` of `localhost` makes PHP connect through MariaDB's Unix socket, and where PHP looks for that socket is compiled in. The distributions' PHP packages know their own MariaDB's path, but FrankenPHP's static binary (used on Arch, and wherever the installer fell back to it) looks in `/tmp/mysql.sock`, so every site answered "Error establishing a database connection". Cove now asks MariaDB for its socket (or finds it in the usual places) and points `mysqli` and `pdo_mysql` at it, for the web server and for `cove wp` alike. A reload or the upgrade applies it.
 * **`cove enable` no longer reports a slow start as a failure:** it gave FrankenPHP 3 seconds to answer, and a large install on a busy machine can take 15 or more, so a server that was coming up fine printed "Caddy server failed to start". It now waits up to a minute while the process is alive, and says it is still starting if it has not answered by then.
 * **A reload no longer leaves every site hanging:** a few seconds after each reload Cove briefly attaches a debugger to FrankenPHP to keep its crash handler intact (`cove signals`). If that debugger was killed before it let go, by its one-minute limit or anything else, FrankenPHP stayed paused and every site timed out until it was restarted. Cove now always tells FrankenPHP to carry on after the debugger exits, which does nothing when it's already running.
 
