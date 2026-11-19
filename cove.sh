@@ -92,9 +92,12 @@ setup_environment() {
             PKG_MANAGER="apt"
         elif [[ "$ID" == "fedora" || "$ID" == "centos" || "$ID" == "rhel" || "$ID_LIKE" == *"fedora"* || "$ID_LIKE" == *"rhel"* ]]; then
             PKG_MANAGER="dnf"
+        elif [[ "$ID" == "arch" || "$ID_LIKE" == *"arch"* ]]; then
+            # Arch and derivatives (Omarchy, EndeavourOS, Manjaro, CachyOS).
+            PKG_MANAGER="pacman"
         else
             echo "❌ ERROR: Unsupported Linux distribution: $ID." >&2
-            echo "Supported: Ubuntu, Debian, Fedora, CentOS, RHEL and derivatives." >&2
+            echo "Supported: Ubuntu, Debian, Fedora, CentOS, RHEL, Arch and derivatives." >&2
             exit 1
         fi
         
@@ -187,7 +190,7 @@ PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
 OPCACHE_EXCLUDE_FILE="$COVE_DIR/opcache-exclude.txt"  # cove opcache exclude
 
 PROTECTED_NAMES="cove"
-COVE_VERSION="2.5"
+COVE_VERSION="2.6"
 # Bundled Whoops release. Pinned here so cove install and cove upgrade deploy
 # the same version. 2.15.3 fatally broke under FrankenPHP's PHP 8.5 (web SAPI),
 # 500-ing every site via the auto_prepend bootstrap; 2.18.0 is compatible.
@@ -203,7 +206,7 @@ MU_PLUGIN_VERSION="0.8.0"
 # compares it against the installed copy (the bundle's
 # CFBundleShortVersionString on macOS, the VERSION file on Linux) to decide
 # whether an enabled menu bar needs a rebuild. Opt-in: never auto-installed.
-MENUBAR_VERSION="1.4"
+MENUBAR_VERSION="1.5"
 CADDY_CMD="frankenphp"
 
 # Note: BIN_DIR is set in setup_environment() based on OS and architecture
@@ -410,9 +413,271 @@ php_fpm_sock_for() {
     echo "$RUN_DIR/php-$1.sock"
 }
 
+# One tool of a native PHP, by major.minor: $2 is fpm, php, phpize or
+# php-config. Echoes its path, or nothing when that PHP (or that tool) isn't
+# installed. On macOS it's Homebrew's php@<ver>. On Linux, first the
+# php-zts packages from FrankenPHP's own repository (php-fpm-zts, php-zts,
+# phpize-zts: what apt and dnf installs use, at FrankenPHP's version, sharing
+# its /etc/php-zts/conf.d), then the distribution's: Arch's php and php-fpm
+# (/usr/bin), Debian and Ubuntu's versioned names (php8.3, php-fpm8.3),
+# Fedora's /usr/sbin/php-fpm, Remi's /opt/remi/php83. Only a binary that
+# reports that version counts, and never FrankenPHP.
+native_php_tool() {
+    local ver="$1" tool="$2" prefix nn c real got
+    case "$ver" in [578].[0-9]|[578].[0-9][0-9]) ;; *) return 0 ;; esac
+    if [ "$OS" = "macos" ]; then
+        prefix=$(php_fpm_prefix_for "$ver")
+        [ -n "$prefix" ] || return 0
+        case "$tool" in
+            fpm) c="$prefix/sbin/php-fpm" ;;
+            *) c="$prefix/bin/$tool" ;;
+        esac
+        [ -x "$c" ] && echo "$c"
+        return 0
+    fi
+    [ "$OS" = "linux" ] || return 0
+    nn="${ver//./}"
+    local cands=()
+    case "$tool" in
+        fpm) cands=(/usr/sbin/php-fpm-zts "/usr/sbin/php-fpm$ver" "/opt/remi/php$nn/root/usr/sbin/php-fpm" /usr/sbin/php-fpm /usr/bin/php-fpm) ;;
+        php) cands=(/usr/bin/php-zts "/usr/bin/php$ver" "/opt/remi/php$nn/root/usr/bin/php" /usr/bin/php) ;;
+        phpize) cands=(/usr/bin/phpize-zts "/usr/bin/phpize$ver" "/opt/remi/php$nn/root/usr/bin/phpize" /usr/bin/phpize) ;;
+        php-config) cands=(/usr/bin/php-config-zts "/usr/bin/php-config$ver" "/opt/remi/php$nn/root/usr/bin/php-config" /usr/bin/php-config) ;;
+        *) return 0 ;;
+    esac
+    for c in "${cands[@]}"; do
+        [ -x "$c" ] || continue
+        real=$(readlink -f "$c" 2>/dev/null || echo "$c")
+        case "$real" in *frankenphp*) continue ;; esac
+        case "$tool" in
+            fpm) got=$("$c" -n -v 2>/dev/null | sed -n '1s/^PHP \([0-9]*\.[0-9]*\).*/\1/p') ;;
+            php) got=$("$c" -n -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null) ;;
+            phpize) got=$("${c%phpize*}php-config${c##*phpize}" --version 2>/dev/null | sed -n 's/^\([0-9]*\.[0-9]*\).*/\1/p') ;;
+            php-config) got=$("$c" --version 2>/dev/null | sed -n 's/^\([0-9]*\.[0-9]*\).*/\1/p') ;;
+        esac
+        if [ "$got" = "$ver" ]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# The major.minor of every native PHP Linux has installed (for messages).
+native_php_versions_linux() {
+    local c v
+    for c in /usr/bin/php-zts /usr/bin/php /usr/bin/php[578].[0-9]* /opt/remi/php*/root/usr/bin/php; do
+        [ -x "$c" ] || continue
+        case "$(readlink -f "$c" 2>/dev/null)" in *frankenphp*) continue ;; esac
+        v=$("$c" -n -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null)
+        [ -n "$v" ] && echo "$v"
+    done | sort -u | paste -sd' ' -
+}
+
 # The PHP version FrankenPHP bundles (e.g. "8.5.2"), parsed from its banner.
 frankenphp_php_version() {
     frankenphp version 2>/dev/null | sed -n 's/.*PHP \([0-9][0-9.]*\).*/\1/p'
+}
+
+# --- Xdebug (cove xdebug) ---
+# FrankenPHP's PHP is a static build and can't load extensions, so a site
+# with Xdebug on (an `xdebug` file in its site dir) is served by a native
+# Homebrew php-fpm at the site's PHP (its pin, or FrankenPHP's own version)
+# with Xdebug loaded. That pool is separate from the plain one for the same
+# version ("8.3-xdebug" beside "8.3"), so sites nobody is debugging never pay
+# for Xdebug. Cove builds the extension itself into $APP_DIR/xdebug/<ver>/
+# (commands/xdebug), which keeps it out of Homebrew's php.ini: pecl would
+# load it into every php@<ver> on the machine.
+XDEBUG_DIR="$APP_DIR/xdebug"
+
+site_xdebug_on() {
+    [ -f "$1/xdebug" ]
+}
+
+# The PHP major.minor a site runs on: its pin, else FrankenPHP's.
+site_php_minor() {
+    local ver
+    ver=$(site_php_version "$1")
+    [ -n "$ver" ] || ver=$(normalize_php_version "$(frankenphp_php_version)")
+    echo "$ver"
+}
+
+# Cove's Xdebug settings, from ~/Cove/config: mode (XDEBUG_MODE, default
+# debug), when a request starts a session (XDEBUG_START: trigger | yes) and
+# the port the IDE listens on (XDEBUG_PORT, default 9003). Every value is
+# checked here, since it ends up in an ini file.
+xdebug_setting() {
+    local v
+    case "$1" in
+        mode)
+            v=$(config_get XDEBUG_MODE)
+            [[ "$v" =~ ^(off|develop|coverage|debug|gcstats|profile|trace)(,(develop|coverage|debug|gcstats|profile|trace))*$ ]] || v="debug"
+            ;;
+        start)
+            v=$(config_get XDEBUG_START)
+            [ "$v" = "yes" ] || v="trigger"
+            ;;
+        port)
+            v=$(config_get XDEBUG_PORT)
+            if [[ "$v" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$v))" -ge 1 ] && [ "$((10#$v))" -le 65535 ]; then
+                v=$((10#$v))
+            else
+                v=9003
+            fi
+            ;;
+    esac
+    echo "$v"
+}
+
+# A native PHP's extension build id, e.g. "API20250925,NTS": what an
+# extension has to be compiled against to load.
+native_php_build_id() {
+    local php
+    php=$(native_php_tool "$1" php)
+    [ -n "$php" ] || return 0
+    "$php" -n -i 2>/dev/null | sed -n 's/^PHP Extension Build => //p' | head -1
+}
+
+# The Xdebug build for a PHP version, when there is one that this native PHP
+# can load: the build records the extension build id of the PHP it was
+# compiled against (build=; older macOS builds only have api=, the extension
+# directory's name, which carries it), and an upgrade that changes it makes
+# the build stale.
+xdebug_so_for() {
+    local ver="$1" so config info want
+    so="$XDEBUG_DIR/$ver/xdebug.so"
+    [ -f "$so" ] || return 0
+    config=$(native_php_tool "$ver" php-config)
+    [ -n "$config" ] || return 0
+    info="$XDEBUG_DIR/$ver/build-info"
+    want=$(sed -n 's/^build=//p' "$info" 2>/dev/null)
+    if [ -n "$want" ]; then
+        [ "$want" = "$(native_php_build_id "$ver")" ] || return 0
+    else
+        want=$(sed -n 's/^api=//p' "$info" 2>/dev/null)
+        [ -n "$want" ] && [ "$want" = "$(basename "$("$config" --extension-dir 2>/dev/null)")" ] || return 0
+    fi
+    echo "$so"
+}
+
+# The extensions a native PHP on Linux should load for WordPress and Laravel
+# that its own ini leaves off: Arch's php ships mysqli, pdo_mysql, zip, exif,
+# bcmath and others as modules, all commented out in /etc/php/php.ini.
+# Prints "extension=<name>" for each module that's in the extension folder
+# and not loaded already; nothing on Debian and Fedora (their conf.d loads
+# every installed module) or macOS.
+native_php_extension_lines() {
+    local ver="$1" php dir loaded ext
+    [ "$OS" = "linux" ] || return 0
+    php=$(native_php_tool "$ver" php)
+    [ -n "$php" ] || return 0
+    # Without PHPRC (Cove exports it for FrankenPHP's CLI), as the pool and
+    # the CLI wrapper run it, so this PHP reads its own php.ini.
+    dir=$(env -u PHPRC "$php" -r 'echo ini_get("extension_dir");' 2>/dev/null)
+    [ -d "$dir" ] || return 0
+    loaded=" $(env -u PHPRC "$php" -m 2>/dev/null | tr 'A-Z\n' 'a-z ') "
+    for ext in mysqli pdo_mysql pdo_sqlite sqlite3 pdo_pgsql pgsql curl zip exif gd intl bcmath iconv sodium gettext gmp sockets bz2 calendar ftp soap xsl igbinary redis imagick; do
+        [ -f "$dir/$ext.so" ] || continue
+        case "$loaded" in *" $ext "*) continue ;; esac
+        echo "extension=$ext"
+    done
+}
+
+# PHP_INI_SCAN_DIR for a native PHP with Cove's extra conf.d ($2): on macOS,
+# Homebrew's conf.d then Cove's; on Linux a leading ":" keeps the folder
+# each SAPI was built with (Debian's fpm/conf.d for php-fpm, cli/conf.d for
+# php) and adds Cove's after it.
+native_php_scan_dir() {
+    local ver="$1" extra="$2" config
+    if [ "$OS" = "macos" ]; then
+        config=$(native_php_tool "$ver" php-config)
+        echo "$("$config" --ini-dir 2>/dev/null):$extra"
+    else
+        echo ":$extra"
+    fi
+}
+
+# Write the ini (and the CLI wrapper) that loads a version's Xdebug build;
+# php-fpm and the CLI both find the ini through PHP_INI_SCAN_DIR, after the
+# PHP's own conf.d. Echoes the folder holding the ini. Rewritten on every
+# reload, so a changed setting lands with the next php-fpm restart. On Linux
+# the folder also holds cove.ini: the extensions the distribution's ini
+# leaves off, MariaDB's socket, Mailpit's sendmail and Cove's memory limit.
+# There the pool and the CLI wrapper run without PHPRC, so the PHP reads its
+# own php.ini whoever starts it (a terminal, the dashboard, the watchdog).
+write_xdebug_ini() {
+    local ver="$1" so php conf_dir tmp sock
+    so=$(xdebug_so_for "$ver")
+    [ -n "$so" ] || return 1
+    php=$(native_php_tool "$ver" php)
+    [ -n "$php" ] || return 1
+    conf_dir="$XDEBUG_DIR/$ver/conf.d"
+    mkdir -p "$conf_dir" "$COVE_DIR/cache/xdebug" "$LOGS_DIR"
+    tmp="$conf_dir/xdebug.ini.tmp"
+    cat > "$tmp" << EOM
+; Auto-generated by Cove (write_xdebug_ini in main). Do not edit: change it
+; with cove xdebug mode|start|port.
+zend_extension = $so
+xdebug.mode = $(xdebug_setting mode)
+xdebug.start_with_request = $(xdebug_setting start)
+xdebug.client_host = 127.0.0.1
+xdebug.client_port = $(xdebug_setting port)
+xdebug.discover_client_host = 0
+xdebug.output_dir = $COVE_DIR/cache/xdebug
+xdebug.profiler_output_name = cachegrind.out.%H.%t.%p
+xdebug.trace_output_name = trace.%H.%t.%p
+xdebug.log = $LOGS_DIR/xdebug.log
+xdebug.log_level = 3
+EOM
+    if cmp -s "$tmp" "$conf_dir/xdebug.ini"; then rm -f "$tmp"; else mv "$tmp" "$conf_dir/xdebug.ini"; fi
+    if [ "$OS" = "linux" ]; then
+        tmp="$conf_dir/cove.ini.tmp"
+        {
+            echo "; Auto-generated by Cove (write_xdebug_ini in main): what this PHP's own"
+            echo "; ini leaves off, for the sites it serves with Xdebug."
+            native_php_extension_lines "$ver"
+            echo "sendmail_path = \"$(write_sendmail_wrapper "$(command -v mailpit)")\""
+            echo "memory_limit = $(cove_ini_get memory_limit 1G)"
+            sock=$(cove_mysql_socket)
+            if [ -n "$sock" ]; then
+                echo "mysqli.default_socket = \"$sock\""
+                echo "pdo_mysql.default_socket = \"$sock\""
+            fi
+        } > "$tmp"
+        if cmp -s "$tmp" "$conf_dir/cove.ini"; then rm -f "$tmp"; else mv "$tmp" "$conf_dir/cove.ini"; fi
+    fi
+    # The php a pinned site's CLI tools run (cove wp, artisan, composer) when
+    # an Xdebug trigger is in the environment: the native php plus this ini.
+    tmp="$XDEBUG_DIR/$ver/php.tmp"
+    local unset_rc=""
+    [ "$OS" = "linux" ] && unset_rc="env -u PHPRC "
+    cat > "$tmp" << EOM
+#!/bin/sh
+# Auto-generated by Cove (write_xdebug_ini in main): PHP $ver with Xdebug.
+PHP_INI_SCAN_DIR="$(native_php_scan_dir "$ver" "$conf_dir")" exec $unset_rc"$php" "\$@"
+EOM
+    chmod +x "$tmp"
+    if cmp -s "$tmp" "$XDEBUG_DIR/$ver/php"; then rm -f "$tmp"; else mv "$tmp" "$XDEBUG_DIR/$ver/php"; fi
+    echo "$conf_dir"
+}
+
+# Which native php-fpm pool serves a site: "<ver>" for a pinned site,
+# "<ver>-xdebug" for a site with Xdebug on (when its build is there), and
+# nothing for FrankenPHP. The pool's socket, unit and config are all named by
+# this key. Without Homebrew there is no pool, and the site stays on
+# FrankenPHP.
+site_fpm_key() {
+    local site_path="$1" ver
+    if site_xdebug_on "$site_path"; then
+        ver=$(site_php_minor "$site_path")
+        if [ -n "$ver" ] && [ -n "$(xdebug_so_for "$ver")" ]; then
+            echo "$ver-xdebug"
+            return 0
+        fi
+    fi
+    ver=$(site_php_version "$site_path")
+    [ -n "$ver" ] && [ -n "$(php_fpm_prefix_for "$ver")" ] && echo "$ver"
+    return 0
 }
 
 # Returns the process name(s) listening on $1 for display purposes, or empty
@@ -1444,8 +1709,19 @@ cove_php_cmd() {
 # A site's pinned native php binary; nothing when the site is unpinned or
 # that PHP isn't installed. Optional $1: a site dir.
 cove_native_php_for() {
-    local site_dir="$1" pinned prefix
+    local site_dir="$1" pinned prefix ver
     [ -n "$site_dir" ] || return 0
+    # A site with Xdebug on, run with a trigger in the environment
+    # (XDEBUG_SESSION=1 cove wp …): its PHP with Xdebug loaded, so the IDE
+    # can step through a CLI command too. Without a trigger, the CLI stays
+    # fast and Xdebug-free.
+    if [ -n "${XDEBUG_SESSION:-}${XDEBUG_TRIGGER:-}${XDEBUG_CONFIG:-}" ] && site_xdebug_on "$site_dir"; then
+        ver=$(site_php_minor "$site_dir")
+        if [ -n "$ver" ] && write_xdebug_ini "$ver" >/dev/null && [ -x "$XDEBUG_DIR/$ver/php" ]; then
+            echo "$XDEBUG_DIR/$ver/php"
+            return 0
+        fi
+    fi
     pinned=$(site_php_version "$site_dir")
     [ -n "$pinned" ] || return 0
     prefix=$(php_fpm_prefix_for "$pinned")
@@ -1546,6 +1822,8 @@ linux_php_extension_packages() {
     case "$PKG_MANAGER" in
         apt) echo "$base php-zts-pdo-sqlite php-zts-pdo-mysql php-zts-pdo-pgsql" ;;
         dnf) echo "$base php-zts-pdo_sqlite php-zts-pdo_mysql php-zts-pdo_pgsql" ;;
+        # pacman: none. Arch has no FrankenPHP package, so FrankenPHP's
+        # installer leaves the static binary, which has these built in.
     esac
 }
 
@@ -1756,9 +2034,18 @@ cove_pg_setup() {
             if [ "$PKG_MANAGER" = "apt" ]; then
                 $SUDO_CMD apt-get update -qq >/dev/null 2>&1
                 $SUDO_CMD env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql >/dev/null 2>&1
+            elif [ "$PKG_MANAGER" = "pacman" ]; then
+                $SUDO_CMD pacman -S --needed --noconfirm postgresql >/dev/null 2>&1
             else
                 $SUDO_CMD dnf install -y -q postgresql-server postgresql >/dev/null 2>&1
             fi || { echo "❌ Error: Could not install PostgreSQL." >&2; return 1; }
+        fi
+        # Arch leaves the cluster to be made too.
+        if [ "$PKG_MANAGER" = "pacman" ] && ! $SUDO_CMD test -f /var/lib/postgres/data/PG_VERSION; then
+            local as_pg="sudo -u postgres"
+            [ "$(id -u)" = "0" ] && as_pg="runuser -u postgres --"
+            (cd /tmp && $as_pg initdb --locale=C.UTF-8 -E UTF-8 -D /var/lib/postgres/data >/dev/null 2>&1) \
+                || { echo "❌ Error: initdb could not create /var/lib/postgres/data." >&2; return 1; }
         fi
         # Fedora and RHEL leave the cluster to be made, and let connections
         # from 127.0.0.1 in only as the matching system account (ident):
@@ -1882,6 +2169,9 @@ ensure_redis() {
         if [ "$PKG_MANAGER" = "apt" ]; then
             $SUDO_CMD apt-get update -qq >/dev/null 2>&1
             $SUDO_CMD env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq redis-server >/dev/null 2>&1
+        elif [ "$PKG_MANAGER" = "pacman" ]; then
+            # Arch replaced redis with valkey in its repositories.
+            $SUDO_CMD pacman -S --needed --noconfirm valkey >/dev/null 2>&1
         else
             $SUDO_CMD dnf install -y -q redis >/dev/null 2>&1 || $SUDO_CMD dnf install -y -q valkey >/dev/null 2>&1
         fi || { echo "❌ Error: Could not install Redis." >&2; return 1; }
@@ -1952,7 +2242,7 @@ cove_redis_site_env() {
 # webroot Cove serves anyway. Cove's own files share that folder: these are
 # listed in the app's .gitignore, never copied by clone or snapshot, and
 # never replaced by a restore.
-COVE_SITE_OWN="logs private history php_version mappings multisite twin tailscale_port lan_config laravel_workers reverb_port"
+COVE_SITE_OWN="logs private history php_version xdebug mappings multisite twin tailscale_port lan_config laravel_workers reverb_port"
 
 site_is_laravel() {
     [ -f "$1/artisan" ] && [ -f "$1/bootstrap/app.php" ] && [ -f "$1/public/index.php" ]
@@ -2636,6 +2926,20 @@ if [ \$((now_s - \$(cat "\$lv_stamp" 2>/dev/null || echo 0))) -ge 60 ] && ls "$S
     echo "\$now_s" > "\$lv_stamp"
     "$watchdog_cove" laravel --ensure >/dev/null 2>&1
 fi
+# Native php-fpm pools on Linux (a site with cove xdebug on): Cove starts
+# them itself, so any whose start script is there and whose process isn't
+# (a crash, a reboot) is started again. macOS pools are launchd's. The pid
+# file outlives a reboot, and its number may since belong to something
+# else, so the process has to be a php-fpm.
+for fpm_start in "$PHP_FPM_DIR"/*/start; do
+    [ -x "\$fpm_start" ] || continue
+    fpm_key=\$(basename "\$(dirname "\$fpm_start")")
+    fpm_pid=\$(cat "$RUN_DIR/php-fpm-\$fpm_key.pid" 2>/dev/null)
+    case "\$fpm_pid" in ''|*[!0-9]*) fpm_pid=0 ;; esac
+    if ! grep -qas php-fpm "/proc/\$fpm_pid/cmdline"; then
+        "\$fpm_start" >> "$LOGS_DIR/php-fpm-\$fpm_key.log" 2>&1
+    fi
+done
 last_s=\$(cat "\$sweep_stamp" 2>/dev/null || echo 0)
 if [ \$((now_s - last_s)) -ge 300 ]; then
     mkdir -p "$COVE_DIR/cache/screenshots"
@@ -3059,6 +3363,36 @@ EOM
     cove_ini_set auto_prepend_file "\"$fix\""
 }
 
+# MariaDB's local socket on Linux, or nothing. WordPress's DB_HOST
+# 'localhost' makes mysqli use a Unix socket, and where PHP looks for it is
+# compiled in: the distributions' php-zts packages know their own MariaDB's
+# path, but FrankenPHP's static binary (Arch, and anywhere the installer fell
+# back to it) looks in /tmp/mysql.sock and finds nothing, so every site
+# answered "Error establishing a database connection". Asks MariaDB for its
+# socket first, then tries the usual places.
+cove_mysql_socket() {
+    [ "$OS" = "linux" ] || return 0
+    local sock candidate
+    if command -v my_print_defaults >/dev/null 2>&1; then
+        sock=$(my_print_defaults mysqld 2>/dev/null | sed -n 's/^--socket=//p' | tail -1)
+        [ -S "$sock" ] && { echo "$sock"; return 0; }
+    fi
+    for candidate in /run/mysqld/mysqld.sock /var/run/mysqld/mysqld.sock /var/lib/mysql/mysql.sock; do
+        [ -S "$candidate" ] && { echo "$candidate"; return 0; }
+    done
+    return 0
+}
+
+# The CLI's half of cove_mysql_socket: ~/Cove/php.ini (PHPRC for wp-cli and
+# every PHP Cove runs from a terminal) points mysqli and PDO at the socket.
+ensure_cli_mysql_socket() {
+    local sock
+    sock=$(cove_mysql_socket)
+    [ -n "$sock" ] || return 0
+    cove_ini_set mysqli.default_socket "\"$sock\""
+    cove_ini_set pdo_mysql.default_socket "\"$sock\""
+}
+
 # The CLI side of the same: $PHP_INI_FILE (~/Cove/php.ini, PHPRC for wp-cli
 # and every other PHP Cove runs from a terminal) sets no sendmail_path, so
 # wp_mail() from `cove wp` went to /usr/sbin/sendmail, which can deliver for
@@ -3269,17 +3603,29 @@ EOM
 # pool then overrides everything Cove cares about via php_admin_value — the
 # FPM analog of the frankenphp{} php_ini block in regenerate_caddyfile.
 write_php_fpm_config() {
+    # $1 is a pool key (site_fpm_key): "8.2", or "8.5-xdebug" for the pool
+    # that loads Xdebug. The key names the folder, socket and log.
     local ver="$1"
     local conf_dir="$PHP_FPM_DIR/$ver"
     local mailpit_path
     mailpit_path=$(command -v mailpit)
     mkdir -p "$conf_dir" "$RUN_DIR" "$LOGS_DIR" "$COVE_DIR/cache/sessions"
+    # launchd keeps a macOS pool in the foreground; on Linux Cove starts the
+    # pool itself and finds it again by its pid file (see php_fpm_pool_pid).
+    local daemon_lines="daemonize = no"
+    [ "$OS" = "linux" ] && daemon_lines="daemonize = yes
+pid = $RUN_DIR/php-fpm-$ver.pid"
+    # MariaDB's socket where PHP wouldn't find it by itself (Linux).
+    local socket_lines="" sock
+    sock=$(cove_mysql_socket)
+    [ -n "$sock" ] && socket_lines="php_admin_value[mysqli.default_socket] = $sock
+php_admin_value[pdo_mysql.default_socket] = $sock"
     cat > "$conf_dir/php-fpm.conf" << EOM
 [global]
 ; Auto-generated by Cove (write_php_fpm_config in main). Do not edit —
 ; regenerated on every pin, reload, and post-upgrade.
 error_log = $LOGS_DIR/php-fpm-$ver.log
-daemonize = no
+$daemon_lines
 
 [cove]
 listen = $RUN_DIR/php-$ver.sock
@@ -3303,6 +3649,7 @@ php_admin_value[memory_limit] = $(cove_ini_get memory_limit 1G)
 php_admin_value[upload_max_filesize] = $(cove_ini_get upload_max_filesize 1G)
 php_admin_value[post_max_size] = $(cove_ini_get post_max_size 1G)
 php_admin_value[session.save_path] = $COVE_DIR/cache/sessions
+$socket_lines
 EOM
     echo "$conf_dir/php-fpm.conf"
 }
@@ -3312,12 +3659,33 @@ EOM
 # a no-op — regenerate_caddyfile calls the reconciler on every reload, and a
 # `cove add` must not bounce every pinned site's FPM as a side effect.
 install_php_fpm_service() {
+    # $1 is a pool key: "<ver>", or "<ver>-xdebug" (see site_fpm_key).
     local ver="$1"
-    local prefix
-    prefix=$(php_fpm_prefix_for "$ver")
-    if [ -z "$prefix" ]; then
-        echo "   ⚠️  php@$ver (php-fpm) not found; sites pinned to $ver fall back to FrankenPHP." >&2
+    local php_ver="${ver%-xdebug}"
+    local fpm_bin
+    fpm_bin=$(native_php_tool "$php_ver" fpm)
+    if [ -z "$fpm_bin" ]; then
+        echo "   ⚠️  php-fpm for PHP $php_ver not found; sites using it fall back to FrankenPHP." >&2
         return 1
+    fi
+
+    # The Xdebug pool finds Cove's xdebug.ini after the PHP's own conf.d. Its
+    # contents count as config: a changed mode or port restarts the pool.
+    local env_block="" xdebug_conf="" old_ini="" new_ini="" scan_dir=""
+    if [ "$ver" != "$php_ver" ]; then
+        old_ini=$(cat "$XDEBUG_DIR/$php_ver/conf.d/"*.ini 2>/dev/null)
+        if ! xdebug_conf=$(write_xdebug_ini "$php_ver"); then
+            echo "   ⚠️  No Xdebug build for PHP $php_ver; run: cove xdebug install $php_ver" >&2
+            return 1
+        fi
+        new_ini=$(cat "$xdebug_conf/"*.ini)
+        scan_dir=$(native_php_scan_dir "$php_ver" "$xdebug_conf")
+        env_block="
+        <key>EnvironmentVariables</key>
+        <dict>
+                <key>PHP_INI_SCAN_DIR</key>
+                <string>$scan_dir</string>
+        </dict>"
     fi
 
     local conf_path="$PHP_FPM_DIR/$ver/php-fpm.conf"
@@ -3327,15 +3695,17 @@ install_php_fpm_service() {
     local new_conf
     new_conf=$(cat "$conf_path")
 
-    local label="com.cove.php-fpm-$ver"
-    local plist_path="$COVE_DIR/$label.plist"
-    if [ "$old_conf" == "$new_conf" ] && [ -f "$plist_path" ] \
-        && pgrep -f "php-fpm/$ver/php-fpm.conf" &>/dev/null; then
-        return 0
+    if [ "$OS" = "linux" ]; then
+        php_fpm_pool_install_linux "$ver" "$fpm_bin" "$scan_dir" "$old_conf$old_ini" "$new_conf$new_ini"
+        return
     fi
 
-    launchctl unload "$plist_path" &>/dev/null || true
-    cat > "$plist_path" << EOM
+    local label="com.cove.php-fpm-$ver"
+    local plist_path="$COVE_DIR/$label.plist"
+    local old_plist=""
+    [ -f "$plist_path" ] && old_plist=$(cat "$plist_path")
+    local new_plist
+    new_plist=$(cat << EOM
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -3348,7 +3718,7 @@ install_php_fpm_service() {
         <string>$label</string>
         <key>ProgramArguments</key>
         <array>
-                <string>$prefix/sbin/php-fpm</string>
+                <string>$fpm_bin</string>
                 <string>--nodaemonize</string>
                 <string>--fpm-config</string>
                 <string>$conf_path</string>
@@ -3358,10 +3728,18 @@ install_php_fpm_service() {
         <key>StandardErrorPath</key>
         <string>$LOGS_DIR/php-fpm-$ver.log</string>
         <key>StandardOutPath</key>
-        <string>$LOGS_DIR/php-fpm-$ver.log</string>
+        <string>$LOGS_DIR/php-fpm-$ver.log</string>${env_block}
 </dict>
 </plist>
 EOM
+)
+    if [ "$old_conf" == "$new_conf" ] && [ "$old_plist" == "$new_plist" ] && [ "$old_ini" == "$new_ini" ] \
+        && pgrep -f "php-fpm/$ver/php-fpm.conf" &>/dev/null; then
+        return 0
+    fi
+
+    launchctl unload "$plist_path" &>/dev/null || true
+    printf '%s\n' "$new_plist" > "$plist_path"
     launchctl load "$plist_path"
     launchctl start "$label"
 }
@@ -3371,9 +3749,78 @@ EOM
 # re-pin instant.
 remove_php_fpm_service() {
     local ver="$1"
+    if [ "$OS" = "linux" ]; then
+        # The start script goes first: the watchdog starts any pool whose
+        # script is there and whose process isn't, so with the pool stopped
+        # first it could start it again in between.
+        rm -f "$PHP_FPM_DIR/$ver/start"
+        php_fpm_pool_stop "$ver"
+        return 0
+    fi
     local plist_path="$COVE_DIR/com.cove.php-fpm-$ver.plist"
     launchctl unload "$plist_path" &>/dev/null || true
     rm -f "$plist_path" "$RUN_DIR/php-$ver.sock"
+}
+
+# --- Linux pools ---
+# No service manager here: a system unit per pool would need sudo on every
+# reload. Cove starts each pool's php-fpm itself (daemonized, as the user
+# running Cove) from $PHP_FPM_DIR/<key>/start, finds it again by
+# $RUN_DIR/php-fpm-<key>.pid, and the watchdog starts any pool whose start
+# script is there and whose process isn't (a crash, a reboot).
+
+# The running master's pid for a pool, or nothing.
+php_fpm_pool_pid() {
+    local key="$1" pid
+    pid=$(cat "$RUN_DIR/php-fpm-$key.pid" 2>/dev/null)
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    # A recycled pid belongs to something else: the master's title names
+    # its config.
+    if [ -r "/proc/$pid/cmdline" ] && ! tr '\0' ' ' < "/proc/$pid/cmdline" | grep -qF "$PHP_FPM_DIR/$key/php-fpm.conf"; then
+        return 0
+    fi
+    echo "$pid"
+}
+
+php_fpm_pool_stop() {
+    local key="$1" pid i
+    pid=$(php_fpm_pool_pid "$key")
+    if [ -n "$pid" ]; then
+        kill -QUIT "$pid" 2>/dev/null
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
+    fi
+    rm -f "$RUN_DIR/php-fpm-$key.pid" "$RUN_DIR/php-$key.sock"
+}
+
+# Write the pool's start script and (re)start it when the script, config or
+# ini changed or it isn't running. $4/$5 = the config + ini before and after.
+php_fpm_pool_install_linux() {
+    local key="$1" fpm_bin="$2" scan_dir="$3" old="$4" new="$5"
+    local start="$PHP_FPM_DIR/$key/start" root_flag="" script
+    # php-fpm refuses to run as root without -R (a root install: containers,
+    # some servers).
+    [ "$(id -u)" -eq 0 ] && root_flag=" -R"
+    script="#!/bin/sh
+# Auto-generated by Cove (php_fpm_pool_install_linux in main): starts the
+# $key php-fpm pool. The watchdog runs it when the pool isn't running.
+${scan_dir:+PHP_INI_SCAN_DIR='$scan_dir' }exec env -u PHPRC '$fpm_bin' --fpm-config '$PHP_FPM_DIR/$key/php-fpm.conf'$root_flag"
+    if [ "$old" == "$new" ] && [ "$(cat "$start" 2>/dev/null)" == "$script" ] && [ -n "$(php_fpm_pool_pid "$key")" ]; then
+        return 0
+    fi
+    printf '%s\n' "$script" > "$start.tmp" && chmod +x "$start.tmp" && mv "$start.tmp" "$start"
+    php_fpm_pool_stop "$key"
+    # The watchdog may have started it from the new script in between; that
+    # start is as good as this one.
+    if ! "$start" >> "$LOGS_DIR/php-fpm-$key.log" 2>&1 && [ -z "$(php_fpm_pool_pid "$key")" ]; then
+        echo "   ⚠️  php-fpm for $key didn't start; see $LOGS_DIR/php-fpm-$key.log" >&2
+        return 1
+    fi
+    return 0
 }
 
 # Reconcile running php-fpm units against what sites actually pin. Called
@@ -3386,10 +3833,24 @@ sync_php_fpm_services() {
     if [ -d "$SITES_DIR" ]; then
         for site_path in "$SITES_DIR"/*; do
             [ -d "$site_path" ] || continue
-            ver=$(site_php_version "$site_path")
-            [ -n "$ver" ] || continue
-            if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
-                echo "   ⚠️  $(basename "$site_path") pins PHP $ver, but per-site PHP requires Homebrew on macOS; serving with FrankenPHP." >&2
+            if [ "$OS" != "linux" ] && { [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; }; then
+                ver=$(site_php_version "$site_path")
+                [ -n "$ver" ] && echo "   ⚠️  $(basename "$site_path") pins PHP $ver, but per-site PHP requires Homebrew on macOS; serving with FrankenPHP." >&2
+                site_xdebug_on "$site_path" && echo "   ⚠️  $(basename "$site_path") has Xdebug on, but Xdebug needs Homebrew on macOS or Linux; serving with FrankenPHP." >&2
+                continue
+            fi
+            # The pool the site's handler points at (pinned, Xdebug, or none).
+            ver=$(site_fpm_key "$site_path")
+            if [ -z "$ver" ]; then
+                ver=$(site_php_version "$site_path")
+                if [ -n "$ver" ]; then
+                    if [ "$OS" = "linux" ]; then
+                        echo "   ⚠️  $(basename "$site_path") pins PHP $ver, but per-site PHP requires Homebrew on macOS; serving with FrankenPHP." >&2
+                    else
+                        echo "   ⚠️  php@$ver (php-fpm) not found; $(basename "$site_path") falls back to FrankenPHP." >&2
+                    fi
+                fi
+                site_xdebug_on "$site_path" && echo "   ⚠️  No Xdebug build for $(basename "$site_path")'s PHP; run: cove xdebug $(basename "$site_path" .localhost) on" >&2
                 continue
             fi
             case "$needed" in
@@ -3399,6 +3860,21 @@ sync_php_fpm_services() {
         done
     fi
 
+    if [ "$OS" = "linux" ]; then
+        for ver in $needed; do
+            install_php_fpm_service "$ver" || true
+        done
+        local start
+        for start in "$PHP_FPM_DIR"/*/start; do
+            [ -f "$start" ] || continue
+            ver=$(basename "$(dirname "$start")")
+            case "$needed" in
+                *" $ver "*) ;;
+                *) remove_php_fpm_service "$ver" ;;
+            esac
+        done
+        return 0
+    fi
     if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
         return 0
     fi
@@ -3474,7 +3950,7 @@ site_not_found() {
 }
 
 # Every command `cove` takes, for suggesting one when a name is mistyped.
-COVE_COMMANDS="add artisan backup clone composer core db delete demo directive disable enable health help history import install lan laravel list log login mappings mcp memory menubar network opcache path php ports postgres proxy pull push redis reload rename screenshot share signals snapshot status tailscale transfer trust twin uninstall upgrade url version wp wsl-hosts"
+COVE_COMMANDS="add artisan backup clone composer core db delete demo directive disable enable health help history import install lan laravel list log login mappings mcp memory menubar network opcache path php ports postgres proxy pull push redis reload rename screenshot share signals snapshot status tailscale transfer trust twin uninstall upgrade url version wp wsl-hosts xdebug"
 
 # The words among $2… nearest to $1 as a slip of the keyboard would make
 # them: up to three, nearest first, one per line. Near is one edit for a word
@@ -3802,6 +4278,8 @@ start_caddy_service() {
 
     if [ "$OS" == "macos" ]; then
         local caddy_plist_path="$COVE_DIR/com.cove.caddy.plist"
+        # Cove is up again, so the next login starts it (cove autostart).
+        rm -f "$AUTOSTART_STOPPED_FILE"
         launchctl unload "$caddy_plist_path" &>/dev/null
         "$CADDY_CMD" stop --config "$CADDYFILE_PATH" &>/dev/null 2>&1
         write_caddy_plist || true
@@ -3861,11 +4339,13 @@ prune_delete_tombstones() {
 emit_site_php_handler() {
     local site_path="$1" env_name="$2" env_value="$3"
     local ver handler open=""
-    ver=$(site_php_version "$site_path")
+    # The native pool for a pinned site or one with Xdebug on (site_fpm_key
+    # only answers when the PHP, and for Xdebug its build, is there).
+    ver=$(site_fpm_key "$site_path")
     # An optional server variable for PHP (a twin's COVE_TWIN_OF) goes in the
     # handler's block, which both php_server and php_fastcgi take.
     [ -n "$env_name" ] && open=" {"
-    if [ -n "$ver" ] && [ -n "$(php_fpm_prefix_for "$ver")" ]; then
+    if [ -n "$ver" ]; then
         # php_server is shorthand for php_fastcgi + file_server. When swapping
         # in a pinned socket, file_server must come along explicitly or every
         # static asset (JS/CSS/images) falls through to no handler and Caddy
@@ -4143,6 +4623,7 @@ regenerate_caddyfile() {
     # `php_ini session.save_path` exists before FrankenPHP tries to use it.
     mkdir -p "$COVE_DIR/cache/sessions" "$RUN_DIR" 2>/dev/null
     ensure_cli_argv_fix
+    ensure_cli_mysql_socket
     # Converge native php-fpm services with the sites' php_version pins BEFORE
     # writing the config that points at their sockets.
     sync_php_fpm_services
@@ -4173,6 +4654,12 @@ regenerate_caddyfile() {
     # Paths OPcache never caches (cove opcache exclude), only while the list
     # has something in it.
     local opcache_exclude_directive=""
+    # MariaDB's socket for mysqli and PDO (see cove_mysql_socket).
+    local mysql_socket_directive="" mysql_socket
+    mysql_socket=$(cove_mysql_socket)
+    if [ -n "$mysql_socket" ]; then
+        mysql_socket_directive="        php_ini mysqli.default_socket \"$mysql_socket\""$'\n'"        php_ini pdo_mysql.default_socket \"$mysql_socket\""$'\n'
+    fi
     if [ -f "$OPCACHE_EXCLUDE_FILE" ] && grep -q -v -E '^[[:space:]]*(;|$)' "$OPCACHE_EXCLUDE_FILE"; then
         opcache_exclude_directive="        php_ini opcache.blacklist_filename \"$OPCACHE_EXCLUDE_FILE\""$'\n'
     fi
@@ -4254,7 +4741,7 @@ ${opcache_exclude_directive}        # See the disabled_fns note above: opcache_r
         # unwritable and Adminer spams session_start warnings every
         # request.
         php_ini session.save_path "$COVE_DIR/cache/sessions"
-    }
+${mysql_socket_directive}    }
     order php_server before file_server
     servers {
         # HTTP/1.1 and HTTP/2. The h1-only pin this replaces dated from
@@ -5864,6 +6351,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                         'db_name' => $laravel ? $laravel['db_name'] : $db_name,
                         // Per-site PHP pin (`cove php`); null = Cove's default PHP.
                         'php_version' => is_file($site_path . '/php_version') ? trim((string) @file_get_contents($site_path . '/php_version')) : null,
+                        // cove xdebug <site> on: served by php-fpm with Xdebug.
+                        'xdebug' => is_file($site_path . '/xdebug'),
                         // When the dashboard's preview of the front page was captured.
                         'shot_mtime' => is_file($user_home . '/Cove/cache/screenshots/' . str_replace('.localhost', '', $item) . '.png') ? filemtime($user_home . '/Cove/cache/screenshots/' . str_replace('.localhost', '', $item) . '.png') : null,
                         // Theme, plugins and the last plugin or theme change
@@ -6028,7 +6517,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             if (!$installed && version_compare($v, '8.1', '<')) continue;
             $versions[] = ['version' => $v, 'installed' => $installed];
         }
-        echo json_encode(['supported' => $supported, 'default' => $default_mm, 'versions' => $versions]);
+        // Cove's Xdebug settings (cove xdebug mode|start|port), as the CLI
+        // reads them. parse_ini_file turns yes into "1" and off into "".
+        $__xd_cfg = isset($__cove_cfg) && is_array($__cove_cfg) ? $__cove_cfg : [];
+        $__xd_mode = array_key_exists('XDEBUG_MODE', $__xd_cfg) ? (string) $__xd_cfg['XDEBUG_MODE'] : 'debug';
+        if ($__xd_mode === '') $__xd_mode = 'off';
+        if (!preg_match('/^(off|develop|coverage|debug|gcstats|profile|trace)(,(develop|coverage|debug|gcstats|profile|trace))*$/', $__xd_mode)) $__xd_mode = 'debug';
+        $__xd_start = in_array((string) ($__xd_cfg['XDEBUG_START'] ?? ''), ['1', 'yes'], true) ? 'yes' : 'trigger';
+        $__xd_port = (int) ($__xd_cfg['XDEBUG_PORT'] ?? 0);
+        if ($__xd_port < 1 || $__xd_port > 65535) $__xd_port = 9003;
+        // Xdebug also runs on Linux, on the distribution's php-fpm (the CLI
+        // offers to install it), though per-site pins don't yet.
+        $xdebug = ['supported' => $supported || PHP_OS_FAMILY === 'Linux', 'mode' => $__xd_mode, 'start' => $__xd_start, 'port' => $__xd_port, 'builds' => []];
+        foreach (glob($user_home . '/Cove/App/xdebug/*/build-info') ?: [] as $__xd_info) {
+            $__xd_ver = basename(dirname($__xd_info));
+            if (preg_match('/^version=(.+)$/m', (string) @file_get_contents($__xd_info), $__xd_m)) $xdebug['builds'][$__xd_ver] = trim($__xd_m[1]);
+        }
+        echo json_encode(['supported' => $supported, 'default' => $default_mm, 'versions' => $versions, 'xdebug' => $xdebug]);
         exit;
     }
 }
@@ -7101,7 +7606,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Parse the command's output to find the URL.
                 foreach ($output_lines as $line) {
-                    if (strpos($line, 'https://') !== false && (strpos($line, '/wp-login.php') !== false || strpos($line, '/__cove/login/') !== false)) {
+                    if (strpos($line, 'https://') !== false && (strpos($line, '/wp-login.php') !== false || strpos($line, '/minn-admin/login?') !== false || strpos($line, '/__cove/login/') !== false)) {
                         // Clean the line from any "gum" box characters.
                         $login_url = trim(preg_replace('/[│└┌]/u', '', $line));
                         break;
@@ -7232,6 +7737,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 escapeshellarg($user_home), escapeshellarg($cove_path),
                 escapeshellarg($site_name), escapeshellarg($php_version), escapeshellarg($apply_log)));
             echo json_encode(['success' => true, 'applying' => true, 'installing' => $needs_install]);
+            exit;
+        case 'set_xdebug':
+            // cove xdebug <site> on|off. In the background, like set_php: it
+            // reloads the Caddy serving this dashboard, and the first 'on'
+            // for a PHP version builds Xdebug (and may install php@<ver>).
+            // The UI polls list_sites for the site's xdebug flag.
+            $xdebug_on = !empty($input['on']);
+            if (empty($site_name) || !preg_match('/^[a-z0-9-]+$/', $site_name) || !is_dir($sitedir . '/' . $site_name . '.localhost')) {
+                $response['message'] = 'Invalid site name provided.';
+                break;
+            }
+            if (PHP_OS_FAMILY !== 'Darwin' && PHP_OS_FAMILY !== 'Linux') {
+                $response['message'] = 'Xdebug needs Homebrew on macOS, or Linux.';
+                break;
+            }
+            $flag_file = $sitedir . '/' . $site_name . '.localhost/xdebug';
+            if (is_file($flag_file) === $xdebug_on) {
+                echo json_encode(['success' => true, 'message' => 'Already set.']);
+                exit;
+            }
+            $pin_file = $sitedir . '/' . $site_name . '.localhost/php_version';
+            $xd_ver = is_file($pin_file) ? trim((string) @file_get_contents($pin_file)) : preg_replace('/^(\d+\.\d+).*$/', '$1', PHP_VERSION);
+            // Linux: the distribution's php-fpm has to be there first, and
+            // installing it takes a password, so that happens in a terminal
+            // (the CLI offers it). Same places native_php_tool looks.
+            if ($xdebug_on && PHP_OS_FAMILY === 'Linux') {
+                $__xd_nn = str_replace('.', '', $xd_ver);
+                $__xd_fpm = false;
+                foreach (['/usr/sbin/php-fpm-zts', '/usr/sbin/php-fpm' . $xd_ver, '/opt/remi/php' . $__xd_nn . '/root/usr/sbin/php-fpm', '/usr/sbin/php-fpm', '/usr/bin/php-fpm'] as $__xd_c) {
+                    if (is_executable($__xd_c)) { $__xd_fpm = true; break; }
+                }
+                if (!$__xd_fpm) {
+                    $response['message'] = 'Xdebug needs PHP ' . $xd_ver . "'s php-fpm. Run cove xdebug " . $site_name . ' on in a terminal: it offers to install it.';
+                    break;
+                }
+            }
+            $needs_build = $xdebug_on && !is_file($user_home . '/Cove/App/xdebug/' . $xd_ver . '/xdebug.so');
+            $apply_log = $user_home . '/Cove/cache/xdebug-apply-' . $site_name . '.log';
+            shell_exec(sprintf('HOME=%s %s xdebug %s %s > %s 2>&1 &',
+                escapeshellarg($user_home), escapeshellarg($cove_path),
+                escapeshellarg($site_name), $xdebug_on ? 'on' : 'off', escapeshellarg($apply_log)));
+            echo json_encode(['success' => true, 'applying' => true, 'building' => $needs_build]);
             exit;
         case 'service_info':
             // One status panel per nav service. Only cheap probes: a socket check
@@ -8650,6 +9197,11 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .site-type.laravel { background: var(--pill-laravel-bg); color: var(--pill-laravel-fg); }
         .site-type.static { background: var(--pill-static-bg); color: var(--pill-static-fg); }
         @keyframes php-pulse { 50% { opacity: 0.45; } }
+        .sl-xdebug { color: var(--accent); border-color: var(--accent); }
+        .php-xdebug { margin-top: 0.9rem; padding-top: 0.8rem; border-top: 1px solid var(--hairline); }
+        .php-xdebug .php-option.on { border-color: var(--accent); background: var(--pill-wp-bg); }
+        .php-xdebug .modal-hint { margin: 0.45rem 0 0; font-size: 0.75rem; color: var(--text-faint); line-height: 1.45; }
+        .php-xdebug .modal-hint code { font-family: var(--font-mono); font-size: 0.72rem; white-space: nowrap; }
         .sl-php.applying { border-color: var(--accent); color: var(--text-dim); animation: php-pulse 1.2s ease-in-out infinite; }
         .sl-sig { display: inline-flex; align-items: center; gap: 0.25rem; padding: 0.05rem 0.45rem 0.05rem 0.32rem; border-radius: 999px; font-family: var(--font-mono); font-weight: 500; font-size: 0.68rem; line-height: 1.5; flex: none; white-space: nowrap; }
         .sl-sig svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.6; }
@@ -9019,6 +9571,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
         .mail-part:hover { color: var(--text); background: var(--panel-hover); }
         .mail-part.is-active { color: var(--text); background: var(--panel); border-color: var(--panel-border); }
         .mail-bar-note { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+        .mail-msg-bar .mail-images { padding: 0.2rem 0.5rem; font-size: 0.7rem; margin-left: -0.4rem; }
+        .mail-msg-bar .mail-scheme { padding: 0.2rem 0.5rem; font-size: 0.7rem; }
+        .mail-msg-bar .mail-scheme.is-dark { background: #1c1c1e; color: #e8e8ea; border-color: #1c1c1e; }
         .mail-msg-actions { margin-left: auto; display: flex; gap: 0.35rem; }
         .mail-msg-actions .pill { padding: 0.26rem 0.6rem; font-size: 0.74rem; }
         .mail-frame { display: block; width: 100%; border: 0; background: #fff; min-height: 240px; color-scheme: light; }
@@ -9849,7 +10404,9 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                                     <button type="button" class="mail-part" role="tab" data-part="text">text</button>
                                     <button type="button" class="mail-part" role="tab" data-part="headers">headers</button>
                                 </div>
+                                <button type="button" class="pill mail-scheme" id="btnMailScheme" title="Preview the message as a mail app in light or dark mode shows it">light</button>
                                 <span class="mail-bar-note" id="mailRemoteNote" style="display: none;"></span>
+                                <button type="button" class="pill mail-images" id="btnMailImages" style="display: none;" title="Load this message's remote images (the sender's server sees the request)">load images</button>
                                 <div class="mail-msg-actions">
                                     <button type="button" class="pill" id="btnMailUnread">mark unread</button>
                                     <button type="button" class="pill" id="btnMailDelete">delete</button>
@@ -9859,7 +10416,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             <div class="mail-msg-body">
                                 <!-- No scripts, no forms, no remote loads: the sandbox denies
                                      script execution, and the CSP injected into the srcdoc
-                                     limits images to inline parts served via /mail-api/.
+                                     limits images to inline parts served via /mail-api/
+                                     and Cove's own *.localhost sites, until "load images".
                                      allow-same-origin is what lets the frame be measured
                                      (and 'self' resolve for those inline parts); with no
                                      allow-scripts nothing inside can act on that origin.
@@ -10514,9 +11072,16 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
     <!-- PHP version picker -->
     <div class="modal-backdrop" id="phpModal" style="display: none;">
         <div class="modal">
-            <h3>PHP version <span class="modal-title-dim" id="phpModalSite"></span></h3>
+            <h3>PHP <span class="modal-title-dim" id="phpModalSite"></span></h3>
             <p class="modal-sub">Pinned sites run on a native Homebrew php-fpm behind FrankenPHP — TLS, logs and the URL stay the same.</p>
             <div class="php-options" id="phpOptions"></div>
+            <div class="php-xdebug" id="phpXdebug" style="display: none;">
+                <button type="button" class="php-option" id="btnXdebug">
+                    <span class="php-option-name" id="phpXdebugName">Xdebug</span>
+                    <span class="php-option-meta" id="phpXdebugMeta"></span>
+                </button>
+                <p class="modal-hint" id="phpXdebugHint"></p>
+            </div>
             <template id="tpl-php-option">
                 <button type="button" class="php-option">
                     <span class="php-option-name"></span>
@@ -10660,7 +11225,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             <button class="ctx-item" id="ctxReveal"><span>Open folder</span></button>
             <button class="ctx-item" id="ctxFiles"><span>Browse files</span></button>
             <button class="ctx-item" id="ctxDb"><span>Open database</span></button>
-            <button class="ctx-item" id="ctxPhp"><span>PHP version…</span><span class="ctx-key" id="ctxPhpMeta"></span></button>
+            <button class="ctx-item" id="ctxPhp"><span>PHP &amp; Xdebug…</span><span class="ctx-key" id="ctxPhpMeta"></span></button>
             <button class="ctx-item" id="ctxDomains"><span>Domains…</span><span class="ctx-key" id="ctxDomainsMeta"></span></button>
             <button class="ctx-item" id="ctxLog"><span>View log</span></button>
             <button class="ctx-item" id="ctxMail"><span>View mail</span></button>
@@ -10899,6 +11464,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // from the site objects because getSites() rebuilds those from the
             // server and would drop a flag stored on them mid-install.
             phpApplying: {},
+            xdebugApplying: {},
             // kind: wordpress | plain | minn | laravel (the add form's type field).
             newSite: { name: '', kind: 'wordpress', wpVersion: 'latest', database: 'sqlite', from: '', isLoading: false },
             userRole: { value: 'administrator' },
@@ -10934,7 +11500,8 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 query: '', site: null, unreadOnly: false,
                 loading: false, loaded: false, error: null,
                 selectedId: null, msg: null, msgLoading: false, msgError: null,
-                part: 'html', headers: null, renderedId: null, remoteBlocked: 0,
+                part: 'html', headers: null, renderedId: null, remoteBlocked: 0, remoteAllowed: false,
+                scheme: (() => { try { return localStorage.getItem('cove-mail-scheme') === 'dark' ? 'dark' : 'light'; } catch (e) { return 'light'; } })(),
                 deleteArmed: false, armTimer: null, searchTimer: null, syncTimer: null,
                 seq: 0, ws: null, pollTimer: null, wsRetry: null, info: null,
             },
@@ -11619,6 +12186,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     const btn = e.target.closest('.php-option');
                     if (btn && !btn.disabled) this.choosePhp(btn.dataset.version);
                 });
+                $id('btnXdebug').addEventListener('click', () => this.toggleXdebug());
                 $id('ctxCopy').addEventListener('click', withCtxSite(s => this.copyPath(s.full_path)));
 
                 // Domains (cove mappings)
@@ -11912,8 +12480,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             sitePhpHtml(site) {
                 const applying = this.phpApplying[site.name];
                 if (applying) return '<span class="sl-php applying" title="Switching PHP version…">' + (applying === 'default' ? 'php default…' : 'php ' + this.escapeHtml(applying) + '…') + '</span>';
-                if (site.php_version) return '<span class="sl-php" title="Pinned to PHP ' + this.escapeHtml(site.php_version) + ' (native php-fpm). Change via the menu.">php ' + this.escapeHtml(site.php_version) + '</span>';
-                return '';
+                let html = '';
+                if (site.php_version) html = '<span class="sl-php" title="Pinned to PHP ' + this.escapeHtml(site.php_version) + ' (native php-fpm). Change via the menu.">php ' + this.escapeHtml(site.php_version) + '</span>';
+                const xd = this.xdebugApplying[site.name];
+                if (xd !== undefined) html += ' <span class="sl-php applying" title="' + (xd ? 'Turning Xdebug on…' : 'Turning Xdebug off…') + '">xdebug…</span>';
+                else if (site.xdebug) html += ' <span class="sl-php sl-xdebug" title="Xdebug is on: served by php-fpm with Xdebug. Turn it off from the PHP menu, or: cove xdebug ' + this.escapeHtml(site.name) + ' off">xdebug</span>';
+                return html;
             },
 
             siteSignalsHtml(site) {
@@ -12392,7 +12964,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 // platforms where per-site pins aren't supported.
                 show($id('ctxPhp'), !this.phpInfo || this.phpInfo.supported !== false);
                 const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
-                $id('ctxPhpMeta').textContent = effPhp ? 'php ' + effPhp : '';
+                $id('ctxPhpMeta').textContent = effPhp ? 'php ' + effPhp + (site.xdebug ? ' · xdebug' : '') : '';
                 // Extra addresses beyond <site>.localhost: explicit mappings
                 // plus the wildcard a subdomain multisite gets for free.
                 const extraDomains = (site.mappings || []).length + (site.multisite === 'subdomain' ? 1 : 0);
@@ -12413,7 +12985,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     ctxReveal: 'open "$(cove path ' + n + ')"',
                     ctxFiles: 'cd "$(cove path ' + n + ')"',
                     ctxDb: { note: 'opens ' + n + "'s tables in the dashboard" },
-                    ctxPhp: 'cove php ' + n + ' <version>',
+                    ctxPhp: site.xdebug ? 'cove xdebug ' + n + ' off' : 'cove php ' + n + ' <version>',
                     ctxDomains: 'cove mappings ' + n,
                     ctxLog: 'cove log ' + n + ' --follow',
                     ctxMail: { note: 'mail sent to anyone @' + n + '.localhost' },
@@ -12449,7 +13021,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const options = [{
                     version: 'default',
                     label: 'default — PHP ' + info.default,
-                    meta: pin ? 'FrankenPHP' : 'current · FrankenPHP',
+                    meta: pin ? 'FrankenPHP' : (live.xdebug ? 'current · php-fpm with Xdebug' : 'current · FrankenPHP'),
                     installed: true,
                     current: !pin,
                 }];
@@ -12457,7 +13029,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     options.push({
                         version: v.version,
                         label: 'PHP ' + v.version,
-                        meta: pin === v.version ? 'current · php-fpm'
+                        meta: pin === v.version ? (live.xdebug ? 'current · php-fpm with Xdebug' : 'current · php-fpm')
                             : (v.installed ? 'installed' : 'not installed — click to install'),
                         installed: v.installed,
                         current: pin === v.version,
@@ -12480,6 +13052,31 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 $id('phpModalHint').textContent = applying
                     ? 'Switching to ' + (applying === 'default' ? 'the default PHP' : 'PHP ' + applying) + '…'
                     : '';
+                // Xdebug: on or off for this site, on whatever PHP it runs.
+                const xd = info.xdebug;
+                show($id('phpXdebug'), !!(xd && xd.supported));
+                if (xd && xd.supported) {
+                    const on = !!live.xdebug;
+                    const busy = this.xdebugApplying[site.name] !== undefined;
+                    const ver = pin || info.default;
+                    const btn = $id('btnXdebug');
+                    btn.classList.toggle('on', on);
+                    btn.disabled = busy || !!applying;
+                    $id('phpXdebugName').textContent = on ? 'Xdebug on' : 'Xdebug off';
+                    $id('phpXdebugMeta').textContent = busy ? (on ? 'turning off…' : 'turning on…')
+                        : on ? 'click to turn off'
+                        : (xd.builds && xd.builds[ver] ? 'click to turn on' : 'click to turn on · builds it for PHP ' + ver + ' first');
+                    const hint = $id('phpXdebugHint');
+                    hint.textContent = '';
+                    const parts = on
+                        ? ['Your IDE listens on port ' + xd.port + '. ', xd.start === 'yes' ? 'Every request starts a session.' : ['Start a session with the ', 'XDEBUG_SESSION', ' cookie (any Xdebug browser extension) or ', '?XDEBUG_SESSION=1', '.']]
+                        : ['Step debugging and profiling (mode ' + xd.mode + '). The site moves to a php-fpm with Xdebug loaded; other sites are untouched.'];
+                    const add = (t, code) => { const el = document.createElement(code ? 'code' : 'span'); el.textContent = t; hint.appendChild(el); };
+                    for (const part of parts) {
+                        if (Array.isArray(part)) part.forEach((t, i) => add(t, i % 2 === 1));
+                        else add(part, false);
+                    }
+                }
             },
 
             renderModals() {
@@ -13385,8 +13982,16 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
             // URLs here. A CSP inside the document keeps everything else out —
             // the sandbox already denies scripts and forms; this also stops
             // remote images, fonts and stylesheets so a message never phones
-            // home when opened.
-            mailHtmlDoc(msg) {
+            // home when opened. Images from Cove's own *.localhost sites load,
+            // since they never leave this machine; any other image waits for
+            // "load images" (remoteAllowed, reset per message).
+            //
+            // scheme 'dark' previews the message as a mail app in dark mode
+            // shows it: the message's prefers-color-scheme rules are rewritten
+            // to match (dark) or never match (light) whatever the dashboard's
+            // own theme is, and a message with no colours of its own gets a
+            // dark page, as Apple Mail gives it.
+            mailHtmlDoc(msg, allowRemote, scheme) {
                 let html = msg.HTML || '';
                 for (const p of (msg.Inline || [])) {
                     if (!p.ContentID) continue;
@@ -13394,12 +13999,51 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     html = html.split('cid:' + p.ContentID).join(url);
                 }
                 html = html.replace(/<script[\s\S]*?<\/script\s*>/gi, '').replace(/<meta[^>]+http-equiv[^>]*>/gi, '');
-                const csp = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'none'";
+                const dark = scheme === 'dark';
+                html = html.replace(/\(\s*prefers-color-scheme\s*:\s*(dark|light)\s*\)/gi, (t, want) =>
+                    (want.toLowerCase() === 'dark') === dark ? '(min-width: 0px)' : '(max-width: 0px)');
+                const img = "'self' data: https://localhost:* http://localhost:* https://*.localhost:* http://*.localhost:*" + (allowRemote ? ' https: http:' : '');
+                const csp = "default-src 'none'; img-src " + img + "; style-src 'unsafe-inline'; form-action 'none'";
                 const head = '<meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + csp + '"><base target="_blank">'
-                    + '<style>html{color-scheme:light}body{margin:0;padding:16px;background:#fff;color:#1a1c1b;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',system-ui,sans-serif;line-height:1.45}</style>';
+                    + '<style>html{color-scheme:' + (dark ? 'dark' : 'light') + '}body{margin:0;padding:16px;background:' + (dark ? '#1c1c1e' : '#fff') + ';color:' + (dark ? '#e8e8ea' : '#1a1c1b') + ';font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',system-ui,sans-serif;line-height:1.45}' + (dark ? 'a{color:#6fa8ff}' : '') + '</style>';
                 if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, (t) => t + head);
                 if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, (t) => t + '<head>' + head + '</head>');
                 return '<!doctype html><html><head>' + head + '</head><body>' + html + '</body></html>';
+            },
+
+            // Draws the HTML part into the sandboxed frame, sizes the frame to
+            // it, and counts the images the CSP held back (any http(s) image
+            // not on a *.localhost host).
+            loadMailFrame(msg) {
+                const m = this.mail;
+                const frame = $id('mailFrame');
+                frame.style.height = '';
+                if (!msg.HTML) {
+                    frame.onload = null;
+                    frame.srcdoc = '';
+                    return;
+                }
+                frame.onload = () => {
+                    try {
+                        const d = frame.contentDocument;
+                        const h = Math.max(d.documentElement.scrollHeight, d.body ? d.body.scrollHeight : 0);
+                        frame.style.height = Math.min(Math.max(h + 8, 240), 6000) + 'px';
+                        const remote = (src) => {
+                            if (!/^(https?:)?\/\//i.test(src || '')) return false;
+                            try { return !/(^|\.)localhost$/i.test(new URL(src, 'https://cove.localhost').hostname); } catch (e) { return true; }
+                        };
+                        m.remoteBlocked = m.remoteAllowed ? 0
+                            : [...d.querySelectorAll('img[src], [background]')].filter(el => remote(el.getAttribute('src') || el.getAttribute('background'))).length;
+                        this.renderMailReader();
+                        // Images that load later change the height.
+                        if (m.remoteAllowed) d.querySelectorAll('img').forEach(i => i.addEventListener('load', () => {
+                            const h2 = Math.max(d.documentElement.scrollHeight, d.body ? d.body.scrollHeight : 0);
+                            frame.style.height = Math.min(Math.max(h2 + 8, 240), 6000) + 'px';
+                        }, { once: true }));
+                    } catch (e) {}
+                };
+                frame.style.colorScheme = m.scheme;
+                frame.srcdoc = this.mailHtmlDoc(msg, m.remoteAllowed, m.scheme);
             },
 
             renderMail() {
@@ -13484,6 +14128,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (m.renderedId !== msg.ID) {
                     m.renderedId = msg.ID;
                     m.remoteBlocked = 0;
+                    m.remoteAllowed = false;
                     $id('mailMsgSubject').textContent = msg.Subject || '(no subject)';
                     const meta = [['from', this.mailAddrFull(msg.From)], ['to', (msg.To || []).map(a => this.mailAddrFull(a)).join(', ')]];
                     if (msg.Cc && msg.Cc.length) meta.push(['cc', msg.Cc.map(a => this.mailAddrFull(a)).join(', ')]);
@@ -13499,23 +14144,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                             + '<button type="button" class="mail-link-copy" data-url="' + this.escapeHtml(u) + '" title="Copy link">copy</button></span>';
                     }).join('');
 
-                    const frame = $id('mailFrame');
-                    frame.style.height = '';
-                    if (msg.HTML) {
-                        frame.onload = () => {
-                            try {
-                                const d = frame.contentDocument;
-                                const h = Math.max(d.documentElement.scrollHeight, d.body ? d.body.scrollHeight : 0);
-                                frame.style.height = Math.min(Math.max(h + 8, 240), 6000) + 'px';
-                                m.remoteBlocked = d.querySelectorAll('img[src^="http"], img[src^="//"]').length;
-                                this.renderMailReader();
-                            } catch (e) {}
-                        };
-                        frame.srcdoc = this.mailHtmlDoc(msg);
-                    } else {
-                        frame.onload = null;
-                        frame.srcdoc = '';
-                    }
+                    this.loadMailFrame(msg);
                     $id('mailText').innerHTML = msg.Text ? this.linkify(msg.Text) : '<span style="color: var(--text-faint)">(no text part)</span>';
 
                     const att = $id('mailAttachments');
@@ -13542,6 +14171,12 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 const note = $id('mailRemoteNote');
                 show(note, m.part === 'html' && m.remoteBlocked > 0);
                 note.textContent = m.remoteBlocked + ' remote image' + (m.remoteBlocked === 1 ? '' : 's') + ' blocked';
+                show($id('btnMailImages'), m.part === 'html' && m.remoteBlocked > 0);
+                const sb = $id('btnMailScheme');
+                show(sb, m.part === 'html' && !!msg.HTML);
+                sb.textContent = m.scheme === 'dark' ? '☾ dark' : '☀ light';
+                sb.classList.toggle('is-dark', m.scheme === 'dark');
+                sb.setAttribute('aria-pressed', m.scheme === 'dark' ? 'true' : 'false');
             },
 
             renderMailFooter() {
@@ -13666,6 +14301,21 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     else if (this.mail.selectedId) this.mailSetRead([this.mail.selectedId], false);
                 });
                 $id('btnMailDelete').addEventListener('click', () => { if (this.mail.selectedId) this.mailDelete([this.mail.selectedId]); });
+                $id('btnMailImages').addEventListener('click', () => {
+                    const m = this.mail;
+                    if (!m.msg) return;
+                    m.remoteAllowed = true;
+                    m.remoteBlocked = 0;
+                    this.loadMailFrame(m.msg);
+                    this.renderMailReader();
+                });
+                $id('btnMailScheme').addEventListener('click', () => {
+                    const m = this.mail;
+                    m.scheme = m.scheme === 'dark' ? 'light' : 'dark';
+                    try { localStorage.setItem('cove-mail-scheme', m.scheme); } catch (e) {}
+                    if (m.msg) this.loadMailFrame(m.msg);
+                    this.renderMailReader();
+                });
                 $id('btnMailBack').addEventListener('click', () => this.closeMail());
                 $id('mailMsgLinks').addEventListener('click', (e) => {
                     const b = e.target.closest('.mail-link-copy');
@@ -14878,6 +15528,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 if (site.multisite) fact('multisite · ' + site.multisite, 'fact-ms');
                 const effPhp = site.php_version || (this.phpInfo && this.phpInfo.default) || '';
                 if ((isWp || lv) && effPhp) fact('php ' + effPhp, '', site.php_version ? 'Pinned with cove php' : 'Cove\'s default PHP');
+                if (site.xdebug) fact('xdebug', 'fact-ver', 'Xdebug is on (php-fpm with Xdebug). Turn it off from the sites list\'s PHP menu, or: cove xdebug ' + site.name + ' off');
                 if (site.size_bytes) fact(this.formatSize(site.size_bytes), '', 'On disk');
                 if (site.modified_at) { const rel = this.formatRelative(site.modified_at); fact(rel === 'now' ? 'modified just now' : 'modified ' + rel + ' ago', '', new Date(site.modified_at * 1000).toLocaleString()); }
                 const path = fact(site.display_path, 'fact-path', 'Click to copy the path');
@@ -18068,6 +18719,53 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                 this.startPhpPoll(site.name, version, res.installing ? 15 * 60 * 1000 : 90 * 1000);
             },
 
+            async toggleXdebug() {
+                const site = this.phpModal.site;
+                if (!site || this.xdebugApplying[site.name] !== undefined) return;
+                const live = this.sites.find(s => s.name === site.name) || site;
+                const want = !live.xdebug;
+                this.closePhpModal();
+                this.xdebugApplying[site.name] = want;
+                this.renderList();
+                const res = await this.apiPostRetry('set_xdebug', { site_name: site.name, on: want });
+                if (!res.success || !res.applying) {
+                    delete this.xdebugApplying[site.name];
+                    this.renderList();
+                    return; // apiPost surfaced any failure; a no-op was already set
+                }
+                if (res.building) {
+                    this.showSnack('Building Xdebug for this PHP. The first time takes about a minute…', false, { duration: 120000 });
+                }
+                // The change runs detached; the site's xdebug flag flipping in
+                // list_sites is the signal, as for a PHP pin.
+                const started = Date.now();
+                const timeoutMs = (res.building ? 15 : 2) * 60 * 1000;
+                const poll = setInterval(async () => {
+                    try {
+                        const r = await fetch('/api.php?action=list_sites');
+                        const data = await r.json();
+                        const s = data.find(x => x.name === site.name);
+                        if (s && !!s.xdebug === want) {
+                            clearInterval(poll);
+                            // The flag is written before the reload: give
+                            // Caddy and the pool a moment before saying so.
+                            await new Promise(ok => setTimeout(ok, 1500));
+                            delete this.xdebugApplying[site.name];
+                            this.loadPhpInfo(true);
+                            await this.getSites();
+                            this.showSnack(want
+                                ? 'Xdebug is on for ' + site.name + '.localhost. Your IDE listens on port ' + ((this.phpInfo && this.phpInfo.xdebug && this.phpInfo.xdebug.port) || 9003) + '.'
+                                : 'Xdebug is off for ' + site.name + '.localhost.');
+                        } else if (Date.now() - started > timeoutMs) {
+                            clearInterval(poll);
+                            delete this.xdebugApplying[site.name];
+                            this.renderList();
+                            this.showSnack('Xdebug hasn\'t finished: see ~/Cove/cache/xdebug-apply-' + site.name + '.log.', true, { duration: 8000 });
+                        }
+                    } catch (e) { /* mid-reload: keep polling */ }
+                }, 3000);
+            },
+
             startPhpPoll(name, version, timeoutMs) {
                 // The change runs detached server-side; the pin state flipping
                 // in list_sites is the completion signal. Polled with a raw
@@ -18901,6 +19599,7 @@ show_general_help() {
     help_cmd path "Prints the path to a site's public folder."
     help_cmd url "Prints a site's HTTPS URL."
     help_cmd php "Pins a site to an older PHP (macOS, with Homebrew)."
+    help_cmd xdebug "Turns Xdebug on for a site, for step debugging."
     echo ""
     help_section "WordPress"
     help_cmd wp "Runs WP-CLI inside a site from anywhere."
@@ -18946,6 +19645,7 @@ show_general_help() {
     help_section "Services & PHP"
     help_cmd enable "Starts Cove's services: Caddy, MariaDB and Mailpit."
     help_cmd disable "Stops Cove's background services."
+    [ "$OS" == "macos" ] && help_cmd autostart "Starts Cove at login: on, off or status."
     help_cmd reload "Regenerates the Caddyfile and reloads Caddy."
     help_cmd memory "Shows or raises PHP's memory_limit across Cove's PHPs."
     help_cmd opcache "FrankenPHP's shared OPcache: show, sites, exclude, set."
@@ -19300,8 +20000,9 @@ display_command_help() {
         login)
             echo "Usage: cove login <site> [<user>] [--url=<subsite-url>] [--to=<path>] [--plain]"
             echo ""
-            echo "Prints a one-time login link for a WordPress or Laravel site."
+            echo "Prints a one-time login link for a WordPress, Minn Engine or Laravel site."
             echo "WordPress: if no user is specified, the first available administrator."
+            echo "Minn Engine: the same, minted by the engine itself (no WP-CLI needed)."
             echo "Laravel: the user is an id or email (default: the app's first user),"
             echo "signed in through the app's own auth guard. The link works once, within"
             echo "five minutes, and only from this machine."
@@ -19313,8 +20014,9 @@ display_command_help() {
             echo "  --url=<url>    (Optional, WordPress) On a multisite network, the subsite"
             echo "                 to log in to, e.g. --url=https://mysite.localhost/store/"
             echo "                 (see 'cove network')."
-            echo "  --to=<path>    (Optional, Laravel) The page to land on, e.g. --to=/admin."
-            echo "                 Default: the app's dashboard route, or the home page."
+            echo "  --to=<path>    (Optional, Laravel and Minn Engine) The page to land on,"
+            echo "                 e.g. --to=/admin. Default: the app's dashboard route or"
+            echo "                 the home page (Laravel), Minn Admin (Minn Engine)."
             echo "  --plain        Print only the link, for scripts (--url-only works too)."
             ;;
         wp)
@@ -19419,6 +20121,20 @@ display_command_help() {
             echo "  add      --domain defaults to wp.<site>.localhost, --root to wp-reference;"
             echo "           --as-site names one more domain that always answers as the site"
             echo "  remove   stop serving the twin"
+            ;;
+        autostart)
+            echo "Usage: cove autostart [on|off|status]"
+            echo ""
+            echo "Start Cove's services at login (macOS). On by default: cove enable"
+            echo "and upgrades put a login agent in ~/Library/LaunchAgents that loads"
+            echo "FrankenPHP, Mailpit, the watchdog and any php-fpm pools when you log in."
+            echo "After cove disable, Cove stays stopped across restarts until cove enable."
+            echo ""
+            echo "  on       start Cove at login"
+            echo "  off      don't; remembered across upgrades (AUTOSTART=off in ~/Cove/config)"
+            echo "  status   show the current setting (the default)"
+            echo ""
+            echo "On Linux, cove enable and disable already turn the systemd units on and off."
             ;;
         lan)
             echo "Usage: cove lan <subcommand>"
@@ -19567,6 +20283,44 @@ display_command_help() {
             echo "The pin is stored in the site's 'php_version' file and travels with the"
             echo "site through clone and rename. WP-CLI, artisan and Composer for a pinned"
             echo "site run under the same native PHP."
+            ;;
+        xdebug)
+            echo "Usage: cove xdebug [<site> [on|off]]"
+            echo "       cove xdebug mode [debug|develop|profile|trace|coverage,…]"
+            echo "       cove xdebug start [trigger|always]"
+            echo "       cove xdebug port [<port>]"
+            echo "       cove xdebug install [<php version>]"
+            echo ""
+            echo "Step debugging, profiling and tracing with Xdebug, on macOS (Homebrew) and"
+            echo "Linux. FrankenPHP's PHP can't load extensions, so a site with Xdebug on is"
+            echo "served by a native php-fpm at the site's own PHP (its pin, or Cove's default)"
+            echo "with Xdebug loaded, in a pool of its own: other sites stay as fast as before."
+            echo "The first 'on' for a PHP version installs that PHP if needed (php@<version>"
+            echo "from Homebrew; on Linux the distribution's php-fpm, from a terminal) and"
+            echo "builds Xdebug from pecl.php.net (about 15 seconds), into ~/Cove/App/xdebug."
+            echo "Nothing is added to the PHP's own php.ini."
+            echo ""
+            echo "Commands:"
+            echo "  cove xdebug                  Settings, sites with Xdebug on, and builds."
+            echo "  cove xdebug <site> on        Turn Xdebug on for a site."
+            echo "  cove xdebug <site> off       Back to the site's usual PHP."
+            echo "  cove xdebug mode debug,profile"
+            echo "                               Xdebug's modes, for every site (default: debug)."
+            echo "  cove xdebug start always     Debug every request instead of on a trigger."
+            echo "  cove xdebug port 9003        The port your IDE listens on (default 9003)."
+            echo "  cove xdebug install 8.3      Build (or rebuild) Xdebug for a PHP version."
+            echo ""
+            echo "With the default 'trigger', a request starts a session when it carries the"
+            echo "XDEBUG_SESSION cookie (any Xdebug browser extension sets it) or"
+            echo "?XDEBUG_SESSION=1. WP-CLI, artisan and Composer run with Xdebug only when"
+            echo "a trigger is in the environment: XDEBUG_SESSION=1 cove wp <site> …"
+            echo "Profiles and traces go to ~/Cove/cache/xdebug, named by host; Xdebug's own"
+            echo "log is ~/Cove/Logs/xdebug.log. Paths need no mapping: the IDE and PHP see"
+            echo "the same files. A site named like a subcommand (mode, start, port,"
+            echo "install) is reached as <name>.localhost."
+            echo ""
+            echo "Flags:"
+            echo "  --format=json   The overview as JSON."
             ;;
         log)
             echo "Usage: cove log [site] [--app|--access] [--follow]"
@@ -19949,6 +20703,7 @@ main() {
             # invoked via the on-disk binary here. Not part of the public CLI.
             # First: WP-CLI fails under FrankenPHP 1.13.0 until it is in place.
             ensure_cli_argv_fix
+            ensure_cli_mysql_socket
             deploy_whoops
             create_whoops_bootstrap
             refresh_all_mu_plugins
@@ -20022,6 +20777,9 @@ main() {
             # enabling it, and only when MENUBAR_VERSION changed. No-op on
             # Linux and for users without the app installed.
             menubar_refresh_if_enabled
+            # Before this, nothing of Cove's but MariaDB came back after a
+            # restart on macOS. On by default, like the Linux units.
+            autostart_sync
             ;;
         status)
             check_dependencies
@@ -20114,6 +20872,9 @@ main() {
             check_dependencies
             cove_lan "$@"
             ;;
+        autostart)
+            cove_autostart "$@"
+            ;;
         ports)
             check_dependencies
             cove_ports "$@"
@@ -20132,6 +20893,10 @@ main() {
         php)
             check_dependencies
             cove_php "$@"
+            ;;
+        xdebug)
+            check_dependencies
+            cove_xdebug "$@"
             ;;
         log)
             cove_log "$@"
@@ -21761,6 +22526,159 @@ cove_artisan() {
     PHP_BINARY="$COVE_TOOLS_DIR/php" COVE_PHP_BIN="$(cove_native_php_for "$site_dir")" exec "$COVE_TOOLS_DIR/php" artisan "$@"
 }
 
+cove_autostart() {
+    local action="${1:-status}"
+
+    if [ "$OS" != "macos" ]; then
+        echo "On Linux, cove enable registers systemd units that start at boot, and cove disable takes them out."
+        return 0
+    fi
+
+    case "$action" in
+        on)
+            config_unset AUTOSTART
+            install_autostart_agent
+            echo "✅ Cove will start at login."
+            if [ -f "$AUTOSTART_STOPPED_FILE" ]; then
+                echo "   Cove is stopped right now (cove disable), so the next login leaves it stopped. cove enable starts it."
+            fi
+            ;;
+        off)
+            config_set AUTOSTART off
+            remove_autostart_agent
+            echo "✅ Cove won't start at login. Start it with cove enable or from the menu bar app."
+            ;;
+        status)
+            if [ -f "$AUTOSTART_PLIST" ]; then
+                echo "Autostart: on. Cove starts at login ($AUTOSTART_PLIST)."
+                if [ -f "$AUTOSTART_STOPPED_FILE" ]; then
+                    echo "Cove is stopped (cove disable), so the next login leaves it stopped."
+                fi
+            else
+                echo "Autostart: off. Turn it on with: cove autostart on"
+            fi
+            ;;
+        *)
+            echo "Usage: cove autostart [on|off|status]" >&2
+            return 1
+            ;;
+    esac
+}
+
+# --- Autostart helpers (macOS) ---
+# Cove's launchd jobs (FrankenPHP, Mailpit, the watchdog, php-fpm pools) live
+# in ~/Cove and are loaded by path, and launchd only loads the files in
+# ~/Library/LaunchAgents at login, so before this they all stayed down after
+# a restart. Rather than move every plist (each reader globs ~/Cove), one
+# small agent in LaunchAgents runs a script at login that loads them. Moving
+# the plists would also show each one as its own item under System Settings →
+# Login Items; this way there's one. MariaDB is Homebrew's (brew services
+# registers it at login already); the script starts it only when it isn't up.
+#
+# `cove disable` leaves AUTOSTART_STOPPED_FILE behind so a stopped Cove stays
+# stopped after a restart (as on Linux, where disable takes the units out);
+# start_caddy_service clears it, so whatever brings Cove up again counts.
+
+AUTOSTART_LABEL="com.cove.autostart"
+AUTOSTART_PLIST="$HOME/Library/LaunchAgents/$AUTOSTART_LABEL.plist"
+AUTOSTART_SCRIPT="$COVE_DIR/autostart.sh"
+AUTOSTART_STOPPED_FILE="$COVE_DIR/.disabled"
+
+# Install (or refresh) the login agent unless the user turned autostart off.
+# Called by enable and post-upgrade. Autostart is on unless AUTOSTART=off.
+autostart_sync() {
+    [ "$OS" = "macos" ] || return 0
+    if [ "$(config_get AUTOSTART)" = "off" ]; then
+        remove_autostart_agent
+        return 0
+    fi
+    install_autostart_agent
+}
+
+write_autostart_script() {
+    local svc_cmd=""
+    if [ "$MAC_BREW" = "nb" ]; then
+        svc_cmd=$(command -v nb 2>/dev/null)
+    else
+        svc_cmd=$(command -v brew 2>/dev/null)
+    fi
+
+    cat > "$AUTOSTART_SCRIPT.new" << EOM
+#!/bin/bash
+# Written by Cove (cove autostart); rewritten by cove enable and upgrades.
+# Run once at login by $AUTOSTART_PLIST.
+# Loads the services cove enable left in $COVE_DIR, which launchd does not
+# load by itself. Stays out of the way after a cove disable.
+cove_dir="$COVE_DIR"
+svc_cmd="$svc_cmd"
+
+echo "\$(date '+%Y-%m-%d %H:%M:%S') login"
+if [ -f "\$cove_dir/.disabled" ]; then
+    echo "   Cove was stopped with cove disable; leaving it stopped."
+    exit 0
+fi
+
+if ! pgrep -qx mariadbd && ! pgrep -qx mysqld && [ -n "\$svc_cmd" ]; then
+    "\$svc_cmd" services start mariadb
+fi
+
+# A saved "<pid> up <n>" line from before the restart could match a new
+# FrankenPHP that got the same pid (see install_watchdog_service).
+rm -f "\$cove_dir/.watchdog.state"
+
+# The watchdog last, once what it watches is loaded.
+for plist in "\$cove_dir"/com.cove.php-fpm-*.plist "\$cove_dir/com.cove.mailpit.plist" \\
+    "\$cove_dir/com.cove.caddy.plist" "\$cove_dir/com.cove.watchdog.plist"; do
+    [ -f "\$plist" ] || continue
+    launchctl load "\$plist"
+done
+EOM
+    chmod 755 "$AUTOSTART_SCRIPT.new"
+    mv "$AUTOSTART_SCRIPT.new" "$AUTOSTART_SCRIPT"
+}
+
+# Write the login agent. Not loaded now: it only has work to do at login,
+# and loading it here would run the script against a Cove that's already up.
+install_autostart_agent() {
+    [ "$OS" = "macos" ] || return 0
+    mkdir -p "$LOGS_DIR" "$(dirname "$AUTOSTART_PLIST")"
+    write_autostart_script
+
+    cat > "$AUTOSTART_PLIST.new" << EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>Label</key>
+        <string>$AUTOSTART_LABEL</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>/bin/bash</string>
+                <string>$AUTOSTART_SCRIPT</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardOutPath</key>
+        <string>$LOGS_DIR/autostart.log</string>
+        <key>StandardErrorPath</key>
+        <string>$LOGS_DIR/autostart.log</string>
+</dict>
+</plist>
+EOM
+    # Unchanged files stay put: macOS announces a new or changed login item.
+    if cmp -s "$AUTOSTART_PLIST.new" "$AUTOSTART_PLIST"; then
+        rm -f "$AUTOSTART_PLIST.new"
+    else
+        mv "$AUTOSTART_PLIST.new" "$AUTOSTART_PLIST"
+    fi
+}
+
+remove_autostart_agent() {
+    [ "$OS" = "macos" ] || return 0
+    launchctl unload "$AUTOSTART_PLIST" &>/dev/null || true
+    rm -f "$AUTOSTART_PLIST" "$AUTOSTART_SCRIPT"
+}
+
 cove_backup() {
     local site_name="" out="" keep=false format="table"
     local arg
@@ -21962,6 +22880,15 @@ cove_clone_reverb() {
     fi
 }
 
+if false; then : <<'exit 0'
+#####################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+exit 0
+fi
 cove_clone() {
     cd ~/
     local source_name="$1"
@@ -22195,15 +23122,15 @@ cove_clone() {
     fi
 
     if [ "$is_wordpress" = true ]; then
-        local wp_cmd_final admin_login one_time_login_url
-        wp_cmd_final=$(get_wp_cmd "$new_dir")
-        # Unlike a fresh install there is no known admin username here, so pick
-        # the first administrator out of the cloned database.
-        admin_login=$($wp_cmd_final user list --role=administrator --field=user_login --number=1 --path="$new_dir/public/" 2>/dev/null </dev/null | head -1)
+        local one_time_login_url=""
         # Credentials come from the source site, so they are deliberately not
         # printed here — a one-time link is the useful thing to hand back.
-        if [ -n "$admin_login" ]; then
-            one_time_login_url=$($wp_cmd_final user login "$admin_login" --path="$new_dir/public/" 2>/dev/null </dev/null | head -1)
+        # `cove login` picks the clone's first administrator and mints it the
+        # way the site wants (a Minn Engine site mints its own).
+        if one_time_login_url=$("$0" login "$new_name" --plain 2>/dev/null </dev/null); then
+            one_time_login_url=$(printf '%s\n' "$one_time_login_url" | tail -n 1)
+        else
+            one_time_login_url=""
         fi
         [ -n "$one_time_login_url" ] || one_time_login_url="(no administrator found — log in as you would on '$source_name')"
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
@@ -22256,6 +23183,15 @@ cove_composer() {
 # Refresh the wp.org stable-check cache the dashboard also reads. Best-effort:
 # every failure leaves whatever cache already exists and returns non-zero, so
 # callers degrade to "no status information" rather than aborting.
+if false; then : <<'exit 0'
+##############################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+exit 0
+fi
 cove_wpver_refresh() {
     local max_age="${1:-86400}"
 
@@ -22948,15 +23884,6 @@ cove_db_fix_collation() {
     fi
 }
 
-if false; then : <<'exit 0'
-#########################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
- exit 0
-########################################################################################################################################################################################################
- exit 0
-########################################################################################################################################################################################################
- exit 0
-exit 0
-fi
 cove_delete() {
     source_config
     local site_name="$1"
@@ -23205,15 +24132,6 @@ demo_db_drop() {
     printf '%s\n' "DROP USER IF EXISTS 'cove_demo'@'localhost';" | MYSQL_PWD="$pw" mysql -u "$user" 2>/dev/null
 }
 
-if false; then : <<'exit 0'
-###########################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
- exit 0
-########################################################################################################################################################################################################
- exit 0
-########################################################################################################################################################################################################
- exit 0
-exit 0
-fi
 cove_demo() {
     local demo_file="$COVE_DIR/demo"
     case "${1:-}" in
@@ -23510,6 +24428,9 @@ cove_disable() {
             launchctl unload "$fpm_plist" &>/dev/null
         done
         pkill -f "Cove/php-fpm/.*/php-fpm\.conf" &>/dev/null || true
+        # Stopped stays stopped after a restart: the login agent (cove
+        # autostart) skips its loads while this is here.
+        touch "$AUTOSTART_STOPPED_FILE"
     fi
 
     # Stop services on Linux
@@ -23518,6 +24439,18 @@ cove_disable() {
         # bring it down.
         $SUDO_CMD systemctl stop cove-watchdog.timer &>/dev/null || true
         cove_disable_laravel_workers
+        # Native php-fpm pools (cove xdebug), stopped once the watchdog can't
+        # start them again. Their start scripts stay: the watchdog brings
+        # them back after the next enable. The pkill catches a master that
+        # lost its pid file, by its title ("php-fpm: master process
+        # (~/Cove/php-fpm/<key>/php-fpm.conf)").
+        local fpm_start
+        for fpm_start in "$PHP_FPM_DIR"/*/start; do
+            [ -e "$fpm_start" ] || continue
+            echo "   - Stopping PHP-FPM ($(basename "$(dirname "$fpm_start")"))..."
+            php_fpm_pool_stop "$(basename "$(dirname "$fpm_start")")"
+        done
+        pkill -f "$PHP_FPM_DIR/.*/php-fpm\.conf" &>/dev/null || true
         # v1.10+: FrankenPHP runs as cove.service under systemd. Try that
         # first; fall back to `frankenphp stop` in case a user skipped
         # cove_enable since the upgrade and still has an ad-hoc instance.
@@ -23579,6 +24512,10 @@ cove_enable() {
 
         # Native php-fpm units for any sites pinned to an older PHP.
         sync_php_fpm_services
+
+        # The login agent that loads all of the above after a restart
+        # (unless `cove autostart off`).
+        autostart_sync
     fi
     
     if [ "$OS" == "linux" ]; then
@@ -23660,11 +24597,20 @@ EOM
     # on the watchdog install's exit code (which is almost always 0 even when a
     # bad Caddyfile kept FrankenPHP from starting). Poll briefly — the admin
     # endpoint binds early but not instantly, especially on large installs.
-    local caddy_up=false
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
+    # A ~140-site Caddyfile under a load average of 50 took 14 s to load
+    # (2026-11-12), so allow up to 60 s while the process is still alive, and
+    # say "still starting" rather than "failed" if it hasn't answered by then.
+    local caddy_up=false caddy_alive=false i
+    for (( i = 0; i < 120; i++ )); do
         if is_caddy_running; then caddy_up=true; break; fi
-        sleep 0.3
+        if [ "$i" -ge 10 ] && ! pgrep -f "frankenphp run --config $CADDYFILE_PATH" &>/dev/null; then
+            break
+        fi
+        sleep 0.5
     done
+    if [ "$caddy_up" = false ] && pgrep -f "frankenphp run --config $CADDYFILE_PATH" &>/dev/null; then
+        caddy_alive=true
+    fi
 
     if [ "$caddy_up" = true ]; then
         echo ""
@@ -23690,10 +24636,21 @@ EOM
             echo ""
             echo "  Note: WSL IP may change on restart. Run 'cove wsl-hosts' to get updated commands."
         fi
+    elif [ "$caddy_alive" = true ]; then
+        gum style --foreground yellow "⏳ Caddy is still starting (the machine is busy). Run 'cove status' in a minute; $LOGS_DIR/caddy-process.log shows progress."
     else
         gum style --foreground red "❌ Caddy server failed to start. Check $LOGS_DIR/caddy-process.log for errors."
     fi
 }
+if false; then : <<'exit 0'
+################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+exit 0
+fi
 cove_health() {
     # Read-only diagnostic. Aggregates the signals you'd otherwise gather by
     # hand after a crash: service liveness, FrankenPHP process health + last
@@ -24716,15 +25673,6 @@ history_rollback() {
 
 # Save every site that changed since its last save. Runs from the watchdog
 # nightly (idle-only), or by hand: cove history --sweep.
-if false; then : <<'exit 0'
-################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
- exit 0
-########################################################################################################################################################################################################
- exit 0
-########################################################################################################################################################################################################
- exit 0
-exit 0
-fi
 history_sweep() {
     local idle_only="$1" force="$2" max="$3" quiet="$4"
     local lock="$COVE_DIR/.history-sweep.lock"
@@ -25475,11 +26423,13 @@ install_dependency() {
     local apt_pkg="$3"       # The package name for apt (Debian/Ubuntu)
     local dnf_pkg="$4"       # The package name for dnf (Fedora/RHEL) - can differ from apt
     local binary_url="$5"    # Optional URL to a binary/tarball for fallback
+    local pacman_pkg="${6-__same_as_dnf__}" # The package name for pacman (Arch); "" = none
 
     # If dnf_pkg not specified, default to apt_pkg
     if [ -z "$dnf_pkg" ]; then
         dnf_pkg="$apt_pkg"
     fi
+    [ "$pacman_pkg" = "__same_as_dnf__" ] && pacman_pkg="$dnf_pkg"
 
     # 1. Validate the command. If it runs, we're done.
     if command -v "$cmd_name" &>/dev/null; then
@@ -25512,22 +26462,33 @@ install_dependency() {
         # Determine the correct package name for this distro
         if [ "$PKG_MANAGER" == "apt" ]; then
             pkg_name="$apt_pkg"
+        elif [ "$PKG_MANAGER" == "pacman" ]; then
+            pkg_name="$pacman_pkg"
         else
             pkg_name="$dnf_pkg"
         fi
-        
+
         # Only try native package manager if a name is provided
         if [ -n "$pkg_name" ]; then
-            echo "   - Updating package cache..."
+            # pacman: no refresh. `pacman -Sy <pkg>` without -u is a partial
+            # upgrade, which Arch doesn't support; install against the
+            # databases the system already has.
+            if [ "$PKG_MANAGER" != "pacman" ]; then
+                echo "   - Updating package cache..."
+            fi
             if [ "$PKG_MANAGER" == "apt" ]; then
                 $SUDO_CMD apt-get update -qq >/dev/null 2>&1
-            else
+            elif [ "$PKG_MANAGER" == "dnf" ]; then
                 $SUDO_CMD dnf makecache -q >/dev/null 2>&1 || true
             fi
-            
+
             echo "   - Installing $pkg_name via $PKG_MANAGER..."
             if [ "$PKG_MANAGER" == "apt" ]; then
                 if $SUDO_CMD apt-get install -y "$pkg_name" >/dev/null 2>&1; then
+                    installed_successfully=true
+                fi
+            elif [ "$PKG_MANAGER" == "pacman" ]; then
+                if $SUDO_CMD pacman -S --needed --noconfirm "$pkg_name" >/dev/null 2>&1; then
                     installed_successfully=true
                 fi
             else
@@ -25556,6 +26517,8 @@ install_dependency() {
                     echo "   - Installing tar (required to extract)..."
                     if [ "$PKG_MANAGER" == "apt" ]; then
                         $SUDO_CMD apt-get install -y tar >/dev/null 2>&1
+                    elif [ "$PKG_MANAGER" == "pacman" ]; then
+                        $SUDO_CMD pacman -S --needed --noconfirm tar >/dev/null 2>&1
                     else
                         $SUDO_CMD dnf install -y tar >/dev/null 2>&1
                     fi
@@ -25952,7 +26915,7 @@ cove_install() {
     fi
 
     # MariaDB - Database server
-    install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" ""
+    install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" "" "mariadb"
     # Pin portable collation defaults before the first start (see
     # write_mariadb_config in main for the MariaDB 11.5+ uca1400 trap).
     write_mariadb_config || true
@@ -26054,6 +27017,18 @@ INI
             exit 1
         fi
     else # Linux
+        # Arch's mariadb package leaves the data directory empty (apt and
+        # dnf initialize it), and the service won't start without one.
+        if [ "$PKG_MANAGER" = "pacman" ] && ! $SUDO_CMD test -d /var/lib/mysql/mysql; then
+            echo "   - Initializing the MariaDB data directory..."
+            if ! $SUDO_CMD mariadb-install-db --user=mysql --basedir=/usr --datadir=/var/lib/mysql >/dev/null 2>&1; then
+                gum style --foreground red "❌ mariadb-install-db failed to initialize /var/lib/mysql."
+                exit 1
+            fi
+        fi
+        # Neither pacman nor dnf enables the unit, so MariaDB would be gone
+        # after a reboot while Cove's own service comes back.
+        $SUDO_CMD systemctl enable mariadb >/dev/null 2>&1 || true
         if ! $SUDO_CMD systemctl restart mariadb; then
             gum style --foreground red "❌ Failed to start MariaDB via systemctl."
             exit 1
@@ -26186,6 +27161,9 @@ INI
                 echo "  To trust it system-wide (Fedora/RHEL):"
                 echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /etc/pki/ca-trust/source/anchors/caddy.crt"
                 echo "    sudo update-ca-trust"
+            elif [ "$PKG_MANAGER" = "pacman" ]; then
+                echo "  To trust it system-wide (Arch):"
+                echo "    sudo trust anchor --store ~/.local/share/caddy/pki/authorities/local/root.crt"
             else
                 echo "  To trust it system-wide (Ubuntu/Debian):"
                 echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"
@@ -27309,6 +28287,15 @@ log_service_cap() {
     echo $((10#${v:-50}))
 }
 
+if false; then : <<'exit 0'
+##################################################################################################################################################################################################################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+exit 0
+fi
 log_size_label() {
     awk -v b="$1" 'BEGIN { if (b >= 1073741824) printf "%.1f GB", b / 1073741824; else if (b >= 1048576) printf "%.1f MB", b / 1048576; else printf "%d KB", (b + 1023) / 1024 }'
 }
@@ -27594,7 +28581,7 @@ cove_log() {
 # Rewrite them to this site's own address, as `cove import` and `cove pull`
 # do, after saving the database to the site's private/ folder. Only a plain
 # single site: a multisite network keeps its domains in tables of its own, a
-# Minn Engine site has no WordPress to run search-replace, and WP_HOME or
+# Minn Engine site can't run the PHP that reads them, and WP_HOME or
 # WP_SITEURL win over the database anyway; those get a warning instead, as
 # does a copy of another Cove site still sharing that site's database. An
 # address the site answers on here (a mapping, its twin) is left alone.
@@ -27743,7 +28730,7 @@ cove_login() {
     local user_identifier="" # Optional: the user to log in as
     local subsite_url=""     # Optional: a subsite of a multisite network
     local plain=false        # --plain: print only the URL, for scripts and agents
-    local to=""              # --to: a Laravel site's page to land on
+    local to=""              # --to: a Laravel or Minn Engine site's page to land on
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -27792,6 +28779,11 @@ cove_login() {
             return
         fi
         site_not_found "$site_name" "WordPress and Laravel"
+    fi
+
+    if site_is_minn "$public_dir" && minn_mints_logins "$site_dir"; then
+        cove_login_minn "$site_name" "$site_dir" "$user_identifier" "$subsite_url" "$to" "$plain"
+        return
     fi
 
     # --url picks a subsite of a multisite network: wp-cli then runs in that
@@ -27876,6 +28868,64 @@ cove_login() {
         exit 1
     fi
 }
+# Whether a Minn Engine site's own engine mints sign-in links (`minn login`,
+# engine 0.2.0 and later). Older engines get the WP-CLI path, whose
+# `wp user login` they answer themselves.
+minn_mints_logins() {
+    local bin="$1/public/minn/bin/minn"
+    [ -f "$bin" ] || return 1
+    $(cove_php_cmd "$1") "$bin" help 2>/dev/null | grep -q "minn login"
+}
+
+# A one-time sign-in link for a Minn Engine site, minted by the engine
+# itself: `minn login` reads wp-config.php as text and writes the token
+# straight to the database, so neither WP-CLI nor the WordPress runtime takes
+# part and the link works whatever the site's MINN_WP_API says. Nothing is
+# written into the site either: the engine redeems its own links, so the
+# CaptainCore Helper mu-plugin is not needed for this. The link opens Minn's
+# sign-in page and lands in Minn Admin, or on --to.
+cove_login_minn() {
+    local site_name="$1" site_dir="$2" who="$3" subsite_url="$4" to="$5" plain="$6"
+    local public_dir="$site_dir/public" fd=1 out json url user roles
+    local -a args=(login "$public_dir")
+    [ "$plain" = true ] && fd=2
+    if [ -n "$subsite_url" ]; then
+        gum style --foreground red "❌ Error: '$site_name.localhost' runs Minn Engine, which serves a single site, so --url does not apply."
+        exit 1
+    fi
+    if [ -n "$to" ] && { ! [[ "$to" =~ ^/[A-Za-z0-9._~/?=\&%:+,@!-]*$ ]] || [[ "$to" == //* ]]; }; then
+        gum style --foreground red "❌ Error: --to is a path on the site, such as /minn-admin/content."
+        exit 1
+    fi
+    [ -n "$who" ] && args+=("$who")
+    [ -n "$to" ] && args+=("--to=$to")
+    args+=(--format=json)
+    [ "$plain" = true ] || echo "🔎 Asking Minn Engine for a one-time login for '$site_name.localhost'..."
+    if ! out=$(cd "$public_dir" && $(cove_php_cmd "$site_dir") "$public_dir/minn/bin/minn" "${args[@]}" 2>&1 </dev/null); then
+        out=$(printf '%s\n' "$out" | grep -m1 '^Error: ')
+        gum style --foreground red "❌ ${out:-Error: Minn Engine could not mint a login link.}"
+        exit 1
+    fi
+    json=$(printf '%s\n' "$out" | grep '^{' | tail -n 1)
+    url=$(printf '%s' "$json" | sed -nE 's/.*"url":"([^"]+)".*/\1/p')
+    user=$(printf '%s' "$json" | sed -nE 's/.*"user":"((\\.|[^"\\])*)".*/\1/p')
+    roles=$(printf '%s' "$json" | sed -nE 's/.*"roles":\[([^]]*)\].*/\1/p' | tr -d '"' | sed 's/,/, /g')
+    if [ -z "$url" ]; then
+        gum style --foreground red "❌ Error: Minn Engine did not hand back a login link."
+        exit 1
+    fi
+    # A named user may hold any role, as on WordPress: say so when it is not
+    # an administrator.
+    if [ -n "$who" ] && [[ ", $roles, " != *", administrator, "* ]]; then
+        echo "⚠️  '$user' is not an administrator (roles: ${roles:-none})." >&"$fd"
+    fi
+    if [ "$plain" = true ]; then
+        echo "$url"
+    else
+        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "🔗 One-Time Login URL for '$user'" "$url"
+    fi
+}
+
 # A one-time sign-in link for a Laravel site. The token waits five minutes
 # in ~/Cove/cache/laravel-login (this user's only); the prepend Cove runs
 # before every request (create_whoops_bootstrap) takes it on a request from
@@ -28038,7 +29088,7 @@ cove_mappings() {
 # comes from the environment, never $argv (see ensure_cli_argv_fix).
 
 if false; then : <<'exit 0'
-############################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+############################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
  exit 0
 ########################################################################################################################################################################################################
  exit 0
@@ -28556,7 +29606,7 @@ function tools(): array {
         'login_link' => [
             'title' => 'One-time login link',
             'description' => "A one-time link that signs into a WordPress site's admin as an administrator (or the user named), or into a Laravel app as its first user (or the one named, by id or email) through the app's own auth, for a browser or a browser-automation tool. Each link works once.",
-            'inputSchema' => $obj(['site' => $site, 'user' => ['type' => 'string', 'description' => 'A user login, email or ID. Default: the first administrator (WordPress) or the first user (Laravel).'], 'url' => ['type' => 'string', 'description' => 'WordPress: on a multisite network, the subsite to sign into.'], 'to' => ['type' => 'string', 'description' => 'Laravel: the path to land on, e.g. /admin. Default: the dashboard route, or home.']], ['site']),
+            'inputSchema' => $obj(['site' => $site, 'user' => ['type' => 'string', 'description' => 'A user login, email or ID. Default: the first administrator (WordPress) or the first user (Laravel).'], 'url' => ['type' => 'string', 'description' => 'WordPress: on a multisite network, the subsite to sign into.'], 'to' => ['type' => 'string', 'description' => 'Laravel and Minn Engine: the path to land on, e.g. /admin. Default: the dashboard route or home (Laravel), Minn Admin (Minn Engine).']], ['site']),
             'annotations' => $rw,
         ],
         'wp_read' => [
@@ -28892,12 +29942,14 @@ function call_tool(string $name, array $a): array {
             $args = ['login', $site];
             if (!empty($a['user'])) $args[] = (string) $a['user'];
             if (!empty($a['url'])) $args[] = '--url=' . $a['url'];
+            // A Minn Engine site lands on the page named; plain WordPress ignores it.
+            if (!empty($a['to'])) $args[] = '--to=' . $a['to'];
             $args[] = '--plain';
             [$out, $err, $code] = cove($args, true);
             $out = clean($out);
-            if ($code !== 0 || !preg_match('~https?://\S+wp-login\.php\S*~', $out, $m)) throw new ToolError($out ?: 'cove login failed.');
+            if ($code !== 0 || !preg_match('~https?://\S+(?:wp-login\.php|/minn-admin/login\?)\S*~', $out, $m)) throw new ToolError($out ?: 'cove login failed.');
             // Anything cove login said first: it rewrote the site's stored URLs, or couldn't.
-            $said = trim(preg_replace('~^.*wp-login\.php.*$~m', '', $out));
+            $said = trim(preg_replace('~^.*(?:wp-login\.php|/minn-admin/login\?).*$~m', '', $out));
             // WordPress builds the link from the home URL in the database. A
             // site imported without its URLs rewritten still names its live
             // domain, and signing in there would leave this machine.
@@ -29870,7 +30922,7 @@ cove_menubar_enable_linux() {
     if ! menubar_linux_deps_ok; then
         echo "📦 The tray app needs python3 with GTK 3 and AyatanaAppIndicator3 bindings."
         if command -v apt-get &>/dev/null; then
-            local pkgs="python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7"
+            local pkgs="python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-dbusmenu-gtk3-0.4 gir1.2-notify-0.7"
             if [ -t 0 ]; then
                 if ! gum confirm "Install them now? (sudo apt-get install $pkgs)"; then
                     echo "Aborted."
@@ -29886,8 +30938,8 @@ cove_menubar_enable_linux() {
             fi
         else
             gum style --foreground red "❌ Install them with your package manager, then re-run 'cove menubar enable':"
-            echo "   Fedora: sudo dnf install python3-gobject gtk3 libayatana-appindicator-gtk3"
-            echo "   Arch:   sudo pacman -S python-gobject gtk3 libayatana-appindicator"
+            echo "   Fedora: sudo dnf install python3-gobject gtk3 libayatana-appindicator-gtk3 libdbusmenu-gtk3"
+            echo "   Arch:   sudo pacman -S python-gobject gtk3 libayatana-appindicator libdbusmenu-gtk3"
             exit 1
         fi
         if ! menubar_linux_deps_ok; then
@@ -30205,15 +31257,6 @@ cove_opcache_restart() {
 # while other threads still use the memory and aborts the process with
 # "zend_mm_heap corrupted" (php/php-src#22281). So what fills the arena, and
 # which site keeps recompiling, is worth seeing: `sites` and `--watch`.
-if false; then : <<'exit 0'
-#####################################################################################################################################################
- exit 0
-########################################################################################################################################################################################################
- exit 0
-########################################################################################################################################################################################################
- exit 0
-exit 0
-fi
 cove_opcache_sites_probe_source() {
     cat <<'PHP'
 <?php
@@ -30919,8 +31962,12 @@ cove_php_overview() {
             [ -d "$site_path/public" ] || continue
             site_name=$(basename "$site_path")
             ver=$(site_php_version "$site_path")
+            local dbg=""
+            site_xdebug_on "$site_path" && dbg=", Xdebug on"
             if [ -n "$ver" ]; then
-                printf "  %-42s %s\n" "$site_name" "$ver (php-fpm)"
+                printf "  %-42s %s\n" "$site_name" "$ver (php-fpm$dbg)"
+            elif [ -n "$dbg" ]; then
+                printf "  %-42s %s\n" "$site_name" "default (php-fpm$dbg)"
             else
                 printf "  %-42s %s\n" "$site_name" "default"
             fi
@@ -30942,6 +31989,17 @@ cove_php_overview() {
             echo "  No native php-fpm services active. Pin one with: cove php <site> 8.2"
         fi
     fi
+}
+
+# A site with Xdebug on keeps it across a PHP change: make sure the new
+# version ($2) has a build, which takes a few seconds the first time. A
+# failed build leaves the site on that PHP without Xdebug, and says so.
+cove_php_xdebug_follow() {
+    site_xdebug_on "$1" || return 0
+    if ! xdebug_ensure "$2"; then
+        echo "⚠️  Xdebug stays off until PHP $2 has a build: cove xdebug install $2" >&2
+    fi
+    return 0
 }
 
 cove_php() {
@@ -30978,6 +32036,7 @@ cove_php() {
             return 0
         fi
         rm -f "$site_dir/php_version"
+        cove_php_xdebug_follow "$site_dir" "$(normalize_php_version "$(frankenphp_php_version)")"
         regenerate_caddyfile
         gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
             "✅ $site_name.localhost back on Cove's default PHP $(frankenphp_php_version)" \
@@ -31001,6 +32060,7 @@ cove_php() {
         echo "ℹ️  PHP $ver is Cove's default (FrankenPHP); nothing to pin."
         if [ -f "$site_dir/php_version" ]; then
             rm -f "$site_dir/php_version"
+            cove_php_xdebug_follow "$site_dir" "$ver"
             regenerate_caddyfile
             echo "   Removed the existing pin."
         fi
@@ -31013,6 +32073,7 @@ cove_php() {
 
     echo "📌 Pinning $site_name.localhost to PHP $ver (native php-fpm behind FrankenPHP)..."
     echo "$ver" > "$site_dir/php_version"
+    cove_php_xdebug_follow "$site_dir" "$ver"
     regenerate_caddyfile
 
     # Same warm-poll as cove add: the reload is synchronous, but give the new
@@ -33497,9 +34558,19 @@ PYTHON_PROXY
 # is re-applied once per pid: the watchdog runs it when a server first turns
 # healthy, and `cove reload` keeps the process, so a reload never loses it.
 
-# GNU timeout is not on stock macOS; run bare when it is missing.
+# GNU timeout is not on stock macOS; run bare when it is missing. A debugger
+# stops its target while attached, and one killed by the timeout (or anything
+# else) before it detaches leaves the server stopped: every site hangs with
+# the process in state T (seen 2026-11-08, after two reloads nine seconds
+# apart). So the server always gets a SIGCONT afterwards, which does nothing
+# to a process that is already running. $1 is the target pid.
 cove_signals_to() {
+    local pid="$1" rc
+    shift
     if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else "$@"; fi
+    rc=$?
+    kill -CONT "$pid" 2>/dev/null
+    return $rc
 }
 
 # One debugger at a time. Two attaches on the same process (the watchdog's
@@ -33545,7 +34616,7 @@ cove_signals_read() {
     local pid="$1" dbg out
     dbg=$(cove_signals_debugger) || return 1
     if [ "$OS" = "macos" ]; then
-        out=$(cove_signals_to "$dbg" -p "$pid" --batch \
+        out=$(cove_signals_to "$pid" "$dbg" -p "$pid" --batch \
             -o 'expr -l c -- unsigned long cove_sa[4]; (int)sigaction(11, 0, cove_sa); (void*)cove_sa[0]' \
             -o 'expr -l c -- (void*)*(void**)&php_parallel_old_sigsegv_action' \
             -o 'process detach' -o 'quit' 2>/dev/null) || return 1
@@ -33554,7 +34625,7 @@ cove_signals_read() {
         cur=$(echo "$out" | sed -n 's/^(void \*) \$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 1p)
         go=$(echo "$out"  | sed -n 's/^(void \*) \$[0-9]* = \(0x[0-9a-f]*\).*/\1/p' | sed -n 2p)
     else
-        out=$(cove_signals_to "$dbg" -p "$pid" -batch -q \
+        out=$(cove_signals_to "$pid" "$dbg" -p "$pid" -batch -q \
             -ex 'set confirm off' \
             -ex 'set $cove_sa = (unsigned long*)malloc(64)' \
             -ex 'call (int)sigaction(11, 0, $cove_sa)' \
@@ -33575,11 +34646,11 @@ cove_signals_apply() {
     local pid="$1" dbg
     dbg=$(cove_signals_debugger) || return 1
     if [ "$OS" = "macos" ]; then
-        cove_signals_to "$dbg" -p "$pid" --batch \
+        cove_signals_to "$pid" "$dbg" -p "$pid" --batch \
             -o 'expr -l c -- (int)sigaction(11, (void*)&php_parallel_old_sigsegv_action, (void*)0)' \
             -o 'process detach' -o 'quit' >/dev/null 2>&1 || return 1
     else
-        cove_signals_to "$dbg" -p "$pid" -batch -q -ex 'set confirm off' \
+        cove_signals_to "$pid" "$dbg" -p "$pid" -batch -q -ex 'set confirm off' \
             -ex 'call (int)sigaction(11, &php_parallel_old_sigsegv_action, 0)' \
             -ex 'detach' -ex 'quit' >/dev/null 2>&1 || return 1
     fi
@@ -36043,7 +37114,56 @@ cove_transfer() {
     esac
 }
 
+# Browsers that are running right now, one "Name<TAB>process<TAB>started"
+# line each (the main process with the lowest pid). On Linux they read their
+# NSS certificate databases only when they start, so one that was already
+# open before `cove trust` keeps showing "Your connection is not private"
+# until it is quit fully and reopened. Child processes (--type=…, Firefox's
+# -contentproc) and helpers such as chrome_crashpad_handler are skipped. With
+# an epoch argument, only browsers started before then are listed: one opened
+# after the root went in already trusts it.
+cove_browsers_running() {
+    command -v ps >/dev/null 2>&1 || return 0
+    local before="${1:-}" pid d1 d2 d3 d4 d5 exe args name base started
+    while read -r pid d1 d2 d3 d4 d5 exe args; do
+        [ -n "$exe" ] || continue
+        if [ -n "$before" ]; then
+            started=$(date -d "$d1 $d2 $d3 $d4 $d5" +%s 2>/dev/null) || started=""
+            [ -n "$started" ] && [ "$started" -ge "$before" ] && continue
+        fi
+        case " $args " in *" --type="*|*" -contentproc "*) continue ;; esac
+        base="${exe##*/}"
+        case "$base" in
+            chrome|google-chrome|google-chrome-stable|google-chrome-beta|google-chrome-unstable) name="Chrome" ;;
+            chromium|chromium-browser) name="Chromium" ;;
+            brave|brave-browser) name="Brave" ;;
+            vivaldi|vivaldi-bin) name="Vivaldi" ;;
+            msedge|microsoft-edge|microsoft-edge-stable) name="Edge" ;;
+            helium) name="Helium" ;;
+            opera) name="Opera" ;;
+            firefox|firefox-bin|firefox-esr) name="Firefox" ;;
+            librewolf) name="LibreWolf" ;;
+            zen|zen-bin) name="Zen" ;;
+            *) continue ;;
+        esac
+        printf '%s\t%s\t%s %s %s %s %s\n' "$name" "$base" "$d1" "$d2" "$d3" "$d4" "$d5"
+    done < <(ps -eo pid=,lstart=,args= 2>/dev/null) | sort -t$'\t' -k1,1 -s | awk -F'\t' '!seen[$1]++'
+}
+
+# "18:18" for a start time today, "Nov 17 18:18" for an earlier day (GNU date;
+# the raw ps time where date can't parse it).
+cove_browser_started_label() {
+    local when="$1" day today
+    day=$(date -d "$when" +%Y-%m-%d 2>/dev/null) || { echo "$when"; return; }
+    today=$(date +%Y-%m-%d)
+    if [ "$day" = "$today" ]; then date -d "$when" +%H:%M; else date -d "$when" '+%b %-d %H:%M'; fi
+}
+
 cove_trust() {
+    # Browsers started before this moment loaded their certificate stores
+    # without the root (see cove_browsers_running).
+    local trust_began
+    trust_began=$(date +%s)
     echo "🔐 Installing Cove's local root certificate..."
 
     # FrankenPHP's `trust` subcommand writes the Caddy local root into the
@@ -36063,6 +37183,8 @@ cove_trust() {
                 $SUDO_CMD apt install -y libnss3-tools &>/dev/null || true
             elif [ "$PKG_MANAGER" = "dnf" ]; then
                 $SUDO_CMD dnf install -y nss-tools &>/dev/null || true
+            elif [ "$PKG_MANAGER" = "pacman" ]; then
+                $SUDO_CMD pacman -S --needed --noconfirm nss &>/dev/null || true
             fi
         fi
     fi
@@ -36099,7 +37221,7 @@ cove_trust() {
             -maxdepth 1 -name 'root.crt' 2>/dev/null | head -1)
         # Fallback: the system-trust copy Caddy drops on first auto-install.
         if [ -z "$root_cert" ]; then
-            root_cert=$(find /usr/local/share/ca-certificates \
+            root_cert=$(find /usr/local/share/ca-certificates /etc/ca-certificates/trust-source/anchors \
                 -maxdepth 1 -name 'Caddy_Local_Authority*.crt' 2>/dev/null | head -1)
         fi
 
@@ -36139,7 +37261,9 @@ cove_trust() {
             local live_fp stale_fp stale_file pruned=0
             live_fp=$(openssl x509 -in "$root_cert" -noout -fingerprint -sha256 2>/dev/null)
             if [ -n "$live_fp" ]; then
-                for stale_file in /usr/local/share/ca-certificates/Caddy_Local_Authority*.crt; do
+                # Debian's store, then Arch's (p11-kit anchors).
+                for stale_file in /usr/local/share/ca-certificates/Caddy_Local_Authority*.crt \
+                                  /etc/ca-certificates/trust-source/anchors/Caddy_Local_Authority*.crt; do
                     [ -f "$stale_file" ] || continue
                     stale_fp=$(openssl x509 -in "$stale_file" -noout -fingerprint -sha256 2>/dev/null)
                     if [ -n "$stale_fp" ] && [ "$stale_fp" != "$live_fp" ]; then
@@ -36148,7 +37272,11 @@ cove_trust() {
                 done
                 if [ "$pruned" -gt 0 ]; then
                     echo "   - Removed $pruned stale Cove root(s) from the system store"
-                    $SUDO_CMD update-ca-certificates --fresh >/dev/null 2>&1 || true
+                    if command -v update-ca-certificates >/dev/null 2>&1; then
+                        $SUDO_CMD update-ca-certificates --fresh >/dev/null 2>&1 || true
+                    elif command -v trust >/dev/null 2>&1; then
+                        $SUDO_CMD trust extract-compat >/dev/null 2>&1 || true
+                    fi
                 fi
             fi
         else
@@ -36158,9 +37286,42 @@ cove_trust() {
 
     echo ""
     if [ "$trust_rc" -eq 0 ]; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
-            "✅ Local SSL trust installed" \
-            "If a browser was open during this run, restart it to pick up the new CA."
+        # On Linux, name the browsers that were already open: they loaded their
+        # NSS databases before the root went in and will keep refusing Cove's
+        # certificates until they are quit fully (closing windows can leave
+        # Chrome running in the background) and opened again.
+        local -a open_lines=() quit_procs=()
+        local b_name b_proc b_started
+        if [ "$OS" = "linux" ]; then
+            while IFS=$'\t' read -r b_name b_proc b_started; do
+                [ -n "$b_name" ] || continue
+                open_lines+=("   • $b_name, open since $(cove_browser_started_label "$b_started")")
+                quit_procs+=("$b_proc")
+            done < <(cove_browsers_running "$trust_began")
+        fi
+        if [ ${#open_lines[@]} -gt 0 ]; then
+            # One pkill pattern for them all (pkill takes a single regex).
+            local quit_pattern
+            quit_pattern=$(IFS='|'; echo "${quit_procs[*]}")
+            local restart_line="⚠️  Restart this browser: it was already running and still shows"
+            if [ ${#quit_procs[@]} -gt 1 ]; then
+                quit_pattern="'$quit_pattern'"
+                restart_line="⚠️  Restart these browsers: they were already running and still show"
+            fi
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+                "✅ Local SSL trust installed" \
+                "" \
+                "$restart_line" \
+                "   \"Your connection is not private\" until quit fully and reopened." \
+                "${open_lines[@]}" \
+                "" \
+                "Quit from the browser's menu (Exit / Quit), not just by closing windows," \
+                "or run: pkill -x $quit_pattern"
+        else
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+                "✅ Local SSL trust installed" \
+                "If a browser was open during this run, restart it to pick up the new CA."
+        fi
     else
         # Tailor the hint based on what frankenphp actually said — "connection
         # refused" almost always means Caddy's admin API isn't up yet.
@@ -36611,6 +37772,7 @@ cove_uninstall() {
     fi
 
     cove_disable
+    remove_autostart_agent
     if [ "$OS" = "linux" ]; then
         echo "   - Removing Cove's systemd units..."
         local unit
@@ -36685,6 +37847,9 @@ cove_uninstall() {
         fp=$(command -v frankenphp 2>/dev/null)
         done_lines+=("  brew uninstall gum mariadb mailpit wp-cli   (plus postgresql@17 and redis if Cove set them up)")
         [ -n "$fp" ] && done_lines+=("  $([ -w "$(dirname "$fp")" ] || echo "sudo ")rm $fp")
+    elif [ "$PKG_MANAGER" = "pacman" ]; then
+        done_lines+=("  sudo pacman -Rs mariadb gum   (plus postgresql and redis if Cove set them up)")
+        done_lines+=("  sudo rm /usr/local/bin/frankenphp /usr/local/bin/mailpit /usr/local/bin/wp")
     else
         done_lines+=("  sudo $PKG_MANAGER remove frankenphp 'php-zts-*' mariadb-server   (plus postgresql and redis if Cove set them up)")
         done_lines+=("  sudo rm /usr/local/bin/mailpit /usr/local/bin/gum /usr/local/bin/wp")
@@ -37308,6 +38473,451 @@ cove_wsl_hosts() {
     echo ""
 }
 
+# cove xdebug — step debugging, profiling and tracing for a site.
+#
+# FrankenPHP's PHP is static and loads no extensions, so a site with Xdebug
+# on is served by a native php-fpm at the site's PHP with Xdebug loaded, in
+# a pool of its own (see site_fpm_key and the Xdebug block in main): Homebrew's
+# php@<ver> on macOS, the distribution's php-fpm on Linux. Cove builds the
+# extension from PECL's source into ~/Cove/App/xdebug/<ver>/ with that PHP's
+# phpize: nothing is added to the PHP's own ini, so no other use of that PHP
+# on the machine loads it.
+
+# The newest stable Xdebug release that supports PHP $1 (major.minor), from
+# PECL's release list and each release's PHP range. Prints the version.
+xdebug_pick_release() {
+    local ver="$1" releases rel deps min max checked=0
+    releases=$(curl -fsSL --max-time 20 "https://pecl.php.net/rest/r/xdebug/allreleases.xml" 2>/dev/null \
+        | grep -o '<v>[^<]*</v><s>stable</s>' | sed 's/<v>\([^<]*\)<.*/\1/') || return 1
+    for rel in $releases; do
+        [[ "$rel" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        checked=$((checked + 1))
+        [ "$checked" -le 40 ] || break
+        deps=$(curl -fsSL --max-time 20 "https://pecl.php.net/rest/r/xdebug/deps.$rel.txt" 2>/dev/null) || continue
+        min=$(printf '%s' "$deps" | grep -o '"php";a:[0-9]*:{[^}]*}' | grep -o '"min";s:[0-9]*:"[^"]*"' | sed 's/.*:"\([^"]*\)"/\1/')
+        max=$(printf '%s' "$deps" | grep -o '"php";a:[0-9]*:{[^}]*}' | grep -o '"max";s:[0-9]*:"[^"]*"' | sed 's/.*:"\([^"]*\)"/\1/')
+        [ -n "$min" ] || continue
+        # Compare major.minor only: "8.5" against "8.0.0" … "8.5.99".
+        if [ "$(printf '%s\n%s\n' "$(normalize_php_version "$min")" "$ver" | sort -t. -k1,1n -k2,2n | head -1)" = "$(normalize_php_version "$min")" ]; then
+            if [ -z "$max" ] || [ "$(printf '%s\n%s\n' "$ver" "$(normalize_php_version "$max")" | sort -t. -k1,1n -k2,2n | head -1)" = "$ver" ]; then
+                echo "$rel"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# Build Xdebug for PHP $1 into $XDEBUG_DIR/$1/xdebug.so. Progress on stderr,
+# the compiler's output in ~/Cove/Logs/xdebug-build.log. Returns non-zero
+# (and leaves any earlier build in place) when anything fails.
+xdebug_build() {
+    local ver="$1" phpize config php rel work log tarball names dest
+    phpize=$(native_php_tool "$ver" phpize)
+    config=$(native_php_tool "$ver" php-config)
+    php=$(native_php_tool "$ver" php)
+    if [ -z "$phpize" ] || [ -z "$config" ] || [ -z "$php" ]; then
+        if [ "$OS" = "macos" ]; then
+            gum style --foreground red "❌ php@$ver isn't installed with phpize; can't build Xdebug for it." >&2
+        else
+            gum style --foreground red "❌ PHP $ver's phpize isn't installed; can't build Xdebug for it." \
+                "Install: $(xdebug_linux_packages "$ver" | xdebug_join_install)" >&2
+        fi
+        return 1
+    fi
+    if [ "$OS" = "macos" ]; then
+        if ! command -v autoconf >/dev/null 2>&1; then
+            echo "📦 Building Xdebug needs autoconf; installing it with Homebrew..." >&2
+            brew install autoconf >&2 || { gum style --foreground red "❌ 'brew install autoconf' failed." >&2; return 1; }
+        fi
+        if ! command -v make >/dev/null 2>&1 || ! command -v cc >/dev/null 2>&1; then
+            gum style --foreground red "❌ Building Xdebug needs a C compiler. Install Apple's command line tools: xcode-select --install" >&2
+            return 1
+        fi
+    elif ! command -v autoconf >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1 || ! command -v cc >/dev/null 2>&1; then
+        gum style --foreground red "❌ Building Xdebug needs autoconf, make and a C compiler." \
+            "Install: $(xdebug_linux_packages "$ver" | xdebug_join_install)" >&2
+        return 1
+    fi
+    echo "🔎 Finding the Xdebug release for PHP $ver..." >&2
+    if ! rel=$(xdebug_pick_release "$ver"); then
+        gum style --foreground red "❌ Couldn't find an Xdebug release for PHP $ver on pecl.php.net." >&2
+        return 1
+    fi
+    mkdir -p "$COVE_DIR/cache" "$LOGS_DIR" "$XDEBUG_DIR/$ver"
+    log="$LOGS_DIR/xdebug-build.log"
+    work=$(mktemp -d "$COVE_DIR/cache/xdebug-build-$ver.XXXXXX") || return 1
+    tarball="$work/xdebug-$rel.tgz"
+    echo "⬇️  Downloading Xdebug $rel..." >&2
+    if ! curl -fsSL --proto '=https' --max-time 120 -o "$tarball" "https://pecl.php.net/get/xdebug-$rel.tgz"; then
+        rm -rf "$work"
+        gum style --foreground red "❌ The download from pecl.php.net failed." >&2
+        return 1
+    fi
+    # Refuse an archive with absolute or parent-relative names before
+    # unpacking anything.
+    names=$(tar -tzf "$tarball" 2>/dev/null) || { rm -rf "$work"; gum style --foreground red "❌ The Xdebug download isn't a readable archive." >&2; return 1; }
+    if printf '%s\n' "$names" | grep -qE '^/|(^|/)\.\.(/|$)'; then
+        rm -rf "$work"
+        gum style --foreground red "❌ The Xdebug archive has unsafe paths; not unpacking it." >&2
+        return 1
+    fi
+    tar -xzf "$tarball" -C "$work" || { rm -rf "$work"; return 1; }
+    if [ ! -f "$work/xdebug-$rel/config.m4" ]; then
+        rm -rf "$work"
+        gum style --foreground red "❌ The Xdebug archive isn't laid out as expected (no xdebug-$rel/config.m4)." >&2
+        return 1
+    fi
+    echo "🔨 Building Xdebug $rel for PHP $ver (about 15 seconds)..." >&2
+    {
+        echo "=== $(date '+%Y-%m-%d %H:%M:%S') Xdebug $rel for PHP $ver ($phpize)"
+    } >> "$log"
+    if ! ( cd "$work/xdebug-$rel" \
+        && "$phpize" \
+        && ./configure --with-php-config="$config" \
+        && make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)" ) >> "$log" 2>&1; then
+        rm -rf "$work"
+        gum style --foreground red "❌ The Xdebug build failed; see $log" >&2
+        return 1
+    fi
+    # Make sure this PHP loads it before putting it in place.
+    if ! "$php" -n -d zend_extension="$work/xdebug-$rel/modules/xdebug.so" -r 'exit(extension_loaded("xdebug") ? 0 : 1);' >> "$log" 2>&1; then
+        rm -rf "$work"
+        gum style --foreground red "❌ PHP $ver wouldn't load the Xdebug it built; see $log" >&2
+        return 1
+    fi
+    dest="$XDEBUG_DIR/$ver"
+    cp "$work/xdebug-$rel/modules/xdebug.so" "$dest/xdebug.so.new" && mv "$dest/xdebug.so.new" "$dest/xdebug.so" || { rm -rf "$work"; return 1; }
+    printf 'version=%s\napi=%s\nbuild=%s\nphp=%s\nbuilt=%s\n' "$rel" \
+        "$(basename "$("$config" --extension-dir)")" "$(native_php_build_id "$ver")" \
+        "$("$config" --version)" "$(date '+%Y-%m-%d %H:%M:%S')" > "$dest/build-info"
+    rm -rf "$work"
+    echo "✅ Xdebug $rel built for PHP $ver." >&2
+    return 0
+}
+
+# The packages that give Linux PHP $1 with php-fpm and phpize, plus what
+# building Xdebug needs, for this distribution's package manager, one a line.
+# apt and dnf: FrankenPHP's own repository (Cove installs FrankenPHP from it
+# there), whose php-zts-fpm is FrankenPHP's PHP and loads the same
+# extensions. Never its php-zts-xdebug: that turns Xdebug on in the shared
+# conf.d, for FrankenPHP and every site. Arch: the distribution's PHP, which
+# follows the latest release as FrankenPHP's static binary does; when the two
+# differ, the message after the install says so.
+xdebug_linux_packages() {
+    local ver="$1"
+    case "$PKG_MANAGER" in
+        pacman) printf '%s\n' php php-fpm php-gd php-sodium base-devel autoconf ;;
+        apt) printf '%s\n' php-zts-fpm php-zts-devel build-essential autoconf ;;
+        dnf) printf '%s\n' php-zts-fpm php-zts-devel gcc make autoconf ;;
+    esac
+}
+
+# The install command for the packages on stdin.
+xdebug_join_install() {
+    local pkgs
+    pkgs=$(paste -sd' ' -)
+    case "$PKG_MANAGER" in
+        pacman) echo "sudo pacman -S --needed $pkgs" ;;
+        apt) echo "sudo apt install $pkgs" ;;
+        dnf) echo "sudo dnf install $pkgs" ;;
+    esac
+}
+
+# Linux: make sure PHP $1 is installed natively with php-fpm and phpize,
+# offering to install the distribution's packages from a terminal. Without a
+# terminal (the dashboard) it says what to run instead.
+xdebug_ensure_native_linux() {
+    local ver="$1" cmd have
+    if [ -n "$(native_php_tool "$ver" fpm)" ] && [ -n "$(native_php_tool "$ver" php)" ] && [ -n "$(native_php_tool "$ver" phpize)" ]; then
+        return 0
+    fi
+    cmd=$(xdebug_linux_packages "$ver" | xdebug_join_install)
+    have=$(native_php_versions_linux)
+    case " $have " in
+        *" $ver "*) echo "📦 Xdebug needs PHP $ver's php-fpm and its development files (phpize), which aren't installed yet." >&2 ;;
+        *) echo "📦 Xdebug runs a debugged site on a native php-fpm at PHP $ver, which isn't installed.${have:+ (Installed: PHP $have.)}" >&2 ;;
+    esac
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        gum style --foreground red "❌ Install it from a terminal, then turn Xdebug on again:" "   $cmd" >&2
+        return 1
+    fi
+    if ! gum confirm "Run: $cmd ?"; then
+        echo "Aborted." >&2
+        return 1
+    fi
+    local pkgs=()
+    while IFS= read -r p; do pkgs+=("$p"); done < <(xdebug_linux_packages "$ver")
+    case "$PKG_MANAGER" in
+        pacman) $SUDO_CMD pacman -S --needed --noconfirm "${pkgs[@]}" ;;
+        apt) $SUDO_CMD apt-get install -y "${pkgs[@]}" ;;
+        dnf) $SUDO_CMD dnf install -y "${pkgs[@]}" ;;
+    esac || { gum style --foreground red "❌ The install failed." >&2; return 1; }
+    if [ -z "$(native_php_tool "$ver" fpm)" ] || [ -z "$(native_php_tool "$ver" phpize)" ]; then
+        have=$(native_php_versions_linux)
+        gum style --foreground red "❌ PHP $ver's php-fpm still isn't there.${have:+ The distribution installed PHP $have.}" \
+            "Cove's PHP is $ver, and a debugged site keeps the PHP it runs." >&2
+        return 1
+    fi
+    return 0
+}
+
+# Make sure PHP $1 has php-fpm and a loadable Xdebug build.
+xdebug_ensure() {
+    local ver="$1"
+    if [ "$OS" = "linux" ]; then
+        xdebug_ensure_native_linux "$ver" || return 1
+    else
+        ensure_php_formula "$ver" || return 1
+    fi
+    [ -n "$(xdebug_so_for "$ver")" ] && return 0
+    xdebug_build "$ver"
+}
+
+xdebug_supported() {
+    [ "$OS" = "linux" ] && return 0
+    if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+        gum style --foreground red "❌ Xdebug needs Homebrew on macOS, or Linux." \
+            "FrankenPHP's bundled PHP can't load extensions, so Cove runs a debugged site on a native php-fpm." >&2
+        return 1
+    fi
+}
+
+# Turning Xdebug on or off reloads Caddy; wait for the site to answer again.
+xdebug_warm() {
+    local url="$1"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        curl -ks --max-time 1 -o /dev/null "$url/" 2>/dev/null && break
+        sleep 0.2
+    done
+}
+
+# How a request starts a session, in a sentence.
+xdebug_start_hint() {
+    if [ "$(xdebug_setting start)" = "yes" ]; then
+        echo "Every request starts a session (cove xdebug start trigger to change)."
+    else
+        echo "Start a session with the XDEBUG_SESSION cookie (any Xdebug browser extension) or ?XDEBUG_SESSION=1."
+    fi
+}
+
+cove_xdebug_overview() {
+    local format="$1" site_path name ver key builds="" sites=() so first=true
+    for site_path in "$SITES_DIR"/*.localhost; do
+        [ -d "$site_path" ] && site_xdebug_on "$site_path" && sites+=("$site_path")
+    done
+    if [ "$format" = "json" ]; then
+        printf '{"mode":"%s","start":"%s","port":%s,"sites":[' "$(xdebug_setting mode)" "$(xdebug_setting start)" "$(xdebug_setting port)"
+        for site_path in "${sites[@]}"; do
+            name=$(basename "$site_path" .localhost)
+            key=$(site_fpm_key "$site_path")
+            $first || printf ','
+            first=false
+            printf '{"site":"%s","php":"%s","active":%s}' "$name" "$(site_php_minor "$site_path")" "$([[ "$key" == *-xdebug ]] && echo true || echo false)"
+        done
+        printf '],"builds":['
+        first=true
+        for so in "$XDEBUG_DIR"/*/xdebug.so; do
+            [ -f "$so" ] || continue
+            ver=$(basename "$(dirname "$so")")
+            $first || printf ','
+            first=false
+            printf '{"php":"%s","xdebug":"%s","loadable":%s}' "$ver" "$(sed -n 's/^version=//p' "$XDEBUG_DIR/$ver/build-info" 2>/dev/null)" "$([ -n "$(xdebug_so_for "$ver")" ] && echo true || echo false)"
+        done
+        printf ']}\n'
+        return 0
+    fi
+    echo "🐞 Xdebug: mode $(xdebug_setting mode), start $(xdebug_setting start), IDE port $(xdebug_setting port)"
+    echo ""
+    if [ "${#sites[@]}" -eq 0 ]; then
+        echo "  No sites have Xdebug on. Turn it on with: cove xdebug <site> on"
+    else
+        for site_path in "${sites[@]}"; do
+            name=$(basename "$site_path")
+            ver=$(site_php_minor "$site_path")
+            key=$(site_fpm_key "$site_path")
+            if [[ "$key" == *-xdebug ]]; then
+                printf "  %-42s %s\n" "$name" "PHP $ver (php-fpm with Xdebug)"
+            else
+                printf "  %-42s %s\n" "$name" "PHP $ver, no Xdebug build yet: cove xdebug install $ver"
+            fi
+        done
+    fi
+    for so in "$XDEBUG_DIR"/*/xdebug.so; do
+        [ -f "$so" ] || continue
+        ver=$(basename "$(dirname "$so")")
+        if [ -n "$(xdebug_so_for "$ver")" ]; then
+            builds+="  PHP $ver: Xdebug $(sed -n 's/^version=//p' "$XDEBUG_DIR/$ver/build-info" 2>/dev/null)"$'\n'
+        else
+            builds+="  PHP $ver: stale after a PHP upgrade; rebuild with cove xdebug install $ver"$'\n'
+        fi
+    done
+    if [ -n "$builds" ]; then
+        echo ""
+        echo "Builds (~/Cove/App/xdebug):"
+        printf '%s' "$builds"
+    fi
+}
+
+# cove xdebug mode|start|port [<value>]: show or change one of Cove's
+# Xdebug settings, then reload so running pools pick it up.
+cove_xdebug_setting_cmd() {
+    local what="$1" value="$2" key
+    case "$what" in
+        mode) key=XDEBUG_MODE ;;
+        start) key=XDEBUG_START ;;
+        port) key=XDEBUG_PORT ;;
+    esac
+    if [ -z "$value" ]; then
+        xdebug_setting "$what"
+        return 0
+    fi
+    case "$what" in
+        mode)
+            value=$(printf '%s' "$value" | tr -d ' ')
+            if ! [[ "$value" =~ ^(off|develop|coverage|debug|gcstats|profile|trace)(,(develop|coverage|debug|gcstats|profile|trace))*$ ]]; then
+                cove_err "❌ Error: Unknown Xdebug mode '$value'." "Use a comma list of: debug, develop, profile, trace, coverage, gcstats (or off)."
+                exit 1
+            fi
+            ;;
+        start)
+            case "$value" in
+                trigger) ;;
+                yes|always) value=yes ;;
+                *) cove_err "❌ Error: Use 'trigger' (a cookie or ?XDEBUG_SESSION=1 starts a session) or 'always'."; exit 1 ;;
+            esac
+            ;;
+        port)
+            if ! [[ "$value" =~ ^[0-9]{1,5}$ ]] || [ "$((10#$value))" -lt 1 ] || [ "$((10#$value))" -gt 65535 ]; then
+                cove_err "❌ Error: '$value' isn't a port number."
+                exit 1
+            fi
+            value=$((10#$value))
+            ;;
+    esac
+    config_set "$key" "$value"
+    echo "✅ Xdebug $what is now $(xdebug_setting "$what")."
+    local site_path any=false
+    for site_path in "$SITES_DIR"/*.localhost; do
+        site_xdebug_on "$site_path" && any=true && break
+    done
+    if [ "$any" = true ]; then
+        regenerate_caddyfile >/dev/null
+        echo "   Restarted the Xdebug php-fpm pools with it."
+    fi
+}
+
+cove_xdebug() {
+    local args=() format=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --format=*) format="${1#*=}"; shift ;;
+            --json) format="json"; shift ;;
+            -h|--help) display_command_help xdebug; exit 0 ;;
+            -*) cove_err "❌ Error: Unknown option: $1" "Usage: cove xdebug [<site> [on|off]] | mode|start|port [<value>] | install [<php version>]"; exit 1 ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    set -- "${args[@]}"
+
+    case "${1:-}" in
+        "")
+            cove_xdebug_overview "$format"
+            return 0
+            ;;
+        mode|start|port)
+            cove_xdebug_setting_cmd "$1" "${2:-}"
+            return 0
+            ;;
+        install)
+            xdebug_supported || exit 1
+            local ver
+            if [ -n "${2:-}" ]; then
+                ver=$(normalize_php_version "$2")
+                [ -n "$ver" ] || { cove_err "❌ Error: Invalid PHP version '$2'." "Use a version like 8.3."; exit 1; }
+            else
+                ver=$(normalize_php_version "$(frankenphp_php_version)")
+            fi
+            if [ "$OS" = "linux" ]; then
+                xdebug_ensure_native_linux "$ver" || exit 1
+            else
+                ensure_php_formula "$ver" || exit 1
+            fi
+            xdebug_build "$ver" || exit 1
+            # Sites already waiting on this build move onto it now.
+            regenerate_caddyfile >/dev/null
+            return 0
+            ;;
+    esac
+
+    local site_name="${1%.localhost}" action="${2:-}"
+    local site_dir="$SITES_DIR/$site_name.localhost"
+    if ! validate_site_name "$site_name" || [ ! -d "$site_dir" ]; then
+        site_not_found "$site_name"
+        exit 1
+    fi
+    local ver
+    ver=$(site_php_minor "$site_dir")
+
+    case "$action" in
+        "")
+            if site_xdebug_on "$site_dir"; then
+                if [[ "$(site_fpm_key "$site_dir")" == *-xdebug ]]; then
+                    echo "Xdebug is on for $site_name.localhost (PHP $ver, IDE port $(xdebug_setting port))."
+                else
+                    echo "Xdebug is on for $site_name.localhost, but PHP $ver has no Xdebug build yet: cove xdebug install $ver"
+                fi
+            else
+                echo "Xdebug is off for $site_name.localhost."
+            fi
+            ;;
+        on)
+            xdebug_supported || exit 1
+            if ! xdebug_ensure "$ver"; then
+                exit 1
+            fi
+            touch "$site_dir/xdebug"
+            regenerate_caddyfile
+            # The site is only on Xdebug once its handler points at the pool.
+            if [[ "$(site_fpm_key "$site_dir")" != *-xdebug ]]; then
+                gum style --foreground red "❌ $site_name.localhost is still on its usual PHP: PHP $ver's Xdebug build doesn't load." \
+                    "Rebuild it with: cove xdebug install $ver" >&2
+                exit 1
+            fi
+            local url
+            url=$(url_for "$site_name.localhost")
+            xdebug_warm "$url"
+            local cli_hint="CLI: XDEBUG_SESSION=1 cove wp $site_name <command>"
+            site_is_laravel "$site_dir" && cli_hint="CLI: XDEBUG_SESSION=1 cove artisan $site_name <command>"
+            [ -f "$site_dir/public/wp-config.php" ] || site_is_laravel "$site_dir" || cli_hint=""
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+                "🐞 Xdebug is on for $site_name.localhost (PHP $ver, mode $(xdebug_setting mode))" \
+                "Have your IDE listen on port $(xdebug_setting port)." \
+                "$(xdebug_start_hint)" \
+                ${cli_hint:+"$cli_hint"} \
+                "Turn it off with: cove xdebug $site_name off"
+            ;;
+        off)
+            if ! site_xdebug_on "$site_dir"; then
+                echo "ℹ️  Xdebug is already off for $site_name.localhost."
+                return 0
+            fi
+            rm -f "$site_dir/xdebug"
+            regenerate_caddyfile
+            xdebug_warm "$(url_for "$site_name.localhost")"
+            if [ -n "$(site_php_version "$site_dir")" ]; then
+                echo "✅ Xdebug is off for $site_name.localhost; it's back on its pinned PHP $ver."
+            else
+                echo "✅ Xdebug is off for $site_name.localhost; it's back on FrankenPHP."
+            fi
+            ;;
+        *)
+            cove_unknown_subcommand xdebug "$action" "on off"
+            exit 1
+            ;;
+    esac
+}
+
 # --- Embedded Menu Bar Apps (generated from menubar/ by compile.sh) ---
 
 emit_menubar_main_m() {
@@ -37389,6 +38999,7 @@ static const NSInteger kServiceRowStartIndex = 2;
 @property(nonatomic, strong) NSMenuItem *dashboardItem;
 @property(nonatomic, strong) NSMenuItem *adminerItem;
 @property(nonatomic, strong) NSMenuItem *mailpitItem;
+@property(nonatomic, strong) NSMenuItem *autostartItem;
 @property(nonatomic, strong) NSMenuItem *launchItem;
 @property(nonatomic, strong) NSMenuItem *versionItem;
 @end
@@ -37897,7 +39508,13 @@ static const NSInteger kServiceRowStartIndex = 2;
 
     [self.menu addItem:[NSMenuItem separatorItem]];
 
-    self.launchItem = [[NSMenuItem alloc] initWithTitle:@"Launch at Login"
+    self.autostartItem = [[NSMenuItem alloc] initWithTitle:@"Start Cove at Login"
+                                                    action:@selector(toggleAutostart)
+                                             keyEquivalent:@""];
+    self.autostartItem.target = self;
+    [self.menu addItem:self.autostartItem];
+
+    self.launchItem = [[NSMenuItem alloc] initWithTitle:@"Open Menu Bar at Login"
                                                  action:@selector(toggleLaunchAtLogin)
                                           keyEquivalent:@""];
     self.launchItem.target = self;
@@ -37951,6 +39568,8 @@ static const NSInteger kServiceRowStartIndex = 2;
     self.adminerItem.enabled = [self serviceRunning:@"caddy"];
     self.mailpitItem.enabled = [self serviceRunning:@"mailpit"];
 
+    self.autostartItem.state = [self autostartEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    self.autostartItem.enabled = !self.busy;
     self.launchItem.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled
         ? NSControlStateValueOn
         : NSControlStateValueOff;
@@ -38578,6 +40197,36 @@ static const NSInteger kServiceRowStartIndex = 2;
 
 #pragma mark - Housekeeping
 
+// `cove autostart` keeps a login agent in LaunchAgents while it's on; its
+// presence is the setting, so no status poll is needed to show it.
+- (BOOL)autostartEnabled {
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:
+                      @"Library/LaunchAgents/com.cove.autostart.plist"];
+    return [[NSFileManager defaultManager] fileExistsAtPath:path];
+}
+
+- (void)toggleAutostart {
+    if (self.busy) {
+        return;
+    }
+    NSString *setting = [self autostartEnabled] ? @"off" : @"on";
+    __weak typeof(self) weakSelf = self;
+    [self runCoveWithArguments:@[@"autostart", setting]
+                       timeout:30.0
+                    completion:^(int status, NSString *output, NSError *error) {
+        (void)output;
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+        if (status != 0) {
+            [strongSelf showErrorWithTitle:@"Start Cove at Login"
+                                   message:error.localizedDescription ?: @"Unable to change the setting."];
+        }
+        [strongSelf updateMenu];
+    }];
+}
+
 - (void)toggleLaunchAtLogin {
     SMAppService *service = SMAppService.mainAppService;
     NSError *error = nil;
@@ -38705,8 +40354,10 @@ cat <<'COVE_MENUBAR_TRAY_EOF'
 # full colour when Caddy, MariaDB and Mailpit are all up, light grey when
 # some are, dark grey when everything is stopped.
 #
-# It is a StatusNotifierItem (the freedesktop tray protocol) published through
-# AyatanaAppIndicator3, so it shows up on any desktop that hosts a tray:
+# It is a StatusNotifierItem (the freedesktop tray protocol), published by
+# SniIndicator with ItemIsMenu set so a left click opens the menu (falling back
+# to AyatanaAppIndicator3 without libdbusmenu-gtk3's bindings), so it shows up
+# on any desktop that hosts a tray:
 # COSMIC, KDE, XFCE, MATE, Cinnamon, and GNOME with the AppIndicator extension
 # (Ubuntu ships it enabled; vanilla GNOME and Debian do not). The menu itself
 # is rendered by the desktop's panel over DBus, which is why there is no
@@ -38733,8 +40384,28 @@ from datetime import datetime
 import gi
 
 gi.require_version("Gtk", "3.0")
-gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+from gi.repository import Gtk, GLib, Gio  # noqa: E402
+
+# The tray item is published by SniIndicator below (its own StatusNotifierItem
+# with ItemIsMenu, the menu exported through libdbusmenu-gtk3). Where those
+# bindings are missing it falls back to AyatanaAppIndicator3, which works
+# everywhere but publishes no ItemIsMenu: hosts that honour the spec then send
+# a left click to Activate, which Ayatana doesn't handle, so only a right
+# click opened the menu (omarchy-shell / Quickshell, 2026-11-18).
+try:
+    gi.require_version("Dbusmenu", "0.4")
+    gi.require_version("DbusmenuGtk3", "0.4")
+    from gi.repository import Dbusmenu, DbusmenuGtk3  # noqa: E402
+    HAVE_DBUSMENU = True
+except (ValueError, ImportError):
+    HAVE_DBUSMENU = False
+
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+    HAVE_AYATANA = True
+except (ValueError, ImportError):
+    HAVE_AYATANA = False
 
 try:
     gi.require_version("Notify", "0.7")
@@ -38770,6 +40441,146 @@ ICON_VARIANTS = {
     "cove-logo-partial": "#9a9a9a",
     "cove-logo-stopped": "#4a4a4a",
 }
+
+
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="WindowId" type="i" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
+    <property name="IconPixmap" type="a(iiay)" access="read"/>
+    <property name="OverlayIconName" type="s" access="read"/>
+    <property name="AttentionIconName" type="s" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
+    <signal name="NewTitle"/>
+    <signal name="NewIcon"/>
+    <signal name="NewAttentionIcon"/>
+    <signal name="NewOverlayIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewStatus"><arg name="status" type="s"/></signal>
+  </interface>
+</node>
+"""
+SNI_PATH = "/StatusNotifierItem"
+SNI_MENU_PATH = "/MenuBar"
+SNI_WATCHER = "org.kde.StatusNotifierWatcher"
+
+
+class SniIndicator:
+    """A StatusNotifierItem of our own, with the few AppIndicator calls the
+    tray uses (set_menu, set_icon_full, set_title, set_icon_theme_path).
+
+    ItemIsMenu is true, so a host opens the menu on a left click as the macOS
+    app does; the menu is the same Gtk.Menu, exported with the dbusmenu
+    parser Ayatana itself uses, so labels changed in place keep updating.
+    It registers with the StatusNotifierWatcher whenever one appears, so the
+    icon comes back when the panel restarts."""
+
+    def __init__(self, item_id, icon_name, theme_path, title):
+        self.item_id = item_id
+        self.icon_name = icon_name
+        self.theme_path = theme_path
+        self.title = title
+        self.tooltip = title
+        self.server = None
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        node = Gio.DBusNodeInfo.new_for_xml(SNI_XML)
+        self.registration = self.bus.register_object(
+            SNI_PATH, node.interfaces[0], self.on_method_call, self.on_get_property, None)
+        self.owner = Gio.bus_own_name_on_connection(
+            self.bus, self.bus_name, Gio.BusNameOwnerFlags.NONE, None, None)
+        self.watch = Gio.bus_watch_name_on_connection(
+            self.bus, SNI_WATCHER, Gio.BusNameWatcherFlags.NONE, self.on_watcher_appeared, None)
+
+    def on_watcher_appeared(self, connection, name, owner):
+        connection.call(SNI_WATCHER, "/StatusNotifierWatcher", SNI_WATCHER, "RegisterStatusNotifierItem",
+                        GLib.Variant("(s)", (self.bus_name,)), None, Gio.DBusCallFlags.NONE, -1, None,
+                        self.on_registered)
+
+    def on_registered(self, connection, result):
+        try:
+            connection.call_finish(result)
+            log("Tray icon registered with the StatusNotifierWatcher")
+        except GLib.Error as error:
+            log(f"Couldn't register the tray icon: {error.message}")
+
+    def on_method_call(self, connection, sender, path, interface, method, params, invocation):
+        # The host renders the menu itself (ItemIsMenu); nothing else to do.
+        invocation.return_value(None)
+
+    def on_get_property(self, connection, sender, path, interface, prop):
+        values = {
+            "Category": GLib.Variant("s", "ApplicationStatus"),
+            "Id": GLib.Variant("s", self.item_id),
+            "Title": GLib.Variant("s", self.title),
+            "Status": GLib.Variant("s", "Active"),
+            "WindowId": GLib.Variant("i", 0),
+            "IconName": GLib.Variant("s", self.icon_name),
+            "IconThemePath": GLib.Variant("s", self.theme_path),
+            "IconPixmap": GLib.Variant("a(iiay)", []),
+            "OverlayIconName": GLib.Variant("s", ""),
+            "AttentionIconName": GLib.Variant("s", ""),
+            "ToolTip": GLib.Variant("(sa(iiay)ss)", ("", [], self.title, self.tooltip)),
+            "ItemIsMenu": GLib.Variant("b", True),
+            "Menu": GLib.Variant("o", SNI_MENU_PATH),
+        }
+        return values.get(prop)
+
+    def emit(self, signal, params=None):
+        try:
+            self.bus.emit_signal(None, SNI_PATH, "org.kde.StatusNotifierItem", signal, params)
+        except GLib.Error as error:
+            log(f"Couldn't signal {signal}: {error.message}")
+
+    def set_menu(self, menu):
+        self.server = Dbusmenu.Server.new(SNI_MENU_PATH)
+        self.server.set_root(DbusmenuGtk3.gtk_parse_menu_structure(menu))
+
+    def set_icon_theme_path(self, path):
+        self.theme_path = path
+
+    def set_title(self, title):
+        self.title = title
+        self.emit("NewTitle")
+
+    def set_icon_full(self, icon_name, description):
+        changed_icon = icon_name != self.icon_name
+        changed_tip = description != self.tooltip
+        self.icon_name = icon_name
+        self.tooltip = description
+        if changed_icon:
+            self.emit("NewIcon")
+        if changed_tip:
+            self.emit("NewToolTip")
+
+
+def new_indicator(icon_name):
+    """The tray item: SniIndicator, or Ayatana's where dbusmenu is missing."""
+    if HAVE_DBUSMENU:
+        try:
+            return SniIndicator("cove", icon_name, ICON_DIR, "Cove")
+        except GLib.Error as error:
+            log(f"Own StatusNotifierItem failed ({error.message}); using AyatanaAppIndicator3")
+    if not HAVE_AYATANA:
+        raise SystemExit("Cove Menu Bar needs libdbusmenu-gtk3 or AyatanaAppIndicator3 bindings.")
+    indicator = AppIndicator.Indicator.new(
+        "cove", icon_name, AppIndicator.IndicatorCategory.APPLICATION_STATUS)
+    indicator.set_icon_theme_path(ICON_DIR)
+    indicator.set_title("Cove")
+    indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+    return indicator
 
 
 def log(text):
@@ -38884,11 +40695,7 @@ class CoveTray:
         self.sites_dir_mtime = None
 
         write_icon_variants()
-        self.indicator = AppIndicator.Indicator.new(
-            "cove", "cove-logo-partial", AppIndicator.IndicatorCategory.APPLICATION_STATUS)
-        self.indicator.set_icon_theme_path(ICON_DIR)
-        self.indicator.set_title("Cove")
-        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator = new_indicator("cove-logo-partial")
 
         self.menu = Gtk.Menu()
         self.build_menu()
