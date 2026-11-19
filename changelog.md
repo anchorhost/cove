@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [2.6] - 2026-11-19
+
+Cove gets Xdebug. `cove xdebug <site> on` moves one site onto its own php-fpm with Xdebug loaded, on macOS and Linux, so you can step through that site's code while every other site stays on FrankenPHP. Cove now installs on Arch Linux and its derivatives, starts itself at login on macOS, and its mail view previews messages in light and dark and loads images when you ask. On Linux, sites find MariaDB's socket wherever the distribution puts it, and `cove enable` no longer reports a slow start as a failure.
 
 ### ✨ New Features
 
