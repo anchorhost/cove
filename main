@@ -2928,12 +2928,15 @@ if [ \$((now_s - \$(cat "\$lv_stamp" 2>/dev/null || echo 0))) -ge 60 ] && ls "$S
 fi
 # Native php-fpm pools on Linux (a site with cove xdebug on): Cove starts
 # them itself, so any whose start script is there and whose process isn't
-# (a crash, a reboot) is started again. macOS pools are launchd's.
+# (a crash, a reboot) is started again. macOS pools are launchd's. The pid
+# file outlives a reboot, and its number may since belong to something
+# else, so the process has to be a php-fpm.
 for fpm_start in "$PHP_FPM_DIR"/*/start; do
     [ -x "\$fpm_start" ] || continue
     fpm_key=\$(basename "\$(dirname "\$fpm_start")")
     fpm_pid=\$(cat "$RUN_DIR/php-fpm-\$fpm_key.pid" 2>/dev/null)
-    if [ -z "\$fpm_pid" ] || ! kill -0 "\$fpm_pid" 2>/dev/null; then
+    case "\$fpm_pid" in ''|*[!0-9]*) fpm_pid=0 ;; esac
+    if ! grep -qas php-fpm "/proc/\$fpm_pid/cmdline"; then
         "\$fpm_start" >> "$LOGS_DIR/php-fpm-\$fpm_key.log" 2>&1
     fi
 done
@@ -3747,8 +3750,11 @@ EOM
 remove_php_fpm_service() {
     local ver="$1"
     if [ "$OS" = "linux" ]; then
-        php_fpm_pool_stop "$ver"
+        # The start script goes first: the watchdog starts any pool whose
+        # script is there and whose process isn't, so with the pool stopped
+        # first it could start it again in between.
         rm -f "$PHP_FPM_DIR/$ver/start"
+        php_fpm_pool_stop "$ver"
         return 0
     fi
     local plist_path="$COVE_DIR/com.cove.php-fpm-$ver.plist"
@@ -3808,7 +3814,9 @@ ${scan_dir:+PHP_INI_SCAN_DIR='$scan_dir' }exec env -u PHPRC '$fpm_bin' --fpm-con
     fi
     printf '%s\n' "$script" > "$start.tmp" && chmod +x "$start.tmp" && mv "$start.tmp" "$start"
     php_fpm_pool_stop "$key"
-    if ! "$start" >> "$LOGS_DIR/php-fpm-$key.log" 2>&1; then
+    # The watchdog may have started it from the new script in between; that
+    # start is as good as this one.
+    if ! "$start" >> "$LOGS_DIR/php-fpm-$key.log" 2>&1 && [ -z "$(php_fpm_pool_pid "$key")" ]; then
         echo "   ⚠️  php-fpm for $key didn't start; see $LOGS_DIR/php-fpm-$key.log" >&2
         return 1
     fi

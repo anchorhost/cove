@@ -42,6 +42,18 @@ cove_disable() {
         # bring it down.
         $SUDO_CMD systemctl stop cove-watchdog.timer &>/dev/null || true
         cove_disable_laravel_workers
+        # Native php-fpm pools (cove xdebug), stopped once the watchdog can't
+        # start them again. Their start scripts stay: the watchdog brings
+        # them back after the next enable. The pkill catches a master that
+        # lost its pid file, by its title ("php-fpm: master process
+        # (~/Cove/php-fpm/<key>/php-fpm.conf)").
+        local fpm_start
+        for fpm_start in "$PHP_FPM_DIR"/*/start; do
+            [ -e "$fpm_start" ] || continue
+            echo "   - Stopping PHP-FPM ($(basename "$(dirname "$fpm_start")"))..."
+            php_fpm_pool_stop "$(basename "$(dirname "$fpm_start")")"
+        done
+        pkill -f "$PHP_FPM_DIR/.*/php-fpm\.conf" &>/dev/null || true
         # v1.10+: FrankenPHP runs as cove.service under systemd. Try that
         # first; fall back to `frankenphp stop` in case a user skipped
         # cove_enable since the upgrade and still has an ad-hoc instance.
