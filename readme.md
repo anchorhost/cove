@@ -13,7 +13,7 @@ Cove is a tiny CLI that spins up local sites in seconds — automatic HTTPS, one
   * **Any PHP app in one line**: `cove add myapp --from=<folder, git URL or archive>` brings in an existing app (a `.zip`, `.tar.gz`, `.tgz` or `.tar`, as a file or an https:// link such as a GitHub release asset) and serves its `public/`. A project with no `public/` but an `index.php` or `index.html` at the top is served whole, and a `cove.json` at its top can name another webroot (`{"webroot": "web"}`), the PHP it needs, and a next step to show. Nothing in it is run.
   * **Laravel**: `cove add myapp laravel` creates a Laravel app the way `laravel new` does, on SQLite by default, on Cove's MariaDB with `--database=mysql` or on PostgreSQL with `--database=pgsql` (set up the first time it's asked for), its mail caught in Cove's mailbox; `cove add shop --from=<folder, git URL or archive>` sets up an existing one instead, packages, database, migrations and front end included. `cove artisan` and `cove composer` run on the PHP the site serves with, `cove login` signs in through the app's own auth (`cove laravel myapp user add` gives a new app someone to sign in as), `cove laravel` keeps a queue worker, the scheduler and Reverb running, and the dashboard has its users, routes, migrations, schedule, database, `laravel.log`, and an artisan console. Vite's `npm run dev` works as it is.
   * **Per-site PHP** (macOS): Pin any site to an older PHP (`cove php mysite 8.2`); it runs on Homebrew's native php-fpm behind the same Caddy, with TLS, logs, and URLs unchanged. On Linux every site runs on FrankenPHP's PHP.
-  * **Xdebug** (macOS): `cove xdebug mysite on` moves one site onto a php-fpm with Xdebug loaded, at the PHP it already runs, so step debugging and profiling work while every other site stays as fast as before. Cove builds Xdebug itself on first use and leaves Homebrew's php.ini alone.
+  * **Xdebug**: `cove xdebug mysite on` moves one site onto a php-fpm with Xdebug loaded, at the PHP it already runs, so step debugging and profiling work while every other site stays as fast as before. Cove builds Xdebug itself on first use and leaves your PHP's own php.ini alone: Homebrew's on macOS, and on Linux `php-zts-fpm` from FrankenPHP's package repository (Arch: `php` and `php-fpm`), which the first `on` offers to install.
   * **WordPress Migration**: Pull a remote site down via SSH (`cove pull`) or push a local site up (`cove push`), including a single tenant of a WP Freighter install (`--tenant`).
   * **Database Management**: Browse and edit any table from the dashboard, run SQL with `⌘↵`, plus Adminer with passwordless auto-login for exports and schema work. `cove db backup` dumps every WordPress site's database; `cove db list` shows their credentials.
   * **Email Catching**: Built-in Mailpit catches every outgoing email so you never risk sending a test to a real inbox. Read it in the dashboard, filtered by site, with reset and login links lifted out of each message — and nothing is ever pruned.
@@ -54,7 +54,7 @@ Run the following in your terminal to install `cove`.
 bash <(curl -fsSL https://cove.run/install-cove.sh)
 ```
 
-On macOS (Apple Silicon or Intel), the installer will offer to install Homebrew first if it's not already present. On Linux (Ubuntu, Debian, Fedora, Rocky Linux/RHEL), make sure `curl` is installed before running it.
+On macOS (Apple Silicon or Intel), the installer will offer to install Homebrew first if it's not already present. On Linux (Ubuntu, Debian, Fedora, Rocky Linux/RHEL, Arch), make sure `curl` is installed before running it.
 
 To preview an unreleased build from the `main` branch — useful for verifying a fix before it's tagged — pass `--main`. The installer downloads the main branch and builds `cove.sh` from its source:
 
@@ -117,7 +117,7 @@ Cove provides a simple set of commands to manage your local environment. Whereve
 | `cove path <name>` | Outputs the full system path to a site's public directory. |
 | `cove url <name>` | Prints the full HTTPS URL for a site (including the port suffix when on alternative ports). |
 | `cove php [<site>] [<version>\|default\|unpin]` | Per-site PHP version switching, on macOS with Homebrew only (on Linux every site runs on FrankenPHP's PHP). Pinning routes a site through a native Homebrew `php@<version>` php-fpm behind Caddy; `default` (or `unpin`) returns it to FrankenPHP's bundled PHP. WP-CLI, artisan and Composer follow the pin, and it travels with the site through clone and rename. |
-| `cove xdebug [<site> [on\|off]]` | Xdebug for one site, on macOS with Homebrew. The site moves to a native php-fpm with Xdebug loaded, at the site's own PHP, in a pool of its own; the first `on` for a PHP version builds Xdebug from pecl.php.net into `~/Cove/App/xdebug`. Sessions start on a trigger (the `XDEBUG_SESSION` cookie or `?XDEBUG_SESSION=1`); `XDEBUG_SESSION=1 cove wp <site> …` debugs a CLI command. `cove xdebug mode debug,profile`, `start always` and `port <n>` change the settings for every site; `cove xdebug install <ver>` rebuilds. |
+| `cove xdebug [<site> [on\|off]]` | Xdebug for one site: on macOS with Homebrew's PHP, on Linux with `php-zts-fpm` from FrankenPHP's package repository (Arch: `php` and `php-fpm`), which the first `on` from a terminal offers to install. The site moves to a native php-fpm with Xdebug loaded, at the site's own PHP, in a pool of its own (on Linux Cove runs it as you, and the watchdog restarts it); the first `on` for a PHP version builds Xdebug from pecl.php.net into `~/Cove/App/xdebug`. Sessions start on a trigger (the `XDEBUG_SESSION` cookie or `?XDEBUG_SESSION=1`); `XDEBUG_SESSION=1 cove wp <site> …` debugs a CLI command. `cove xdebug mode debug,profile`, `start always` and `port <n>` change the settings for every site; `cove xdebug install <ver>` rebuilds. |
 | `cove log [<site>] [--app\|--access] [-f]` | Without a site, the shared PHP error log. With one, the app's own log first (a Laravel app's newest `storage/logs/*.log`, or WordPress's `wp-content/debug.log`), then Caddy's access log; `--app` or `--access` shows just one. Use `-f` to follow logs in real-time. The dashboard's **logs** view shows the same files parsed, filtered by level, and scoped per site. |
 | `cove log rotate` | How long each log is kept, with sizes. Cove keeps every line of its own logs in `~/Cove/Logs` by default; `cove log rotate 50` moves a log past 50 MB to `<name>.log.1` (replacing the one before). `cove log rotate services <MB>\|off\|default` sets the restart-storm cap on FrankenPHP's and Mailpit's own output (50 MB by default, the last tenth kept). `cove log rotate access <MB>\|off\|default [--keep=N] [--days=N]` sets how Caddy rolls each site's access log (100 MB, 10 files, 90 days by default). |
 
@@ -137,6 +137,7 @@ Cove provides a simple set of commands to manage your local environment. Whereve
 | `cove disable` | Stops Cove's background services and Laravel sites' workers. PostgreSQL and Redis are left alone. |
 | `cove status` | Checks the status of all background services. PostgreSQL and Redis show once a Laravel site has set them up, marked optional. Exits 1 when one of Cove's own services is stopped; `--porcelain` for scripts. |
 | `cove reload` | Regenerates the Caddyfile and reloads the Caddy server. |
+| `cove autostart [on\|off\|status]` | macOS: starts Cove's services when you log in (on by default). A login agent, `com.cove.autostart`, loads FrankenPHP, Mailpit, the watchdog and any php-fpm pools; a Cove stopped with `cove disable` stays stopped. On Linux Cove's systemd units already start at boot. |
 | `cove health` | Read-only diagnostic: service liveness, FrankenPHP process state and last exit, recent segfaults classified by cause, live OPcache pressure, on-disk hygiene, and network exposure (what other machines can reach). Recommends fixes, changes nothing, and exits 1 when something is critical. |
 | `cove opcache [show]` | The shared OPcache that FrankenPHP keeps for every site: its configured limits and the running server's live state (full or not, hits and misses). |
 | `cove opcache sites [--watch[=<sec>]] [--format=json]` | Splits the cache by site: files, MB, and how much was compiled again since the server started (dead weight until the next restart). `--watch` prints, per site, what was new and what was recompiled every minute (or every `<sec>`), with totals on Ctrl-C. |
@@ -182,7 +183,7 @@ For browsing and editing, the dashboard's **databases** view lists every databas
 
 | Command | Description |
 | --- | --- |
-| `cove install` | Installs and configures all required dependencies: FrankenPHP, MariaDB, Mailpit, gum and WP-CLI, through Homebrew on macOS (FrankenPHP from its GitHub release) or apt/dnf on Linux. PostgreSQL and Redis are set up later, when a Laravel site needs them. |
+| `cove install` | Installs and configures all required dependencies: FrankenPHP, MariaDB, Mailpit, gum and WP-CLI, through Homebrew on macOS (FrankenPHP from its GitHub release) or apt, dnf or pacman on Linux. PostgreSQL and Redis are set up later, when a Laravel site needs them. |
 | `cove uninstall [--purge] [--dry-run] [--yes]` | Removes Cove's services, background shares, LAN advertisements, the menu bar app, Cove's `/etc/hosts` lines, and the `cove` command, keeping `~/Cove` and the databases. `--purge` also deletes every site and the databases Cove made for them, `~/Cove` and the local CA, after you type `delete`. See [Uninstalling](#uninstalling). |
 | `cove trust` | Installs Cove's local root certificate into the system trust store and every browser certificate database it can find: Chrome/Chromium/Brave/Edge's shared `~/.pki/nssdb`, Firefox profiles, snap and Flatpak browsers. Fresh installs run it automatically; re-run any time the root rotates. |
 | `cove upgrade` | Upgrades Cove, FrankenPHP, and Adminer to the latest versions, and refreshes the managed bits (Whoops, the login helper, the watchdog). |
@@ -286,7 +287,8 @@ The web dashboard lives at `https://cove.localhost` (or `https://cove.localhost:
 ### Mail — `/mail`, `/mail/<site>`
 
   * An inbox of every message your sites send, over Mailpit's API. Each message carries a site chip; one click narrows the inbox to that site, and a site's row menu lands there directly.
-  * The message opens beside the list with `html`, `text`, and `headers` a click apart. HTML renders in a sandboxed frame that runs no scripts and loads nothing remote; inline images come through, remote ones are counted and blocked.
+  * The message opens beside the list with `html`, `text`, and `headers` a click apart. HTML renders in a sandboxed frame that runs no scripts. Inline images and images from your own `*.localhost` sites come through; remote ones are counted and blocked until **load images** loads them for that message.
+  * A **light / dark** pill previews a message as a mail app in light or dark mode would, using the message's own `prefers-color-scheme: dark` styles.
   * Every link in a message is lifted into a row of chips with a **copy** button — most local mail exists to carry a password reset or login link.
   * Mark unread, delete, mark all read, delete everything matching. New mail arrives live. Nothing is ever pruned: Cove launches Mailpit with no message cap.
 
@@ -390,10 +392,10 @@ The `--dev` flag tells the installer to use the local `cove.sh` from the same di
 ### Supported Platforms
 
 - **macOS**: Apple Silicon and Intel (via Homebrew; FrankenPHP comes from its GitHub release)
-- **Linux**: Ubuntu and Debian (apt), Fedora and Rocky Linux/RHEL (dnf), and distributions derived from them. Each release is tested on Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43 and Rocky Linux 9.
+- **Linux**: Ubuntu and Debian (apt), Fedora and Rocky Linux/RHEL (dnf), Arch (pacman), and distributions derived from them (Omarchy, EndeavourOS, Manjaro, CachyOS). Each release is tested on Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43 and Rocky Linux 9, and on Arch on the developer's own machine.
 - **WSL2**: Windows Subsystem for Linux (requires systemd enabled)
 
-Per-site PHP versions (`cove php`) need Homebrew, so they are macOS-only; on Linux every site runs on FrankenPHP's bundled PHP.
+Per-site PHP versions (`cove php`) need Homebrew, so they are macOS-only; on Linux every site runs on FrankenPHP's bundled PHP, except one with Xdebug on.
 
 ## 🩺 Troubleshooting
 
