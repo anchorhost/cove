@@ -8,8 +8,10 @@
 # full colour when Caddy, MariaDB and Mailpit are all up, light grey when
 # some are, dark grey when everything is stopped.
 #
-# It is a StatusNotifierItem (the freedesktop tray protocol) published through
-# AyatanaAppIndicator3, so it shows up on any desktop that hosts a tray:
+# It is a StatusNotifierItem (the freedesktop tray protocol), published by
+# SniIndicator with ItemIsMenu set so a left click opens the menu (falling back
+# to AyatanaAppIndicator3 without libdbusmenu-gtk3's bindings), so it shows up
+# on any desktop that hosts a tray:
 # COSMIC, KDE, XFCE, MATE, Cinnamon, and GNOME with the AppIndicator extension
 # (Ubuntu ships it enabled; vanilla GNOME and Debian do not). The menu itself
 # is rendered by the desktop's panel over DBus, which is why there is no
@@ -36,8 +38,28 @@ from datetime import datetime
 import gi
 
 gi.require_version("Gtk", "3.0")
-gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+from gi.repository import Gtk, GLib, Gio  # noqa: E402
+
+# The tray item is published by SniIndicator below (its own StatusNotifierItem
+# with ItemIsMenu, the menu exported through libdbusmenu-gtk3). Where those
+# bindings are missing it falls back to AyatanaAppIndicator3, which works
+# everywhere but publishes no ItemIsMenu: hosts that honour the spec then send
+# a left click to Activate, which Ayatana doesn't handle, so only a right
+# click opened the menu (omarchy-shell / Quickshell, 2026-11-18).
+try:
+    gi.require_version("Dbusmenu", "0.4")
+    gi.require_version("DbusmenuGtk3", "0.4")
+    from gi.repository import Dbusmenu, DbusmenuGtk3  # noqa: E402
+    HAVE_DBUSMENU = True
+except (ValueError, ImportError):
+    HAVE_DBUSMENU = False
+
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+    HAVE_AYATANA = True
+except (ValueError, ImportError):
+    HAVE_AYATANA = False
 
 try:
     gi.require_version("Notify", "0.7")
@@ -73,6 +95,146 @@ ICON_VARIANTS = {
     "cove-logo-partial": "#9a9a9a",
     "cove-logo-stopped": "#4a4a4a",
 }
+
+
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="WindowId" type="i" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
+    <property name="IconPixmap" type="a(iiay)" access="read"/>
+    <property name="OverlayIconName" type="s" access="read"/>
+    <property name="AttentionIconName" type="s" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
+    <signal name="NewTitle"/>
+    <signal name="NewIcon"/>
+    <signal name="NewAttentionIcon"/>
+    <signal name="NewOverlayIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewStatus"><arg name="status" type="s"/></signal>
+  </interface>
+</node>
+"""
+SNI_PATH = "/StatusNotifierItem"
+SNI_MENU_PATH = "/MenuBar"
+SNI_WATCHER = "org.kde.StatusNotifierWatcher"
+
+
+class SniIndicator:
+    """A StatusNotifierItem of our own, with the few AppIndicator calls the
+    tray uses (set_menu, set_icon_full, set_title, set_icon_theme_path).
+
+    ItemIsMenu is true, so a host opens the menu on a left click as the macOS
+    app does; the menu is the same Gtk.Menu, exported with the dbusmenu
+    parser Ayatana itself uses, so labels changed in place keep updating.
+    It registers with the StatusNotifierWatcher whenever one appears, so the
+    icon comes back when the panel restarts."""
+
+    def __init__(self, item_id, icon_name, theme_path, title):
+        self.item_id = item_id
+        self.icon_name = icon_name
+        self.theme_path = theme_path
+        self.title = title
+        self.tooltip = title
+        self.server = None
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        node = Gio.DBusNodeInfo.new_for_xml(SNI_XML)
+        self.registration = self.bus.register_object(
+            SNI_PATH, node.interfaces[0], self.on_method_call, self.on_get_property, None)
+        self.owner = Gio.bus_own_name_on_connection(
+            self.bus, self.bus_name, Gio.BusNameOwnerFlags.NONE, None, None)
+        self.watch = Gio.bus_watch_name_on_connection(
+            self.bus, SNI_WATCHER, Gio.BusNameWatcherFlags.NONE, self.on_watcher_appeared, None)
+
+    def on_watcher_appeared(self, connection, name, owner):
+        connection.call(SNI_WATCHER, "/StatusNotifierWatcher", SNI_WATCHER, "RegisterStatusNotifierItem",
+                        GLib.Variant("(s)", (self.bus_name,)), None, Gio.DBusCallFlags.NONE, -1, None,
+                        self.on_registered)
+
+    def on_registered(self, connection, result):
+        try:
+            connection.call_finish(result)
+            log("Tray icon registered with the StatusNotifierWatcher")
+        except GLib.Error as error:
+            log(f"Couldn't register the tray icon: {error.message}")
+
+    def on_method_call(self, connection, sender, path, interface, method, params, invocation):
+        # The host renders the menu itself (ItemIsMenu); nothing else to do.
+        invocation.return_value(None)
+
+    def on_get_property(self, connection, sender, path, interface, prop):
+        values = {
+            "Category": GLib.Variant("s", "ApplicationStatus"),
+            "Id": GLib.Variant("s", self.item_id),
+            "Title": GLib.Variant("s", self.title),
+            "Status": GLib.Variant("s", "Active"),
+            "WindowId": GLib.Variant("i", 0),
+            "IconName": GLib.Variant("s", self.icon_name),
+            "IconThemePath": GLib.Variant("s", self.theme_path),
+            "IconPixmap": GLib.Variant("a(iiay)", []),
+            "OverlayIconName": GLib.Variant("s", ""),
+            "AttentionIconName": GLib.Variant("s", ""),
+            "ToolTip": GLib.Variant("(sa(iiay)ss)", ("", [], self.title, self.tooltip)),
+            "ItemIsMenu": GLib.Variant("b", True),
+            "Menu": GLib.Variant("o", SNI_MENU_PATH),
+        }
+        return values.get(prop)
+
+    def emit(self, signal, params=None):
+        try:
+            self.bus.emit_signal(None, SNI_PATH, "org.kde.StatusNotifierItem", signal, params)
+        except GLib.Error as error:
+            log(f"Couldn't signal {signal}: {error.message}")
+
+    def set_menu(self, menu):
+        self.server = Dbusmenu.Server.new(SNI_MENU_PATH)
+        self.server.set_root(DbusmenuGtk3.gtk_parse_menu_structure(menu))
+
+    def set_icon_theme_path(self, path):
+        self.theme_path = path
+
+    def set_title(self, title):
+        self.title = title
+        self.emit("NewTitle")
+
+    def set_icon_full(self, icon_name, description):
+        changed_icon = icon_name != self.icon_name
+        changed_tip = description != self.tooltip
+        self.icon_name = icon_name
+        self.tooltip = description
+        if changed_icon:
+            self.emit("NewIcon")
+        if changed_tip:
+            self.emit("NewToolTip")
+
+
+def new_indicator(icon_name):
+    """The tray item: SniIndicator, or Ayatana's where dbusmenu is missing."""
+    if HAVE_DBUSMENU:
+        try:
+            return SniIndicator("cove", icon_name, ICON_DIR, "Cove")
+        except GLib.Error as error:
+            log(f"Own StatusNotifierItem failed ({error.message}); using AyatanaAppIndicator3")
+    if not HAVE_AYATANA:
+        raise SystemExit("Cove Menu Bar needs libdbusmenu-gtk3 or AyatanaAppIndicator3 bindings.")
+    indicator = AppIndicator.Indicator.new(
+        "cove", icon_name, AppIndicator.IndicatorCategory.APPLICATION_STATUS)
+    indicator.set_icon_theme_path(ICON_DIR)
+    indicator.set_title("Cove")
+    indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+    return indicator
 
 
 def log(text):
@@ -187,11 +349,7 @@ class CoveTray:
         self.sites_dir_mtime = None
 
         write_icon_variants()
-        self.indicator = AppIndicator.Indicator.new(
-            "cove", "cove-logo-partial", AppIndicator.IndicatorCategory.APPLICATION_STATUS)
-        self.indicator.set_icon_theme_path(ICON_DIR)
-        self.indicator.set_title("Cove")
-        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator = new_indicator("cove-logo-partial")
 
         self.menu = Gtk.Menu()
         self.build_menu()

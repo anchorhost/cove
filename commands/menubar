@@ -176,7 +176,7 @@ cove_menubar_enable_linux() {
     if ! menubar_linux_deps_ok; then
         echo "📦 The tray app needs python3 with GTK 3 and AyatanaAppIndicator3 bindings."
         if command -v apt-get &>/dev/null; then
-            local pkgs="python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7"
+            local pkgs="python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-dbusmenu-gtk3-0.4 gir1.2-notify-0.7"
             if [ -t 0 ]; then
                 if ! gum confirm "Install them now? (sudo apt-get install $pkgs)"; then
                     echo "Aborted."
@@ -192,8 +192,8 @@ cove_menubar_enable_linux() {
             fi
         else
             gum style --foreground red "❌ Install them with your package manager, then re-run 'cove menubar enable':"
-            echo "   Fedora: sudo dnf install python3-gobject gtk3 libayatana-appindicator-gtk3"
-            echo "   Arch:   sudo pacman -S python-gobject gtk3 libayatana-appindicator"
+            echo "   Fedora: sudo dnf install python3-gobject gtk3 libayatana-appindicator-gtk3 libdbusmenu-gtk3"
+            echo "   Arch:   sudo pacman -S python-gobject gtk3 libayatana-appindicator libdbusmenu-gtk3"
             exit 1
         fi
         if ! menubar_linux_deps_ok; then
