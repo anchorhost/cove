@@ -18,8 +18,9 @@
 #                      status/health/mailpit → mail from a page and WP-CLI →
 #                      `cove mcp` over stdio → Laravel sites (SQLite and
 #                      MariaDB, artisan, one-time login, clone, delete) →
-#                      log rotation settings →
-#                      container reboot survival
+#                      log rotation settings → Xdebug (php-zts-fpm pool,
+#                      sessions from a page and WP-CLI) →
+#                      container reboot survival (and the pool's return)
 #    B (one apt/dnf):  previous GitHub release → candidate + post-upgrade
 #    C (one apt/dnf):  install + add as a non-root sudo user →
 #                      the previous release's own `cove upgrade` to the
@@ -194,7 +195,7 @@ lane_a() {
             res "$c" install PASS
         else
             res "$c" install FAIL
-            for k in add_latest add_pinned add_plain add_from clone rename login login_rewrite delete status health mailpit mail mcp laravel logrotate reboot uninstall; do res "$c" "$k" SKIP; done
+            for k in add_latest add_pinned add_plain add_from clone rename login login_rewrite delete status health mailpit mail mcp laravel logrotate xdebug reboot xdebug_boot uninstall; do res "$c" "$k" SKIP; done
             return
         fi
 
@@ -472,11 +473,76 @@ LOGROTATE
             res "$c" logrotate FAIL
         fi
 
+        # Xdebug: without a terminal `cove xdebug on` names the packages to
+        # install (FrankenPHP's php-zts-fpm and php-zts-devel here); after
+        # that it builds Xdebug and moves the site to its own php-fpm pool.
+        # An "IDE" (php-cli on port 9003) gets a session from a page with
+        # the trigger, none without, and one from `cove wp`. Left on, so the
+        # reboot below shows the watchdog bringing the pool back.
+        if cx "$c" bash -s <<'XDEBUGCHECK'
+fail() { echo "xdebug: $*" >&2; exit 1; }
+pub=/root/Cove/Sites/alpha.localhost/public
+if cove xdebug alpha on </dev/null >/tmp/xd-first.log 2>&1; then fail "on worked before php-fpm was installed"; fi
+cmd=$(grep -oE '(sudo )?(apt|dnf|pacman) [^│]*' /tmp/xd-first.log | head -1 | sed 's/[[:space:]]*$//')
+[ -n "$cmd" ] || fail "no install command: $(cat /tmp/xd-first.log)"
+case "$cmd" in *php-zts-xdebug*) fail "the install names php-zts-xdebug: $cmd" ;; esac
+cmd=${cmd#sudo }
+case "$cmd" in apt\ *) cmd="DEBIAN_FRONTEND=noninteractive apt-get -y ${cmd#apt }" ;; dnf\ *) cmd="$cmd -y" ;; esac
+eval "$cmd" >/tmp/xd-pkgs.log 2>&1 || fail "installing ($cmd): $(tail -n 5 /tmp/xd-pkgs.log)"
+cove xdebug alpha on </dev/null >/tmp/xd-on.log 2>&1 || fail "cove xdebug alpha on: $(tail -n 12 /tmp/xd-on.log)"
+cove xdebug | grep -q 'alpha.localhost.*php-fpm with Xdebug' || fail "overview: $(cove xdebug)"
+printf '%s\n' '<?php header("Content-Type: text/plain"); echo PHP_SAPI, " xdebug=", extension_loaded("xdebug") ? "yes" : "no", " mysqli=", extension_loaded("mysqli") ? "yes" : "no";' > "$pub/xd-check.php"
+r=""
+for i in 1 2 3 4 5; do r=$(curl -sk --max-time 20 https://alpha.localhost/xd-check.php); [ "$r" = "fpm-fcgi xdebug=yes mysqli=yes" ] && break; sleep 2; done
+[ "$r" = "fpm-fcgi xdebug=yes mysqli=yes" ] || fail "xd-check said: $r"
+curl -sk --max-time 30 https://alpha.localhost/ | grep -q 'Welcome to alpha' || fail "alpha's home page under the pool"
+# frankenphp php-cli takes no argv (php/frankenphp#2690), so env in.
+ide() { COVE_T="$1" timeout 60 frankenphp php-cli -r '$s = stream_socket_server("tcp://127.0.0.1:9003", $e, $es); if (!$s) { echo "listen failed"; exit(1); } $c = @stream_socket_accept($s, (float) getenv("COVE_T")); if (!$c) { echo "none"; exit(0); } $d = fread($c, 8192); preg_match("/fileuri=\"([^\"]+)\"/", $d, $m); fwrite($c, "run -i 1\0"); echo $m[1] ?? "init?"; fclose($c);'; }
+ide 25 >/tmp/xd-ide1 & sleep 1
+curl -sk --max-time 30 -o /dev/null 'https://alpha.localhost/?XDEBUG_SESSION=1'; wait
+grep -q '^file://' /tmp/xd-ide1 || fail "no session from a page with the trigger: $(cat /tmp/xd-ide1)"
+ide 5 >/tmp/xd-ide2 & sleep 1
+curl -sk --max-time 30 -o /dev/null https://alpha.localhost/; wait
+[ "$(cat /tmp/xd-ide2)" = none ] || fail "a session without the trigger: $(cat /tmp/xd-ide2)"
+ide 40 >/tmp/xd-ide3 & sleep 1
+XDEBUG_SESSION=1 cove wp alpha option get home >/tmp/xd-cli.log 2>&1; wait
+grep -q '^file://' /tmp/xd-ide3 || fail "no session from cove wp: $(cat /tmp/xd-ide3) / $(tail -n 3 /tmp/xd-cli.log)"
+grep -q 'alpha.localhost' /tmp/xd-cli.log || fail "cove wp under Xdebug: $(tail -n 3 /tmp/xd-cli.log)"
+exit 0
+XDEBUGCHECK
+        then
+            res "$c" xdebug PASS
+        else
+            res "$c" xdebug FAIL
+        fi
+
         incus restart "$c"; sleep 25
         if site_has "$c" alpha "Welcome to alpha"; then
             res "$c" reboot PASS
         else
             res "$c" reboot FAIL
+        fi
+
+        # The pool comes back after the reboot (the watchdog starts it), and
+        # `off` puts alpha back on FrankenPHP and stops it.
+        if cx "$c" bash -s <<'XDEBUGBOOT'
+fail() { echo "xdebug_boot: $*" >&2; exit 1; }
+[ -f /root/Cove/Sites/alpha.localhost/xdebug ] || fail "xdebug was not on before the reboot"
+r=""
+for i in $(seq 1 20); do r=$(curl -sk --max-time 20 https://alpha.localhost/xd-check.php); [ "$r" = "fpm-fcgi xdebug=yes mysqli=yes" ] && break; sleep 3; done
+[ "$r" = "fpm-fcgi xdebug=yes mysqli=yes" ] || fail "after the reboot xd-check said: $r"
+cove xdebug alpha off </dev/null >/tmp/xd-off.log 2>&1 || fail "off: $(tail -n 5 /tmp/xd-off.log)"
+sleep 2
+r=$(curl -sk --max-time 20 https://alpha.localhost/xd-check.php)
+case "$r" in fpm-fcgi*) fail "still on php-fpm after off: $r" ;; *xdebug=no*) ;; *) fail "after off: $r" ;; esac
+pgrep -f 'php-fpm[:] master' >/dev/null && fail "a pool is still running"
+rm -f /root/Cove/Sites/alpha.localhost/public/xd-check.php
+exit 0
+XDEBUGBOOT
+        then
+            res "$c" xdebug_boot PASS
+        else
+            res "$c" xdebug_boot FAIL
         fi
 
         # `cove uninstall`, last as it takes Cove away (lanes B and C restore
