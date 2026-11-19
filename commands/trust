@@ -1,4 +1,53 @@
+# Browsers that are running right now, one "Name<TAB>process<TAB>started"
+# line each (the main process with the lowest pid). On Linux they read their
+# NSS certificate databases only when they start, so one that was already
+# open before `cove trust` keeps showing "Your connection is not private"
+# until it is quit fully and reopened. Child processes (--type=…, Firefox's
+# -contentproc) and helpers such as chrome_crashpad_handler are skipped. With
+# an epoch argument, only browsers started before then are listed: one opened
+# after the root went in already trusts it.
+cove_browsers_running() {
+    command -v ps >/dev/null 2>&1 || return 0
+    local before="${1:-}" pid d1 d2 d3 d4 d5 exe args name base started
+    while read -r pid d1 d2 d3 d4 d5 exe args; do
+        [ -n "$exe" ] || continue
+        if [ -n "$before" ]; then
+            started=$(date -d "$d1 $d2 $d3 $d4 $d5" +%s 2>/dev/null) || started=""
+            [ -n "$started" ] && [ "$started" -ge "$before" ] && continue
+        fi
+        case " $args " in *" --type="*|*" -contentproc "*) continue ;; esac
+        base="${exe##*/}"
+        case "$base" in
+            chrome|google-chrome|google-chrome-stable|google-chrome-beta|google-chrome-unstable) name="Chrome" ;;
+            chromium|chromium-browser) name="Chromium" ;;
+            brave|brave-browser) name="Brave" ;;
+            vivaldi|vivaldi-bin) name="Vivaldi" ;;
+            msedge|microsoft-edge|microsoft-edge-stable) name="Edge" ;;
+            helium) name="Helium" ;;
+            opera) name="Opera" ;;
+            firefox|firefox-bin|firefox-esr) name="Firefox" ;;
+            librewolf) name="LibreWolf" ;;
+            zen|zen-bin) name="Zen" ;;
+            *) continue ;;
+        esac
+        printf '%s\t%s\t%s %s %s %s %s\n' "$name" "$base" "$d1" "$d2" "$d3" "$d4" "$d5"
+    done < <(ps -eo pid=,lstart=,args= 2>/dev/null) | sort -t$'\t' -k1,1 -s | awk -F'\t' '!seen[$1]++'
+}
+
+# "18:18" for a start time today, "Nov 17 18:18" for an earlier day (GNU date;
+# the raw ps time where date can't parse it).
+cove_browser_started_label() {
+    local when="$1" day today
+    day=$(date -d "$when" +%Y-%m-%d 2>/dev/null) || { echo "$when"; return; }
+    today=$(date +%Y-%m-%d)
+    if [ "$day" = "$today" ]; then date -d "$when" +%H:%M; else date -d "$when" '+%b %-d %H:%M'; fi
+}
+
 cove_trust() {
+    # Browsers started before this moment loaded their certificate stores
+    # without the root (see cove_browsers_running).
+    local trust_began
+    trust_began=$(date +%s)
     echo "🔐 Installing Cove's local root certificate..."
 
     # FrankenPHP's `trust` subcommand writes the Caddy local root into the
@@ -121,9 +170,42 @@ cove_trust() {
 
     echo ""
     if [ "$trust_rc" -eq 0 ]; then
-        gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
-            "✅ Local SSL trust installed" \
-            "If a browser was open during this run, restart it to pick up the new CA."
+        # On Linux, name the browsers that were already open: they loaded their
+        # NSS databases before the root went in and will keep refusing Cove's
+        # certificates until they are quit fully (closing windows can leave
+        # Chrome running in the background) and opened again.
+        local -a open_lines=() quit_procs=()
+        local b_name b_proc b_started
+        if [ "$OS" = "linux" ]; then
+            while IFS=$'\t' read -r b_name b_proc b_started; do
+                [ -n "$b_name" ] || continue
+                open_lines+=("   • $b_name, open since $(cove_browser_started_label "$b_started")")
+                quit_procs+=("$b_proc")
+            done < <(cove_browsers_running "$trust_began")
+        fi
+        if [ ${#open_lines[@]} -gt 0 ]; then
+            # One pkill pattern for them all (pkill takes a single regex).
+            local quit_pattern
+            quit_pattern=$(IFS='|'; echo "${quit_procs[*]}")
+            local restart_line="⚠️  Restart this browser: it was already running and still shows"
+            if [ ${#quit_procs[@]} -gt 1 ]; then
+                quit_pattern="'$quit_pattern'"
+                restart_line="⚠️  Restart these browsers: they were already running and still show"
+            fi
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+                "✅ Local SSL trust installed" \
+                "" \
+                "$restart_line" \
+                "   \"Your connection is not private\" until quit fully and reopened." \
+                "${open_lines[@]}" \
+                "" \
+                "Quit from the browser's menu (Exit / Quit), not just by closing windows," \
+                "or run: pkill -x $quit_pattern"
+        else
+            gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 \
+                "✅ Local SSL trust installed" \
+                "If a browser was open during this run, restart it to pick up the new CA."
+        fi
     else
         # Tailor the hint based on what frankenphp actually said — "connection
         # refused" almost always means Caddy's admin API isn't up yet.
