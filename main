@@ -415,11 +415,13 @@ php_fpm_sock_for() {
 
 # One tool of a native PHP, by major.minor: $2 is fpm, php, phpize or
 # php-config. Echoes its path, or nothing when that PHP (or that tool) isn't
-# installed. On macOS it's Homebrew's php@<ver>. On Linux it's what the
-# distribution installed: Arch's php and php-fpm (/usr/bin), Debian and
-# Ubuntu's versioned names (php8.3, php-fpm8.3, phpize8.3), Fedora's
-# /usr/sbin/php-fpm, Remi's /opt/remi/php83. Only a binary that reports that
-# version counts, and never FrankenPHP.
+# installed. On macOS it's Homebrew's php@<ver>. On Linux, first the
+# php-zts packages from FrankenPHP's own repository (php-fpm-zts, php-zts,
+# phpize-zts: what apt and dnf installs use, at FrankenPHP's version, sharing
+# its /etc/php-zts/conf.d), then the distribution's: Arch's php and php-fpm
+# (/usr/bin), Debian and Ubuntu's versioned names (php8.3, php-fpm8.3),
+# Fedora's /usr/sbin/php-fpm, Remi's /opt/remi/php83. Only a binary that
+# reports that version counts, and never FrankenPHP.
 native_php_tool() {
     local ver="$1" tool="$2" prefix nn c real got
     case "$ver" in [578].[0-9]|[578].[0-9][0-9]) ;; *) return 0 ;; esac
@@ -437,10 +439,10 @@ native_php_tool() {
     nn="${ver//./}"
     local cands=()
     case "$tool" in
-        fpm) cands=("/usr/sbin/php-fpm$ver" "/opt/remi/php$nn/root/usr/sbin/php-fpm" /usr/sbin/php-fpm /usr/bin/php-fpm) ;;
-        php) cands=("/usr/bin/php$ver" "/opt/remi/php$nn/root/usr/bin/php" /usr/bin/php) ;;
-        phpize) cands=("/usr/bin/phpize$ver" "/opt/remi/php$nn/root/usr/bin/phpize" /usr/bin/phpize) ;;
-        php-config) cands=("/usr/bin/php-config$ver" "/opt/remi/php$nn/root/usr/bin/php-config" /usr/bin/php-config) ;;
+        fpm) cands=(/usr/sbin/php-fpm-zts "/usr/sbin/php-fpm$ver" "/opt/remi/php$nn/root/usr/sbin/php-fpm" /usr/sbin/php-fpm /usr/bin/php-fpm) ;;
+        php) cands=(/usr/bin/php-zts "/usr/bin/php$ver" "/opt/remi/php$nn/root/usr/bin/php" /usr/bin/php) ;;
+        phpize) cands=(/usr/bin/phpize-zts "/usr/bin/phpize$ver" "/opt/remi/php$nn/root/usr/bin/phpize" /usr/bin/phpize) ;;
+        php-config) cands=(/usr/bin/php-config-zts "/usr/bin/php-config$ver" "/opt/remi/php$nn/root/usr/bin/php-config" /usr/bin/php-config) ;;
         *) return 0 ;;
     esac
     for c in "${cands[@]}"; do
@@ -464,7 +466,7 @@ native_php_tool() {
 # The major.minor of every native PHP Linux has installed (for messages).
 native_php_versions_linux() {
     local c v
-    for c in /usr/bin/php /usr/bin/php[578].[0-9]* /opt/remi/php*/root/usr/bin/php; do
+    for c in /usr/bin/php-zts /usr/bin/php /usr/bin/php[578].[0-9]* /opt/remi/php*/root/usr/bin/php; do
         [ -x "$c" ] || continue
         case "$(readlink -f "$c" 2>/dev/null)" in *frankenphp*) continue ;; esac
         v=$("$c" -n -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null)
@@ -7755,7 +7757,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($xdebug_on && PHP_OS_FAMILY === 'Linux') {
                 $__xd_nn = str_replace('.', '', $xd_ver);
                 $__xd_fpm = false;
-                foreach (['/usr/sbin/php-fpm' . $xd_ver, '/opt/remi/php' . $__xd_nn . '/root/usr/sbin/php-fpm', '/usr/sbin/php-fpm', '/usr/bin/php-fpm'] as $__xd_c) {
+                foreach (['/usr/sbin/php-fpm-zts', '/usr/sbin/php-fpm' . $xd_ver, '/opt/remi/php' . $__xd_nn . '/root/usr/sbin/php-fpm', '/usr/sbin/php-fpm', '/usr/bin/php-fpm'] as $__xd_c) {
                     if (is_executable($__xd_c)) { $__xd_fpm = true; break; }
                 }
                 if (!$__xd_fpm) {

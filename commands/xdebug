@@ -123,14 +123,18 @@ xdebug_build() {
 
 # The packages that give Linux PHP $1 with php-fpm and phpize, plus what
 # building Xdebug needs, for this distribution's package manager, one a line.
-# The distribution's own PHP: when it's another version, the message after
-# the install says so.
+# apt and dnf: FrankenPHP's own repository (Cove installs FrankenPHP from it
+# there), whose php-zts-fpm is FrankenPHP's PHP and loads the same
+# extensions. Never its php-zts-xdebug: that turns Xdebug on in the shared
+# conf.d, for FrankenPHP and every site. Arch: the distribution's PHP, which
+# follows the latest release as FrankenPHP's static binary does; when the two
+# differ, the message after the install says so.
 xdebug_linux_packages() {
     local ver="$1"
     case "$PKG_MANAGER" in
         pacman) printf '%s\n' php php-fpm php-gd php-sodium base-devel autoconf ;;
-        apt) printf '%s\n' "php$ver-fpm" "php$ver-dev" "php$ver-mysql" "php$ver-curl" "php$ver-gd" "php$ver-intl" "php$ver-mbstring" "php$ver-xml" "php$ver-zip" build-essential autoconf ;;
-        dnf) printf '%s\n' php-fpm php-devel php-mysqlnd php-gd php-intl php-mbstring php-xml php-pecl-zip gcc make autoconf ;;
+        apt) printf '%s\n' php-zts-fpm php-zts-devel build-essential autoconf ;;
+        dnf) printf '%s\n' php-zts-fpm php-zts-devel gcc make autoconf ;;
     esac
 }
 
