@@ -92,9 +92,12 @@ setup_environment() {
             PKG_MANAGER="apt"
         elif [[ "$ID" == "fedora" || "$ID" == "centos" || "$ID" == "rhel" || "$ID_LIKE" == *"fedora"* || "$ID_LIKE" == *"rhel"* ]]; then
             PKG_MANAGER="dnf"
+        elif [[ "$ID" == "arch" || "$ID_LIKE" == *"arch"* ]]; then
+            # Arch and derivatives (Omarchy, EndeavourOS, Manjaro, CachyOS).
+            PKG_MANAGER="pacman"
         else
             echo "❌ ERROR: Unsupported Linux distribution: $ID." >&2
-            echo "Supported: Ubuntu, Debian, Fedora, CentOS, RHEL and derivatives." >&2
+            echo "Supported: Ubuntu, Debian, Fedora, CentOS, RHEL, Arch and derivatives." >&2
             exit 1
         fi
         
@@ -1682,6 +1685,8 @@ linux_php_extension_packages() {
     case "$PKG_MANAGER" in
         apt) echo "$base php-zts-pdo-sqlite php-zts-pdo-mysql php-zts-pdo-pgsql" ;;
         dnf) echo "$base php-zts-pdo_sqlite php-zts-pdo_mysql php-zts-pdo_pgsql" ;;
+        # pacman: none. Arch has no FrankenPHP package, so FrankenPHP's
+        # installer leaves the static binary, which has these built in.
     esac
 }
 
@@ -1892,9 +1897,18 @@ cove_pg_setup() {
             if [ "$PKG_MANAGER" = "apt" ]; then
                 $SUDO_CMD apt-get update -qq >/dev/null 2>&1
                 $SUDO_CMD env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql >/dev/null 2>&1
+            elif [ "$PKG_MANAGER" = "pacman" ]; then
+                $SUDO_CMD pacman -S --needed --noconfirm postgresql >/dev/null 2>&1
             else
                 $SUDO_CMD dnf install -y -q postgresql-server postgresql >/dev/null 2>&1
             fi || { echo "❌ Error: Could not install PostgreSQL." >&2; return 1; }
+        fi
+        # Arch leaves the cluster to be made too.
+        if [ "$PKG_MANAGER" = "pacman" ] && ! $SUDO_CMD test -f /var/lib/postgres/data/PG_VERSION; then
+            local as_pg="sudo -u postgres"
+            [ "$(id -u)" = "0" ] && as_pg="runuser -u postgres --"
+            (cd /tmp && $as_pg initdb --locale=C.UTF-8 -E UTF-8 -D /var/lib/postgres/data >/dev/null 2>&1) \
+                || { echo "❌ Error: initdb could not create /var/lib/postgres/data." >&2; return 1; }
         fi
         # Fedora and RHEL leave the cluster to be made, and let connections
         # from 127.0.0.1 in only as the matching system account (ident):
@@ -2018,6 +2032,9 @@ ensure_redis() {
         if [ "$PKG_MANAGER" = "apt" ]; then
             $SUDO_CMD apt-get update -qq >/dev/null 2>&1
             $SUDO_CMD env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq redis-server >/dev/null 2>&1
+        elif [ "$PKG_MANAGER" = "pacman" ]; then
+            # Arch replaced redis with valkey in its repositories.
+            $SUDO_CMD pacman -S --needed --noconfirm valkey >/dev/null 2>&1
         else
             $SUDO_CMD dnf install -y -q redis >/dev/null 2>&1 || $SUDO_CMD dnf install -y -q valkey >/dev/null 2>&1
         fi || { echo "❌ Error: Could not install Redis." >&2; return 1; }

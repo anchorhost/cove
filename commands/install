@@ -5,11 +5,13 @@ install_dependency() {
     local apt_pkg="$3"       # The package name for apt (Debian/Ubuntu)
     local dnf_pkg="$4"       # The package name for dnf (Fedora/RHEL) - can differ from apt
     local binary_url="$5"    # Optional URL to a binary/tarball for fallback
+    local pacman_pkg="${6-__same_as_dnf__}" # The package name for pacman (Arch); "" = none
 
     # If dnf_pkg not specified, default to apt_pkg
     if [ -z "$dnf_pkg" ]; then
         dnf_pkg="$apt_pkg"
     fi
+    [ "$pacman_pkg" = "__same_as_dnf__" ] && pacman_pkg="$dnf_pkg"
 
     # 1. Validate the command. If it runs, we're done.
     if command -v "$cmd_name" &>/dev/null; then
@@ -42,22 +44,33 @@ install_dependency() {
         # Determine the correct package name for this distro
         if [ "$PKG_MANAGER" == "apt" ]; then
             pkg_name="$apt_pkg"
+        elif [ "$PKG_MANAGER" == "pacman" ]; then
+            pkg_name="$pacman_pkg"
         else
             pkg_name="$dnf_pkg"
         fi
-        
+
         # Only try native package manager if a name is provided
         if [ -n "$pkg_name" ]; then
-            echo "   - Updating package cache..."
+            # pacman: no refresh. `pacman -Sy <pkg>` without -u is a partial
+            # upgrade, which Arch doesn't support; install against the
+            # databases the system already has.
+            if [ "$PKG_MANAGER" != "pacman" ]; then
+                echo "   - Updating package cache..."
+            fi
             if [ "$PKG_MANAGER" == "apt" ]; then
                 $SUDO_CMD apt-get update -qq >/dev/null 2>&1
-            else
+            elif [ "$PKG_MANAGER" == "dnf" ]; then
                 $SUDO_CMD dnf makecache -q >/dev/null 2>&1 || true
             fi
-            
+
             echo "   - Installing $pkg_name via $PKG_MANAGER..."
             if [ "$PKG_MANAGER" == "apt" ]; then
                 if $SUDO_CMD apt-get install -y "$pkg_name" >/dev/null 2>&1; then
+                    installed_successfully=true
+                fi
+            elif [ "$PKG_MANAGER" == "pacman" ]; then
+                if $SUDO_CMD pacman -S --needed --noconfirm "$pkg_name" >/dev/null 2>&1; then
                     installed_successfully=true
                 fi
             else
@@ -86,6 +99,8 @@ install_dependency() {
                     echo "   - Installing tar (required to extract)..."
                     if [ "$PKG_MANAGER" == "apt" ]; then
                         $SUDO_CMD apt-get install -y tar >/dev/null 2>&1
+                    elif [ "$PKG_MANAGER" == "pacman" ]; then
+                        $SUDO_CMD pacman -S --needed --noconfirm tar >/dev/null 2>&1
                     else
                         $SUDO_CMD dnf install -y tar >/dev/null 2>&1
                     fi
@@ -482,7 +497,7 @@ cove_install() {
     fi
 
     # MariaDB - Database server
-    install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" ""
+    install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" "" "mariadb"
     # Pin portable collation defaults before the first start (see
     # write_mariadb_config in main for the MariaDB 11.5+ uca1400 trap).
     write_mariadb_config || true
@@ -584,6 +599,18 @@ INI
             exit 1
         fi
     else # Linux
+        # Arch's mariadb package leaves the data directory empty (apt and
+        # dnf initialize it), and the service won't start without one.
+        if [ "$PKG_MANAGER" = "pacman" ] && ! $SUDO_CMD test -d /var/lib/mysql/mysql; then
+            echo "   - Initializing the MariaDB data directory..."
+            if ! $SUDO_CMD mariadb-install-db --user=mysql --basedir=/usr --datadir=/var/lib/mysql >/dev/null 2>&1; then
+                gum style --foreground red "❌ mariadb-install-db failed to initialize /var/lib/mysql."
+                exit 1
+            fi
+        fi
+        # Neither pacman nor dnf enables the unit, so MariaDB would be gone
+        # after a reboot while Cove's own service comes back.
+        $SUDO_CMD systemctl enable mariadb >/dev/null 2>&1 || true
         if ! $SUDO_CMD systemctl restart mariadb; then
             gum style --foreground red "❌ Failed to start MariaDB via systemctl."
             exit 1
@@ -716,6 +743,9 @@ INI
                 echo "  To trust it system-wide (Fedora/RHEL):"
                 echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /etc/pki/ca-trust/source/anchors/caddy.crt"
                 echo "    sudo update-ca-trust"
+            elif [ "$PKG_MANAGER" = "pacman" ]; then
+                echo "  To trust it system-wide (Arch):"
+                echo "    sudo trust anchor --store ~/.local/share/caddy/pki/authorities/local/root.crt"
             else
                 echo "  To trust it system-wide (Ubuntu/Debian):"
                 echo "    sudo cp ~/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy.crt"

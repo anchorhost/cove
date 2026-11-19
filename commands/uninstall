@@ -320,6 +320,9 @@ cove_uninstall() {
         fp=$(command -v frankenphp 2>/dev/null)
         done_lines+=("  brew uninstall gum mariadb mailpit wp-cli   (plus postgresql@17 and redis if Cove set them up)")
         [ -n "$fp" ] && done_lines+=("  $([ -w "$(dirname "$fp")" ] || echo "sudo ")rm $fp")
+    elif [ "$PKG_MANAGER" = "pacman" ]; then
+        done_lines+=("  sudo pacman -Rs mariadb gum   (plus postgresql and redis if Cove set them up)")
+        done_lines+=("  sudo rm /usr/local/bin/frankenphp /usr/local/bin/mailpit /usr/local/bin/wp")
     else
         done_lines+=("  sudo $PKG_MANAGER remove frankenphp 'php-zts-*' mariadb-server   (plus postgresql and redis if Cove set them up)")
         done_lines+=("  sudo rm /usr/local/bin/mailpit /usr/local/bin/gum /usr/local/bin/wp")

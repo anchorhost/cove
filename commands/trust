@@ -18,6 +18,8 @@ cove_trust() {
                 $SUDO_CMD apt install -y libnss3-tools &>/dev/null || true
             elif [ "$PKG_MANAGER" = "dnf" ]; then
                 $SUDO_CMD dnf install -y nss-tools &>/dev/null || true
+            elif [ "$PKG_MANAGER" = "pacman" ]; then
+                $SUDO_CMD pacman -S --needed --noconfirm nss &>/dev/null || true
             fi
         fi
     fi
@@ -54,7 +56,7 @@ cove_trust() {
             -maxdepth 1 -name 'root.crt' 2>/dev/null | head -1)
         # Fallback: the system-trust copy Caddy drops on first auto-install.
         if [ -z "$root_cert" ]; then
-            root_cert=$(find /usr/local/share/ca-certificates \
+            root_cert=$(find /usr/local/share/ca-certificates /etc/ca-certificates/trust-source/anchors \
                 -maxdepth 1 -name 'Caddy_Local_Authority*.crt' 2>/dev/null | head -1)
         fi
 
@@ -94,7 +96,9 @@ cove_trust() {
             local live_fp stale_fp stale_file pruned=0
             live_fp=$(openssl x509 -in "$root_cert" -noout -fingerprint -sha256 2>/dev/null)
             if [ -n "$live_fp" ]; then
-                for stale_file in /usr/local/share/ca-certificates/Caddy_Local_Authority*.crt; do
+                # Debian's store, then Arch's (p11-kit anchors).
+                for stale_file in /usr/local/share/ca-certificates/Caddy_Local_Authority*.crt \
+                                  /etc/ca-certificates/trust-source/anchors/Caddy_Local_Authority*.crt; do
                     [ -f "$stale_file" ] || continue
                     stale_fp=$(openssl x509 -in "$stale_file" -noout -fingerprint -sha256 2>/dev/null)
                     if [ -n "$stale_fp" ] && [ "$stale_fp" != "$live_fp" ]; then
@@ -103,7 +107,11 @@ cove_trust() {
                 done
                 if [ "$pruned" -gt 0 ]; then
                     echo "   - Removed $pruned stale Cove root(s) from the system store"
-                    $SUDO_CMD update-ca-certificates --fresh >/dev/null 2>&1 || true
+                    if command -v update-ca-certificates >/dev/null 2>&1; then
+                        $SUDO_CMD update-ca-certificates --fresh >/dev/null 2>&1 || true
+                    elif command -v trust >/dev/null 2>&1; then
+                        $SUDO_CMD trust extract-compat >/dev/null 2>&1 || true
+                    fi
                 fi
             fi
         else
